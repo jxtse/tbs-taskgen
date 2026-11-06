@@ -16,6 +16,7 @@ Thresholds (DESIGN §3.1 S6B): for each metric, from per-seed values of ref and 
 from __future__ import annotations
 
 import math
+import re
 
 FORMS_ALL = {"ANS", "PROG", "DOMF", "CODE", "MULTI", "DESIGN", "INTERACT", "TRAJ", "PROOF"}
 
@@ -57,6 +58,12 @@ def validate_spec(spec: dict, cfg: dict) -> list[str]:
         if not any(m.get("on") == "hidden" for m in mets):
             errs.append("PROG needs hidden metrics")
     return errs
+
+
+def metric_family(name: str) -> str:
+    """public_rmse / hidden_rmse / rmse_public / rmse_hidden -> rmse"""
+    n = re.sub(r"^(public|hidden)_", "", name)
+    return re.sub(r"_(public|hidden)$", "", n)
 
 
 def _worse(direction: str, a: float, b: float) -> bool:
@@ -122,8 +129,12 @@ def set_thresholds(spec: dict, measure: dict, cfg: dict) -> dict:
         ok_ref = not _worse(d, r, thr)
         out[name] = dict(direction=d, threshold=thr, ref_worst=r, mid_best=m_best, separating=separating,
                          ref_passes=ok_ref, naive_capped=naive_capped)
-    mid_fail = {s: sum(1 for k, t in out.items() if t.get("threshold") is not None and v.get(k) is not None
-                       and _worse(t["direction"], v[k], t["threshold"])) for s, v in measure["mid"].items()}
+    # v2.2: the 1..2 "near miss" rule counts failed criteria, not metric names: the same quantity measured on public
+    # and on hidden data (public_X / hidden_X / X_public ...) is one criterion (e2e-iter1 RCESPP: mid failed
+    # public_optimal_frac + hidden_optimal_frac + hidden_mean_rel_gap = 2 criteria, was counted as 3 and dropped)
+    mid_fail = {s: len({metric_family(k) for k, t in out.items() if t.get("threshold") is not None
+                        and v.get(k) is not None and _worse(t["direction"], v[k], t["threshold"])})
+                for s, v in measure["mid"].items()}
     naive_fail = {s: sum(1 for k, t in out.items() if t.get("threshold") is not None and v.get(k) is not None
                          and _worse(t["direction"], v[k], t["threshold"])) + sum(1 for k in out if k not in v)
                   for s, v in measure.get("naive", {}).items()}

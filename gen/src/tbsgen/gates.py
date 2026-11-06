@@ -25,6 +25,7 @@ from pathlib import Path
 
 from . import runner
 from .leakcheck import leak_report
+from .spec import metric_family
 
 
 CLI_RE = re.compile(r"solution_cli\.py\s+<input_dir>\s+<output_dir>")
@@ -79,7 +80,8 @@ def run_gates(cfg: dict, item_dir: Path, spec: dict, thresholds: dict, attempt: 
         ok["oracle"] &= ref["passed"] and ref["solve_rc"] == 0
         ok["nop"] &= not sd["nop"]["passed"]
         ok["naive"] &= (not sd["naive"]["passed"]) and sd["naive"]["n_failed"] >= cfg["gates"]["naive_fail_min"]
-        ok["mid"] &= (not sd["mid"]["passed"]) and 1 <= sd["mid"]["n_failed"] <= 2 and \
+        n_mid = len({metric_family(n) for n in sd["mid"]["failed"]})   # public/hidden twins = one criterion
+        ok["mid"] &= (not sd["mid"]["passed"]) and 1 <= n_mid <= 2 and \
             sd["mid"]["n_checks"] >= ref["n_checks"]
         ok["exploit"] &= all(not sd[Path(e).stem]["passed"] for e in exploits) and bool(exploits)
         for m in ref["metrics"]:
