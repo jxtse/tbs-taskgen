@@ -27,7 +27,9 @@ from pathlib import Path
 
 POS = re.compile(r"\b(algorithm|estimat|simulat|inversion|solver|numerical|optimi[sz]|reconstruct|calibrat|"
                  r"likelihood|bayesian|monte carlo|finite[- ]element|regression|model(?:ling|ing)?|filter|"
-                 r"spectr|dataset|benchmark|open[- ]source|code is available|github|python|implementation)\w*",
+                 r"spectr|dataset|benchmark|open[- ]source|code is available|github|python|implementation|"
+                 r"deconvol|iterative|phantom|least[- ]squares|fitting|denois|unwrap|retriev|kalman|assimilat|"
+                 r"quantif|extrapolat|interpolat|decompos|inference|correction)\w*",
                  re.I)
 NEG = re.compile(r"\b(review|survey|perspective|editorial|commentary|qualitative|interview|questionnaire|"
                  r"case report|randomi[sz]ed controlled|patients were recruited)\b", re.I)
@@ -56,18 +58,25 @@ def load_candidates(path: Path) -> list[dict]:
         return d
     if "papers" in d:
         return [dict(p, _target=(d.get("target") or {}).get("id")) for p in d["papers"]]
+    if "selected" in d:                     # recorded retrieval eval output (retrieval/eval/raw/*.json)
+        return [dict(p, _target=(d.get("target") or {}).get("id")) for p in d["selected"]]
     raise ValueError("unrecognised candidates file")
 
 
 # ------------------------------------------------------------------------------------------- S2
-def screen(c: dict, cfg: dict) -> dict:
-    text = f"{c.get('title', '')}\n{c.get('abstract') or ''}"
+def screen(c: dict, cfg: dict, fulltext_head: str | None = None) -> dict:
+    """Rule screen on title + abstract.  No abstract: S2 defers (keep, deferred=True) and S4 re-screens on the
+    first chars of the full text (e2e-iter1: a nanoindentation drift-correction method paper with no abstract
+    in the retrieval record scored -1 and was dropped)."""
+    if not c.get("abstract") and fulltext_head is None:
+        return dict(score=None, pos=[], neg=[], keep=True, deferred=True, form_hint=None, method="rules-v1",
+                    reason=None)
+    abstract = c.get("abstract") or (fulltext_head or "")[:4000]
+    text = f"{c.get('title', '')}\n{abstract}"
     pos = sorted({m.group(0).lower() for m in POS.finditer(text)})
     neg = sorted({m.group(0).lower() for m in NEG.finditer(text)})
     score = len(pos) - 2 * len(neg) + (1 if c.get("code_links") or c.get("code_urls") else 0) + \
         (1 if c.get("data_links") or c.get("data_urls") else 0)
-    if not c.get("abstract"):
-        score -= 1
     form_hint = "INTERACT" if BLACKBOX.search(text) else None
     keep = score >= cfg["screen"]["min_score"]
     return dict(score=score, pos=pos, neg=neg, keep=keep, form_hint=form_hint, method="rules-v1",

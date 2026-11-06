@@ -18,6 +18,17 @@ from . import sandbox
 METRICS_HELPER = Path(__file__).with_name("templates_metrics.py")
 
 
+# Verifier steps run as root on container-local copies of /tests and /app/output, as under Harbor, so that
+# _metrics.run_solution really drops the agent program to `nobody` and the chmod lock on /tests/truth is enforced
+# (bind mounts from the host would not enforce it).  Before v2.1 the local runner used the host uid: the lock was
+# skipped and a truth-reading solution_cli.py went unnoticed until a Harbor run (e2e-iter1).
+# /app/data is present too: under Harbor the verifier runs in the agent's container (e2e-iter1: a measure.py that
+# reads /app/data/config.json got the missing-output sentinel locally after v2.1 dropped that mount)
+VERIFIER_PRE = ("mkdir -p /app && cp -a /src/tests /tests && cp -a /src/output /app/output && "
+                "cp -a /src/data /app/data && chown -R -h root:root /tests /app/output /app/data && "
+                "chmod 700 /src && ")   # staging mounts stay in the container: make them root-only (review #2)
+
+
 def tree_hash(d: Path) -> str:
     h = hashlib.sha256()
     for p in sorted(Path(d).rglob("*")):
@@ -75,8 +86,10 @@ def measure(cfg: dict, task: Path, gen: Path, outd: Path, work: Path, tag: str) 
     logs = work / f"mlogs-{tag}"
     logs.mkdir(parents=True, exist_ok=True)
     logs.chmod(0o777)
-    r = sandbox.run(cfg, [(outd, "/app/output", "ro"), (tests, "/tests", "ro"), (logs, "/logs/verifier", "rw")],
-                    "cd /tests && python /tests/measure.py", cfg["gen"]["test_timeout"], f"tbsgen-measure-{tag}")
+    r = sandbox.run(cfg, [(outd, "/src/output", "ro"), (tests, "/src/tests", "ro"), (logs, "/logs/verifier", "rw"),
+                          (gen / "environment" / "data", "/src/data", "ro")],
+                    VERIFIER_PRE + "cd /tests && python /tests/measure.py", cfg["gen"]["test_timeout"],
+                    f"tbsgen-measure-{tag}", root=True)
     vals = {}
     for line in reversed(r["out"].strip().splitlines()):
         try:
@@ -96,12 +109,64 @@ def test(cfg: dict, task: Path, gen: Path, outd: Path, work: Path, tag: str) -> 
         shutil.rmtree(logs)
     logs.mkdir(parents=True)
     logs.chmod(0o777)
-    r = sandbox.run(cfg, [(outd, "/app/output", "ro"), (tests, "/tests", "ro"), (logs, "/logs/verifier", "rw")],
-                    "cd /tests && python -m pytest -q -p no:cacheprovider /tests/test_outputs.py",
-                    cfg["gen"]["test_timeout"], f"tbsgen-test-{tag}")
+    r = sandbox.run(cfg, [(outd, "/src/output", "ro"), (tests, "/src/tests", "ro"), (logs, "/logs/verifier", "rw"),
+                          (gen / "environment" / "data", "/src/data", "ro")],
+                    VERIFIER_PRE + "cd /tests && python -m pytest -q -p no:cacheprovider /tests/test_outputs.py",
+                    cfg["gen"]["test_timeout"], f"tbsgen-test-{tag}", root=True)
     mf = logs / "metrics.jsonl"
     metrics = [json.loads(x) for x in mf.read_text().splitlines() if x.strip()] if mf.exists() else []
     acc = [m for m in metrics if not m.get("aux")]
     r.update(passed=r["rc"] == 0, metrics=metrics, n_checks=len(acc), n_failed=sum(not m["passed"] for m in acc),
              failed=[m["name"] for m in acc if not m["passed"]])
     return r
+
+
+TRUTH_PROBE = r'''import json, os, sys
+# tbsgen truth-isolation probe: an adversarial solution_cli.py.  The trusted side writes the exact paths to try
+# into probe_targets.json next to this file (verifier-only files, their /src copies, and the same files reached
+# through an agent-planted symlink /app/output/leak -> /tests/truth).  Every path is opened directly; nothing
+# relies on listing directories (a 0711 directory cannot be listed but its files may still be readable).
+here = os.path.dirname(os.path.abspath(__file__))
+targets = json.load(open(os.path.join(here, "probe_targets.json")))
+hits = []
+for p in targets:
+    try:
+        with open(p, "rb") as f:
+            f.read(16)
+        hits.append(p)
+    except Exception:
+        pass
+sys.stderr.write("TBSGEN_TRUTH_PROBE attempted=%d readable=%d %s\\n" % (len(targets), len(hits), " ".join(hits[:5])))
+sys.exit(3)
+'''
+
+
+def truth_probe(cfg: dict, task: Path, gen: Path, ref_out: Path, work: Path, tag: str) -> dict:
+    """PROG: run the verifier on the reference's public outputs with solution_cli.py replaced by TRUTH_PROBE.
+    ok = the verifier executed the probe through _metrics.run_solution, the probe attempted every target path
+    and could read none of them.  Targets: each file under tests/ except hidden inputs (at /tests/... and at the
+    /src/tests/... staging copy) plus each truth file through a pre-planted symlink /app/output/leak."""
+    outd = work / f"out-{tag}"
+    if outd.exists():
+        shutil.rmtree(outd)
+    shutil.copytree(ref_out, outd, symlinks=True)
+    tests = work / f"tests-{tag}"
+    _verifier_tests(task, gen, tests, "test_outputs.py")
+    rel = sorted(str(p.relative_to(tests)) for p in tests.rglob("*")
+                 if p.is_file() and not str(p.relative_to(tests)).startswith("hidden"))
+    truth_rel = sorted(str(p.relative_to(tests / "truth")) for p in (tests / "truth").rglob("*") if p.is_file()) \
+        if (tests / "truth").exists() else []
+    targets = [f"/tests/{r}" for r in rel] + [f"/src/tests/{r}" for r in rel] + \
+        [f"/app/output/leak/{r}" for r in truth_rel]
+    (outd / "solution_cli.py").write_text(TRUTH_PROBE)
+    (outd / "probe_targets.json").write_text(json.dumps(targets))
+    leak = outd / "leak"
+    if leak.exists() or leak.is_symlink():
+        leak.unlink()
+    leak.symlink_to("/tests/truth")
+    t = test(cfg, task, gen, outd, work, tag)
+    runs = [m for m in t["metrics"] if m.get("name") == "_solution_cli_run"]
+    want = f"TBSGEN_TRUTH_PROBE attempted={len(targets)} readable=0"
+    bad = [m.get("stderr_tail", "") for m in runs if want not in m.get("stderr_tail", "")]
+    return dict(ok=bool(runs) and bool(truth_rel) and not bad, n_runs=len(runs), via_run_solution=bool(runs),
+                n_targets=len(targets), readable=[x[-400:] for x in bad][:3], passed=t["passed"])

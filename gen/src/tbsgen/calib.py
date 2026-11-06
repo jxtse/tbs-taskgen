@@ -49,6 +49,8 @@ def next_action(runs: list[dict], cfg: dict) -> tuple[str, str | None]:
         if any(t["outcome"] == "pass" for t in tea):
             return "label", "hard"
         if len(tea) < c["teacher_runs_max"]:
+            if not c.get("teacher_available", True):
+                return "label", "parked:teacher_unavailable"
             return "run", "teacher"
         return "label", "parked:teacher_failed"
     # GLM#1 passed
@@ -58,6 +60,15 @@ def next_action(runs: list[dict], cfg: dict) -> tuple[str, str | None]:
             return "label", "easy"
         return "run", "glm"
     return "label", "unstable" if glm[1]["outcome"] == "fail" else "easy"
+
+
+def task_path(cfg: dict, item_dir: Path) -> Path:
+    """Task folder the job runs: the sandbox-prepared copy (docker_image pointing at a registered template) when
+    calib.prepared_tasks_dir has one for this item, else the item's own pkg/ (local Docker backends)."""
+    d = cfg["calib"].get("prepared_tasks_dir")
+    if d and (Path(d) / item_dir.name / "task.toml").exists():
+        return Path(d) / item_dir.name
+    return item_dir / "pkg"
 
 
 def job_config(cfg: dict, pkg: Path, who: str, job_name: str) -> dict:
@@ -77,21 +88,102 @@ def job_config(cfg: dict, pkg: Path, who: str, job_name: str) -> dict:
             "agents": [agent], "tasks": [{"path": str(pkg.resolve())}]}
 
 
-def submit(cfg: dict, item_dir: Path, who: str, n: int) -> dict:
-    """Write the job config + launcher command.  Actually launching requires calib.allow_submit=True."""
+def job_name_for(item_dir: Path, who: str, n: int) -> str:
+    """Stable per (item, who, attempt): a re-run after a crash finds the same job instead of starting another."""
+    return f"tbsgen-{item_dir.name}-{who}{n}"
+
+
+def prepare(cfg: dict, item_dir: Path, who: str, n: int) -> dict:
+    """Intent record for attempt n (no side effects outside item_dir).  Persist it BEFORE reserve/launch."""
     c = cfg["calib"]
-    job_name = f"tbsgen-{item_dir.name}-{who}{n}-{time.strftime('%Y%m%d%H%M%S')}"
-    conf = job_config(cfg, item_dir / "pkg", who, job_name)
+    job_name = job_name_for(item_dir, who, n)
+    conf = job_config(cfg, task_path(cfg, item_dir), who, job_name)
     p = item_dir / "calib" / f"{job_name}.json"
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(json.dumps(conf, indent=1))
     p = p.resolve()
     launcher = c["student_launcher"] if who == "glm" else c["teacher_launcher"]
-    cmd = f"cd {c['harbor_root']} && ./{launcher} run {p}"
-    rec = dict(who=who, n=n, job_name=job_name, config=str(p), command=cmd, submitted=False, ts=time.time())
-    if c.get("allow_submit"):
-        raise NotImplementedError("live submission is intentionally not wired in the MVP; run `command` by hand")
+    model = c["student_model"] if who == "glm" else c["teacher_model"]
+    rec = dict(who=who, n=n, item=item_dir.name, model=model, job_name=job_name, config=str(p),
+               command=f"cd {c['harbor_root']} && ./{launcher} run {p}", state="intent", submitted=False,
+               ts=time.time(), job_dir=str(Path(c["jobs_dir"]) / job_name), task=conf["tasks"][0]["path"],
+               outcome=None)
+    if c.get("prepared_tasks_dir") and not rec["task"].startswith(str(Path(c["prepared_tasks_dir"]))):
+        # remote sandbox backends cannot build a Dockerfile: a missing prepared template means the run would die
+        # at environment start (e2e-iter1: FileUploadException, no model use) -> do not launch
+        rec["blocked"] = "no prepared sandbox template for this item"
     return rec
+
+
+def job_started(rec: dict) -> bool:
+    """Harbor created the job dir (or the launcher wrote its start marker): the job exists, never relaunch."""
+    jd = Path(rec["job_dir"])
+    return (jd / "config.json").exists() or (jd / "result.json").exists() or Path(rec.get("log", "/x")).exists()
+
+
+def launch(cfg: dict, rec: dict, ledger, save) -> dict:
+    """intent -> reserved -> launched.  `save(rec)` persists the run record; it is called after every step so a
+    crash at any point is recoverable: a reserved-but-not-started job is launched once on resume, a started job
+    is never launched again.  Any launch exception settles the reservation at 0 and marks the run failed."""
+    import shlex
+    import subprocess
+    c = cfg["calib"]
+    if rec["state"] == "intent":
+        rec["ledger_call"] = ledger.reserve(rec["model"], "S9", rec["item"], True,
+                                            est_usd=float(c["est_usd_per_run"])) if ledger is not None else None
+        rec["state"] = "reserved"
+        save(rec)
+    if rec["state"] != "reserved":
+        return rec
+    if job_started(rec):                                   # crashed after launch, before recording it
+        rec.update(state="launched", submitted=True, recovered=True)
+        save(rec)
+        return rec
+    item_dir = Path(rec["config"]).parent.parent
+    log = item_dir / "calib" / f"{rec['job_name']}.log"
+    launcher = c["student_launcher"] if rec["who"] == "glm" else c["teacher_launcher"]
+    # the launcher's exit status is written next to the log, so a launcher that dies at once is visible
+    inner = (f"cd {shlex.quote(c['harbor_root'])} && env -u PYTHONPATH -u VIRTUAL_ENV ./{launcher} run "
+             f"{shlex.quote(rec['config'])} > {shlex.quote(str(log))} 2>&1; "
+             f"echo $? > {shlex.quote(str(log) + '.exit')}")
+    rec["log"] = str(log)
+    try:
+        r = subprocess.run([c.get("tmux_bin", "tmux"), "new-session", "-d", "-s", rec["job_name"][-60:],
+                            "bash", "-lc", inner], capture_output=True, text=True, timeout=60)
+        err = None if r.returncode == 0 else f"tmux rc={r.returncode}: {r.stderr[-300:]}"
+    except Exception as e:  # noqa: BLE001  (missing tmux, timeout, ...)
+        err = f"{type(e).__name__}: {e}"
+    if err:
+        if ledger is not None and rec.get("ledger_call"):
+            ledger.settle(rec["ledger_call"], 0.0, status="error", note=f"launch failed: {err}"[:500])
+        rec.update(state="launch_failed", outcome="infra", error=err)
+        save(rec)
+        return rec
+    rec.update(state="launched", submitted=True, tmux=rec["job_name"][-60:])
+    save(rec)
+    return rec
+
+
+def launcher_failed(rec: dict) -> str | None:
+    """Launcher exited without creating a Harbor job (bad cwd, missing script, key fetch failure ...)."""
+    ex = Path(rec.get("log", "") + ".exit")
+    if rec.get("state") == "launched" and ex.exists() and not (Path(rec["job_dir"]) / "result.json").exists():
+        tail = Path(rec["log"]).read_text(errors="replace")[-300:] if Path(rec["log"]).exists() else ""
+        return f"launcher exit {ex.read_text().strip()} without a job: {tail}"
+    return None
+
+
+def actual_spend(ledger) -> float:
+    with ledger._db() as db:
+        return db.execute("SELECT COALESCE(SUM(usd),0) FROM calls WHERE real=1 AND status!='reserved'").fetchone()[0]
+
+
+def submit(cfg: dict, item_dir: Path, who: str, n: int, ledger=None) -> dict:
+    """Back-compat helper (tests / config-only use): prepare + launch without persistence."""
+    rec = prepare(cfg, item_dir, who, n)
+    if rec.get("blocked") or not cfg["calib"].get("allow_submit"):
+        return rec
+    return launch(cfg, rec, ledger, lambda r: None)
 
 
 def _api_status(trial: Path) -> tuple[int | None, str | None]:
@@ -132,8 +224,9 @@ def classify_trial(trial: Path) -> dict:
     else:
         outcome = "fail"
     quota = bool(msg and re.search(r"额度|quota|429", msg))
+    cost = (r.get("agent_result") or {}).get("cost_usd")
     return dict(trial=trial.name, outcome=outcome, reward=reward, exception=exc, api_status=status,
-                api_msg=msg, quota=quota, minutes=minutes)
+                api_msg=msg, quota=quota, minutes=minutes, cost_usd=cost)
 
 
 def collect(job_dir: Path) -> list[dict]:

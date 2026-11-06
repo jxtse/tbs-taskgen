@@ -206,7 +206,7 @@ class FakeClient(_Base):
             if isinstance(out, dict):
                 if out.get("error"):
                     raise ModelError(out["error"], out.get("text", "scripted error"))
-                return out.get("text", ""), out.get("usage", {}), self.name, "end_turn"
+                return out.get("text", ""), out.get("usage", {}), self.name, out.get("stop", "end_turn")
             return out, {"input_tokens": len(system + user) // 4, "output_tokens": len(out) // 4}, self.name, "end_turn"
         for i, rule in enumerate(self.script):
             if i in self.used or rule.get("stage") not in (stage, "*"):
@@ -269,13 +269,35 @@ def extract_json(text: str):
 FILE_RE = re.compile(r"^=== FILE: (?P<path>[^\n=]+?) ===\n(?P<body>.*?)(?=^=== FILE: |^=== END ===|\Z)", re.S | re.M)
 
 
-def parse_files(text: str) -> dict[str, str]:
-    """Multi-file model output:  === FILE: rel/path ===\\n<content>  ...  === END ==="""
+def parse_files(text: str, truncated: bool = False) -> dict[str, str]:
+    """Multi-file model output:  === FILE: rel/path ===\\n<content>  ...  === END ===
+
+    truncated=True (stop_reason == max_tokens): the last block is cut mid-file unless an END/next-FILE marker
+    follows it, so it is dropped instead of being written as a broken file."""
     out = {}
-    for m in FILE_RE.finditer(text):
+    cut_marker = False
+    ms = list(FILE_RE.finditer(text))
+    if truncated and ms:
+        # The last block is complete iff its body is followed by a marker line, possibly itself cut short
+        # ("=== FILE: b.py" / "=== END" / "===").  Only a body that runs to the very end of the text was cut
+        # (review #10: a cut inside the next FILE header used to drop the previous, complete file).
+        last = ms[-1]
+        rest = text[last.end("body"):]
+        if not re.match(r"\A\s*={1,3}(?: ?(?:F|E)[A-Z]*)?", rest) or not rest.strip():
+            body = last.group("body")
+            lines = body.rstrip("\n").split("\n")
+            tail_line = lines[-1] if lines else ""
+            if re.fullmatch(r"={1,3}(?: ?(?:FILE|END|F|E|FI|FIL|EN)?.*)?", tail_line.strip()) and tail_line.strip():
+                cut_marker = True     # body ends with a cut marker line: the file itself was complete
+            else:
+                ms = ms[:-1]
+    for idx, m in enumerate(ms):
         p = m.group("path").strip()
         body = m.group("body")
+        if cut_marker and idx == len(ms) - 1:
+            body = body.rstrip("\n").rsplit("\n", 1)[0] + "\n"     # drop the cut marker line
         body = re.sub(r"^```[a-zA-Z0-9]*\n", "", body)
         body = re.sub(r"\n```\s*$", "\n", body.rstrip() + "\n")
         out[p] = body
+
     return out

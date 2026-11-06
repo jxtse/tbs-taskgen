@@ -57,6 +57,59 @@ def _thread_env(env):
     return env
 
 
+def _open_workspace(app):
+    """Make the agent workspace usable for `nobody` (caches, relative writes) without ever following a symlink or
+    touching anything whose real path is outside `app`, and without touching hard-linked files."""
+    if not os.path.isdir(app) or os.path.islink(app):
+        return
+    real_app = os.path.realpath(app)
+    for root, dirs, files in os.walk(app, followlinks=False):
+        for name in dirs + files:
+            p = os.path.join(root, name)
+            try:
+                st = os.lstat(p)
+            except OSError:
+                continue
+            if os.path.islink(p) or not os.path.realpath(p).startswith(real_app + os.sep):
+                continue
+            if os.path.isdir(p):
+                os.chmod(p, 0o777)
+            elif os.path.isfile(p) and st.st_nlink == 1:
+                os.chmod(p, 0o777 if os.access(p, os.X_OK) else 0o666)
+    os.chmod(app, 0o777)
+
+
+def _lock_tree(path):
+    """root-only, recursively; symlinks are left alone (their targets are locked where they live)."""
+    if os.path.islink(path):
+        return
+    if os.path.isdir(path):
+        for root, dirs, files in os.walk(path, followlinks=False):
+            os.chmod(root, 0o700)
+            for f in files:
+                p = os.path.join(root, f)
+                if not os.path.islink(p):
+                    os.chmod(p, 0o600)
+    else:
+        os.chmod(path, 0o600)
+
+
+def _unlocked(tests_root, hidden_root):
+    """paths under tests_root (outside the hidden inputs) that group/other can still read or traverse"""
+    import stat
+    paths = []
+    for name in os.listdir(tests_root):
+        top = os.path.join(tests_root, name)
+        if os.path.abspath(top) == hidden_root or os.path.islink(top):
+            continue
+        if os.path.isdir(top):
+            for root, dirs, files in os.walk(top, followlinks=False):
+                paths += [root] + [os.path.join(root, f) for f in files]
+        else:
+            paths.append(top)
+    return [p for p in paths if not os.path.islink(p) and os.lstat(p).st_mode & (stat.S_IRWXG | stat.S_IRWXO)]
+
+
 def _sandbox_prepare(input_dir, out):
     """v0.3: when the verifier runs as root (Harbor), run the agent program as `nobody` and make the
     answer-bearing tests/truth unreadable to it, so solution_cli.py cannot read ground truth.
@@ -69,22 +122,30 @@ def _sandbox_prepare(input_dir, out):
         pw = pwd.getpwnam("nobody")
     except KeyError:
         return None
-    tests_root = os.path.dirname(os.path.abspath(input_dir))
+    # v2.1: lock everything under the tests root (parent of HIDDEN, i.e. /tests) except the hidden-input tree.
+    # v2.3 (review of e2e-iter1): the agent workspace pass must not follow symlinks -- an agent-made
+    # /app/leak -> /tests/truth used to be chmod-ed 0777 through the link -- and the lock runs AFTER it and is
+    # verified; on any lock failure the agent program is not run at all.
+    hidden_root = os.path.abspath(HIDDEN)
+    inp = os.path.abspath(input_dir)
+    if not (inp == hidden_root or inp.startswith(hidden_root + os.sep)):
+        hidden_root = inp
+    tests_root = os.path.dirname(hidden_root)
+    _open_workspace("/app")
     for name in os.listdir(tests_root):  # everything in /tests except the hidden inputs becomes root-only
         pth = os.path.join(tests_root, name)
-        if os.path.abspath(pth) != os.path.abspath(input_dir):
-            os.chmod(pth, 0o700 if os.path.isdir(pth) else 0o600)
+        if os.path.abspath(pth) != hidden_root:
+            _lock_tree(pth)
     os.chmod(tests_root, 0o711)
-    for root, dirs, files in os.walk(input_dir):
+    for root, dirs, files in os.walk(hidden_root):
         os.chmod(root, 0o755)
         for f in files:
-            os.chmod(os.path.join(root, f), 0o644)
-    for root, dirs, files in os.walk("/app"):  # agent workspace: keep it usable (caches, relative writes)
-        for d in dirs:
-            os.chmod(os.path.join(root, d), 0o777)
-        for f in files:
-            os.chmod(os.path.join(root, f), 0o666 if not os.access(os.path.join(root, f), os.X_OK) else 0o777)
-    os.chmod("/app", 0o777) if os.path.isdir("/app") else None
+            p = os.path.join(root, f)
+            if not os.path.islink(p):
+                os.chmod(p, 0o644)
+    bad = _unlocked(tests_root, hidden_root)
+    if bad:
+        raise PermissionError(f"truth lock failed, agent program not run: {bad[:3]}")
     os.chown(out, pw.pw_uid, pw.pw_gid)
     home = tempfile.mkdtemp(prefix="solhome-")
     os.chown(home, pw.pw_uid, pw.pw_gid)
@@ -93,16 +154,43 @@ def _sandbox_prepare(input_dir, out):
     return pw.pw_uid, pw.pw_gid, env
 
 
+def hidden_sets():
+    """Hidden input sets: subdirectories of HIDDEN if it has any (several shifted regimes), else [HIDDEN]."""
+    subs = sorted(os.path.join(HIDDEN, d) for d in os.listdir(HIDDEN) if os.path.isdir(os.path.join(HIDDEN, d))) \
+        if os.path.isdir(HIDDEN) else []
+    return subs or [HIDDEN]
+
+
+def _no_new_privs():
+    """preexec: PR_SET_NO_NEW_PRIVS, so a setuid-root binary the (root) agent planted earlier cannot lift the
+    unprivileged program back to root (review of e2e-iter1)."""
+    try:
+        import ctypes
+        ctypes.CDLL(None, use_errno=True).prctl(38, 1, 0, 0, 0)
+    except Exception:
+        pass
+
+
 def run_solution(timeout_sec, input_dir=HIDDEN, entry=ENTRY):
     """Run `python <entry> <input_dir> <out_dir>` once per session; returns (out_dir, wall_seconds, returncode).
+    Several hidden sets: call once per set, e.g. `for d in hidden_sets(): out, sec, rc = run_solution(t, d)`.
+    This is the ONLY sanctioned way to execute agent code in the verifier (it drops to `nobody` and locks truth).
     The wall time is also recorded (not a pass/fail check by itself; tests decide whether to check() it)."""
     key = (entry, input_dir)
     if key in _CACHE:
         return _CACHE[key]
     out = tempfile.mkdtemp(prefix="sol-")
-    sb = _sandbox_prepare(input_dir, out)
+    try:
+        sb = _sandbox_prepare(input_dir, out)
+    except Exception as e:  # never run untrusted code with truth possibly readable
+        _record({"name": "_solution_cli_run", "value": 0.0, "rc": -1, "stderr_tail": f"not run: {e}"[-500:],
+                 "threshold": float(timeout_sec), "direction": "<=", "passed": False, "aux": True,
+                 "sandboxed": False, "lock_failed": True})
+        _CACHE[key] = (out, 0.0, -1)
+        return _CACHE[key]
     kw = dict(env=_thread_env(dict(os.environ))) if sb is None else \
-        dict(user=sb[0], group=sb[1], extra_groups=[], env=_thread_env(sb[2]), cwd=sb[2]["HOME"])
+        dict(user=sb[0], group=sb[1], extra_groups=[], env=_thread_env(sb[2]), cwd=sb[2]["HOME"],
+             preexec_fn=_no_new_privs)
     t0 = time.time()
     try:
         p = subprocess.run([sys.executable, entry, input_dir, out], capture_output=True, text=True,

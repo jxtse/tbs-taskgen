@@ -16,6 +16,7 @@ Thresholds (DESIGN §3.1 S6B): for each metric, from per-seed values of ref and 
 from __future__ import annotations
 
 import math
+import re
 
 FORMS_ALL = {"ANS", "PROG", "DOMF", "CODE", "MULTI", "DESIGN", "INTERACT", "TRAJ", "PROOF"}
 
@@ -59,6 +60,12 @@ def validate_spec(spec: dict, cfg: dict) -> list[str]:
     return errs
 
 
+def metric_family(name: str) -> str:
+    """public_rmse / hidden_rmse / rmse_public / rmse_hidden -> rmse"""
+    n = re.sub(r"^(public|hidden)_", "", name)
+    return re.sub(r"_(public|hidden)$", "", n)
+
+
 def _worse(direction: str, a: float, b: float) -> bool:
     """is a worse than b"""
     return a > b if direction == "<=" else a < b
@@ -85,9 +92,21 @@ def set_thresholds(spec: dict, measure: dict, cfg: dict) -> dict:
             out[name] = dict(direction=d, threshold=None, error="reference metric missing/non-finite")
             continue
         r = max(r_vals) if d == "<=" else min(r_vals)
+        # v2.3: the reference sitting exactly on the metric's empty-output value (measured on nop) means it did not
+        # produce that deliverable (e2e-iter1 IEnKS: ref filter_rmse_public = 1e6 -> threshold 1.5e6).  Works in
+        # both directions, for negative / zero / large-scale metrics (review #7).
+        nop_vals = [v.get(name) for v in measure.get("nop", {}).values()]
+        hit = [x for x in r_vals for nv in nop_vals if nv is not None and math.isfinite(nv) and
+               math.isclose(x, nv, rel_tol=1e-12, abs_tol=1e-15)]
+        if hit:
+            out[name] = dict(direction=d, threshold=None,
+                             error=f"reference value {hit[0]:g} equals the empty-output value of this metric")
+            continue
         mm = [x for x in m_vals if x is not None and math.isfinite(x)]
         m_best = (min(mm) if d == "<=" else max(mm)) if mm else None
         margin = tc["min_ref_margin"]
+        naive_capped = False
+        n_best = None
         separating = m_best is not None and _worse(d, m_best, r) and \
             abs(m_best - r) > margin * max(abs(r), 1e-12)
         if separating:
@@ -100,23 +119,67 @@ def set_thresholds(spec: dict, measure: dict, cfg: dict) -> dict:
             thr = r * (1 + tc["loose_margin"]) if (d == "<=") == (r >= 0) else r * (1 - tc["loose_margin"])
             if r == 0:
                 thr = 1e-9 if d == "<=" else -1e-9
-        thr = _round_sig(thr, tc["sig_digits"], d, toward_loose=True)
+            # v2.1: a non-separating metric must still reject the naive baseline when the naive is clearly worse
+            # (e2e-iter1: oracle-relative RMSE ratio, ref 1.00, naive 1.48-1.58, loose threshold 1.6 let naive pass)
+            nv = [v.get(name) for v in measure.get("naive", {}).values()]
+            nv = [x for x in nv if x is not None and math.isfinite(x)]
+            n_best = (min(nv) if d == "<=" else max(nv)) if nv else None
+            # v2.2: also when naive is worse by less than min_ref_margin (e2e-iter1: Pearson ref 0.996, naive 0.89,
+            # loose rule gave 0.49), but never tighter than the reference worsened by min_ref_margin
+            if n_best is not None and _worse(d, n_best, r):
+                mid_n = math.exp(math.log(r) + tc["frac"] * (math.log(n_best) - math.log(r))) \
+                    if r > 0 and n_best > 0 else r + tc["frac"] * (n_best - r)
+                floor = r * (1 + margin) if (d == "<=") == (r >= 0) else r * (1 - margin)
+                if _worse(d, floor, mid_n):          # midpoint tighter than the reference margin allows
+                    mid_n = floor
+                if _worse(d, thr, mid_n):
+                    thr, naive_capped = mid_n, True
+        exact = thr
+        thr = _round_sig(exact, tc["sig_digits"], d, toward_loose=True)
         if separating and not _worse(d, m_best, thr):   # rounding must not let the mid baseline pass
-            thr = _round_sig(thr, tc["sig_digits"] + 2, d, toward_loose=False)
+            thr = _round_sig(exact, tc["sig_digits"] + 2, d, toward_loose=False)
+        if naive_capped and not _worse(d, n_best, thr):  # nor the naive baseline (review #9)
+            for extra in (1, 2, 3):
+                thr = _round_sig(exact, tc["sig_digits"] + extra, d, toward_loose=True)
+                if _worse(d, n_best, thr):
+                    break
+            else:
+                thr = exact
         ok_ref = not _worse(d, r, thr)
         out[name] = dict(direction=d, threshold=thr, ref_worst=r, mid_best=m_best, separating=separating,
-                         ref_passes=ok_ref)
-    mid_fail = {s: sum(1 for k, t in out.items() if t.get("threshold") is not None and v.get(k) is not None
-                       and _worse(t["direction"], v[k], t["threshold"])) for s, v in measure["mid"].items()}
+                         ref_passes=ok_ref, naive_capped=naive_capped)
+    # v2.2: the 1..2 "near miss" rule counts failed criteria, not metric names: the same quantity measured on public
+    # and on hidden data (public_X / hidden_X / X_public ...) is one criterion (e2e-iter1 RCESPP: mid failed
+    # public_optimal_frac + hidden_optimal_frac + hidden_mean_rel_gap = 2 criteria, was counted as 3 and dropped)
+    mid_fail = {s: len({metric_family(k) for k, t in out.items() if t.get("threshold") is not None
+                        and v.get(k) is not None and _worse(t["direction"], v[k], t["threshold"])})
+                for s, v in measure["mid"].items()}
     naive_fail = {s: sum(1 for k, t in out.items() if t.get("threshold") is not None and v.get(k) is not None
                          and _worse(t["direction"], v[k], t["threshold"])) + sum(1 for k in out if k not in v)
                   for s, v in measure.get("naive", {}).items()}
+    # v2.2: the reference must not be clearly worse than the naive baseline on any metric; otherwise that metric
+    # does not measure the method (e2e-iter1 IEnKS: on the hidden regime the reference diverged, filter RMSE 4.19
+    # vs naive 3.39-3.52, and the loose rule still produced thresholds that both passed)
+    ref_worse = []
+    for name, t in out.items():
+        if t.get("threshold") is None:
+            continue
+        nv = [v.get(name) for v in measure.get("naive", {}).values()]
+        nv = [x for x in nv if x is not None and math.isfinite(x)]
+        if nv:
+            n_best = min(nv) if t["direction"] == "<=" else max(nv)
+            if _worse(t["direction"], t["ref_worst"], n_best) and \
+                    abs(t["ref_worst"] - n_best) > tc["min_ref_margin"] * max(abs(n_best), 1e-12):
+                ref_worse.append(name)
     lo, hi = tc["min_mid_fail"], tc["max_mid_fail"]
     status = "ok"
     if any(t.get("threshold") is None for t in out.values()):
         status = "ref_metric_missing"
+    elif ref_worse:
+        status = "ref_worse_than_naive"
     elif not all(t["ref_passes"] for t in out.values()):
         status = "ref_fails"
     elif not mid_fail or not all(lo <= n <= hi for n in mid_fail.values()):
         status = "not_separable"
-    return dict(status=status, thresholds=out, separating=sep, mid_fail=mid_fail, naive_fail=naive_fail)
+    return dict(status=status, thresholds=out, separating=sep, mid_fail=mid_fail, naive_fail=naive_fail,
+                ref_worse_than_naive=ref_worse)
