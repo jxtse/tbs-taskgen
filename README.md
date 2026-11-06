@@ -1,59 +1,274 @@
-# tbs-taskgen：TB-Science 训练题出题管线 v2
+# tbs-taskgen
 
-把科学论文转成 Terminal-Bench-Science 风格的 Harbor 任务（题面 + 数据生成器 + 参考解 + 隐藏测试），用于 GLM-5.3 的 SFT 数据构造。
+**Turn scientific papers into executable, Terminal-Bench-style scientific computing tasks.**
+
+tbs-taskgen is a research pipeline that reads a method paper and produces a
+[Harbor](https://github.com/harbor-framework/harbor)-format task in the style of
+[Terminal-Bench-Science](https://github.com/harbor-framework/terminal-bench-science): a task
+statement, a seeded data generator, a reference solution, mid/naive baselines and hidden tests.
+The tasks are meant for evaluating terminal agents and for building agent training data.
+
+- **Input:** a retrieval target (a method topic plus a few keyword queries), or your own list of
+  candidate papers as JSON/JSONL.
+- **Output:** one directory per paper under `runs/<run>/items/<id>/`. Papers that pass every gate
+  get a Harbor task in `pkg/` (`task.toml`, `instruction.md`, `environment/` with Dockerfile and
+  public data, `solution/`, `tests/`). Each run also has a per-item state machine, a spend ledger
+  and `release/manifest.jsonl` listing the tasks that passed difficulty calibration.
+- **Scope:** computational tasks whose deliverable is a numeric answer or a program and can be
+  graded automatically (task forms `ANS` and `PROG`). File-format-heavy, interactive and proof
+  tasks are not supported yet.
+
+> **Status: research code, not production.** The pipeline runs end to end on real papers, but it
+> has been tried on only a handful of them and has not been used for bulk generation. See
+> [Status and limitations](#status-and-limitations).
+
+## How it works
 
 ```
-retrieval/   检索层 tbsretr：OpenAlex / Semantic Scholar / Exa / Crossref / arXiv / Europe PMC → RRF 融合 → 候选论文
-gen/         出题层 tbsgen：S1 入库 → S2 筛选 → S3 全文 → S4 可行性 → S5 规格 → S6 生成+按实测定阈值
-             → S7 机械门（含 4 层泄漏检查）→ S8 局部修复 → S9 难度校准（GLM 顺序校准 + Opus 教师）→ PKG 打包
-docs/        DESIGN.md（设计与决策记录）、evidence/（旧管线数字复算、成本模型）、E2E_LOG.md（端到端测试记录）
+retrieval/ (tbsretr)                       gen/ (tbsgen)
+────────────────────                       ──────────────────────────────────────────────────────────
+OpenAlex · Semantic Scholar · Exa          S1 ingest → S2 screen → S3 full text → S4 feasibility + dedup
+Crossref · arXiv · Europe PMC              → S5 spec (teacher) → S6 generate files (teacher), set thresholds
+(Tavily adapter, off by default)             from measured reference / mid / naive scores
+  → dedup → RRF fusion → rule prefilter    → S7 mechanical gates, incl. 4-layer leak check
+  → ranked candidate papers  ──────────▶   → S8 bounded local repair → PKG Harbor package
+                                           → S9 difficulty calibration → S10 release manifest
 ```
 
-## 当前状态
+1. **Multi-source literature retrieval** (`retrieval/`). Sources are queried in parallel; results
+   are normalised, deduplicated across DOI / arXiv / OpenAlex / S2 IDs / title, fused with
+   reciprocal-rank fusion and rule-prefiltered. URLs of the TB-Science benchmark itself are dropped by
+   default, and papers that TB-Science tasks were built from are dropped when you provide that
+   list (`TBS_LEAK_REFS`). This layer calls no LLM.
+2. **Teacher-model task authoring** (`gen/`, S5–S6). A teacher model writes a spec with an explicit
+   information-dependency graph, then the generator, reference solution, baselines, tests and
+   statement. Pass thresholds are set from the *measured* scores of the reference and the mid
+   baseline in a Docker sandbox, not chosen by the model.
+3. **Leak checks** (S7). L1: truth or secret names in the statement or public text, and rules that
+   "protect" public files only by asking the agent not to read them. L2: truth values in public
+   files, including permuted, negated or scaled copies. L3: introspection of public Python objects
+   inside Docker. L4a: rank correlation of truth columns with public columns. A `truth_isolation`
+   gate checks that the agent's program cannot read `/tests` during grading.
+4. **Reference and empty-submission checks** (S7). Same seed gives the same output; the reference
+   passes every seed with margin; an empty submission (`nop`) fails; the naive baseline fails at
+   least two criteria and the mid baseline one or two; scripted exploit attempts fail; `PROG`
+   tasks are graded on hidden, distribution-shifted inputs. Blocking failures go to a local repair
+   loop (S8, at most two rounds).
+5. **Difficulty calibration** (S9). A student agent runs the packaged task in Harbor; if it fails, a
+   teacher agent tries. A task is kept if it is *unstable* (the student passes one of two runs) or
+   *hard* (the student fails and the teacher passes). By default S9 only writes job configs and
+   launch commands; submitting jobs must be enabled explicitly.
+6. **Packaging** (PKG, S10). Harbor task layout with a self-contained Dockerfile; kept tasks are
+   appended to `release/manifest.jsonl`.
 
-见 `docs/STATUS.md`。一句话：离线测试和假模型全流程已通过，真实论文端到端测试正在进行；还没有量产。
+Every real model call goes through a sqlite budget ledger with daily and per-run caps and a
+circuit breaker. Real calls are refused until a daily budget is configured. Items resume from
+their last completed stage after a crash or a budget stop.
 
-## 快速开始
+## Quick start
 
-需要 `uv`、Docker（沙箱跑生成器/参考解/基线）、Python 3.12。
+### Hand this to your coding agent
+
+> Clone https://github.com/jxtse/tbs-taskgen. Make sure `uv` and Docker are installed. Build the
+> sandbox image from `gen/docker/Dockerfile.base` with the tag `tbsgen-base:py311-sci-v2`. Run the
+> offline tests with `uv run pytest -q` in `retrieval/` and then in `gen/`. Then run the fake-model
+> dry run `uv run --directory gen python -m tbsgen.dryrun --out runs/dryrun`. Expected result: all
+> tests pass, and the dry run prints `toy: S10 done hard` and leaves a packaged Harbor task in
+> `gen/runs/dryrun/items/*/pkg/`. Do not set any API keys or budgets; none of these steps should
+> call a paid API. Afterwards, read the Configuration section of the README and tell me which
+> environment variables and `config.toml` keys I must set to run the pipeline on my own papers.
+
+### Manually
+
+You need [uv](https://docs.astral.sh/uv/) (it installs Python 3.12 if needed) and Docker for the
+sandbox and the integration tests.
 
 ```bash
-cd retrieval && uv sync && uv run pytest -q          # 26 个离线单测
-cd ../gen   && uv sync && uv run pytest -q           # 36 个单测+集成测试（集成测试需要 Docker）
-docker build -t tbsgen-base:py311-sci-v2 -f gen/docker/Dockerfile.base gen/docker   # 沙箱镜像
-uv run --directory gen python -m tbsgen.dryrun --out runs/dryrun   # 假模型端到端干跑
+git clone https://github.com/jxtse/tbs-taskgen.git
+cd tbs-taskgen
+
+# Sandbox image for generators, references, baselines and tests (python 3.11 + pinned scientific stack).
+# Add --build-arg PIP_INDEX_URL=<mirror>/simple if PyPI is slow from your network.
+docker build -t tbsgen-base:py311-sci-v2 -f gen/docker/Dockerfile.base gen/docker
+
+# Offline tests: recorded API responses, no keys, no model calls
+cd retrieval && uv sync && uv run pytest -q && cd ..
+cd gen && uv sync && uv run pytest -q && cd ..   # Docker integration tests are skipped without Docker or the image
+
+# End-to-end dry run with a scripted fake teacher: S1 → S10, no real model calls, no Harbor jobs
+uv run --directory gen python -m tbsgen.dryrun --out runs/dryrun
 ```
 
-真实运行：
+The dry run prints the run status and then `toy: S10 done hard`; the packaged task is in
+`gen/runs/dryrun/items/<id>/pkg/`. To inspect a run:
 
 ```bash
 cd gen
-uv run tbsgen ingest --run runs/R --candidates candidates.jsonl --config my.toml
-uv run tbsgen run    --run runs/R --config my.toml
-uv run tbsgen status --run runs/R ; uv run tbsgen report --run runs/R ; uv run tbsgen ledger --run runs/R
+uv run tbsgen status --run runs/dryrun
+uv run tbsgen ledger --run runs/dryrun
+uv run tbsgen report --run runs/dryrun    # writes runs/dryrun/reports/daily-<date>.md
 ```
 
-`my.toml` 必须显式写每日预算（`[budget] daily_usd_total`、`daily_calls_per_model`），否则真实模型调用一律拒绝。
+### On real papers
 
-## 机器相关配置
+The first two steps make free API calls (OpenAlex, Crossref, arXiv) and no model calls. They also
+need [`jq`](https://jqlang.org/). Without a key, OpenAlex may answer with HTTP 429; the source then
+cools down and the run finishes with the remaining sources.
 
-| 环境变量 | 默认 | 用途 |
+```bash
+# 1. Retrieve candidates for one of the bundled targets (sources without a key are skipped)
+uv run --directory retrieval tbsretr status
+uv run --directory retrieval tbsretr run --targets eval/targets10.json \
+    --only task:ambient-rna-correction --sources openalex,crossref,arxiv --seed-mode none \
+    --out ../runs/retrieval
+
+# 2. Turn the top candidates into pipeline items and run the stages that need no model
+jq -c '.papers[:2][]' runs/retrieval/task__ambient-rna-correction.json > runs/candidates.jsonl
+uv run --directory gen tbsgen ingest --run runs/R --candidates ../runs/candidates.jsonl
+uv run --directory gen tbsgen run    --run runs/R --config ../my.toml
+uv run --directory gen tbsgen status --run runs/R
+```
+
+On a fresh machine both items stop at S3 as `parked: fulltext_unavailable` (listed in
+`S3_queue.json`): the pipeline needs the paper's full text, from a local cache
+(`fulltext.cache_dirs`) or an open-access PDF link. With full text, a teacher endpoint and a
+budget in `my.toml` (see below), `tbsgen run` continues into the model stages. The other commands
+(`resume`, `reset`, `breaker`, `calib-ingest`, `harbor-local`, `ping`) are documented in
+[`gen/README.md`](gen/README.md) §3.
+
+## Configuration
+
+Both packages start from built-in defaults, then apply an optional TOML file, then the environment
+variables listed below. Pass the file with `tbsgen <command> --config FILE` or
+`tbsretr --config FILE <command>`; `tbsretr` also reads `retrieval/config.toml` if it exists. Only
+the keys you want to change need to be in the file.
+
+### LLM provider (teacher model)
+
+The teacher client uses the Anthropic Messages API (`POST …/v1/messages`). Point it at any
+compatible endpoint and pick the model yourself:
+
+```toml
+# my.toml
+[budget]
+daily_usd_total = 5.0                                  # required: real model calls are refused while this is unset
+daily_calls_per_model = { "my-teacher-model" = 10 }
+
+[models.opus]                                          # historical alias name; any compatible model works
+url     = "https://your-endpoint.example.com/v1/messages"
+model   = "my-teacher-model"
+key_env = "MY_TEACHER_API_KEY"                         # name of the environment variable holding your key
+
+[models.prices]                                        # USD per million tokens, for the ledger
+"my-teacher-model" = { in = 3.0, out = 15.0 }
+```
+
+The key is read from the named variable at call time, sent only in a request header and redacted
+from error messages. Without `key_env`, no key is sent (useful behind a local gateway that holds
+credentials). The built-in price table is a placeholder; set prices for your model.
+
+### Environment variables
+
+| Variable | Used by | Purpose |
 |---|---|---|
-| `TBS_WORKSPACE` | `/Volumes/Storage/hermes/workspace` | 工作区根 |
-| `TBS_OLD_PIPE` | `$TBS_WORKSPACE/tbs-datapipe-20261015` | 旧管线：全文缓存 `literature/txt`、官方题文本 `tasks_text`（去重用） |
-| `TBS_HARBOR_ROOT` | `$TBS_WORKSPACE/tbs-aliyun` | Harbor 作业脚本（S9 校准） |
-| `TBS_LEAK_REFS` | `$TBS_OLD_PIPE/literature/tbs_task_refs.json` | 官方题来源论文列表，检索时排除 |
+| `TBS_OPUS_URL` | gen | Teacher endpoint URL. The default is a local gateway on `127.0.0.1`; **override it** here or with `models.opus.url`. |
+| *your `key_env`* | gen | Teacher API key, if `models.opus.key_env` is set. |
+| `TBS_WORKSPACE` | gen, retrieval eval scripts | Root of the author's workspace. The default is a machine-specific absolute path; **set it**, or set the variables below directly. |
+| `TBS_OLD_PIPE` | gen, retrieval | Data from an earlier pipeline: a full-text cache (`literature/txt`) and TB-Science task texts used for deduplication (`tasks_text`). Defaults to a path under `TBS_WORKSPACE`; missing directories are skipped. |
+| `TBS_LEAK_REFS` | retrieval | JSON file of papers that TB-Science tasks were built from; these are excluded from retrieval. Defaults to a path under `TBS_OLD_PIPE`; skipped if missing. |
+| `TBS_HARBOR_ROOT` | gen (S9) | Directory with your Harbor job launch scripts for calibration. Defaults to a path under `TBS_WORKSPACE`. |
+| `TBS_HARBOR_BIN` | gen | Path to the `harbor` binary for `tbsgen harbor-local` (otherwise looked up on `PATH`). |
+| `TBS_SEARCH_POOL_URL` | retrieval | Search-pool service for Exa (`sources.exa.backend = "pool"`, the default). The default is `127.0.0.1`; **override it**, or set `backend = "direct"` and use `EXA_API_KEY_SECONDARY`. |
+| `OPENALEX_API_KEY` | retrieval | Optional; OpenAlex also works without a key, at lower rate limits. |
+| `SEMANTIC_SCHOLAR_API_KEY` | retrieval | Required for Semantic Scholar; the source is skipped without it. |
+| `EXA_API_KEY_SECONDARY` | retrieval | Exa key, used with `sources.exa.backend = "direct"`. |
+| `TAVILY_API_KEY_SECONDARY` | retrieval | Tavily key; the Tavily source is disabled by default. |
+| `TBSGEN_METRICS`, `TBSGEN_ENTRY`, `TBSGEN_HIDDEN` | generated tests | Set by the local test runner inside the sandbox; you do not set these. |
 
-模型网关：`gen/src/tbsgen/config.py` 中 `models.opus.url`（Anthropic Messages 兼容端点），可在 config.toml 覆盖。检索 API key 只从环境变量读取（`OPENALEX_API_KEY`、`SEMANTIC_SCHOLAR_API_KEY`、`EXA_API_KEY_SECONDARY` 等，见 `retrieval/README.md`），仓库内不存任何 key。
+Crossref, arXiv and Europe PMC need no key. `uv run tbsretr status` lists which sources are usable;
+it shows whether a key is present, never its value.
 
-## 不在仓库里的东西
+### Defaults you must override on another machine
 
-- 运行目录 `runs/`、`state/`（账本、缓存、沙箱产物）
-- `retrieval/eval/raw/`（10 个目标的原始检索响应，16 MB）
-- 旧管线语料、官方题文本、论文全文（受版权/许可约束）
+Several defaults point at the author's machine: `TBS_WORKSPACE` and every path derived from it,
+the teacher URL (`127.0.0.1:3000`), the Exa search-pool URL (`127.0.0.1:18150`), and the S9
+launcher scripts and Harbor agent classes under `[calib]` (`student_launcher`, `teacher_launcher`,
+`student_agent`, `teacher_agent`, `environment`). Set them with the environment variables above or
+in your TOML file. Leaving them unset does not affect the tests or the dry run, but a real run then
+has no full-text cache, no deduplication against TB-Science tasks and no calibration.
 
-## 协作约定
+All other keys and their defaults are in [`gen/src/tbsgen/config.py`](gen/src/tbsgen/config.py) and
+[`retrieval/src/tbsretr/config.py`](retrieval/src/tbsretr/config.py), and are explained in the two
+package READMEs. Commonly changed ones: `fulltext.cache_dirs` (directories of full texts named
+after the DOI), `fulltext.allow_network` (open-access PDF download), `calib.allow_submit`
+(default `false`: only write calibration job configs), `calib.prepared_tasks_dir`,
+`sandbox.image`, and the per-source daily budgets of the retrieval layer.
 
-- `main` 保持测试全绿；改动走分支 + PR。
-- 改提示词时同步提高 `gen/src/tbsgen/prompts.py` 里的版本号（写入每题 provenance）。
-- 新的端到端测试结论追加到 `docs/E2E_LOG.md`，不要覆盖旧记录。
+## Status and limitations
+
+Research code under active development. Everything below is documented in this repository.
+
+**Tests** (current `main`, run locally; there is no CI)
+
+- `retrieval/`: 46 offline unit tests that replay recorded API responses.
+- `gen/`: 65 tests: 49 unit tests and 16 integration tests that run task code in Docker (skipped
+  when Docker or the sandbox image is missing).
+- Fake-model dry run: S1 → S10 on a synthetic toy task, including the mechanical gates and
+  simulated calibration results.
+
+**Evaluations** (separate from the tests)
+
+- Leak-gate backtest on previously generated tasks, no LLM calls
+  ([`gen/eval/LEAK_BACKTEST.md`](gen/eval/LEAK_BACKTEST.md)): 7/7 known leaking tasks caught;
+  0/231 blocking false positives in-sample (the rules were tuned on this set) and 1/81 on a
+  held-out set.
+- Retrieval evaluation on 10 targets ([`retrieval/eval/REPORT.md`](retrieval/eval/REPORT.md)).
+  Relevance labels come from a single annotator and are subjective.
+- End-to-end runs on 6 real papers ([`docs/E2E_LOG.md`](docs/E2E_LOG.md)): 3 became packaged
+  Harbor tasks where the reference solution scores 1 and an empty submission scores 0; 2 were
+  dropped because the mid baseline could not be separated from the reference; 1 was still in
+  repair. Each of the 3 packaged tasks was calibrated with a single student run, which is not
+  enough to assign difficulty labels.
+
+**Known limitations**
+
+- Packaged tasks currently use `network_mode = "public"`, so an agent could install an existing
+  implementation of the paper's method. Offline-by-default and a check for ready-made
+  implementations are planned, not implemented.
+- The teacher-agent branch of calibration has not been run on real tasks.
+- The L4b inversion attack, the cheap-model roles, harder-variant generation (S9b) and the
+  file-format and interactive task forms are not implemented.
+- The expert-time estimate in `task.toml` is the teacher model's own estimate.
+- Full text comes only from a local cache or open-access PDF links.
+- S9 job submission is wired to the author's Harbor launch scripts; you need to supply your own.
+
+## Repository layout
+
+```
+retrieval/                 tbsretr: retrieval layer (standard library only)
+  src/tbsretr/             source adapters, fusion, rate-limited and budgeted HTTP ledger, CLI
+  tests/                   offline tests and recorded responses (keys stripped)
+  eval/                    10-target retrieval evaluation, REPORT.md
+  scripts/                 fixture re-recording
+gen/                       tbsgen: task-generation pipeline
+  src/tbsgen/              stages, gates, leak checks, sandbox runner, packaging, calibration, CLI
+  docker/Dockerfile.base   sandbox image
+  tests/                   unit and Docker integration tests; fixtures/toy_task is a synthetic task
+  eval/                    leak-gate backtest results
+docs/
+  DESIGN.md                design document and decision record
+  E2E_LOG.md               end-to-end test log
+  STATUS.md                current status
+  evidence/                scripts that recompute numbers cited in DESIGN.md
+```
+
+The package READMEs ([`retrieval/README.md`](retrieval/README.md), [`gen/README.md`](gen/README.md))
+and the files in `docs/` are development notes in Chinese. They contain the full stage-by-stage
+specification and the configuration reference.
+
+Not in the repository: run directories (`runs/`, `state/`), raw retrieval responses, paper full
+texts and TB-Science task texts.
+
+## License
+
+[MIT](LICENSE) © 2026 Jinxiang Xie
