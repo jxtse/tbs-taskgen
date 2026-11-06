@@ -88,6 +88,7 @@ DEFAULTS: dict[str, Any] = {
         "back_to_spec_max": 1,              # S6B "mid not separable" -> back to S5 at most once
         "s6a_max_tokens": 64000,            # S6A emits 5 files + adaptive thinking; 32k truncated in e2e-iter1
         "s6c_max_tokens": 48000,
+        "mid_rework_max": 1,                # S6B mid not separable -> S6M rewrites only mid.py (before back to S5)
         "continue_calls": 1,                # missing files after a truncated multi-file answer -> 1 continuation
     },
     "thresholds": {

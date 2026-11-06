@@ -20,9 +20,9 @@ from .config import resolve_role
 from .models import ModelError, get_client
 from .state import Store, write_json
 
-HANDLERS = {"S1": A.s1, "S2": A.s2, "S3": A.s3, "S4": A.s4, "S5": A.s5, "S6A": A.s6a, "S6A_run": A.s6a_run,
+HANDLERS = {"S1": A.s1, "S2": A.s2, "S3": A.s3, "S4": A.s4, "S5": A.s5, "S6A": A.s6a, "S6A_run": A.s6a_run, "S6M": A.s6m,
             "S6B": A.s6b, "S6C": B.s6c, "S7": B.s7, "S8": B.s8, "PKG": B.pkg, "S9": B.s9, "S10": B.s10}
-MODEL_STAGES = {"S5": "spec", "S6A": "gen", "S6C": "tests", "S8": "repair"}
+MODEL_STAGES = {"S5": "spec", "S6A": "gen", "S6M": "gen", "S6C": "tests", "S8": "repair"}
 
 
 class Pipeline:

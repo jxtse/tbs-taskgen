@@ -3,7 +3,16 @@ S8 local repair).  Outputs are machine-parsed: S5 -> one JSON object; S6A/S6C/S8
 "=== FILE: <rel path> ===" ... "=== END ===".  Kept short on purpose: the contract (file layout + rules)
 matters more than prose.  Version strings go into provenance so prompt changes are traceable.
 """
-PROMPT_VERSION = "v2.1-2026-11-06"
+PROMPT_VERSION = "v2.2-2026-11-06"
+
+METRICS_API = """Verifier helper module `_metrics` (provided, importable from tests/; exact signatures):
+  check(name: str, value: float, threshold: float, direction: "<=" | ">=") -> None   # records + asserts
+  hidden_sets() -> list[str]          # absolute dirs: subdirectories of /tests/hidden, or [/tests/hidden]
+  run_solution(timeout_sec: float, input_dir: str = "/tests/hidden") -> tuple[str, float, int]
+      # runs `python /app/output/solution_cli.py <input_dir> <out_dir>` as user nobody with /tests/truth locked;
+      # returns (out_dir, wall_seconds, returncode); cached per input_dir
+Example (PROG):  for d in hidden_sets(): out_dir, sec, rc = run_solution(600, d)"""
+
 
 SYSTEM = (
     "You design verifiable scientific-computing training tasks for terminal agents, grounded in one research "
@@ -71,7 +80,9 @@ Write the generator and the reference solution.  Files:
   `from _metrics import run_solution, hidden_sets`; `for d in hidden_sets(): out_dir, sec, rc = run_solution(t, d)`
   runs `python /app/output/solution_cli.py <d> <out_dir>` as an unprivileged user with /tests/truth locked
   (hidden_sets() = subdirectories of /tests/hidden, or /tests/hidden itself).  Never subprocess/exec agent code
-  yourself (the verifier runs as root, so that would expose the truth).  Under
+  yourself (the verifier runs as root, so that would expose the truth).
+{metrics_api}
+  Under
   `if __name__ == "__main__":` prints ONE JSON line of compute().  No thresholds, no asserts.  Missing or
   malformed deliverables must give the worst value (e.g. inf / 0.0), never an exception.
 Format: === FILE: <path> === blocks, then === END ===.  Write the files in the order listed."""
@@ -99,8 +110,24 @@ Format: === FILE: <path> === blocks, then === END ==="""
 
 S8_REPAIR = """The task failed blocking gates.  Gate log:
 {gates}
+{metrics_api}
 Dependency graph (fixed, do not change): {depgraph}
 Current files:
 {files}
 Return ONLY the files you change (same paths; no new files, no deleted criteria, thresholds unchanged unless the
 gate log says they were re-derived).  Format: === FILE: <path> === blocks, then === END ==="""
+
+
+S6M_MID = """Specification:
+{spec}
+Reference solution (fixed):
+=== FILE: solution/solve.py ===
+{solve}
+=== END ===
+Measured metrics: reference {ref}; current mid baseline (drops {old_drop}) {mid}.
+Thresholds sit between the reference and the mid baseline, and the mid baseline should be a NEAR miss: it must
+fail only 1-2 of the metrics.  The current mid fails too many ({n_fail} of {n_metrics}): the dropped step is too
+fundamental.  Pick ONE other key derive node from the depgraph (not in {tried}) whose omission costs accuracy on
+only part of the metrics, and write baselines/mid.py = the reference minus exactly that node (simple default
+instead), same I/O as solve.py (PROG: it writes its own self-contained /app/output/solution_cli.py).
+First line of your answer: MID_DROP: <node id>.  Then === FILE: baselines/mid.py === ... === END ==="""
