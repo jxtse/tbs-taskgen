@@ -216,9 +216,25 @@ EXA_CHANNEL = {
 
 
 class Exa(Source):
+    """Exa search.  backend="pool" (default) goes through a local search-pool service (POST {pool_url}/v1/search,
+    engine=exa, no Tavily fallback) that holds the Exa keys; backend="direct" calls api.exa.ai with key_env."""
     name = "exa"
 
+    def __init__(self, cfg: dict, http: Http):
+        super().__init__(cfg, http)
+        self.backend = self.scfg.get("backend", "pool")
+        self.pool_url = (os.environ.get("TBS_SEARCH_POOL_URL") or self.scfg.get("pool_url") or "").rstrip("/")
+
+    def available(self) -> tuple[bool, str]:
+        if self.backend == "pool":
+            if not self.scfg.get("enabled", True):
+                return False, "disabled in config"
+            return (True, "") if self.pool_url else (False, "skipped: sources.exa.pool_url not set")
+        return super().available()
+
     def _search(self, kind: str, query: str, extra: dict, target: Target) -> dict:
+        if self.backend == "pool":
+            return self._search_pool(kind, query, extra, target)
         body = {"query": query, "type": self.scfg.get("type", "auto"), "numResults": self.scfg["num_results"],
                 "contents": {"highlights": {"maxCharacters": self.scfg.get("highlights_chars", 400)}}, **extra}
         est = self.scfg.get("est_cost_usd", 0.012)
@@ -232,6 +248,30 @@ class Exa(Source):
                               headers={"x-api-key": self.key or ""}, body=body, cost_usd=est, target=target.id,
                               cost_from_response=cost)
         return r.json() if r.status == 200 else {}
+
+    def _search_pool(self, kind: str, query: str, extra: dict, target: Target) -> dict:
+        """Same Exa request shape as the direct path, sent through the pool.  The pool returns each Exa row
+        unchanged under `raw` (entities included), so downstream parsing is identical."""
+        opts = {"type": self.scfg.get("type", "auto"), "highlights_max_characters": self.scfg.get("highlights_chars", 400),
+                **extra}
+        body = {"query": query[:1500], "limit": min(int(self.scfg["num_results"]), 20), "engine": "exa",
+                "include_contents": False, "exa_options": opts}
+        est = self.scfg.get("est_cost_usd", 0.012)
+
+        def cost(st, hd, b):
+            try:
+                return float((json.loads(b).get("usage") or {}).get("cost_usd", est)), 0.0
+            except Exception:  # noqa: BLE001
+                return est, 0.0
+        r = self.http.request(self.name, kind, f"{self.pool_url}/v1/search", method="POST", body=body,
+                              cost_usd=est, target=target.id, cost_from_response=cost)
+        if r.status != 200:
+            return {}
+        d = r.json()
+        if d.get("provider") != "exa":       # engine=exa never falls back, but do not mix providers silently
+            self.errors.append(f"pool returned provider={d.get('provider')!r}; ignored")
+            return {}
+        return {"results": [row.get("raw") or row for row in d.get("results") or []]}
 
     def channel(self, ch: str, target: Target, query: str | None = None) -> RankedList:
         tmpl, extra = EXA_CHANNEL[ch]

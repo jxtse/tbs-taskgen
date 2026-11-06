@@ -1,6 +1,7 @@
 """Offline tests on recorded real responses (tests/fixtures, recorded 2026-11-05 by scripts/record_fixtures.py)."""
 import json
 import os
+from pathlib import Path
 
 import pytest
 from conftest import Replay, load_fixtures, make_sources
@@ -319,3 +320,63 @@ def test_retrieve_end_to_end_offline(cfg, keys):
     assert any(r["kind"] == "code" for r in out["resources"])
     assert out["sources"]["openalex"]["lists"] >= 1 and out["sources"]["exa"]["lists"] == 1
     json.dumps({k: v for k, v in out.items() if not k.startswith("_")})
+
+
+# ------------------------------------------------------------------ exa via local search pool
+def _pool_replay(fx_name="exa_6.json", provider="exa"):
+    """Wrap a recorded direct Exa response the way the search-pool service returns it."""
+    rec = json.loads((Path(__file__).parent / "fixtures" / fx_name).read_text())
+    exa = json.loads(rec["response"])
+    rows = [{"position": i + 1, "title": r.get("title"), "url": r.get("url"), "content": "", "raw": r}
+            for i, r in enumerate(exa["results"])]
+    out = {"object": "search.results", "provider": provider, "results": rows,
+           "usage": {"result_count": len(rows), "cost_usd": exa.get("costDollars", {}).get("total")},
+           "account": {"provider": provider, "index": 1, "name": "SLOT"}}
+    seen = []
+
+    def transport(method, url, headers, body):
+        seen.append((method, url, headers, body))
+        return 200, {}, json.dumps(out).encode()
+    return transport, seen, rec
+
+
+def test_exa_pool_backend_same_parse_as_direct(cfg, monkeypatch):
+    monkeypatch.delenv("EXA_API_KEY_SECONDARY", raising=False)     # pool backend needs no key in this process
+    monkeypatch.delenv("TBS_SEARCH_POOL_URL", raising=False)
+    cfg["sources"]["exa"]["backend"] = "pool"
+    tr, seen, rec = _pool_replay()
+    S, led, _ = make_sources(cfg, tr)
+    assert S["exa"].available() == (True, "")
+    rl = S["exa"].channel("paper", T)
+    m, url, hdr, body = seen[0]
+    assert url == "http://127.0.0.1:18150/v1/search" and m == "POST"
+    assert "x-api-key" not in {k.lower() for k in hdr}
+    assert body["engine"] == "exa" and body["limit"] == 10 and body["include_contents"] is False
+    assert body["exa_options"] == {"type": "auto", "highlights_max_characters": 400, "category": "publication"}
+    assert body["query"] == rec["body"]["query"]
+    assert led.usage("exa")["usd"] == pytest.approx(0.007)          # cost_usd reported by the pool
+    # identical parsing to the direct path on the same Exa rows
+    S2, _, _ = make_sources(dict(cfg, sources=dict(cfg["sources"], exa=dict(cfg["sources"]["exa"], backend="direct"))),
+                            Replay())
+    monkeypatch.setenv("EXA_API_KEY_SECONDARY", "SECRET-x")
+    direct = S2["exa"].channel("paper", T)
+    assert [(p.doi, p.title) for p in rl.papers] == [(p.doi, p.title) for p in direct.papers]
+    assert len(rl.papers) >= 8 and sum(bool(p.doi) for p in rl.papers) >= 6
+
+
+def test_exa_pool_rejects_other_provider_and_env_url(cfg, monkeypatch):
+    monkeypatch.setenv("TBS_SEARCH_POOL_URL", "http://127.0.0.1:9/")
+    cfg["sources"]["exa"]["backend"] = "pool"
+    tr, seen, _ = _pool_replay(provider="tavily")
+    S, _, _ = make_sources(cfg, tr)
+    rl = S["exa"].channel("code", T)
+    assert seen[0][1] == "http://127.0.0.1:9/v1/search"
+    assert rl.papers == [] and rl.resources == [] and "provider='tavily'" in S["exa"].errors[0]
+
+
+def test_exa_pool_unset_url_skips(cfg, monkeypatch):
+    monkeypatch.delenv("TBS_SEARCH_POOL_URL", raising=False)
+    cfg["sources"]["exa"]["backend"] = "pool"
+    cfg["sources"]["exa"]["pool_url"] = ""
+    S, _, _ = make_sources(cfg, Replay())
+    assert S["exa"].available()[0] is False

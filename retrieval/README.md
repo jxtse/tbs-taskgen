@@ -21,6 +21,17 @@ eval/          10 个目标的实测：run_eval.py / analyze.py / coverage.py / 
 state/         运行时生成：ledger.sqlite（账本）、cache.sqlite（响应缓存）；已加入 .gitignore
 ```
 
+## Exa 后端
+
+`sources.exa.backend` 有两种取值：
+
+- `pool`（默认）：请求发到本地搜索池服务 `POST {pool_url}/v1/search`，默认 `pool_url = http://127.0.0.1:18150`，可用环境变量 `TBS_SEARCH_POOL_URL` 覆盖。服务持有 Exa key 并在多个 key 之间轮换，本进程不读 key。请求固定 `engine=exa`，不回退到 Tavily；`type`、`category`、`includeDomains`、highlights 长度通过 `exa_options` 原样传给 Exa。服务把 Exa 原始结果行放在 `raw` 里返回，解析与直连完全相同；费用按服务返回的 `usage.cost_usd`（即 Exa `costDollars.total`）记账。池服务地址未设置时 Exa 自动跳过。
+- `direct`：直连 `https://api.exa.ai/search`，key 从 `key_env` 读取。离线测试的录制数据用这个后端。
+
+搜索池服务需要支持 `exa_options` 字段，接口约定：请求 `{query, limit (1–20), engine, include_contents, exa_options}`，响应 `{provider, results: [{url, title, raw}], usage: {cost_usd}}`。
+
+2026-11-06 对照：10 个目标的 40 条 Exa 查询经池服务重跑，与 11-05 直连录制结果相比，URL 重合率为 code 88%、data 84%、docs 84%、paper 93%，论文 DOI 数 79→80，费用 $0.28（40 次）。差异来自两次检索相隔一天的 Exa 索引变化，没有出现解析或字段缺失问题。
+
 ## 用法
 
 ```bash
@@ -66,7 +77,7 @@ out["dropped"]     # 预筛剔除的计数：综述、非英文、无摘要、TB
 |---|---|---|
 | OpenAlex | 4 次 search + 1 次种子回查 + 1–2 次引用扩展 + 1–3 次 DOI 批量回查（list） | 主关键词检索。引用扩展取种子论文共同引用的参考文献。回查给其他源找到的 DOI 补摘要、OA 链接、类型和语言 |
 | Semantic Scholar | 3 次 search + 1 次 paper/batch（另有约 40% 的 429 重试） | 论文检索；batch 回查补 `openAccessPdf` 和 S2 id。recommendations 实测几乎没有增益，默认关闭（`recommend=True` 可开启）。没有 key 时跳过，并在输出里标为 `skipped` |
-| Exa | 4 次（code / data / docs / paper，paper 通道用 `category=publication`） | 代码仓库、数据集、软件文档；补充论文召回 |
+| Exa | 4 次（code / data / docs / paper，paper 通道用 `category=publication`） | 代码仓库、数据集、软件文档；补充论文召回。默认经本地搜索池服务调用（见下文“Exa 后端”） |
 | Tavily | 0 次（默认关闭） | 2026-11-05 起按项目决定从默认管线移除：实测质量明显低于 Exa（可用资源 35 vs 137，噪声 41 vs 0）。适配器保留，`sources.tavily.enabled=True` 可重开做对照 |
 | Crossref | 3 次 search + 0–1 次 DOI 回查 | 兜底源。用工具名或作者名等精确词查询（例如 `V-SHARP ...`、`VerifyBamID ...`），同时提供 DOI 和出版商元数据。走 polite pool（带 mailto），间隔 ≥0.34 s |
 | arXiv | 2 次（只在路由命中 astro-ph / physics / cond-mat / quant-ph / stat / math / cs 时调用） | 预印本。单连接，每 3.1 s 一次 |
@@ -80,7 +91,7 @@ out["dropped"]     # 预筛剔除的计数：综述、非英文、无摘要、TB
 - 环境变量名可在配置里改（`sources.<name>.key_env`），默认值：
   - OpenAlex：`OPENALEX_API_KEY`
   - Semantic Scholar：`SEMANTIC_SCHOLAR_API_KEY`
-  - Exa：`EXA_API_KEY_SECONDARY`（管线用副 key，主 key 留给 Hermes 日常网页搜索）
+  - Exa：默认 `backend = "pool"`，本进程不需要 Exa key；`backend = "direct"` 时读 `EXA_API_KEY_SECONDARY`
   - Tavily：`TAVILY_API_KEY_SECONDARY`（同上）
 - Crossref、arXiv、Europe PMC 不需要 key。OpenAlex 没有 key 也能跑，但同一 IP 共享每天 $0.10 的额度。S2、Exa、Tavily 没有 key 时会自动跳过。
 - 防泄露措施：

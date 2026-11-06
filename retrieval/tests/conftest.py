@@ -47,6 +47,7 @@ class Replay:
 @pytest.fixture
 def cfg(tmp_path):
     c = load_config(overrides={"state_dir": str(tmp_path / "state"), "leak_refs": None})
+    c["sources"]["exa"]["backend"] = "direct"   # recorded fixtures are direct api.exa.ai responses
     for s in c["sources"].values():          # no real sleeping in tests
         s["min_interval_s"] = 0.0
         s["backoff_429_s"] = 0.0
