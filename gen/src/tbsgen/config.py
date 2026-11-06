@@ -103,7 +103,8 @@ DEFAULTS: dict[str, Any] = {
         "l4a_spearman": 0.995,
         "l4b_minutes": 20,                  # cheap-agent inversion (待定, disabled)
         "max_repair_rounds": 2,
-        "blocking": ["oracle", "hidden_shift", "leak", "isolation", "infeasible", "determinism"],
+        "blocking": ["oracle", "hidden_shift", "leak", "isolation", "infeasible", "determinism", "truth_isolation",
+                     "cli_contract"],
     },
     "sandbox": {
         "backend": "docker",                # only docker is supported

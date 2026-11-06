@@ -88,6 +88,7 @@ def set_thresholds(spec: dict, measure: dict, cfg: dict) -> dict:
         mm = [x for x in m_vals if x is not None and math.isfinite(x)]
         m_best = (min(mm) if d == "<=" else max(mm)) if mm else None
         margin = tc["min_ref_margin"]
+        naive_capped = False
         separating = m_best is not None and _worse(d, m_best, r) and \
             abs(m_best - r) > margin * max(abs(r), 1e-12)
         if separating:
@@ -100,12 +101,22 @@ def set_thresholds(spec: dict, measure: dict, cfg: dict) -> dict:
             thr = r * (1 + tc["loose_margin"]) if (d == "<=") == (r >= 0) else r * (1 - tc["loose_margin"])
             if r == 0:
                 thr = 1e-9 if d == "<=" else -1e-9
+            # v2.1: a non-separating metric must still reject the naive baseline when the naive is clearly worse
+            # (e2e-iter1: oracle-relative RMSE ratio, ref 1.00, naive 1.48-1.58, loose threshold 1.6 let naive pass)
+            nv = [v.get(name) for v in measure.get("naive", {}).values()]
+            nv = [x for x in nv if x is not None and math.isfinite(x)]
+            n_best = (min(nv) if d == "<=" else max(nv)) if nv else None
+            if n_best is not None and _worse(d, n_best, r) and abs(n_best - r) > margin * max(abs(r), 1e-12):
+                mid_n = math.exp(math.log(r) + tc["frac"] * (math.log(n_best) - math.log(r))) \
+                    if r > 0 and n_best > 0 else r + tc["frac"] * (n_best - r)
+                if _worse(d, thr, mid_n):
+                    thr, naive_capped = mid_n, True
         thr = _round_sig(thr, tc["sig_digits"], d, toward_loose=True)
         if separating and not _worse(d, m_best, thr):   # rounding must not let the mid baseline pass
             thr = _round_sig(thr, tc["sig_digits"] + 2, d, toward_loose=False)
         ok_ref = not _worse(d, r, thr)
         out[name] = dict(direction=d, threshold=thr, ref_worst=r, mid_best=m_best, separating=separating,
-                         ref_passes=ok_ref)
+                         ref_passes=ok_ref, naive_capped=naive_capped)
     mid_fail = {s: sum(1 for k, t in out.items() if t.get("threshold") is not None and v.get(k) is not None
                        and _worse(t["direction"], v[k], t["threshold"])) for s, v in measure["mid"].items()}
     naive_fail = {s: sum(1 for k, t in out.items() if t.get("threshold") is not None and v.get(k) is not None

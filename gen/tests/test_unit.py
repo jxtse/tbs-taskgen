@@ -102,6 +102,16 @@ def test_parse_files_truncated_drops_partial_last_block():
 
 
 # ------------------------------------------------------------------ spec + thresholds
+def test_non_separating_threshold_rejects_clearly_worse_naive():
+    # e2e-iter1 numbers: ratio metric, ref ~1.00, mid ~1.08 (not separating at 10%), naive ~1.5 -> was 1.6 (naive passed)
+    cfg = load_config()
+    spec = {"metrics": [{"name": "r", "direction": "<="}]}
+    meas = {"ref": {"0": {"r": 1.0024}, "1": {"r": 1.0037}}, "mid": {"0": {"r": 1.089}, "1": {"r": 1.084}},
+            "naive": {"0": {"r": 1.478}, "1": {"r": 1.487}}}
+    t = set_thresholds(spec, meas, cfg)["thresholds"]["r"]
+    assert not t["separating"] and t["naive_capped"]
+    assert 1.0037 * 1.1 <= t["threshold"] < 1.478
+
 def test_validate_spec_ok_and_bad():
     cfg = load_config()
     assert validate_spec(SPEC, cfg) == []

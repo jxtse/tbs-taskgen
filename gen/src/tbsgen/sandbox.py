@@ -32,14 +32,14 @@ def image_exists(image: str) -> bool:
     return sh(["docker", "image", "inspect", image], 30)["rc"] == 0
 
 
-def run(cfg: dict, mounts: list[tuple], cmd: str, timeout: int, name: str = "") -> dict:
+def run(cfg: dict, mounts: list[tuple], cmd: str, timeout: int, name: str = "", root: bool = False) -> dict:
     sb = cfg["sandbox"]
     name = re.sub(r"[^a-zA-Z0-9_.-]", "-", (name or "tbsgen") + "-" + uuid.uuid4().hex[:6])[:120]
     if sb["backend"] != "docker":
         raise ValueError("only the docker sandbox backend is supported (task code hard-codes /app, /tests paths)")
     args = ["docker", "run", "--rm", "--name", name, "--network", "none", "--cpus", str(sb["cpus"]),
             "--memory", sb["memory"], "--memory-swap", sb["memory"], "--pids-limit", str(sb["pids"]),
-            "--user", f"{os.getuid()}:{os.getgid()}", "-e", "HOME=/tmp", "-e", "OMP_NUM_THREADS=2",
+            "--user", "0:0" if root else f"{os.getuid()}:{os.getgid()}", "-e", "HOME=/tmp", "-e", "OMP_NUM_THREADS=2",
             "-e", "OPENBLAS_NUM_THREADS=2", "-e", "MPLCONFIGDIR=/tmp"]
     for src, dst, mode in mounts:
         args += ["-v", f"{Path(src).resolve()}:{dst}:{mode}"]

@@ -67,8 +67,11 @@ Write the generator and the reference solution.  Files:
   baselines/naive.py: also drops the naive_drop nodes.  Same I/O as solve.py (PROG: they write their own
   self-contained solution_cli.py).  Keep the baselines compact.
 - tests/measure.py: defines `compute() -> dict` returning {{"<metric name>": float}} for every metric in the spec
-  (reads /app/output and /tests/truth; PROG: hidden metrics via `from _metrics import run_solution`;
-  `out_dir, sec, rc = run_solution(timeout_sec)` runs /app/output/solution_cli.py on /tests/hidden), and under
+  (reads /app/output and /tests/truth).  PROG: execute the agent program ONLY through the provided helper
+  `from _metrics import run_solution, hidden_sets`; `for d in hidden_sets(): out_dir, sec, rc = run_solution(t, d)`
+  runs `python /app/output/solution_cli.py <d> <out_dir>` as an unprivileged user with /tests/truth locked
+  (hidden_sets() = subdirectories of /tests/hidden, or /tests/hidden itself).  Never subprocess/exec agent code
+  yourself (the verifier runs as root, so that would expose the truth).  Under
   `if __name__ == "__main__":` prints ONE JSON line of compute().  No thresholds, no asserts.  Missing or
   malformed deliverables must give the worst value (e.g. inf / 0.0), never an exception.
 Format: === FILE: <path> === blocks, then === END ===.  Write the files in the order listed."""
@@ -85,8 +88,10 @@ Write (generator, solution and mid/naive baselines already exist and are fixed):
 - baselines/exploit_*.py: at least one shortcut attempt (constant/default output, public-data echo, skipping the
   {mid_drop} step entirely).
 - instruction.md: the task statement for an expert agent.  States the scientific problem and the data files
-  (columns, units); deliverables and file formats exact; for PROG the solution_cli.py contract and what may
-  change on the hidden inputs (qualitatively, no hidden parameter values); every metric defined precisely and
+  (columns, units); deliverables and file formats exact (must agree with what tests/measure.py reads); for PROG
+  include verbatim the line `python /app/output/solution_cli.py <input_dir> <output_dir>` (positional args,
+  <input_dir> laid out like /app/data) and say what may change on the hidden inputs (qualitatively, no hidden
+  parameter values); every metric defined precisely and
   every threshold above with its direction.  Nothing from derive/internal/hidden_truth nodes: do not give the
   method recipe, formulas or parameter values the agent must derive; no "do not read" rules; time budget
   {hours} h.

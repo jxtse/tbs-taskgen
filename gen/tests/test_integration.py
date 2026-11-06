@@ -156,6 +156,44 @@ def test_s6a_truncated_answer_gets_one_continuation(tmp_path):
     assert it.state["status"] == "waiting", it.state
 
 
+def _prog_task(root: Path, direct_exec: bool) -> tuple[Path, Path, Path]:
+    task, gen = root / "task", root / "gen"
+    (task / "tests").mkdir(parents=True)
+    for d in ("environment/data", "tests/truth", "tests/hidden/set1"):
+        (gen / d).mkdir(parents=True)
+    (gen / "environment/data/x.csv").write_text("a\n1\n")
+    (gen / "tests/hidden/set1/x.csv").write_text("a\n2\n")
+    (gen / "tests/truth/secret.csv").write_text("truth\n42\n")
+    run = ("import subprocess, sys, tempfile\n"
+           "def go():\n    o = tempfile.mkdtemp()\n"
+           "    p = subprocess.run([sys.executable, '/app/output/solution_cli.py', '/tests/hidden/set1', o],"
+           " capture_output=True, text=True)\n"
+           "    from _metrics import _record\n"
+           "    _record({'name': '_solution_cli_run', 'value': 0, 'rc': p.returncode, 'stderr_tail': p.stderr,"
+           " 'aux': True, 'passed': True, 'threshold': 1, 'direction': '<='})\n") if direct_exec else \
+        ("from _metrics import run_solution, hidden_sets\n"
+         "def go():\n    for d in hidden_sets():\n        run_solution(60, d)\n")
+    (task / "tests/measure.py").write_text(run + "def compute():\n    go()\n    return {'m': 1.0}\n")
+    (task / "tests/test_outputs.py").write_text("from measure import compute\nfrom _metrics import check\n"
+                                                "def test_m():\n    check('m', compute()['m'], 2.0, '<=')\n")
+    ref = root / "ref"
+    ref.mkdir()
+    (ref / "solution_cli.py").write_text("pass\n")
+    return task, gen, ref
+
+
+@pytest.mark.parametrize("direct_exec", [True, False])
+def test_truth_isolation_probe(tmp_path, direct_exec):
+    """e2e-iter1 regression: the generated measure.py ran solution_cli.py itself (as root) instead of via
+    _metrics.run_solution, so /tests/truth was readable and a truth-reading CLI got Harbor reward 1."""
+    from tbsgen import runner
+    cfg = load_config(None, {"run": {"root": str(tmp_path)}})
+    task, gen, ref = _prog_task(tmp_path, direct_exec)
+    r = runner.truth_probe(cfg, task, gen, ref, tmp_path / "work", "tp")
+    assert r["via_run_solution"]
+    assert r["ok"] is (not direct_exec), r
+
+
 def test_intake_failure_routes(tmp_path):
     P, _ = mk(tmp_path)
     cands = [dict(doi="10.1/review", title="A review of things", abstract="This review surveys perspectives."),
