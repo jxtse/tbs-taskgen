@@ -1,0 +1,28 @@
+caps this run: {'openalex': 292, 'exa': 76, 'tavily': 76, 'crossref': 117, 'arxiv': 58, 'europepmc': 58, 's2': 140}
+task:ambient-rna-correction                          56.7s pool=317 top=60 res=38 status={}
+task:3x2pt-inference                                 82.5s pool=309 top=60 res=47 status={}
+task:nanoindentation-property-extraction            271.5s pool=326 top=60 res=41 status={}
+task:tumor-immune-interface                         138.9s pool=334 top=60 res=52 status={}
+task:qsm-reconstruction                             319.7s pool=313 top=60 res=43 status={}
+method:column-generation-branch-and-price-for-vehi  122.6s pool=321 top=60 res=39 status={}
+method:strong-constraint-4d-var-with-window-length   96.4s pool=297 top=60 res=37 status={}
+method:mixture-likelihood-contamination-and-tumor-   95.8s pool=325 top=60 res=49 status={}
+method:stochastic-reconfiguration-natural-gradient  143.5s pool=348 top=60 res=42 status={}
+method:multivariate-fay-herriot-hierarchical-small   58.0s pool=201 top=60 res=37 status={}
+{"source": "arxiv", "kind": "search", "live": 18, "cached": 2, "ok": 18, "n429": 0, "usd": 0.0, "credits": 0.0, "avg_latency_s": 2.186}
+{"source": "crossref", "kind": "lookup", "live": 6, "cached": 4, "ok": 6, "n429": 0, "usd": 0.0, "credits": 0.0, "avg_latency_s": 1.793}
+{"source": "crossref", "kind": "search", "live": 27, "cached": 3, "ok": 27, "n429": 0, "usd": 0.0, "credits": 0.0, "avg_latency_s": 2.431}
+{"source": "europepmc", "kind": "search", "live": 18, "cached": 2, "ok": 2, "n429": 0, "usd": 0.0, "credits": 0.0, "avg_latency_s": 3.264}
+{"source": "exa", "kind": "code", "live": 9, "cached": 1, "ok": 9, "n429": 0, "usd": 0.063, "credits": 0.0, "avg_latency_s": 6.115}
+{"source": "exa", "kind": "data", "live": 9, "cached": 1, "ok": 9, "n429": 0, "usd": 0.063, "credits": 0.0, "avg_latency_s": 5.632}
+{"source": "exa", "kind": "docs", "live": 9, "cached": 1, "ok": 9, "n429": 0, "usd": 0.063, "credits": 0.0, "avg_latency_s": 5.842}
+{"source": "exa", "kind": "paper", "live": 9, "cached": 1, "ok": 9, "n429": 0, "usd": 0.063, "credits": 0.0, "avg_latency_s": 4.906}
+{"source": "openalex", "kind": "list", "live": 46, "cached": 1, "ok": 46, "n429": 0, "usd": 0.0046, "credits": 0.0, "avg_latency_s": 5.65}
+{"source": "openalex", "kind": "search", "live": 36, "cached": 4, "ok": 36, "n429": 0, "usd": 0.036, "credits": 0.0, "avg_latency_s": 8.95}
+{"source": "s2", "kind": "batch", "live": 33, "cached": 0, "ok": 19, "n429": 14, "usd": 0.0, "credits": 0.0, "avg_latency_s": 2.722}
+{"source": "s2", "kind": "recommend", "live": 36, "cached": 2, "ok": 16, "n429": 19, "usd": 0.0, "credits": 0.0, "avg_latency_s": 2.73}
+{"source": "s2", "kind": "search", "live": 36, "cached": 3, "ok": 27, "n429": 9, "usd": 0.0, "credits": 0.0, "avg_latency_s": 2.277}
+{"source": "tavily", "kind": "code", "live": 9, "cached": 1, "ok": 9, "n429": 0, "usd": 0.0, "credits": 9.0, "avg_latency_s": 4.528}
+{"source": "tavily", "kind": "data", "live": 9, "cached": 1, "ok": 9, "n429": 0, "usd": 0.0, "credits": 9.0, "avg_latency_s": 3.467}
+{"source": "tavily", "kind": "docs", "live": 9, "cached": 1, "ok": 9, "n429": 0, "usd": 0.0, "credits": 9.0, "avg_latency_s": 3.34}
+{"source": "tavily", "kind": "paper", "live": 9, "cached": 1, "ok": 9, "n429": 0, "usd": 0.0, "credits": 9.0, "avg_latency_s": 4.458}

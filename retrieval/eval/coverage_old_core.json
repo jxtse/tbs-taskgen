@@ -1,0 +1,379 @@
+{
+ "per_target": {
+  "method:column-generation-branch-and-price-for-vehicle-routing": {
+   "old_core_ref": 4,
+   "new4": {
+    "in_pool": 4,
+    "in_head60": 2,
+    "dropped_by_prefilter": 0,
+    "missing": []
+   },
+   "new4-s2": {
+    "in_pool": 2,
+    "in_head60": 1,
+    "dropped_by_prefilter": 0,
+    "missing": [
+     "crossref: Improvements in solving resource constrained shortest path problems in",
+     "crossref: Branch-and-cut-and-price for the Electric Vehicle Routing Problem with"
+    ]
+   },
+   "oa": {
+    "in_pool": 2,
+    "in_head60": 1,
+    "dropped_by_prefilter": 0,
+    "missing": [
+     "crossref: Improvements in solving resource constrained shortest path problems in",
+     "crossref: Branch-and-cut-and-price for the Electric Vehicle Routing Problem with"
+    ]
+   },
+   "full7": {
+    "in_pool": 4,
+    "in_head60": 3,
+    "dropped_by_prefilter": 0,
+    "missing": []
+   }
+  },
+  "method:mixture-likelihood-contamination-and-tumor-in-normal-estimat": {
+   "old_core_ref": 1,
+   "new4": {
+    "in_pool": 0,
+    "in_head60": 0,
+    "dropped_by_prefilter": 0,
+    "missing": [
+     "crossref: Removing sample-to-sample cross-contamination in high-throughput seque"
+    ]
+   },
+   "new4-s2": {
+    "in_pool": 0,
+    "in_head60": 0,
+    "dropped_by_prefilter": 0,
+    "missing": [
+     "crossref: Removing sample-to-sample cross-contamination in high-throughput seque"
+    ]
+   },
+   "oa": {
+    "in_pool": 0,
+    "in_head60": 0,
+    "dropped_by_prefilter": 0,
+    "missing": [
+     "crossref: Removing sample-to-sample cross-contamination in high-throughput seque"
+    ]
+   },
+   "full7": {
+    "in_pool": 1,
+    "in_head60": 0,
+    "dropped_by_prefilter": 0,
+    "missing": []
+   }
+  },
+  "method:multivariate-fay-herriot-hierarchical-small-area-models": {
+   "old_core_ref": 8,
+   "new4": {
+    "in_pool": 7,
+    "in_head60": 7,
+    "dropped_by_prefilter": 0,
+    "missing": [
+     "europepmc: Direct-Assisted Bayesian Unit-level Modeling for Small Area Estimation"
+    ]
+   },
+   "new4-s2": {
+    "in_pool": 7,
+    "in_head60": 6,
+    "dropped_by_prefilter": 0,
+    "missing": [
+     "europepmc: Direct-Assisted Bayesian Unit-level Modeling for Small Area Estimation"
+    ]
+   },
+   "oa": {
+    "in_pool": 6,
+    "in_head60": 5,
+    "dropped_by_prefilter": 0,
+    "missing": [
+     "arxiv: Benchmarking Priors: A Fully Bayesian Approach to Small Area Benchmark",
+     "europepmc: Direct-Assisted Bayesian Unit-level Modeling for Small Area Estimation"
+    ]
+   },
+   "full7": {
+    "in_pool": 7,
+    "in_head60": 7,
+    "dropped_by_prefilter": 0,
+    "missing": [
+     "europepmc: Direct-Assisted Bayesian Unit-level Modeling for Small Area Estimation"
+    ]
+   }
+  },
+  "method:stochastic-reconfiguration-natural-gradient-for-neural-quant": {
+   "old_core_ref": 2,
+   "new4": {
+    "in_pool": 2,
+    "in_head60": 2,
+    "dropped_by_prefilter": 0,
+    "missing": []
+   },
+   "new4-s2": {
+    "in_pool": 2,
+    "in_head60": 2,
+    "dropped_by_prefilter": 0,
+    "missing": []
+   },
+   "oa": {
+    "in_pool": 2,
+    "in_head60": 2,
+    "dropped_by_prefilter": 0,
+    "missing": []
+   },
+   "full7": {
+    "in_pool": 2,
+    "in_head60": 2,
+    "dropped_by_prefilter": 0,
+    "missing": []
+   }
+  },
+  "method:strong-constraint-4d-var-with-window-lengthening-warm-starte": {
+   "old_core_ref": 4,
+   "new4": {
+    "in_pool": 3,
+    "in_head60": 2,
+    "dropped_by_prefilter": 0,
+    "missing": [
+     "crossref: Coupling ensemble Kalman filter with four-dimensional variational data"
+    ]
+   },
+   "new4-s2": {
+    "in_pool": 3,
+    "in_head60": 1,
+    "dropped_by_prefilter": 0,
+    "missing": [
+     "crossref: Coupling ensemble Kalman filter with four-dimensional variational data"
+    ]
+   },
+   "oa": {
+    "in_pool": 2,
+    "in_head60": 1,
+    "dropped_by_prefilter": 0,
+    "missing": [
+     "crossref: Coupling ensemble Kalman filter with four-dimensional variational data",
+     "crossref: E4DVar: Coupling an Ensemble Kalman Filter with Four-Dimensional Varia"
+    ]
+   },
+   "full7": {
+    "in_pool": 4,
+    "in_head60": 3,
+    "dropped_by_prefilter": 0,
+    "missing": []
+   }
+  },
+  "task:3x2pt-inference": {
+   "old_core_ref": 5,
+   "new4": {
+    "in_pool": 5,
+    "in_head60": 5,
+    "dropped_by_prefilter": 0,
+    "missing": []
+   },
+   "new4-s2": {
+    "in_pool": 5,
+    "in_head60": 5,
+    "dropped_by_prefilter": 0,
+    "missing": []
+   },
+   "oa": {
+    "in_pool": 5,
+    "in_head60": 5,
+    "dropped_by_prefilter": 0,
+    "missing": []
+   },
+   "full7": {
+    "in_pool": 5,
+    "in_head60": 5,
+    "dropped_by_prefilter": 0,
+    "missing": []
+   }
+  },
+  "task:ambient-rna-correction": {
+   "old_core_ref": 3,
+   "new4": {
+    "in_pool": 3,
+    "in_head60": 3,
+    "dropped_by_prefilter": 0,
+    "missing": []
+   },
+   "new4-s2": {
+    "in_pool": 3,
+    "in_head60": 3,
+    "dropped_by_prefilter": 0,
+    "missing": []
+   },
+   "oa": {
+    "in_pool": 3,
+    "in_head60": 3,
+    "dropped_by_prefilter": 0,
+    "missing": []
+   },
+   "full7": {
+    "in_pool": 3,
+    "in_head60": 3,
+    "dropped_by_prefilter": 0,
+    "missing": []
+   }
+  },
+  "task:nanoindentation-property-extraction": {
+   "old_core_ref": 7,
+   "new4": {
+    "in_pool": 5,
+    "in_head60": 5,
+    "dropped_by_prefilter": 0,
+    "missing": [
+     "crossref: High-Precision Calibration of Indenter Area Function and Instrument Co",
+     "crossref: The Strain Gradient Effects in Micro-Indentation Hardness Experiments"
+    ]
+   },
+   "new4-s2": {
+    "in_pool": 4,
+    "in_head60": 3,
+    "dropped_by_prefilter": 0,
+    "missing": [
+     "crossref: High-Precision Calibration of Indenter Area Function and Instrument Co",
+     "crossref: The Strain Gradient Effects in Micro-Indentation Hardness Experiments",
+     "crossref: Thermal drift in room temperature nanoindentation experiments: Measure"
+    ]
+   },
+   "oa": {
+    "in_pool": 3,
+    "in_head60": 2,
+    "dropped_by_prefilter": 0,
+    "missing": [
+     "crossref: High-Precision Calibration of Indenter Area Function and Instrument Co",
+     "crossref: The Strain Gradient Effects in Micro-Indentation Hardness Experiments",
+     "crossref: Thermal drift in room temperature nanoindentation experiments: Measure",
+     "crossref: Simple method and critical comparison of frame compliance and indenter"
+    ]
+   },
+   "full7": {
+    "in_pool": 7,
+    "in_head60": 5,
+    "dropped_by_prefilter": 0,
+    "missing": []
+   }
+  },
+  "task:qsm-reconstruction": {
+   "old_core_ref": 12,
+   "new4": {
+    "in_pool": 8,
+    "in_head60": 6,
+    "dropped_by_prefilter": 0,
+    "missing": [
+     "crossref: Spatially Adaptive Regularization in Total Field Inversion for Quantit",
+     "arxiv: Robust Multi-echo GRE Phase processing using a unity rank enforced com",
+     "arxiv: A Probabilistic Bayesian Approach to Recover $R_2^*$ map and Phase Ima",
+     "arxiv: Robust Quantitative Susceptibility Mapping via Approximate Message Pas"
+    ]
+   },
+   "new4-s2": {
+    "in_pool": 8,
+    "in_head60": 4,
+    "dropped_by_prefilter": 0,
+    "missing": [
+     "crossref: Spatially Adaptive Regularization in Total Field Inversion for Quantit",
+     "arxiv: Robust Multi-echo GRE Phase processing using a unity rank enforced com",
+     "arxiv: A Probabilistic Bayesian Approach to Recover $R_2^*$ map and Phase Ima",
+     "arxiv: Robust Quantitative Susceptibility Mapping via Approximate Message Pas"
+    ]
+   },
+   "oa": {
+    "in_pool": 8,
+    "in_head60": 4,
+    "dropped_by_prefilter": 0,
+    "missing": [
+     "crossref: Spatially Adaptive Regularization in Total Field Inversion for Quantit",
+     "arxiv: Robust Multi-echo GRE Phase processing using a unity rank enforced com",
+     "arxiv: A Probabilistic Bayesian Approach to Recover $R_2^*$ map and Phase Ima",
+     "arxiv: Robust Quantitative Susceptibility Mapping via Approximate Message Pas"
+    ]
+   },
+   "full7": {
+    "in_pool": 8,
+    "in_head60": 7,
+    "dropped_by_prefilter": 0,
+    "missing": [
+     "crossref: Spatially Adaptive Regularization in Total Field Inversion for Quantit",
+     "arxiv: Robust Multi-echo GRE Phase processing using a unity rank enforced com",
+     "arxiv: A Probabilistic Bayesian Approach to Recover $R_2^*$ map and Phase Ima",
+     "arxiv: Robust Quantitative Susceptibility Mapping via Approximate Message Pas"
+    ]
+   }
+  },
+  "task:tumor-immune-interface": {
+   "old_core_ref": 9,
+   "new4": {
+    "in_pool": 6,
+    "in_head60": 5,
+    "dropped_by_prefilter": 0,
+    "missing": [
+     "crossref: Pushing the Limits of Cell Segmentation Models for Imaging Mass Cytome",
+     "crossref: Cell phenotyping using unsupervised clustering on multiplexed fluoresc",
+     "arxiv: RRScell method for automated single-cell profiling of multiplexed immu"
+    ]
+   },
+   "new4-s2": {
+    "in_pool": 4,
+    "in_head60": 3,
+    "dropped_by_prefilter": 0,
+    "missing": [
+     "crossref: Pushing the Limits of Cell Segmentation Models for Imaging Mass Cytome",
+     "crossref: Compensation of Signal Spillover in Suspension and Imaging Mass Cytome",
+     "crossref: <tt>spillR</tt>\n                    : spillover compensation in mass c",
+     "crossref: Cell phenotyping using unsupervised clustering on multiplexed fluoresc",
+     "arxiv: RRScell method for automated single-cell profiling of multiplexed immu"
+    ]
+   },
+   "oa": {
+    "in_pool": 3,
+    "in_head60": 3,
+    "dropped_by_prefilter": 0,
+    "missing": [
+     "crossref: Pushing the Limits of Cell Segmentation Models for Imaging Mass Cytome",
+     "crossref: Compensation of Signal Spillover in Suspension and Imaging Mass Cytome",
+     "crossref: <tt>spillR</tt>\n                    : spillover compensation in mass c",
+     "crossref: Cell phenotyping using unsupervised clustering on multiplexed fluoresc",
+     "arxiv: RRScell method for automated single-cell profiling of multiplexed immu",
+     "europepmc: Spatialproteomics: an interoperable toolbox for analyzing highly multi"
+    ]
+   },
+   "full7": {
+    "in_pool": 7,
+    "in_head60": 6,
+    "dropped_by_prefilter": 0,
+    "missing": [
+     "crossref: Cell phenotyping using unsupervised clustering on multiplexed fluoresc",
+     "arxiv: RRScell method for automated single-cell profiling of multiplexed immu"
+    ]
+   }
+  }
+ },
+ "total": {
+  "new4": {
+   "in_pool": 43,
+   "in_head60": 37,
+   "dropped_by_prefilter": 0
+  },
+  "new4-s2": {
+   "in_pool": 38,
+   "in_head60": 28,
+   "dropped_by_prefilter": 0
+  },
+  "oa": {
+   "in_pool": 34,
+   "in_head60": 26,
+   "dropped_by_prefilter": 0
+  },
+  "full7": {
+   "in_pool": 48,
+   "in_head60": 41,
+   "dropped_by_prefilter": 0
+  },
+  "ref": {
+   "n": 55
+  }
+ }
+}
