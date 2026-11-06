@@ -104,6 +104,11 @@ def submit(cfg: dict, item_dir: Path, who: str, n: int, ledger=None) -> dict:
                job_dir=str(Path(c["jobs_dir"]) / job_name), task=conf["tasks"][0]["path"])
     if not c.get("allow_submit"):
         return rec
+    if c.get("prepared_tasks_dir") and not rec["task"].startswith(str(Path(c["prepared_tasks_dir"]))):
+        # remote sandbox backends cannot build a Dockerfile: a missing prepared template means the run would die
+        # at environment start (e2e-iter1: FileUploadException, no model use) -> do not launch
+        rec["blocked"] = "no prepared sandbox template for this item"
+        return rec
     import shlex
     import subprocess
     model = c["student_model"] if who == "glm" else c["teacher_model"]
