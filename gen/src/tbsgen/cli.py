@@ -118,7 +118,8 @@ def main(argv=None):
         if not pend:
             sys.exit("no pending calibration run for this item")
         job_dir = Path(a.job_dir or pend[-1].get("job_dir") or "")
-        if not (job_dir / "result.json").exists() and not a.job_dir:
+        jr = read_json(job_dir / "result.json", {})
+        if not jr.get("finished_at"):           # Harbor writes result.json at job start; finished_at marks the end
             sys.exit(f"job not finished yet: {job_dir}")
         trials = calib.collect(job_dir)
         if not trials:

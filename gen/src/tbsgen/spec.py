@@ -144,12 +144,29 @@ def set_thresholds(spec: dict, measure: dict, cfg: dict) -> dict:
     naive_fail = {s: sum(1 for k, t in out.items() if t.get("threshold") is not None and v.get(k) is not None
                          and _worse(t["direction"], v[k], t["threshold"])) + sum(1 for k in out if k not in v)
                   for s, v in measure.get("naive", {}).items()}
+    # v2.2: the reference must not be clearly worse than the naive baseline on any metric; otherwise that metric
+    # does not measure the method (e2e-iter1 IEnKS: on the hidden regime the reference diverged, filter RMSE 4.19
+    # vs naive 3.39-3.52, and the loose rule still produced thresholds that both passed)
+    ref_worse = []
+    for name, t in out.items():
+        if t.get("threshold") is None:
+            continue
+        nv = [v.get(name) for v in measure.get("naive", {}).values()]
+        nv = [x for x in nv if x is not None and math.isfinite(x)]
+        if nv:
+            n_best = min(nv) if t["direction"] == "<=" else max(nv)
+            if _worse(t["direction"], t["ref_worst"], n_best) and \
+                    abs(t["ref_worst"] - n_best) > tc["min_ref_margin"] * max(abs(n_best), 1e-12):
+                ref_worse.append(name)
     lo, hi = tc["min_mid_fail"], tc["max_mid_fail"]
     status = "ok"
     if any(t.get("threshold") is None for t in out.values()):
         status = "ref_metric_missing"
+    elif ref_worse:
+        status = "ref_worse_than_naive"
     elif not all(t["ref_passes"] for t in out.values()):
         status = "ref_fails"
     elif not mid_fail or not all(lo <= n <= hi for n in mid_fail.values()):
         status = "not_separable"
-    return dict(status=status, thresholds=out, separating=sep, mid_fail=mid_fail, naive_fail=naive_fail)
+    return dict(status=status, thresholds=out, separating=sep, mid_fail=mid_fail, naive_fail=naive_fail,
+                ref_worse_than_naive=ref_worse)

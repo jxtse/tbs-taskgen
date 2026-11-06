@@ -164,6 +164,16 @@ def test_reference_sentinel_value_is_missing_output():
     assert th["status"] == "ref_metric_missing" and th["thresholds"]["rmse_public"]["threshold"] is None
 
 
+def test_reference_worse_than_naive_is_flagged():
+    cfg = load_config()
+    spec = {"metrics": [{"name": "public_rmse", "direction": "<="}, {"name": "hidden_rmse", "direction": "<="}]}
+    meas = {"ref": {"0": {"public_rmse": 0.29, "hidden_rmse": 4.19}},
+            "mid": {"0": {"public_rmse": 3.77, "hidden_rmse": 4.36}},
+            "naive": {"0": {"public_rmse": 3.70, "hidden_rmse": 3.52}}}
+    th = set_thresholds(spec, meas, cfg)
+    assert th["status"] == "ref_worse_than_naive" and th["ref_worse_than_naive"] == ["hidden_rmse"], th
+
+
 def test_mid_fail_counts_public_hidden_twins_once():
     # e2e-iter1 RCESPP: mid fails optimal_frac on public AND hidden + mean_rel_gap = 2 criteria (was 3 -> dropped)
     cfg = load_config()
