@@ -11,8 +11,8 @@ Rules
   the "budget_unset" rule.
 - `finish()` records usage+cost; error classes in budget.breaker_open_on (quota/auth) open the breaker at
   once; N consecutive errors of any class open it too.  The breaker stays open until `reset_breaker()`
-  (manual, after a human has looked) — this is what would have stopped the 2026-11-02 teacher job after
-  the first "额度已用完" 429 instead of 100 failed trials.
+  (manual, after a human has looked), so a quota error stops the run at once instead of after many failed
+  calls.
 - Day boundary: Asia/Shanghai (UTC+8) calendar day.
 """
 from __future__ import annotations

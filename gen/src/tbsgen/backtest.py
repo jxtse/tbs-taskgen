@@ -1,12 +1,13 @@
-"""Leak-gate back-test on old-pipeline tasks (no LLM, no model inference).
+"""Leak-gate back-test on tasks from an earlier generation batch (no LLM, no model inference).
+The task data is not part of this repository; the paths below point into the author's workspace.
 
-Positives (human review, out/tbs-simple-final-20261031/REVIEW_DECISIONS.jsonl):
-  * 6 "drop" tasks (public oracle object leaks the optimum)              -> st-corpus410 harbor/<id>
-  * doi-196db5a3b2c31394 pre-fix (design covariance invertible)           -> st-corpus410 harbor/<id>
+Positives (from the human review decisions of that batch):
+  * 6 "drop" tasks (public oracle object leaks the optimum)
+  * doi-196db5a3b2c31394 pre-fix (design covariance invertible)
 Controls:
-  * every reviewed-accepted task in out/tbs-simple-final-20261031/harbor-v07-new244 (use_v2_seed0 /
-    use_catchup_latest; these passed human review, so any flag is counted as a false positive *candidate*)
-  * doi-196db5a3b2c31394 post-fix (harbor-v07-new244-fix)
+  * every reviewed-accepted task of the batch (use_v2_seed0 / use_catchup_latest; these passed human
+    review, so any flag is counted as a false positive *candidate*)
+  * doi-196db5a3b2c31394 post-fix
 
     uv run python -m tbsgen.backtest --out eval/leak_backtest [--limit N] [--no-introspect]
 """
@@ -49,7 +50,7 @@ HOLD = OLD_PIPE / "runs" / "harbor-v06"
 
 
 def holdout_cases():
-    """81 earlier accepted tasks (st-final81, packaged in runs/harbor-v06).  NOT looked at while tuning the
+    """81 accepted tasks from an earlier batch.  NOT looked at while tuning the
     rules (tuning used the 231 controls above), so their flag rate is an out-of-sample false-positive estimate.
     They passed Harbor oracle/nop but only part of them had human review."""
     return [dict(id=d.name, label="clean", why="holdout81", dir=d) for d in sorted(HOLD.iterdir())

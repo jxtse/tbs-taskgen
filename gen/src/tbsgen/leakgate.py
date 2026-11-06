@@ -1,4 +1,4 @@
-"""Deterministic leak gates (no LLM).  Used by S7 and by the back-test on old tasks.
+"""Deterministic leak gates (no LLM).  Used by S7 and by the back-test (tbsgen.backtest).
 
 L1  text / isolation
     a. depgraph mode: names and values of derive/internal/hidden_truth nodes must not appear in the

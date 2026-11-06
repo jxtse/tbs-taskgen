@@ -1,9 +1,9 @@
 """PKG: build the Harbor task directory items/<id>/pkg/ from the working tree + seed-0 generation.
 
-Same layout as the old package.py (so the same harness / verifier code paths apply), plus:
+Standard Harbor task layout, plus:
   * tests/hidden copied only into tests/ (never into environment/)
   * provenance.json carries spec hash, gate summary, thresholds, ledger cost of the item
-  * Dockerfile: "selfcontained" (pip install of the pinned stack, portable to Aliyun sandbox / self-hosted Docker servers) or
+  * Dockerfile: "selfcontained" (pip install of the pinned stack, portable to remote sandboxes / self-hosted Docker servers) or
     "local_base" (FROM tbsgen-base:py311-sci-v2, only for local Docker checks)
   * validate_pkg(): structural check that Harbor can load the task (task.toml parses, required files)
 """

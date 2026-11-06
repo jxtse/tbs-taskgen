@@ -1,6 +1,6 @@
 # tbsgen：TB-Science 出题管线 v2
 
-出题管线 MVP：从检索结果开始，经过全文获取、可行性检查、规格、生成、机械门、修复、校准调度，最后打包成 Harbor 任务。**目前只做过调通和干跑，没有量产，也没有生成真实题目。** 量产要等定预算（见文末）。
+出题管线 MVP：从检索结果开始，经过全文获取、可行性检查、规格、生成、机械门、修复、校准调度，最后打包成 Harbor 任务。**已在少量真实论文上端到端跑通（见 §6），还没有量产。**
 
 ## 1. 架构
 
@@ -8,14 +8,14 @@
 src/tbsgen/
   config.py        全部配置与默认值（待定项都在这里）；config.toml 可覆盖
   budget.py        sqlite 预算账本：按 模型×阶段×条目 记 token/美元/次数；日预算、调用上限、单条目上限；熔断
-  models.py        模型调用层：OpusClient（本机网关，同旧 llm.py）/ FakeClient（脚本化）/ RecordingClient（录制）
+  models.py        模型调用层：OpusClient（Anthropic 兼容端点）/ FakeClient（脚本化）/ RecordingClient（录制）
   state.py         每条目一个状态目录 + state.json 状态机；events.jsonl
   pipeline.py      编排：逐条推进、断点续跑、预算/熔断暂停、resume
   intake.py        S1 读检索层输出；S2 规则筛选；S3 全文；S4 可行性（规则部分 + 官方题去重）
   prompts.py       S5/S6A/S6C/S8 提示词（版本号写进 provenance）
   spec.py          S5 规格校验（依赖图规则）；S6B 按实测定阈值
   runner.py        Docker 沙箱里跑 生成器/参考解/基线/measure/verifier
-  sandbox.py       docker run（--network none、2 CPU、4 GB、pids 512，与旧 validate.py 相同）
+  sandbox.py       docker run（--network none、2 CPU、4 GB、pids 512）
   gates.py         S7 机械门
   leaves.py, leakgate.py, leakcheck.py, introspect_probe.py   4 层泄漏门（L1–L4a）
   repair.py        S8 局部修复的保工审查（机械 diff）
@@ -26,10 +26,10 @@ src/tbsgen/
   cli.py           命令行 tbsgen
   fakes.py, dryrun.py        fake 模型脚本与端到端干跑
   backtest.py      泄漏门回测
-  templates_metrics.py       verifier 公共部分（复制自旧 templates_metrics.py v0.3）
-docker/Dockerfile.base       沙箱镜像 tbsgen-base:py311-sci-v2（同旧 package.py 的科学栈版本）
+  templates_metrics.py       verifier 公共部分，复制进每道题的 tests/_metrics.py
+docker/Dockerfile.base       沙箱镜像 tbsgen-base:py311-sci-v2（python 3.11 + 固定版本的科学计算库）
 tests/                       单测 + 集成测试；tests/fixtures/toy_task 为人造最小题
-eval/                        泄漏门回测、旧教师作业 UnknownApiError 归因
+eval/                        泄漏门回测结果
 ```
 
 运行目录（`--run DIR`）：
@@ -60,7 +60,7 @@ items/<item_id>/
 | S5 | 全文摘录 + 探针卡 | `_spec/spec.json`、`depgraph.json`、`coverage.json`、`provenance.json` | Opus | 校验不过重试 1 次，仍不过 `dropped: spec_invalid` |
 | S6A | 规格 | `task/generator/`、`solution/`、`baselines/{mid,naive}.py`、`tests/measure.py` | Opus | 缺文件 `dropped` |
 | S6A_run | 工作树 | `S6A_measure.json`：两个种子下 ref/mid/naive 的实测指标 | 无（Docker） | 生成器或参考解失败 → S8 |
-| S6B | 实测指标 | `thresholds.json`：分离型指标取 ref 与 mid 的对数中点，非分离型取 ref 放宽 50%，取整一律向宽松方向，且保证 mid 仍不过 | 无 | mid 拉不开 → 回 S5 换 `mid_drop`（限 1 次），再不行 `dropped`；ref 不过 → S8 |
+| S6B | 实测指标 | `thresholds.json`：分离型指标取 ref 与 mid 的对数中点，非分离型取 ref 放宽 50%，取整一律向宽松方向，且保证 mid 仍不过 | 无 | mid 拉不开 → 先由 S6M 只重写 mid（限 1 次），再回 S5 换 `mid_drop`（限 1 次），再不行 `dropped`；ref 不过 → S8 |
 | S6C | 规格 + 阈值 + 实测 | `tests/test_outputs.py`、`instruction.md`、`baselines/exploit_*.py` | Opus | 缺文件 `dropped` |
 | S7 | 完整工作树 | `gates/attempt-n.json` | 无（Docker） | 阻塞级 → S8；只有“阈值未写明”时由程序追加判据表 |
 | S8 | 门日志 + 依赖图 + 相关文件 | `repair/round-n/`（补丁 + 审查结论） | Opus 修复；审查为机械 diff | 审查不过算用掉 1 轮；2 轮后 `dropped: repair_limit` |
@@ -85,11 +85,10 @@ items/<item_id>/
 ```bash
 cd gen
 uv sync
-docker build --build-arg PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple \
-  -t tbsgen-base:py311-sci-v2 -f docker/Dockerfile.base docker/     # 沙箱镜像（已建好）
-uv run pytest -q                                                    # 49 个测试（集成测试需要 Docker）
+docker build -t tbsgen-base:py311-sci-v2 -f docker/Dockerfile.base docker/   # 沙箱镜像；可加 --build-arg PIP_INDEX_URL=<镜像源>
+uv run pytest -q                                                    # 65 个测试：49 单测 + 16 集成（集成测试需要 Docker 和沙箱镜像，缺了就跳过）
 uv run python -m tbsgen.dryrun --out runs/dryrun-X                  # fake 模型端到端干跑
-uv run python -m tbsgen.backtest --out eval/leak_backtest_X         # 泄漏门回测（--set holdout81 跑留出集）
+uv run python -m tbsgen.backtest --out eval/leak_backtest_X         # 泄漏门回测（需要旧批次题目数据，不在仓库里；--set holdout81 跑留出集）
 
 # 真实运行（必须先在 config.toml 里设预算；不设则真实模型调用全部拒绝）
 uv run tbsgen ingest --run runs/R --candidates <tbsretr 输出.json> [--top N] --config config.toml
@@ -113,7 +112,7 @@ daily_calls_per_model = { "claude-opus-5-5" = 40 }
 allow_submit = false
 ```
 
-凭据：出题阶段的 Opus 走本机 Anthropic 兼容网关（`models.opus.url`，可用 `TBS_OPUS_URL` 覆盖），与旧 `llm.py` 一样，本进程不持有 key。如果改走需要 key 的端点，设置 `models.opus.key_env`，再用 `uv run tbsgen ...` 注入；key 只放在请求头里，不写日志或文件，错误信息会先脱敏。
+凭据：出题阶段的 Opus 走 Anthropic 兼容端点（`models.opus.url`，可用 `TBS_OPUS_URL` 覆盖）。默认假设本机网关持有凭据，本进程不持有 key。如果改走需要 key 的端点，设置 `models.opus.key_env`，再用 `uv run tbsgen ...` 注入；key 只放在请求头里，不写日志或文件，错误信息会先脱敏。
 
 ## 4. 配置项与待定项默认值
 
@@ -133,19 +132,19 @@ allow_submit = false
 | `thresholds.sentinel_abs` | 1e5 | "≤"指标上参考值达到此量级视为缺输出（判分脚本的哨兵值） |
 | `gen.s6a_max_tokens / s6c_max_tokens / continue_calls` | 64000 / 48000 / 1 | 多文件输出上限；被截断时最多 1 次续写，只要缺的文件 |
 | `gen.mid_rework_max` | 1 | mid 不可区分时先由 S6M 只重写 `baselines/mid.py`，再不行才回 S5 |
-| `gates.max_repair_rounds` | 2 | 沿用旧上限 |
+| `gates.max_repair_rounds` | 2 | S8 修复轮数上限 |
 | `calib.quick_pass_minutes` | None | GLM 首次通过且用时短时直接记 easy（**待定**，默认关） |
-| `calib.keep_labels` | hard, unstable | decision 2026-11-05 |
+| `calib.keep_labels` | hard, unstable | 保留的难度标签 |
 | `calib.variant_depth` | 0 | S9b 更难变体（**待定**，MVP 关闭） |
 | `calib.infra_retries` | 2 | API/沙箱异常不计入校准次数 |
 | `calib.allow_submit` | **False** | True 时：账本预留 → tmux 后台运行启动脚本；预留超总额则拒绝 |
 | `calib.est_usd_per_run` | 20 | 每次校准作业的预留额，`calib-ingest` 用 Harbor `cost_usd` 冲销 |
 | `calib.teacher_available` | True | False：GLM 首次失败直接记 `parked:teacher_unavailable` |
 | `calib.prepared_tasks_dir` | None | 远端沙箱已注册模板的任务副本目录；设置后缺模板的条目不提交 |
-| `fulltext.mode` | 旧文献缓存（只读）→ OA PDF 链接 | 浏览器通道（旧 `browser_fetch.py`）**未接入**，取不到全文的条目进 `S3_queue.json` 并暂存 |
+| `fulltext.mode` | 本地全文缓存（只读，`fulltext.cache_dirs`）→ OA PDF 链接 | 浏览器通道**未接入**，取不到全文的条目进 `S3_queue.json` 并暂存 |
 | `package.dockerfile_mode` | selfcontained | Dockerfile 里用 pip 安装固定版本；`local_base` 只用于本机检查 |
 
-## 5. S9 校准规则（decision 2026-11-05）
+## 5. S9 校准规则
 
 GLM-5.3 + Claude Code 2.1.280 先跑第 1 次：
 
@@ -154,40 +153,30 @@ GLM-5.3 + Claude Code 2.1.280 先跑第 1 次：
 
 hard 和 unstable 保留。reward=1 一律算通过，即使之后报了 API 错误。没有 reward 的 API/沙箱异常算 `infra`，不计入次数，连续超过 2 次则暂存。`allow_submit=false` 时只写出作业配置和启动命令，由人执行；`true` 时先在账本预留、再后台启动。结果用 `calib-ingest` 回填。
 
-远端沙箱不执行 Dockerfile：提交前要为每题建好模板（打包出的 Dockerfile 与旧批次相同，可用"共享基础镜像 + 数据层"的薄镜像方式），并把准备好的任务副本目录配到 `calib.prepared_tasks_dir`。
+远端沙箱不执行 Dockerfile：提交前要为每题建好模板（可用"共享基础镜像 + 数据层"的薄镜像方式），并把准备好的任务副本目录配到 `calib.prepared_tasks_dir`。
 
 ## 6. 已验证 / 未验证
 
 **已验证（实际跑过）**
 
-- `uv run pytest -q`：36 passed（单测 28 + 集成 8，集成测试在本机 Docker 里执行任务代码）。
-- fake 模型端到端干跑（`runs/dryrun-final/`）：4 条候选（1 条人造 + 3 条来自检索层录制结果、全文取自旧缓存）全部走完 S1→S9。人造条目再用模拟的校准结果走到 S10（GLM 失败 + 教师通过 → hard）。机械门全过：nop、mid（2 项不过）、naive、exploit 都不过，参考解通过。
-- 集成测试覆盖的情况：断点续跑（中途停止，换新进程继续，已完成阶段不重复调用模型）；预算上限触发暂停，`resume` 后继续；quota 错误触发熔断并暂停；参考解崩溃 → S8 修复 → 恢复；注入泄漏 → L2 阻塞 → 修复后通过；修不好 → 2 轮后丢弃；筛选丢弃；取不到全文 → 暂存。
-- 打包出的 Harbor 任务：Harbor 0.23.0 能解析 `task.toml`。用本机 Docker 实际跑了 Harbor：oracle reward=1，nop reward=0（`state/harbor-local/jobs/`）。注意：本机检查时把 Dockerfile 换成了本地基础镜像，因为通过代理从 PyPI 下载超时。
+- 测试：65 个（49 单测 + 16 个在 Docker 里执行任务代码的集成测试），每次推送由 GitHub Actions CI 运行。
+- 集成测试覆盖的情况：断点续跑（中途停止，换新进程继续，已完成阶段不重复调用模型）；预算上限触发暂停，`resume` 后继续；quota 错误触发熔断并暂停；参考解崩溃 → S8 修复 → 恢复；注入泄漏 → L2 阻塞 → 修复后通过；修不好 → 2 轮后丢弃；S6A 截断续写；mid 不可区分时 S6M 只重写 mid；真值隔离探针；筛选丢弃；取不到全文 → 暂存。
+- fake 模型端到端干跑：人造条目走完 S1→S9，再用模拟的校准结果走到 S10。
+- 打包出的 Harbor 任务：用本机 Docker 实际跑 Harbor，oracle reward=1，nop reward=0（`tbsgen harbor-local`，Dockerfile 换成本地基础镜像）。
 - 泄漏门回测：见 `eval/LEAK_BACKTEST.md`（召回 7/7；样本内误报 0/231；留出误报 1/81）。
-- Opus 连通性：2 次真实调用，非流式和流式（SSE）都成功，均记入账本，共 $0.0013（占位价）。
+- 真实论文端到端（6 篇，真实 Opus）：3 篇走完 S1→PKG 并通过 oracle=1 / nop=0；2 篇因 mid 与参考解拉不开被丢弃；1 篇仍在修复。S9 已真实提交学生模型（GLM）校准，每题 1 次，不足以给出难度标签。
 
 **未验证**
 
-- 任何真实论文的 S5/S6A/S6C/S8：提示词没有在真实 Opus 上试过，Opus 产出能否通过解析和各道门都未知。
-- `selfcontained` Dockerfile 在阿里云沙箱/自建服务器 上的构建；Harbor 在阿里云沙箱环境下加载 tbsgen 任务。
-- S9 实际提交与 `calib-ingest` 对真实作业目录的解析（只用旧作业的 `result.json` 格式做过单测）。
-- OA PDF 下载分支（单测只走了缓存分支；网络分支的代码与旧管线的标题校验逻辑相同，但没有实测）。
+- 校准的教师（Opus agent）分支。
 - L4b 反解攻击、廉价模型各角色、S9b 变体、DOMF/CODE/MULTI 形态。
-- 价格是占位值，美元数字不是账单。
+- OA PDF 下载分支（单测只走了缓存分支）。
+- 专家时长是教师模型的自报值；价格是占位值，美元数字不是账单。
 
-## 6b. e2e-iter1（2026-11-06）新增门与检查
+## 6b. 真实论文端到端测试后新增的门与检查
 
 - `truth_isolation`（PROG，阻断）：判分时把 `solution_cli.py` 换成探针，探针尝试读 `/tests` 下除隐藏输入外的所有文件。要求探针经 `_metrics.run_solution` 执行，且什么都读不到。本地判分步骤与 Harbor 一致，以 root 运行在容器内副本上（含 `/app/data`）。
 - `cli_contract`（PROG，阻断）：指令必须原样包含 `solution_cli.py <input_dir> <output_dir>`。
 - S6B：
   - mid "只差 1–2 项"按判据计数，同名的 public/hidden 指标算一个；
   - 参考在某指标上明显差于 naive 时记 `ref_worse_than_naive`，送去修复。
-
-
-## 7. 真实 1 篇端到端烟测方案（已执行）
-
-- 选 1 篇已有全文缓存、非黑盒类的旧论文（例如 `10.1007/s10182-025-00550-5`）。只跑 S1–PKG，S9 只生成配置，不提交。
-- 预计 Opus 调用 3–5 次：S5 1 次、S6A 1 次、S6C 1 次，S8 0–2 次。按占位价估算约 $2–3（S5 约 4 万输入/1 万输出，S6A 约 3 万/2.5 万，S6C 约 4.5 万/1.5 万，S8 每次约 3.5 万/0.6 万）。
-- 配置：`daily_usd_total=5`、`daily_calls_per_model={claude-opus-5-5=6}`，超出即停。
-- 可选：再跑 1 次 GLM（CC）校准，按旧数据约 $11/次，需要单独批准；教师作业还要先确认教师模型端点的额度。

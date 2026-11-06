@@ -54,7 +54,7 @@ DEFAULTS: dict = {
             "min_interval_s": 0.2, "per_page": 50, "max_queries": 4,
             "filter": "type:article|preprint|book-chapter,language:en,is_retracted:false",
             "snowball": True, "snowball_min_shared": 2, "snowball_max": 50,
-            "semantic": False,                     # search.semantic was unstable in search_api (0/10 on 2 targets)
+            "semantic": False,                     # search.semantic was unstable in an earlier benchmark (0/10 on 2 targets)
             "backfill_top": 120,                    # DOI batch lookup to fill abstracts / OA for fused papers
             "cost_usd": {"search": 0.001, "semantic": 0.001, "list": 0.0001, "get": 0.0},
             "daily_budget_usd": 0.50, "monthly_budget_usd": None, "daily_max_calls": 2000,

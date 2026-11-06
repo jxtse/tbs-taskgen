@@ -4,7 +4,7 @@
     r = client.chat(system, user, stage="S5", item="doi-...", max_tokens=...)
     r.text, r.usage, r.usd, r.model
 
-* OpusClient: same request shape as the old tbsdata/llm.py (local Anthropic-compatible gateway, Anthropic /v1/messages,
+* OpusClient: Anthropic /v1/messages request to an Anthropic-compatible endpoint (by default a local gateway;
   model claude-opus-5-5, adaptive thinking, effort medium, SSE for long outputs).  No key in this process: the
   gateway holds the credentials.  If cfg.models.opus.key_env is set, the key is read from that env var
   (injected by your secret manager) and only placed in a request header; never logged.
