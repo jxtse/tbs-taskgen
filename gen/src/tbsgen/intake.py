@@ -56,6 +56,8 @@ def load_candidates(path: Path) -> list[dict]:
         return d
     if "papers" in d:
         return [dict(p, _target=(d.get("target") or {}).get("id")) for p in d["papers"]]
+    if "selected" in d:                     # recorded retrieval eval output (retrieval/eval/raw/*.json)
+        return [dict(p, _target=(d.get("target") or {}).get("id")) for p in d["selected"]]
     raise ValueError("unrecognised candidates file")
 
 

@@ -87,7 +87,9 @@ def run_gates(cfg: dict, item_dir: Path, spec: dict, thresholds: dict, attempt: 
             pub = gen / "environment" / "data"
             hfiles = [p for p in hid.rglob("*") if p.is_file()]
             differs = bool(hfiles) and runner.tree_hash(hid) != runner.tree_hash(pub)
-            n_hidden = sum(1 for m in ref["metrics"] if m["name"].startswith("hidden_"))
+            hid_names = {m["name"] for m in spec.get("metrics", []) if m.get("on") == "hidden"}
+            n_hidden = sum(1 for m in ref["metrics"] if not m.get("aux") and
+                           (m["name"].startswith("hidden_") or m["name"] in hid_names))
             ok["hidden_shift"] &= differs and n_hidden >= 2
         det["seeds"][s] = sd
     g.update(ok)

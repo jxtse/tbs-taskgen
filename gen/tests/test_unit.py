@@ -92,6 +92,15 @@ def test_parse_files_and_extract_json():
     assert extract_json("blah ```json\n{\"k\": [1,2]}\n``` tail") == {"k": [1, 2]}
 
 
+def test_parse_files_truncated_drops_partial_last_block():
+    # e2e-iter1: S6A hit max_tokens=32000 mid-file; the partial file must not be written as if complete
+    t = "=== FILE: a.py ===\nprint(1)\n=== FILE: b.py ===\ndef f(:\n    x = ["
+    assert set(parse_files(t)) == {"a.py", "b.py"}
+    assert set(parse_files(t, truncated=True)) == {"a.py"}
+    done = t + "1]\n=== END ===\n"
+    assert set(parse_files(done, truncated=True)) == {"a.py", "b.py"}
+
+
 # ------------------------------------------------------------------ spec + thresholds
 def test_validate_spec_ok_and_bad():
     cfg = load_config()

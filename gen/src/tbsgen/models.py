@@ -206,7 +206,7 @@ class FakeClient(_Base):
             if isinstance(out, dict):
                 if out.get("error"):
                     raise ModelError(out["error"], out.get("text", "scripted error"))
-                return out.get("text", ""), out.get("usage", {}), self.name, "end_turn"
+                return out.get("text", ""), out.get("usage", {}), self.name, out.get("stop", "end_turn")
             return out, {"input_tokens": len(system + user) // 4, "output_tokens": len(out) // 4}, self.name, "end_turn"
         for i, rule in enumerate(self.script):
             if i in self.used or rule.get("stage") not in (stage, "*"):
@@ -269,10 +269,16 @@ def extract_json(text: str):
 FILE_RE = re.compile(r"^=== FILE: (?P<path>[^\n=]+?) ===\n(?P<body>.*?)(?=^=== FILE: |^=== END ===|\Z)", re.S | re.M)
 
 
-def parse_files(text: str) -> dict[str, str]:
-    """Multi-file model output:  === FILE: rel/path ===\\n<content>  ...  === END ==="""
+def parse_files(text: str, truncated: bool = False) -> dict[str, str]:
+    """Multi-file model output:  === FILE: rel/path ===\\n<content>  ...  === END ===
+
+    truncated=True (stop_reason == max_tokens): the last block is cut mid-file unless an END/next-FILE marker
+    follows it, so it is dropped instead of being written as a broken file."""
     out = {}
-    for m in FILE_RE.finditer(text):
+    ms = list(FILE_RE.finditer(text))
+    if truncated and ms and not re.search(r"^=== END ===", text[ms[-1].start():], re.M):
+        ms = ms[:-1]
+    for m in ms:
         p = m.group("path").strip()
         body = m.group("body")
         body = re.sub(r"^```[a-zA-Z0-9]*\n", "", body)

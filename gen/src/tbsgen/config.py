@@ -78,12 +78,17 @@ DEFAULTS: dict[str, Any] = {
         "prog_quota_frac": 0.5,             # 待定: max share of PROG among released tasks
         "spec_retries": 1,
         "excerpt_chars": 60000,
+        "expert_hours": [2, 6],             # target expert time stated in the S5 prompt (old pipeline: 0.4-0.6 h)
+        "max_tokens": 32000,
     },
     "gen": {
         "seeds": [0, 1],
         "gen_timeout": 300, "solve_timeout": 900, "baseline_timeout": 600, "test_timeout": 900,
         "max_public_mb": 50,
         "back_to_spec_max": 1,              # S6B "mid not separable" -> back to S5 at most once
+        "s6a_max_tokens": 64000,            # S6A emits 5 files + adaptive thinking; 32k truncated in e2e-iter1
+        "s6c_max_tokens": 48000,
+        "continue_calls": 1,                # missing files after a truncated multi-file answer -> 1 continuation
     },
     "thresholds": {
         "frac": 0.5,                        # 待定: threshold position between ref and mid (log-midpoint)
