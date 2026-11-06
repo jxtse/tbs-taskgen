@@ -275,13 +275,29 @@ def parse_files(text: str, truncated: bool = False) -> dict[str, str]:
     truncated=True (stop_reason == max_tokens): the last block is cut mid-file unless an END/next-FILE marker
     follows it, so it is dropped instead of being written as a broken file."""
     out = {}
+    cut_marker = False
     ms = list(FILE_RE.finditer(text))
-    if truncated and ms and not re.search(r"^=== END ===", text[ms[-1].start():], re.M):
-        ms = ms[:-1]
-    for m in ms:
+    if truncated and ms:
+        # The last block is complete iff its body is followed by a marker line, possibly itself cut short
+        # ("=== FILE: b.py" / "=== END" / "===").  Only a body that runs to the very end of the text was cut
+        # (review #10: a cut inside the next FILE header used to drop the previous, complete file).
+        last = ms[-1]
+        rest = text[last.end("body"):]
+        if not re.match(r"\A\s*={1,3}(?: ?(?:F|E)[A-Z]*)?", rest) or not rest.strip():
+            body = last.group("body")
+            lines = body.rstrip("\n").split("\n")
+            tail_line = lines[-1] if lines else ""
+            if re.fullmatch(r"={1,3}(?: ?(?:FILE|END|F|E|FI|FIL|EN)?.*)?", tail_line.strip()) and tail_line.strip():
+                cut_marker = True     # body ends with a cut marker line: the file itself was complete
+            else:
+                ms = ms[:-1]
+    for idx, m in enumerate(ms):
         p = m.group("path").strip()
         body = m.group("body")
+        if cut_marker and idx == len(ms) - 1:
+            body = body.rstrip("\n").rsplit("\n", 1)[0] + "\n"     # drop the cut marker line
         body = re.sub(r"^```[a-zA-Z0-9]*\n", "", body)
         body = re.sub(r"\n```\s*$", "\n", body.rstrip() + "\n")
         out[p] = body
+
     return out

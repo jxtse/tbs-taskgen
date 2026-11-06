@@ -3,7 +3,7 @@ S8 local repair).  Outputs are machine-parsed: S5 -> one JSON object; S6A/S6C/S8
 "=== FILE: <rel path> ===" ... "=== END ===".  Kept short on purpose: the contract (file layout + rules)
 matters more than prose.  Version strings go into provenance so prompt changes are traceable.
 """
-PROMPT_VERSION = "v2.2-2026-11-06"
+PROMPT_VERSION = "v2.3-2026-11-06"
 
 METRICS_API = """Verifier helper module `_metrics` (provided, importable from tests/; exact signatures):
   check(name: str, value: float, threshold: float, direction: "<=" | ">=") -> None   # records + asserts
@@ -128,6 +128,9 @@ Measured metrics: reference {ref}; current mid baseline (drops {old_drop}) {mid}
 Thresholds sit between the reference and the mid baseline, and the mid baseline should be a NEAR miss: it must
 fail only 1-2 of the metrics.  The current mid fails too many ({n_fail} of {n_metrics}): the dropped step is too
 fundamental.  Pick ONE other key derive node from the depgraph (not in {tried}) whose omission costs accuracy on
-only part of the metrics, and write baselines/mid.py = the reference minus exactly that node (simple default
-instead), same I/O as solve.py (PROG: it writes its own self-contained /app/output/solution_cli.py).
-First line of your answer: MID_DROP: <node id>.  Then === FILE: baselines/mid.py === ... === END ==="""
+only part of the metrics -- prefer a node of naive_drop {naive_drop}, so the naive baseline (which drops all of
+those) stays a superset of the mid baseline -- and write baselines/mid.py = the reference minus exactly that node
+(simple default instead), same I/O as solve.py (PROG: it writes its own self-contained /app/output/solution_cli.py).
+If the node you pick is NOT in naive_drop, also rewrite baselines/naive.py so it drops naive_drop + that node.
+First line of your answer: MID_DROP: <node id>.  Then === FILE: baselines/mid.py === ... (and naive.py if needed)
+=== END ==="""
