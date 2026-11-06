@@ -223,7 +223,12 @@ class Exa(Source):
     def __init__(self, cfg: dict, http: Http):
         super().__init__(cfg, http)
         self.backend = self.scfg.get("backend", "pool")
+        if self.backend not in ("pool", "direct"):
+            raise ValueError(f"sources.exa.backend must be 'pool' or 'direct', got {self.backend!r}")
         self.pool_url = (os.environ.get("TBS_SEARCH_POOL_URL") or self.scfg.get("pool_url") or "").rstrip("/")
+        n = self.scfg.get("num_results")
+        if self.backend == "pool" and not (isinstance(n, int) and not isinstance(n, bool) and 1 <= n <= 20):
+            raise ValueError(f"sources.exa.num_results must be an integer 1-20 with backend='pool', got {n!r}")
 
     def available(self) -> tuple[bool, str]:
         if self.backend == "pool":
@@ -254,7 +259,7 @@ class Exa(Source):
         unchanged under `raw` (entities included), so downstream parsing is identical."""
         opts = {"type": self.scfg.get("type", "auto"), "highlights_max_characters": self.scfg.get("highlights_chars", 400),
                 **extra}
-        body = {"query": query[:1500], "limit": min(int(self.scfg["num_results"]), 20), "engine": "exa",
+        body = {"query": query[:1500], "limit": self.scfg["num_results"], "engine": "exa",
                 "include_contents": False, "exa_options": opts}
         est = self.scfg.get("est_cost_usd", 0.012)
 
@@ -263,15 +268,22 @@ class Exa(Source):
                 return float((json.loads(b).get("usage") or {}).get("cost_usd", est)), 0.0
             except Exception:  # noqa: BLE001
                 return est, 0.0
+        def validate(b: bytes):
+            # checked before caching: a wrong-provider or malformed 200 must not be cached as an empty result
+            try:
+                d = json.loads(b)
+            except ValueError:
+                return "pool response is not JSON"
+            if not isinstance(d, dict) or not isinstance(d.get("results"), list):
+                return "pool response has no results list"
+            if d.get("provider") != "exa":   # engine=exa never falls back, but never mix providers silently
+                return f"pool returned provider={d.get('provider')!r}"
+            return None
         r = self.http.request(self.name, kind, f"{self.pool_url}/v1/search", method="POST", body=body,
-                              cost_usd=est, target=target.id, cost_from_response=cost)
-        if r.status != 200:
-            return {}
-        d = r.json()
-        if d.get("provider") != "exa":       # engine=exa never falls back, but do not mix providers silently
-            self.errors.append(f"pool returned provider={d.get('provider')!r}; ignored")
-            return {}
-        return {"results": [row.get("raw") or row for row in d.get("results") or []]}
+                              cost_usd=est, target=target.id, cost_from_response=cost, validate=validate)
+        if r.status != 200:    # Http passes 404 through; for the pool endpoint that is a misconfiguration
+            raise HTTPFailure(r.status, f"pool endpoint {self.pool_url}/v1/search returned HTTP {r.status}")
+        return {"results": [row.get("raw") or row for row in r.json()["results"]]}
 
     def channel(self, ch: str, target: Target, query: str | None = None) -> RankedList:
         tmpl, extra = EXA_CHANNEL[ch]
