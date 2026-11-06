@@ -74,6 +74,9 @@ DEFAULTS: dict = {
             "daily_max_calls": 1500, "retries": 5, "cooldown_429_s": 900,
         },
         "exa": {
+            # backend "pool": local search-pool service that holds the Exa keys (POST {pool_url}/v1/search, engine=exa,
+            # no Tavily fallback; env TBS_SEARCH_POOL_URL overrides pool_url).  backend "direct": api.exa.ai + key_env.
+            "backend": "pool", "pool_url": "http://127.0.0.1:18150",
             "enabled": True, "key_env": "EXA_API_KEY_SECONDARY", "require_key": True,
             "min_interval_s": 0.3, "num_results": 10, "type": "auto",
             # 2026-11-05 eval: usable resources per 100 results: code 65, docs 53, data 39. The paper channel is
