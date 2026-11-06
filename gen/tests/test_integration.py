@@ -183,6 +183,35 @@ def test_mid_not_separable_reworks_only_mid(tmp_path):
     assert read_json(it.p("_spec", "spec.json"))["depgraph"]["mid_drop"] == ["C2"]
 
 
+def test_s6m_new_node_outside_naive_drop_keeps_inclusion(tmp_path):
+    """Review #8: S6M picking a node outside naive_drop must keep naive_drop ⊇ mid_drop (spec re-validated)."""
+    from tbsgen.spec import validate_spec
+    base = toy_script(FIX)
+
+    def script(stage, system, user):
+        if stage == "S6A":
+            out = base(stage, system, user)
+            solve = (FIX / "solution/solve.py").read_text()
+            i = out.index("=== FILE: baselines/mid.py ===")
+            j = out.index("=== FILE:", i + 10)
+            return out[:i] + "=== FILE: baselines/mid.py ===\n" + solve + out[j:]
+        if stage == "S6M":
+            return ("MID_DROP: P1\n=== FILE: baselines/mid.py ===\n" + (FIX / "baselines/mid.py").read_text() +
+                    "=== FILE: baselines/naive.py ===\n" + (FIX / "baselines/naive.py").read_text() + "=== END ===\n")
+        return base(stage, system, user)
+    P, fake = mk(tmp_path, script=script)
+    [iid] = P.ingest([make_toy_candidate(tmp_path)])
+    P.run()
+    it = P.store.item(iid)
+    spec = read_json(it.p("_spec", "spec.json"))
+    g = spec["depgraph"]
+    if it.state["status"] == "dropped":       # P1 is a given_file premise: validate_spec must refuse it
+        assert it.state["reason"].startswith("s6m_invalid_spec"), it.state
+        assert g["mid_drop"] == ["C1"]
+    else:
+        assert set(g["mid_drop"]) <= set(g["naive_drop"]) and validate_spec(spec, P.cfg) == []
+
+
 def _prog_task(root: Path, direct_exec: bool) -> tuple[Path, Path, Path]:
     task, gen = root / "task", root / "gen"
     (task / "tests").mkdir(parents=True)

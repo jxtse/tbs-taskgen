@@ -92,16 +92,21 @@ def set_thresholds(spec: dict, measure: dict, cfg: dict) -> dict:
             out[name] = dict(direction=d, threshold=None, error="reference metric missing/non-finite")
             continue
         r = max(r_vals) if d == "<=" else min(r_vals)
-        # v2.2: a reference sitting on a sentinel worst value (1e6 / inf-substitute) did not produce the
-        # deliverable that metric reads (e2e-iter1 IEnKS: ref filter_rmse_public = 1e6 -> threshold 1.5e6)
-        if d == "<=" and abs(r) >= tc.get("sentinel_abs", 1e5):
-            out[name] = dict(direction=d, threshold=None, error=f"reference value {r:g} looks like a missing-output "
-                                                                "sentinel")
+        # v2.3: the reference sitting exactly on the metric's empty-output value (measured on nop) means it did not
+        # produce that deliverable (e2e-iter1 IEnKS: ref filter_rmse_public = 1e6 -> threshold 1.5e6).  Works in
+        # both directions, for negative / zero / large-scale metrics (review #7).
+        nop_vals = [v.get(name) for v in measure.get("nop", {}).values()]
+        hit = [x for x in r_vals for nv in nop_vals if nv is not None and math.isfinite(nv) and
+               math.isclose(x, nv, rel_tol=1e-12, abs_tol=1e-15)]
+        if hit:
+            out[name] = dict(direction=d, threshold=None,
+                             error=f"reference value {hit[0]:g} equals the empty-output value of this metric")
             continue
         mm = [x for x in m_vals if x is not None and math.isfinite(x)]
         m_best = (min(mm) if d == "<=" else max(mm)) if mm else None
         margin = tc["min_ref_margin"]
         naive_capped = False
+        n_best = None
         separating = m_best is not None and _worse(d, m_best, r) and \
             abs(m_best - r) > margin * max(abs(r), 1e-12)
         if separating:
@@ -129,9 +134,17 @@ def set_thresholds(spec: dict, measure: dict, cfg: dict) -> dict:
                     mid_n = floor
                 if _worse(d, thr, mid_n):
                     thr, naive_capped = mid_n, True
-        thr = _round_sig(thr, tc["sig_digits"], d, toward_loose=True)
+        exact = thr
+        thr = _round_sig(exact, tc["sig_digits"], d, toward_loose=True)
         if separating and not _worse(d, m_best, thr):   # rounding must not let the mid baseline pass
-            thr = _round_sig(thr, tc["sig_digits"] + 2, d, toward_loose=False)
+            thr = _round_sig(exact, tc["sig_digits"] + 2, d, toward_loose=False)
+        if naive_capped and not _worse(d, n_best, thr):  # nor the naive baseline (review #9)
+            for extra in (1, 2, 3):
+                thr = _round_sig(exact, tc["sig_digits"] + extra, d, toward_loose=True)
+                if _worse(d, n_best, thr):
+                    break
+            else:
+                thr = exact
         ok_ref = not _worse(d, r, thr)
         out[name] = dict(direction=d, threshold=thr, ref_worst=r, mid_best=m_best, separating=separating,
                          ref_passes=ok_ref, naive_capped=naive_capped)

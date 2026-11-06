@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
 import re
 from pathlib import Path
 
@@ -169,7 +170,7 @@ def s6a_run(P, it):
     """Measure the reference (and mid/naive if S6C already produced them) on each seed."""
     task = it.p("task")
     work = it.p("runs", "s6")
-    meas = {"ref": {}, "mid": {}, "naive": {}, "runs": {}}
+    meas = {"ref": {}, "mid": {}, "naive": {}, "nop": {}, "runs": {}}
     for s in P.cfg["gen"]["seeds"]:
         gen = work / f"gen{s}"
         g = runner.generate(P.cfg, task, s, gen)
@@ -177,6 +178,15 @@ def s6a_run(P, it):
         if g["rc"] != 0:
             write_json(it.p("S6A_measure.json"), meas)
             return _to_repair(P, it, "generator_failed", meas)
+        # nop (empty /app/output) gives each metric's missing-output value: a reference equal to it on some
+        # metric did not produce that deliverable (review #7: replaces the global |value| >= 1e5 heuristic)
+        nd = work / f"out-nop{s}"
+        if nd.exists():
+            shutil.rmtree(nd)
+        nd.mkdir(parents=True)
+        nd.chmod(0o777)
+        mn = runner.measure(P.cfg, task, gen, nd, work, f"nop{s}")
+        meas.setdefault("nop", {})[str(s)] = mn["values"]
         for who, prog in (("ref", "solution/solve.py"), ("mid", "baselines/mid.py"), ("naive", "baselines/naive.py")):
             if not (task / prog).exists():
                 continue
@@ -226,6 +236,7 @@ def s6m(P, it):
     tried = list(dict.fromkeys(g.get("mid_drop", []) + it.state.get("avoid_mid_drop", [])))
     n_fail = max(th.get("mid_fail", {}).values() or [0])
     user = S6M_MID.format(spec=json.dumps(spec, indent=1), solve=(task / "solution" / "solve.py").read_text(),
+                          naive_drop=g.get("naive_drop"),
                           ref=json.dumps(meas["ref"]), mid=json.dumps(meas["mid"]), old_drop=g.get("mid_drop"),
                           n_fail=n_fail, n_metrics=len(spec.get("metrics", [])), tried=tried)
     if n_fail < P.cfg["thresholds"]["min_mid_fail"]:
@@ -241,9 +252,24 @@ def s6m(P, it):
     if "baselines/mid.py" not in files:
         return it.finish("dropped", "s6m_missing_file")
     _write_files(task, {"baselines/mid.py": files["baselines/mid.py"]}, ("baselines/mid.py",))
+    if "baselines/naive.py" in files and m and m.group(1) not in g.get("naive_drop", []):
+        _write_files(task, {"baselines/naive.py": files["baselines/naive.py"]}, ("baselines/naive.py",))
     if m:
+        new = m.group(1)
+        cand = json.loads(json.dumps(spec))
+        cand["depgraph"]["mid_drop"] = [new]
+        if new not in cand["depgraph"].get("naive_drop", []):
+            # the naive baseline already drops a superset of key derive nodes; keep naive_drop ⊇ mid_drop by
+            # adding the node (naive.py is regenerated below only if the node really is new to it) (review #8)
+            cand["depgraph"]["naive_drop"] = list(cand["depgraph"].get("naive_drop", [])) + [new]
+        errs = validate_spec(cand, P.cfg)
+        if errs:
+            write_json(it.p("S6M_error.json"), dict(mid_drop=new, errors=errs))
+            return it.finish("dropped", "s6m_invalid_spec:" + ";".join(errs)[:200])
         it.state.setdefault("avoid_mid_drop", []).extend(g.get("mid_drop", []))
-        spec["depgraph"]["mid_drop"] = [m.group(1)]
+        if cand["depgraph"]["naive_drop"] != spec["depgraph"].get("naive_drop"):
+            it.state["naive_needs_node"] = new
+        spec = cand
         write_json(it.p("_spec", "spec.json"), spec)
     it.save()
     it.advance("S6M", "S6A_run", mid_drop=m.group(1) if m else None)
