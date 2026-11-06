@@ -22,8 +22,10 @@ METRICS_HELPER = Path(__file__).with_name("templates_metrics.py")
 # _metrics.run_solution really drops the agent program to `nobody` and the chmod lock on /tests/truth is enforced
 # (bind mounts from the host would not enforce it).  Before v2.1 the local runner used the host uid: the lock was
 # skipped and a truth-reading solution_cli.py went unnoticed until a Harbor run (e2e-iter1).
+# /app/data is present too: under Harbor the verifier runs in the agent's container (e2e-iter1: a measure.py that
+# reads /app/data/config.json got the missing-output sentinel locally after v2.1 dropped that mount)
 VERIFIER_PRE = ("mkdir -p /app && cp -a /src/tests /tests && cp -a /src/output /app/output && "
-                "chown -R root:root /tests /app/output && ")
+                "cp -a /src/data /app/data && chown -R root:root /tests /app/output /app/data && ")
 
 
 def tree_hash(d: Path) -> str:
@@ -83,7 +85,8 @@ def measure(cfg: dict, task: Path, gen: Path, outd: Path, work: Path, tag: str) 
     logs = work / f"mlogs-{tag}"
     logs.mkdir(parents=True, exist_ok=True)
     logs.chmod(0o777)
-    r = sandbox.run(cfg, [(outd, "/src/output", "ro"), (tests, "/src/tests", "ro"), (logs, "/logs/verifier", "rw")],
+    r = sandbox.run(cfg, [(outd, "/src/output", "ro"), (tests, "/src/tests", "ro"), (logs, "/logs/verifier", "rw"),
+                          (gen / "environment" / "data", "/src/data", "ro")],
                     VERIFIER_PRE + "cd /tests && python /tests/measure.py", cfg["gen"]["test_timeout"],
                     f"tbsgen-measure-{tag}", root=True)
     vals = {}
@@ -105,7 +108,8 @@ def test(cfg: dict, task: Path, gen: Path, outd: Path, work: Path, tag: str) -> 
         shutil.rmtree(logs)
     logs.mkdir(parents=True)
     logs.chmod(0o777)
-    r = sandbox.run(cfg, [(outd, "/src/output", "ro"), (tests, "/src/tests", "ro"), (logs, "/logs/verifier", "rw")],
+    r = sandbox.run(cfg, [(outd, "/src/output", "ro"), (tests, "/src/tests", "ro"), (logs, "/logs/verifier", "rw"),
+                          (gen / "environment" / "data", "/src/data", "ro")],
                     VERIFIER_PRE + "cd /tests && python -m pytest -q -p no:cacheprovider /tests/test_outputs.py",
                     cfg["gen"]["test_timeout"], f"tbsgen-test-{tag}", root=True)
     mf = logs / "metrics.jsonl"

@@ -209,6 +209,18 @@ def _prog_task(root: Path, direct_exec: bool) -> tuple[Path, Path, Path]:
     return task, gen, ref
 
 
+def test_verifier_sees_app_data(tmp_path):
+    """v2.1 regression (e2e-iter1): verifier steps lost the /app/data mount; Harbor's verifier has it."""
+    from tbsgen import runner
+    cfg = load_config(None, {"run": {"root": str(tmp_path)}})
+    task, gen, ref = _prog_task(tmp_path, False)
+    (task / "tests/measure.py").write_text("import json\ndef compute():\n"
+                                          "    return {'m': float(open('/app/data/x.csv').read().split()[1])}\n"
+                                          "if __name__ == '__main__':\n    print(json.dumps(compute()))\n")
+    m = runner.measure(cfg, task, gen, ref, tmp_path / "work", "ad")
+    assert m["values"] == {"m": 1.0}, m
+
+
 @pytest.mark.parametrize("direct_exec", [True, False])
 def test_truth_isolation_probe(tmp_path, direct_exec):
     """e2e-iter1 regression: the generated measure.py ran solution_cli.py itself (as root) instead of via
