@@ -8,7 +8,7 @@ from pathlib import Path
 from . import calib, gates, package, repair
 from .models import parse_files
 from .prompts import S6C_TESTS, S8_REPAIR, SYSTEM
-from .stages_a import _write_files
+from .stages_a import _write_files, chat_files, save_raw
 from .state import read_json, write_json
 
 
@@ -24,11 +24,12 @@ def s6c(P, it):
                                 measure=json.dumps({k: meas[k] for k in ("ref", "mid", "naive")}),
                                 thresholds=json.dumps(thr), mid_drop=g.get("mid_drop"), naive_drop=g.get("naive_drop"),
                                 hours=P.cfg["package"]["agent_hours"])
-        r = P.client("tests").chat(SYSTEM, user, stage="S6C", item=it.item_id)
-        files = parse_files(r.text)
         need = {"tests/test_outputs.py", "instruction.md"}
+        files, log = chat_files(P, it, "tests", "S6C", user, need, max_tokens=P.cfg["gen"].get("s6c_max_tokens"),
+                                need_prefix=("baselines/exploit_",))
+        write_json(it.p("S6C_calls.json"), log)
         if not need <= set(files) or not any(f.startswith("baselines/exploit_") for f in files):
-            write_json(it.p("S6C_error.json"), dict(got=sorted(files)))
+            write_json(it.p("S6C_error.json"), dict(got=sorted(files), calls=log))
             return it.finish("dropped", "s6c_missing_files")
         bad = _write_files(task, files, ("tests/test_outputs.py", "instruction.md", "baselines/exploit_"))
         it.state.pop("regen_6c", None)
@@ -70,8 +71,10 @@ def s8(P, it):
         read_json(it.p("S6_failure.json"))
     slim = json.dumps(_slim(gate_log), default=str)[:20000]
     user = S8_REPAIR.format(gates=slim, depgraph=json.dumps(spec["depgraph"]), files=repair.files_for_repair(task, gate_log))
-    r = P.client("repair").chat(SYSTEM, user, stage="S8", item=it.item_id)
-    patch = parse_files(r.text)
+    r = P.client("repair").chat(SYSTEM, user, stage="S8", item=it.item_id,
+                                max_tokens=P.cfg["gen"].get("s6a_max_tokens"))
+    save_raw(it, "S8", r)
+    patch = parse_files(r.text, truncated=r.stop_reason == "max_tokens")
     rv = repair.review(task, patch, spec["depgraph"])
     d = it.p("repair", f"round-{rounds + 1}")
     d.mkdir(parents=True, exist_ok=True)

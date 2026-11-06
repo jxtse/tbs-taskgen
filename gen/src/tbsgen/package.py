@@ -93,6 +93,8 @@ def package(cfg: dict, item_dir: Path, gen0: Path, spec: dict, provenance: dict)
     shutil.copytree(gen0 / "environment" / "data", out / "environment" / "data")
     (out / "tests").mkdir()
     shutil.copy(task / "tests" / "test_outputs.py", out / "tests" / "test_outputs.py")
+    if (task / "tests" / "measure.py").exists():       # test_outputs.py imports compute() from it
+        shutil.copy(task / "tests" / "measure.py", out / "tests" / "measure.py")
     shutil.copytree(gen0 / "tests" / "truth", out / "tests" / "truth")
     if any((gen0 / "tests" / "hidden").rglob("*")):
         shutil.copytree(gen0 / "tests" / "hidden", out / "tests" / "hidden")

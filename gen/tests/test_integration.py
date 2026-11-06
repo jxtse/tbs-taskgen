@@ -129,6 +129,33 @@ def test_unrepairable_is_dropped_after_two_rounds(tmp_path):
     assert st["repair_rounds"] == 2
 
 
+def test_s6a_truncated_answer_gets_one_continuation(tmp_path):
+    """e2e-iter1 regression: a real S6A answer stopped at max_tokens after generator/generate.py and the item was
+    dropped (s6a_missing_files).  Now: partial last block discarded, one continuation asks for the missing files."""
+    base = toy_script(FIX)
+    seen = {"S6A": 0}
+
+    def script(stage, system, user):
+        out = base(stage, system, user)
+        if stage != "S6A":
+            return out
+        seen["S6A"] += 1
+        if seen["S6A"] == 1:      # cut inside solution/solve.py
+            cut = out.index("=== FILE: solution/solve.py ===") + 60
+            return {"text": out[:cut], "stop": "max_tokens", "usage": {"output_tokens": 32000}}
+        assert "Files already received" in user and "solution/solve.py" in user.split("missing files")[-1]
+        return out[out.index("=== FILE: solution/solve.py ==="):]
+    P, fake = mk(tmp_path, script=script)
+    [iid] = P.ingest([make_toy_candidate(tmp_path)])
+    P.run()
+    it = P.store.item(iid)
+    assert seen["S6A"] == 2
+    calls = read_json(it.p("S6A_calls.json"))
+    assert calls[0]["stop"] == "max_tokens" and "solution/solve.py" not in calls[0]["got"] and calls[1]["cont"]
+    assert len(list(it.p("raw").glob("S6A-*.txt"))) == 2
+    assert it.state["status"] == "waiting", it.state
+
+
 def test_intake_failure_routes(tmp_path):
     P, _ = mk(tmp_path)
     cands = [dict(doi="10.1/review", title="A review of things", abstract="This review surveys perspectives."),

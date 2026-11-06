@@ -7,7 +7,7 @@ import json
 from pathlib import Path
 
 from . import intake, runner
-from .models import extract_json, parse_files
+from .models import extract_json, parse_files  # noqa: F401
 from .prompts import PROMPT_VERSION, S5_SPEC, S6A_GEN, SYSTEM
 from .spec import set_thresholds, validate_spec
 from .state import read_json, write_json
@@ -55,13 +55,15 @@ def s5(P, it):
     excerpt = it.p("fulltext.txt").read_text()[: P.cfg["spec"]["excerpt_chars"]]
     probe = {k: v for k, v in read_json(it.p("S4_probe.json"), {}).items() if k != "decontam"}
     avoid = it.state.get("avoid_mid_drop", [])
+    lo, hi = P.cfg["spec"].get("expert_hours", [2, 6])
     user = S5_SPEC.format(doi=c.get("doi"), excerpt=excerpt, probe=json.dumps(probe),
-                          forms=P.cfg["spec"]["allowed_forms"])
+                          forms=P.cfg["spec"]["allowed_forms"], hours_lo=lo, hours_hi=hi)
     if avoid:
         user += f"\nA previous spec used mid_drop {avoid}: it did not separate reference and mid. Choose another."
     errs = ["not run"]
     for _ in range(1 + P.cfg["spec"]["spec_retries"]):
-        r = client.chat(SYSTEM, user, stage="S5", item=it.item_id)
+        r = client.chat(SYSTEM, user, stage="S5", item=it.item_id, max_tokens=P.cfg["spec"].get("max_tokens"))
+        save_raw(it, "S5", r)
         try:
             spec = extract_json(r.text)
         except ValueError as e:
@@ -97,16 +99,58 @@ def _write_files(root: Path, files: dict[str, str], allowed_prefixes: tuple[str,
     return bad
 
 
+def save_raw(it, stage: str, r) -> Path:
+    """Keep every raw model response (debugging truncation / parse failures needs the text, not just usage)."""
+    n = it.bump(f"raw:{stage}")
+    p = it.p("raw", f"{stage}-{n}.txt")
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(f"# stop_reason={r.stop_reason} usage={json.dumps(r.usage)}\n" + (r.text or ""))
+    return p
+
+
+def chat_files(P, it, role: str, stage: str, user: str, need: set[str], max_tokens: int | None = None,
+               need_prefix: tuple[str, ...] = ()) -> tuple[dict, list[dict]]:
+    """One multi-file call; if required files are missing (typically stop_reason=max_tokens), at most
+    `continue_calls` continuation calls that show the files already received and ask only for the missing ones."""
+    client = P.client(role)
+    r = client.chat(SYSTEM, user, stage=stage, item=it.item_id, max_tokens=max_tokens)
+    save_raw(it, stage, r)
+    files = parse_files(r.text, truncated=r.stop_reason == "max_tokens")
+    log = [dict(stop=r.stop_reason, out_tok=r.usage.get("output_tokens"), got=sorted(files))]
+
+    def missing():
+        m = need - set(files)
+        if need_prefix and not any(f.startswith(need_prefix) for f in files):
+            m |= {need_prefix[0] + "*"}
+        return m
+
+    for _ in range(P.cfg["gen"].get("continue_calls", 1)):
+        if not missing():
+            break
+        shown = "\n".join(f"=== FILE: {k} ===\n{v}" for k, v in files.items())
+        cont = (user + "\n\nYour previous answer was cut off or incomplete.  Files already received (fixed, do NOT "
+                "repeat them):\n" + shown + "\n=== END ===\n\nNow write ONLY these missing files, consistent with the "
+                f"files above: {sorted(missing())}.  Keep code compact.  Format: === FILE: <path> === blocks, then "
+                "=== END ===")
+        r = client.chat(SYSTEM, cont, stage=stage, item=it.item_id, max_tokens=max_tokens)
+        save_raw(it, stage, r)
+        more = parse_files(r.text, truncated=r.stop_reason == "max_tokens")
+        files.update({k: v for k, v in more.items() if k not in files})
+        log.append(dict(stop=r.stop_reason, out_tok=r.usage.get("output_tokens"), got=sorted(more), cont=True))
+    return files, log
+
+
 def s6a(P, it):
     spec = read_json(it.p("_spec", "spec.json"))
     task = it.p("task")
     if not (task / "generator" / "generate.py").exists() or it.state.get("regen_6a"):
-        r = P.client("gen").chat(SYSTEM, S6A_GEN.format(spec=json.dumps(spec, indent=1)), stage="S6A", item=it.item_id)
-        files = parse_files(r.text)
         need = {"generator/generate.py", "solution/solve.py", "tests/measure.py", "baselines/mid.py",
                 "baselines/naive.py"}
+        files, log = chat_files(P, it, "gen", "S6A", S6A_GEN.format(spec=json.dumps(spec, indent=1)), need,
+                                max_tokens=P.cfg["gen"].get("s6a_max_tokens"))
+        write_json(it.p("S6A_calls.json"), log)
         if not need <= set(files):
-            write_json(it.p("S6A_error.json"), dict(missing=sorted(need - set(files)), got=sorted(files)))
+            write_json(it.p("S6A_error.json"), dict(missing=sorted(need - set(files)), got=sorted(files), calls=log))
             return it.finish("dropped", "s6a_missing_files")
         _write_files(task, files, ("generator/", "solution/", "tests/", "baselines/"))
         it.state.pop("regen_6a", None)
