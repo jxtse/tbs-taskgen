@@ -14,7 +14,7 @@ import tomllib
 from pathlib import Path
 from typing import Any
 
-PIPELINE_V2 = Path(__file__).resolve().parents[3]          # repo root (gen/ and retrieval/ live here)
+REPO_ROOT = Path(__file__).resolve().parents[3]          # repo root (gen/ and retrieval/ live here)
 # Machine-specific locations.  Override with env vars (or config.toml) on another machine.
 WORKSPACE = Path(os.environ.get("TBS_WORKSPACE", "/Volumes/Storage/hermes/workspace"))
 OLD_PIPE = Path(os.environ.get("TBS_OLD_PIPE", str(WORKSPACE / "tbs-datapipe-20261015")))
@@ -123,7 +123,7 @@ DEFAULTS: dict[str, Any] = {
         "teacher_agent": "harbor_ext.tbs_agent:ClaudeCodeTbs",
         "environment": "harbor_ext.sandbox:SandboxEnvironment",
         "harbor_root": str(HARBOR_ROOT),
-        "jobs_dir": str(PIPELINE_V2 / "gen" / "state" / "harbor-jobs"),
+        "jobs_dir": str(REPO_ROOT / "gen" / "state" / "harbor-jobs"),
         "student_launcher": "glm53-official65/run-glm65.sh",
         "teacher_launcher": "run-job-opus.sh",
         "allow_submit": False,              # must be flipped explicitly; True = reserve in ledger + tmux launch

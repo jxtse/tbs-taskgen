@@ -15,13 +15,13 @@ import json
 from pathlib import Path
 
 from .budget import Ledger
-from .config import PIPELINE_V2, load_config
+from .config import REPO_ROOT, load_config
 from .fakes import toy_script
 from .models import FakeClient
 from .pipeline import Pipeline
 from .report import daily_report
 
-FIX = PIPELINE_V2 / "gen" / "tests" / "fixtures" / "toy_task"
+FIX = REPO_ROOT / "gen" / "tests" / "fixtures" / "toy_task"
 TOY_TEXT = ("Robust estimation of exponential decay constants from detector afterglow traces. We fit "
             "amplitude and rate by weighted log-linear least squares with heteroscedastic weights, and "
             "reject one-sided spikes from cosmic rays with an iterative robust estimator. Numerical "
@@ -71,7 +71,7 @@ def simulate_harbor(P, item_id: str, outcomes: list[str]):
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", required=True)
-    ap.add_argument("--retrieval-json", default=str(PIPELINE_V2 / "retrieval" / "eval" / "raw" /
+    ap.add_argument("--retrieval-json", default=str(REPO_ROOT / "retrieval" / "eval" / "raw" /
                                                    "method__multivariate-fay-herriot-hierarchical-small-area-models.json"))
     a = ap.parse_args(argv)
     out = Path(a.out)
