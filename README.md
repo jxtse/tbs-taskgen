@@ -1,5 +1,7 @@
 # tbs-taskgen
 
+[![CI](https://github.com/jxtse/tbs-taskgen/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/jxtse/tbs-taskgen/actions/workflows/ci.yml)
+
 **Turn scientific papers into executable, Terminal-Bench-style scientific computing tasks.**
 
 tbs-taskgen is a research pipeline that reads a method paper and produces a
@@ -208,11 +210,12 @@ after the DOI), `fulltext.allow_network` (open-access PDF download), `calib.allo
 
 Research code under active development.
 
-**Tests** (current `main`, run locally; there is no CI)
+**Tests** (run by [GitHub Actions CI](.github/workflows/ci.yml) on every push to `main` and every pull request)
 
 - `retrieval/`: 46 offline unit tests that replay recorded API responses.
-- `gen/`: 65 tests: 49 unit tests and 16 integration tests that run task code in Docker (skipped
-  when Docker or the sandbox image is missing).
+- `gen/`: 65 tests: 49 unit tests and 16 integration tests that run task code in Docker. Locally
+  they are skipped when Docker or the sandbox image is missing; CI builds the image and fails if
+  any of them is skipped.
 - Fake-model dry run: S1 → S10 on a synthetic toy task, including the mechanical gates and
   simulated calibration results.
 
