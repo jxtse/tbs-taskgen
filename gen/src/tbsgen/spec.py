@@ -92,6 +92,12 @@ def set_thresholds(spec: dict, measure: dict, cfg: dict) -> dict:
             out[name] = dict(direction=d, threshold=None, error="reference metric missing/non-finite")
             continue
         r = max(r_vals) if d == "<=" else min(r_vals)
+        # v2.2: a reference sitting on a sentinel worst value (1e6 / inf-substitute) did not produce the
+        # deliverable that metric reads (e2e-iter1 IEnKS: ref filter_rmse_public = 1e6 -> threshold 1.5e6)
+        if d == "<=" and abs(r) >= tc.get("sentinel_abs", 1e5):
+            out[name] = dict(direction=d, threshold=None, error=f"reference value {r:g} looks like a missing-output "
+                                                                "sentinel")
+            continue
         mm = [x for x in m_vals if x is not None and math.isfinite(x)]
         m_best = (min(mm) if d == "<=" else max(mm)) if mm else None
         margin = tc["min_ref_margin"]

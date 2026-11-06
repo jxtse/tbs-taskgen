@@ -157,6 +157,13 @@ def test_non_separating_threshold_rejects_clearly_worse_naive():
     # the naive (0.89-0.92) is inside the 10% reference margin here, so it is rejected by its other metrics
     assert t["naive_capped"] and 0.85 < t["threshold"] <= 0.99623 * 0.9, t
 
+def test_reference_sentinel_value_is_missing_output():
+    cfg = load_config()
+    spec = {"metrics": [{"name": "rmse_public", "direction": "<="}]}
+    th = set_thresholds(spec, {"ref": {"0": {"rmse_public": 1e6}}, "mid": {"0": {"rmse_public": 1e6}}}, cfg)
+    assert th["status"] == "ref_metric_missing" and th["thresholds"]["rmse_public"]["threshold"] is None
+
+
 def test_mid_fail_counts_public_hidden_twins_once():
     # e2e-iter1 RCESPP: mid fails optimal_frac on public AND hidden + mean_rel_gap = 2 criteria (was 3 -> dropped)
     cfg = load_config()
