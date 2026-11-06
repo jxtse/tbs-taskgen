@@ -118,3 +118,16 @@
 - DecontX 题的指令点名了 DecontX。PyPI 上有现成实现（如 `decontx-python`），agent 理论上可以直接 `pip install`；Fay–Herriot、RCESPP 也可能有公开代码可抄。
 - 在 GLM 校准中途做了只读核查（检索 `pip install`、`git clone`、`github.com`、`pypi.org`、`curl`、`wget`、WebFetch/WebSearch、`decontx` 包名），结果按题记录在下方"校准结果"一节。
 - 下一轮会默认 no-network，并加"现成库/仓库捷径"检查。在此之前不再提交新的校准作业。
+
+### 校准结果（GLM-5.3 + Claude Code 2.1.280，阿里云沙箱，每题 1 次）
+
+| 题 | 结果 | 用时 | 费用（Harbor `cost_usd`） | 轨迹核查：pip install / git clone / github / pypi / curl / wget / WebFetch / WebSearch | 标签 |
+|---|---|---|---|---|---|
+| 196db Fay–Herriot | reward 1（6 项全过） | 76 min | $16.92 | 全部 0 次 | 待 GLM#2（未提交） |
+| e9e2a RCESPP | reward 1（5 项全过） | 86 min | $10.00 | 全部 0 次 | 待 GLM#2（未提交） |
+| d7c20 DecontX | reward 0，`AgentTimeoutError`（2 h 上限） | 120 min | 无记录（按 $30 预留额记账；按另两次的 token 单价折算约 $18–19） | 全部 0 次；"celda" 出现 7 次，都是 agent 在思考中回忆 DecontX 原始实现，不是安装或调用 | `parked:teacher_unavailable` |
+
+- DecontX 超时时，隐藏集 4 项均已通过（`solution_cli.py` 已写好）。唯一失败的是公开集的 `contam_rmse`：`/app/output/contamination.csv` 没有生成。这次失败是"没在时限内交齐"，不是方法错。
+- 实测的 3 次运行都没有用到网络捷径。但 `network_mode="public"` 仍是漏洞：没用不代表不能用。
+- 与旧管线对比（旧题 GLM 3 次）：同一论文的旧题 Fay–Herriot 3/3、RCESPP 3/3、DecontX 1/3。新题首轮 GLM 2/3 一次通过，说明这两道新题对 GLM 仍可能偏容易。需要 GLM#2 才能判断属于 easy 还是 unstable，本次按要求未提交。
+- 校准总花费：已结算 $26.91（两次通过），加超时一次按预留 $30 记，合计 $56.91。另有两次启动失败，未用到模型，均按 $0 结算。沙箱已清理（本次作业残留 0 个）。
