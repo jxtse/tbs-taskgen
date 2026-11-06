@@ -2,7 +2,7 @@
 Only scheduling + result collection.  Submitting is gated by cfg.calib.allow_submit (default False): the
 pipeline writes a Harbor job config + the exact launcher command and the item waits in "S9/waiting".
 
-Decision rule (decision 2026-11-05, DESIGN §3.5 order):
+Decision rule:
     GLM#1 fail  -> teacher#1; pass -> "hard" (keep); fail -> teacher#2 (teacher_runs_max) ; fail -> "parked"
                    (possible defect or too hard; human spot check)
     GLM#1 pass  -> (quick_pass_minutes set and duration below it -> "easy") else GLM#2

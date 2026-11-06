@@ -1,7 +1,7 @@
 """S0-S4: intake, screening, full text, feasibility probe (no Opus).
 
 S1  intake: candidates come from the retrieval layer (tbsretr) output JSON (`out["papers"]`) or from a
-    hand-written candidates JSONL.  The generation side never calls search APIs (DESIGN §3.2).
+    hand-written candidates JSONL.  The generation side never calls search APIs.
 S2  screen: rules (cheap model role 待定 -> rules fallback).  Score from abstract cues (method / data / code /
     computational words, negative cues for reviews / purely clinical / qualitative work).
 S3  full text: (1) old literature cache (read-only, `fulltext.cache_dirs`, keyed by DOI like the old lit.py),

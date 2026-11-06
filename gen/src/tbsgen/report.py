@@ -32,7 +32,7 @@ def daily_report(P, day: str | None = None) -> Path:
     b = P.cfg["budget"]
     lines += ["", f"今日合计：{led['calls_total']} 次，${led['usd_total']:.4f}；累计：{led_all['calls_total']} 次，"
                   f"${led_all['usd_total']:.4f}。日预算：{b['daily_usd_total'] if b['daily_usd_total'] is not None else '未设置（真实模型不可调用）'}。",
-              "价格为占位值（DESIGN §3.1），以实际账单为准。"]
+              "价格为占位值（config.py models.prices），以实际账单为准。"]
     lines += ["", "## 熔断"]
     lines += [f"- {x['model']}: {x['reason']}" for x in led["breakers_open"]] or ["- 无"]
     waiting = [i for i in P.store.items() if i.state["status"] == "waiting"]
