@@ -1,6 +1,6 @@
 # tbsgen：TB-Science 出题管线 v2
 
-按 `../docs/DESIGN.md` 的 MVP 搭好的出题管线：从检索结果开始，经过全文获取、可行性检查、规格、生成、机械门、修复、校准调度，最后打包成 Harbor 任务。**目前只做过调通和干跑，没有量产，也没有生成真实题目。** 量产要等定预算（见文末）。
+出题管线 MVP：从检索结果开始，经过全文获取、可行性检查、规格、生成、机械门、修复、校准调度，最后打包成 Harbor 任务。**目前只做过调通和干跑，没有量产，也没有生成真实题目。** 量产要等定预算（见文末）。
 
 ## 1. 架构
 
@@ -125,7 +125,7 @@ allow_submit = false
 | `budget.run_usd_total / run_calls_per_model` | None / 空 | 整个运行目录（跨天）的总上限；S9 每次按 `calib.est_usd_per_run` 预留 |
 | `budget.breaker_open_on` | quota, auth | 出现即熔断；另有连续 4 次错误也熔断 |
 | `budget.est_usd_per_call` | 1.5 | 调用前按此金额预占，用于判断是否会超预算 |
-| `models.prices` | Opus $5/$25 每百万 token | **占位**，同 DESIGN §3.1，需用账单替换 |
+| `models.prices` | Opus $5/$25 每百万 token | **占位**，需按实际价格替换 |
 | `models.cheap` / `roles.screen/probe/review/invert` | None / rules | 廉价模型角色**待定**；S2/S4/S8 审查先用规则，L4b 跳过 |
 | `spec.allowed_forms` | ANS, PROG | DOMF 需要逐格式读写库；INTERACT 在隔离方案落地前禁止 |
 | `spec.prog_quota_frac` | 0.5 | PROG 占比上限（**待定**；当前只记录，未在调度中强制） |
@@ -134,7 +134,7 @@ allow_submit = false
 | `gen.s6a_max_tokens / s6c_max_tokens / continue_calls` | 64000 / 48000 / 1 | 多文件输出上限；被截断时最多 1 次续写，只要缺的文件 |
 | `gen.mid_rework_max` | 1 | mid 不可区分时先由 S6M 只重写 `baselines/mid.py`，再不行才回 S5 |
 | `gates.max_repair_rounds` | 2 | 沿用旧上限 |
-| `calib.quick_pass_minutes` | None | GLM 首次通过且用时短时直接记 easy（DESIGN 建议 30 min，**待定**，默认关） |
+| `calib.quick_pass_minutes` | None | GLM 首次通过且用时短时直接记 easy（**待定**，默认关） |
 | `calib.keep_labels` | hard, unstable | decision 2026-11-05 |
 | `calib.variant_depth` | 0 | S9b 更难变体（**待定**，MVP 关闭） |
 | `calib.infra_retries` | 2 | API/沙箱异常不计入校准次数 |
@@ -184,9 +184,8 @@ hard 和 unstable 保留。reward=1 一律算通过，即使之后报了 API 错
   - mid "只差 1–2 项"按判据计数，同名的 public/hidden 指标算一个；
   - 参考在某指标上明显差于 naive 时记 `ref_worse_than_naive`，送去修复。
 
-真实论文结果与失败模式见 `../docs/E2E_LOG.md`。
 
-## 7. 真实 1 篇端到端烟测方案（已执行，见 docs/E2E_LOG.md）
+## 7. 真实 1 篇端到端烟测方案（已执行）
 
 - 选 1 篇已有全文缓存、非黑盒类的旧论文（例如 `10.1007/s10182-025-00550-5`）。只跑 S1–PKG，S9 只生成配置，不提交。
 - 预计 Opus 调用 3–5 次：S5 1 次、S6A 1 次、S6C 1 次，S8 0–2 次。按占位价估算约 $2–3（S5 约 4 万输入/1 万输出，S6A 约 3 万/2.5 万，S6C 约 4.5 万/1.5 万，S8 每次约 3.5 万/0.6 万）。

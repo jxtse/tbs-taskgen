@@ -206,7 +206,7 @@ after the DOI), `fulltext.allow_network` (open-access PDF download), `calib.allo
 
 ## Status and limitations
 
-Research code under active development. Everything below is documented in this repository.
+Research code under active development.
 
 **Tests** (current `main`, run locally; there is no CI)
 
@@ -224,7 +224,7 @@ Research code under active development. Everything below is documented in this r
   held-out set.
 - Retrieval evaluation on 10 targets ([`retrieval/eval/REPORT.md`](retrieval/eval/REPORT.md)).
   Relevance labels come from a single annotator and are subjective.
-- End-to-end runs on 6 real papers ([`docs/E2E_LOG.md`](docs/E2E_LOG.md)): 3 became packaged
+- End-to-end runs on 6 real papers: 3 became packaged
   Harbor tasks where the reference solution scores 1 and an empty submission scores 0; 2 were
   dropped because the mid baseline could not be separated from the reference; 1 was still in
   repair. Each of the 3 packaged tasks was calibrated with a single student run, which is not
@@ -255,16 +255,12 @@ gen/                       tbsgen: task-generation pipeline
   docker/Dockerfile.base   sandbox image
   tests/                   unit and Docker integration tests; fixtures/toy_task is a synthetic task
   eval/                    leak-gate backtest results
-docs/
-  DESIGN.md                design document and decision record
-  E2E_LOG.md               end-to-end test log
-  STATUS.md                current status
-  evidence/                scripts that recompute numbers cited in DESIGN.md
 ```
 
 The package READMEs ([`retrieval/README.md`](retrieval/README.md), [`gen/README.md`](gen/README.md))
-and the files in `docs/` are development notes in Chinese. They contain the full stage-by-stage
-specification and the configuration reference.
+are development notes in Chinese. They contain the full stage-by-stage specification and the
+configuration reference. Internal working notes (design drafts, run logs) are kept out of the
+repository; `docs/internal/` is git-ignored for that purpose.
 
 Not in the repository: run directories (`runs/`, `state/`), raw retrieval responses, paper full
 texts and TB-Science task texts.

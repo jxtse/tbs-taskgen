@@ -55,7 +55,7 @@ DEFAULTS: dict[str, Any] = {
         },
         "opus": {"model": "claude-opus-5-5", "url": os.environ.get("TBS_OPUS_URL", "http://127.0.0.1:3000/v1/messages"),
                  "effort": "medium", "max_tokens": 32000, "timeout": 1800, "retries": 2},
-        # USD per million tokens.  PLACEHOLDERS (same as DESIGN.md §3.1) until real bills replace them.
+        # USD per million tokens.  PLACEHOLDERS: set real prices for your model.
         "prices": {"claude-opus-5-5": {"in": 5.0, "out": 25.0, "cache_read": 0.5},
                    "fake": {"in": 0.0, "out": 0.0}},
     },
@@ -130,12 +130,12 @@ DEFAULTS: dict[str, Any] = {
         "est_usd_per_run": 20.0,            # ledger reservation per Harbor run (GLM-5.3 short tasks: p90 ~$19)
         "teacher_available": True,          # False: GLM#1 fail -> parked:teacher_unavailable (no teacher run)
         "prepared_tasks_dir": None,         # sandbox-prepared task copies (docker_image set), one dir per item
-        "glm_runs_on_first_fail": 1,        # DESIGN §3.5: first GLM fail -> teacher (no 2nd GLM run)
+        "glm_runs_on_first_fail": 1,        # first GLM fail -> teacher (no 2nd GLM run)
         "teacher_runs_max": 2,
-        "quick_pass_minutes": None,         # 待定: 1st-pass shortcut to "easy" (DESIGN suggests 30); None=off
+        "quick_pass_minutes": None,         # 待定: 1st-pass shortcut to "easy" (e.g. 30); None=off
         "keep_labels": ["hard", "unstable"],  # decision 2026-11-05: GLM 1/2, or GLM 0 + teacher pass
         "infra_retries": 2,                 # API quota / sandbox errors do not count as attempts
-        "variant_depth": 0,                 # S9b harder variants; 待定 (DESIGN suggests <=2); 0 = off in MVP
+        "variant_depth": 0,                 # S9b harder variants; 待定 (e.g. <=2); 0 = off in MVP
     },
     "package": {
         "dockerfile_mode": "selfcontained",  # "selfcontained" (pip in Dockerfile, portable) | "local_base"

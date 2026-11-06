@@ -16,3 +16,10 @@ gen/eval/**/results.jsonl
 gen/docker/build.log
 config.local.toml
 *.local.toml
+
+# Internal development notes (design drafts, run logs, cost estimates) live here and are never committed.
+docs/internal/
+docs/DESIGN.md
+docs/E2E_LOG.md
+docs/STATUS.md
+docs/evidence/

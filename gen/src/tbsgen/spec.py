@@ -1,11 +1,11 @@
 """S5 spec validation (rules) and S6B thresholds-from-measurement (no model).
 
-Spec rules (DESIGN §2.3):
+Spec rules:
   * form in cfg.spec.allowed_forms; INTERACT/DESIGN/CODE/MULTI/PROOF rejected in MVP
   * depgraph: unique ids; edges reference nodes; >=1 deliverable; mid_drop = exactly 1 key derive/compute node;
     naive_drop >= 2 nodes and contains mid_drop; >=1 hidden_truth node; PROG needs a shift node + hidden metrics
   * 3..8 metrics with direction <= / >=
-Thresholds (DESIGN §3.1 S6B): for each metric, from per-seed values of ref and mid:
+Thresholds (S6B): for each metric, from per-seed values of ref and mid:
   * worst ref value over seeds = r, best mid value over seeds = m.
   * separating metric (mid worse than ref on every seed by > min_ref_margin relative):
       threshold = geometric (or linear if signs differ / zero) interpolation at cfg.thresholds.frac between r and m
