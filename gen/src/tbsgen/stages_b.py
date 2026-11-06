@@ -7,8 +7,8 @@ from pathlib import Path
 
 from . import calib, gates, package, repair
 from .models import parse_files
-from .prompts import S6C_TESTS, S8_REPAIR, SYSTEM
-from .stages_a import _write_files
+from .prompts import METRICS_API, S6C_TESTS, S8_REPAIR, SYSTEM
+from .stages_a import _write_files, chat_files, save_raw
 from .state import read_json, write_json
 
 
@@ -24,11 +24,12 @@ def s6c(P, it):
                                 measure=json.dumps({k: meas[k] for k in ("ref", "mid", "naive")}),
                                 thresholds=json.dumps(thr), mid_drop=g.get("mid_drop"), naive_drop=g.get("naive_drop"),
                                 hours=P.cfg["package"]["agent_hours"])
-        r = P.client("tests").chat(SYSTEM, user, stage="S6C", item=it.item_id)
-        files = parse_files(r.text)
         need = {"tests/test_outputs.py", "instruction.md"}
+        files, log = chat_files(P, it, "tests", "S6C", user, need, max_tokens=P.cfg["gen"].get("s6c_max_tokens"),
+                                need_prefix=("baselines/exploit_",))
+        write_json(it.p("S6C_calls.json"), log)
         if not need <= set(files) or not any(f.startswith("baselines/exploit_") for f in files):
-            write_json(it.p("S6C_error.json"), dict(got=sorted(files)))
+            write_json(it.p("S6C_error.json"), dict(got=sorted(files), calls=log))
             return it.finish("dropped", "s6c_missing_files")
         bad = _write_files(task, files, ("tests/test_outputs.py", "instruction.md", "baselines/exploit_"))
         it.state.pop("regen_6c", None)
@@ -69,9 +70,12 @@ def s8(P, it):
     gate_log = read_json(last[-1]) if last and str(it.state.get("repair_from", "")).startswith("gates:") else \
         read_json(it.p("S6_failure.json"))
     slim = json.dumps(_slim(gate_log), default=str)[:20000]
-    user = S8_REPAIR.format(gates=slim, depgraph=json.dumps(spec["depgraph"]), files=repair.files_for_repair(task, gate_log))
-    r = P.client("repair").chat(SYSTEM, user, stage="S8", item=it.item_id)
-    patch = parse_files(r.text)
+    user = S8_REPAIR.format(gates=slim, depgraph=json.dumps(spec["depgraph"]), files=repair.files_for_repair(task, gate_log),
+                            metrics_api=METRICS_API)
+    r = P.client("repair").chat(SYSTEM, user, stage="S8", item=it.item_id,
+                                max_tokens=P.cfg["gen"].get("s6a_max_tokens"))
+    save_raw(it, "S8", r)
+    patch = parse_files(r.text, truncated=r.stop_reason == "max_tokens")
     rv = repair.review(task, patch, spec["depgraph"])
     d = it.p("repair", f"round-{rounds + 1}")
     d.mkdir(parents=True, exist_ok=True)
@@ -94,7 +98,12 @@ def _slim(g):
     out = {k: g[k] for k in ("gates", "blocking", "nonblocking", "why") if k in g}
     det = g.get("details") or g.get("info") or {}
     if isinstance(det, dict):
-        out["details"] = {k: det[k] for k in ("determinism", "unstated", "isolation", "runs") if k in det}
+        out["details"] = {k: det[k] for k in ("determinism", "unstated", "isolation", "runs", "truth_isolation")
+                          if k in det}
+        if "truth_isolation" in out.get("blocking", []):
+            out["fix_hint"] = ("tests/measure.py must execute /app/output/solution_cli.py ONLY via "
+                               "`from _metrics import run_solution, hidden_sets` (one call per hidden set dir); "
+                               "never subprocess it directly: run_solution drops privileges and locks /tests/truth.")
         if "leak" in det:
             out["details"]["leak"] = dict(classes=det["leak"].get("classes"), findings=det["leak"].get("findings", [])[:8])
         if "seeds" in det:
@@ -126,8 +135,35 @@ def _sha_file(p: Path) -> str:
     return hashlib.sha256(p.read_bytes()).hexdigest()[:16]
 
 
+def _save_run(it, rec):
+    runs = read_json(it.p("calib", "runs.json"), [])
+    for i, r in enumerate(runs):
+        if r.get("job_name") == rec["job_name"]:
+            runs[i] = rec
+            break
+    else:
+        runs.append(rec)
+    write_json(it.p("calib", "runs.json"), runs)
+
+
 def s9(P, it):
-    """Schedule the next calibration run, or label.  Results are attached by `tbsgen calib-ingest`."""
+    """Schedule the next calibration run, or label.  Results are attached by `tbsgen calib-ingest`.
+    Run records are persisted before every side effect (intent -> reserved -> launched); resume reconciles."""
+    c = P.cfg["calib"]
+    runs = read_json(it.p("calib", "runs.json"), [])
+    for rec in runs:                                         # reconcile interrupted submissions
+        if rec.get("outcome") is None and rec.get("state") in ("intent", "reserved"):
+            if not c.get("allow_submit"):
+                return it.finish("waiting", f"calib {rec['job_name']} in state {rec['state']}; submit disabled")
+            rec = calib.launch(P.cfg, rec, P.ledger, lambda r: _save_run(it, r))
+            P.store.event("calib_reconciled", item=it.item_id, job=rec["job_name"], state=rec["state"])
+        elif rec.get("outcome") is None and rec.get("state") == "launched":
+            why = calib.launcher_failed(rec)
+            if why:
+                if rec.get("ledger_call"):
+                    P.ledger.settle(rec["ledger_call"], 0.0, status="error", note=why[:500])
+                rec.update(state="launch_failed", outcome="infra", error=why)
+                _save_run(it, rec)
     runs = read_json(it.p("calib", "runs.json"), [])
     pending = [r for r in runs if r.get("outcome") is None]
     if pending:
@@ -138,16 +174,69 @@ def s9(P, it):
         it.save()
         if what.startswith("parked"):
             return it.finish("parked", what)
-        if what in P.cfg["calib"]["keep_labels"]:
+        if what in c["keep_labels"]:
             return it.advance("S9", "S10", label=what)
         return it.finish("done", f"label:{what} (not kept; S9b variants off)")
     n = sum(1 for r in runs if r["who"] == what) + 1
-    rec = calib.submit(P.cfg, it.dir, what, n)
-    rec["outcome"] = None
-    runs.append(rec)
+    rec = calib.prepare(P.cfg, it.dir, what, n)
+    if rec.get("blocked"):
+        return it.finish("waiting", f"calib blocked: {rec['blocked']}")
+    if not c.get("allow_submit"):
+        _save_run(it, rec)
+        P.store.event("calib_submit_prepared", item=it.item_id, who=what, config=rec["config"])
+        return it.finish("waiting", f"prepared {what} run {n}; submit disabled (calib.allow_submit=false)")
+    cap = P.cfg["budget"].get("run_usd_total")
+    if cap is not None and calib.actual_spend(P.ledger) >= float(cap):
+        # reservations only gate admission; a single Harbor run has no hard cost ceiling, so once settled
+        # actual spend reaches the cap no further run is started (review #6)
+        return it.finish("paused", f"budget:run_total_actual ({calib.actual_spend(P.ledger):.2f} >= {cap})")
+    _save_run(it, rec)                                       # intent persisted before reserve/launch (review #3)
+    rec = calib.launch(P.cfg, rec, P.ledger, lambda r: _save_run(it, r))
+    P.store.event("calib_submitted" if rec.get("submitted") else "calib_launch_failed", item=it.item_id, who=what,
+                  config=rec["config"], state=rec["state"])
+    if rec.get("submitted"):
+        return it.finish("waiting", f"submitted {what} run {n}: {rec['job_name']}")
+    return it.goto("S9", f"launch failed: {rec.get('error', '')[:120]}")
+
+
+def ingest(P, it, job_dir: str | None = None) -> dict:
+    """Attach a finished Harbor job to its pending run.  The job must be that run's own job (job name, task path,
+    agent model all match) and each run is consumed once; repairs a crash between saving runs.json and the item
+    state (review #3/#4)."""
+    runs = read_json(it.p("calib", "runs.json"), [])
+    pend = [r for r in runs if r.get("outcome") is None and r.get("state", "launched") == "launched"]
+    if not pend:
+        if runs and runs[-1].get("outcome") is not None and it.state.get("status") == "waiting":
+            it.state["stage"], it.state["status"] = "S9", "active"     # recover the item state
+            it.save()
+            return dict(recovered=True, job_name=runs[-1]["job_name"])
+        raise ValueError("no pending calibration run for this item")
+    rec = pend[0]
+    jd = Path(job_dir or rec["job_dir"])
+    jr = read_json(jd / "result.json", {})
+    if not jr.get("finished_at"):           # Harbor writes result.json at job start; finished_at marks the end
+        raise ValueError(f"job not finished yet: {jd}")
+    conf = read_json(jd / "config.json", {})
+    agents = conf.get("agents") or [{}]
+    tasks = conf.get("tasks") or [{}]
+    ident = dict(job_name=conf.get("job_name"), model=agents[0].get("model_name"), task=tasks[0].get("path"))
+    want = dict(job_name=rec["job_name"], model=rec.get("model", ident["model"]), task=rec.get("task", ident["task"]))
+    if ident != want:
+        raise ValueError(f"job identity mismatch: job {ident} vs pending run {want}")
+    used = {r.get("trial", {}).get("job_dir") for r in runs if r.get("outcome") is not None}
+    if str(jd.resolve()) in used:
+        raise ValueError(f"job dir already consumed: {jd}")
+    trials = calib.collect(jd)
+    if not trials:
+        raise ValueError("no trial results in job dir")
+    t = dict(trials[0], job_dir=str(jd.resolve()))
+    rec.update(outcome=t["outcome"], minutes=t["minutes"], trial=t)
+    if rec.get("ledger_call"):
+        P.ledger.settle(rec["ledger_call"], t.get("cost_usd"), note=f"harbor cost_usd, outcome={t['outcome']}")
     write_json(it.p("calib", "runs.json"), runs)
-    P.store.event("calib_submit_prepared", item=it.item_id, who=what, config=rec["config"])
-    it.finish("waiting", f"prepared {what} run {n}; submit disabled (calib.allow_submit=false)")
+    it.state["stage"], it.state["status"] = "S9", "active"
+    it.save()
+    return t
 
 
 def s10(P, it):

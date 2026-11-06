@@ -44,6 +44,25 @@ def test_daily_budget_and_call_caps(tmp_path):
     assert s["calls_total"] == 3
 
 
+def test_run_caps_and_s9_reservation_settle(tmp_path):
+    cfg = cfg_with(tmp_path, daily_usd_total=500.0, run_usd_total=30.0, run_calls_per_model={"claude-opus-5-5": 2})
+    led = Ledger(tmp_path / "l.sqlite", cfg)
+    led.reserve("claude-opus-5-5", "S5", "i", True)
+    led.reserve("claude-opus-5-5", "S5", "i", True)
+    with pytest.raises(BudgetStop) as e:
+        led.reserve("claude-opus-5-5", "S5", "i", True)
+    assert e.value.reason == "run_calls"
+    cid = led.reserve("glm-5.3", "S9", "i", True, est_usd=20.0)          # 3.0 + 20 <= 30
+    with pytest.raises(BudgetStop) as e:
+        led.reserve("glm-5.3", "S9", "i", True, est_usd=20.0)
+    assert e.value.reason == "run_total"
+    led.settle(cid, 4.5)                                                  # actual Harbor cost replaces the estimate
+    led.reserve("glm-5.3", "S9", "i", True, est_usd=20.0)                 # 3.0 + 4.5 + 20 <= 30
+    cid2 = led.reserve("fake", "S9", "i", False)
+    led.settle(cid2, None)
+    assert led.summary(None)["usd_total"] == pytest.approx(3.0 + 4.5 + 20.0)
+
+
 def test_breaker_opens_on_quota_and_blocks(tmp_path):
     cfg = cfg_with(tmp_path, daily_usd_total=100.0)
     led = Ledger(tmp_path / "l.sqlite", cfg)
@@ -92,7 +111,122 @@ def test_parse_files_and_extract_json():
     assert extract_json("blah ```json\n{\"k\": [1,2]}\n``` tail") == {"k": [1, 2]}
 
 
+def test_parse_files_truncated_drops_partial_last_block():
+    # e2e-iter1: S6A hit max_tokens=32000 mid-file; the partial file must not be written as if complete
+    t = "=== FILE: a.py ===\nprint(1)\n=== FILE: b.py ===\ndef f(:\n    x = ["
+    assert set(parse_files(t)) == {"a.py", "b.py"}
+    assert set(parse_files(t, truncated=True)) == {"a.py"}
+    done = t + "1]\n=== END ===\n"
+    assert set(parse_files(done, truncated=True)) == {"a.py", "b.py"}
+
+
+@pytest.mark.parametrize("tail,keep", [
+    ("=== FILE: b.py", {"a.py"}),            # cut inside the next file header (review #10)
+    ("=== FI", {"a.py"}),
+    ("=== FILE: b.py ===\nx = [", {"a.py"}),   # cut inside the next body
+    ("=== END", {"a.py"}),                   # cut inside END
+    ("=== END ===\n", {"a.py"}),
+    ("x = [1,", set()),                      # cut inside a.py itself
+])
+def test_parse_files_truncation_boundaries(tail, keep):
+    f = parse_files("=== FILE: a.py ===\nprint(1)\n" + tail, truncated=True)
+    assert set(f) == keep
+    if keep:
+        assert f["a.py"] == "print(1)\n"
+
+
+# ------------------------------------------------------------------ intake screen
+def test_screen_keeps_method_papers_found_in_e2e():
+    from tbsgen.intake import screen
+    cfg = load_config()
+    ismv = dict(title="An iterative spherical mean value method for background field removal in MRI",
+                abstract="The proposed background field removal method, termed iterative SMV (iSMV), consists of "
+                         "applying the SMV operation repeatedly on the field map. It was validated in a phantom; "
+                         "truncation threshold needed for deconvolution.")
+    assert screen(ismv, cfg)["keep"]
+    noabs = dict(title="Thermal drift in room temperature nanoindentation experiments: Measurement and correction")
+    r = screen(noabs, cfg)
+    assert r["keep"] and r["deferred"]
+    r2 = screen(noabs, cfg, fulltext_head="We propose a correction algorithm; drift is estimated by least-squares "
+                                          "fitting of hold segments and validated by simulation.")
+    assert r2["keep"] and not r2.get("deferred")
+    assert not screen(dict(title="A review", abstract="This review surveys perspectives."), cfg)["keep"]
+
+
 # ------------------------------------------------------------------ spec + thresholds
+def test_non_separating_threshold_rejects_clearly_worse_naive():
+    # e2e-iter1 numbers: ratio metric, ref ~1.00, mid ~1.08 (not separating at 10%), naive ~1.5 -> was 1.6 (naive passed)
+    cfg = load_config()
+    spec = {"metrics": [{"name": "r", "direction": "<="}]}
+    meas = {"ref": {"0": {"r": 1.0024}, "1": {"r": 1.0037}}, "mid": {"0": {"r": 1.089}, "1": {"r": 1.084}},
+            "naive": {"0": {"r": 1.478}, "1": {"r": 1.487}}}
+    t = set_thresholds(spec, meas, cfg)["thresholds"]["r"]
+    assert not t["separating"] and t["naive_capped"]
+    assert 1.0037 * 1.1 <= t["threshold"] < 1.478
+    # e2e-iter1 DecontX: correlation (>=), ref 0.9962, mid equal, naive 0.89 -> loose rule gave 0.49
+    spec = {"metrics": [{"name": "p", "direction": ">="}]}
+    meas = {"ref": {"0": {"p": 0.99623}, "1": {"p": 0.99692}}, "mid": {"0": {"p": 0.99623}, "1": {"p": 0.99692}},
+            "naive": {"0": {"p": 0.8908}, "1": {"p": 0.9238}}}
+    t = set_thresholds(spec, meas, cfg)["thresholds"]["p"]
+    # capped at the reference margin floor (0.99623*0.9 = 0.8966 -> 0.89 after loose rounding), not at 0.49;
+    # the naive (0.89-0.92) is inside the 10% reference margin here, so it is rejected by its other metrics
+    assert t["naive_capped"] and 0.85 < t["threshold"] <= 0.99623 * 0.9, t
+
+def test_reference_equal_to_empty_output_value_is_missing():
+    """Review #7: missing output is detected against the nop measurement, not by a global magnitude."""
+    cfg = load_config()
+    spec = {"metrics": [{"name": "rmse_public", "direction": "<="}, {"name": "corr", "direction": ">="},
+                        {"name": "neg_ll", "direction": "<="}, {"name": "big", "direction": "<="}]}
+    nop = {"rmse_public": 1e6, "corr": -1e6, "neg_ll": 0.0, "big": 1e12}
+    ok_ref = {"rmse_public": 0.3, "corr": 0.9, "neg_ll": -1e6, "big": 2e7}     # legit: negative and huge values
+    mid = {"rmse_public": 0.6, "corr": 0.5, "neg_ll": -5e5, "big": 4e7}
+    th = set_thresholds(spec, {"ref": {"0": ok_ref}, "mid": {"0": mid}, "nop": {"0": nop}}, cfg)
+    assert all(t["threshold"] is not None for t in th["thresholds"].values()), th
+    bad_ref = dict(ok_ref, corr=-1e6)                                           # ">=" metric missing
+    th = set_thresholds(spec, {"ref": {"0": bad_ref}, "mid": {"0": mid}, "nop": {"0": nop}}, cfg)
+    assert th["status"] == "ref_metric_missing" and th["thresholds"]["corr"]["threshold"] is None
+    bad_ref = dict(ok_ref, rmse_public=1e6)                                     # "<=" metric missing
+    th = set_thresholds(spec, {"ref": {"0": bad_ref}, "mid": {"0": mid}, "nop": {"0": nop}}, cfg)
+    assert th["status"] == "ref_metric_missing" and th["thresholds"]["rmse_public"]["threshold"] is None
+
+
+def test_reference_worse_than_naive_is_flagged():
+    cfg = load_config()
+    spec = {"metrics": [{"name": "public_rmse", "direction": "<="}, {"name": "hidden_rmse", "direction": "<="}]}
+    meas = {"ref": {"0": {"public_rmse": 0.29, "hidden_rmse": 4.19}},
+            "mid": {"0": {"public_rmse": 3.77, "hidden_rmse": 4.36}},
+            "naive": {"0": {"public_rmse": 3.70, "hidden_rmse": 3.52}}}
+    th = set_thresholds(spec, meas, cfg)
+    assert th["status"] == "ref_worse_than_naive" and th["ref_worse_than_naive"] == ["hidden_rmse"], th
+
+
+@pytest.mark.parametrize("d,ref,naive", [("<=", 1.04, 1.15), (">=", 0.96, 0.85)])
+def test_naive_cap_survives_rounding(d, ref, naive):
+    """Review #9: ref=mid=1.04, naive=1.15 -> floor 1.144 used to round to 1.2 and let naive pass."""
+    cfg = load_config()
+    spec = {"metrics": [{"name": "r", "direction": d}]}
+    th = set_thresholds(spec, {"ref": {"0": {"r": ref}}, "mid": {"0": {"r": ref}}, "naive": {"0": {"r": naive}}},
+                        cfg)["thresholds"]["r"]
+    thr = th["threshold"]
+    assert th["naive_capped"]
+    assert (naive > thr) if d == "<=" else (naive < thr), th
+    assert (ref <= thr) if d == "<=" else (ref >= thr), th
+
+
+def test_mid_fail_counts_public_hidden_twins_once():
+    # e2e-iter1 RCESPP: mid fails optimal_frac on public AND hidden + mean_rel_gap = 2 criteria (was 3 -> dropped)
+    cfg = load_config()
+    spec = {"metrics": [{"name": n, "direction": d} for n, d in
+                        (("hidden_feasible_frac", ">="), ("hidden_optimal_frac", ">="), ("hidden_mean_rel_gap", "<="),
+                         ("public_optimal_frac", ">="))]}
+    ref = {"hidden_feasible_frac": 1.0, "hidden_optimal_frac": 1.0, "hidden_mean_rel_gap": 0.01,
+           "public_optimal_frac": 1.0}
+    mid = {"hidden_feasible_frac": 1.0, "hidden_optimal_frac": 0.7, "hidden_mean_rel_gap": 0.067,
+           "public_optimal_frac": 0.667}
+    th = set_thresholds(spec, {"ref": {"0": ref}, "mid": {"0": mid}, "naive": {"0": mid}}, cfg)
+    assert th["mid_fail"] == {"0": 2} and th["status"] == "ok", th
+
+
 def test_validate_spec_ok_and_bad():
     cfg = load_config()
     assert validate_spec(SPEC, cfg) == []
@@ -147,6 +281,12 @@ def test_calibration_sequence(runs, expect):
 def test_quick_pass_option():
     cfg = load_config(None, {"calib": {"quick_pass_minutes": 30}})
     assert calib.next_action([dict(who="glm", outcome="pass", minutes=12)], cfg) == ("label", "easy")
+
+
+def test_calibration_teacher_unavailable_parks():
+    cfg = load_config(None, {"calib": {"teacher_available": False}})
+    assert calib.next_action([dict(who="glm", outcome="fail", minutes=60)], cfg) == \
+        ("label", "parked:teacher_unavailable")
 
 
 def test_classify_trial_quota_is_infra_but_reward1_is_pass(tmp_path):
@@ -229,3 +369,128 @@ def test_repair_review_rejects_threshold_change(tmp_path):
     assert not new["ok"]
     sec = repair.review(tmp_path, {"instruction.md": "see params.csv"}, dg)
     assert not sec["ok"]
+
+
+# ------------------------------------------------------------------ S9 submission robustness (review #3-#6)
+def _s9_env(tmp_path, monkeypatch=None, launcher_rc=0, make_job=True, **calib_kw):
+    import os
+    from tbsgen.pipeline import Pipeline
+    hr = tmp_path / "harbor"
+    hr.mkdir()
+    jobs = tmp_path / "jobs"
+    jobs.mkdir()
+    counter = tmp_path / "tmux_calls"
+    tmux = tmp_path / "fake-tmux"
+    tmux.write_text("#!/bin/bash\necho x >> %s\nshift 4\n\"$@\"\n" % counter)   # runs `bash -lc INNER` inline
+    tmux.chmod(0o755)
+    mk = ('mkdir -p "%s/$(python3 -c \'import json,sys;print(json.load(open(sys.argv[1]))[\"job_name\"])\' $2)" && '
+          'cp $2 "%s/$(python3 -c \'import json,sys;print(json.load(open(sys.argv[1]))[\"job_name\"])\' $2)/config.json"'
+          % (jobs, jobs)) if make_job else "true"
+    (hr / "launch.sh").write_text("#!/bin/bash\n%s\nexit %d\n" % (mk, launcher_rc))
+    (hr / "launch.sh").chmod(0o755)
+    cal = dict(allow_submit=True, harbor_root=str(hr), jobs_dir=str(jobs), student_launcher="launch.sh",
+               tmux_bin=str(tmux), est_usd_per_run=10.0)
+    cal.update(calib_kw)
+    cfg = load_config(None, {"run": {"root": str(tmp_path / "run")}, "calib": cal,
+                             "budget": {"daily_usd_total": 1000.0, "run_usd_total": 100.0}})
+    P = Pipeline(cfg, clients={})
+    [iid] = P.ingest([dict(doi="10.1/s9", title="t", abstract="algorithm estimation simulation benchmark")])
+    it = P.store.item(iid)
+    it.state.update(stage="S9", status="active")
+    it.save()
+    return P, iid, counter, jobs
+
+
+def _finish_job(jobs, job_name, reward=1.0, cost=4.0):
+    jd = jobs / job_name
+    (jd / "trial__a").mkdir(parents=True, exist_ok=True)
+    (jd / "trial__a" / "result.json").write_text(json.dumps(
+        {"verifier_result": {"rewards": {"reward": reward}}, "agent_result": {"cost_usd": cost}}))
+    (jd / "result.json").write_text(json.dumps({"finished_at": "2026-11-06T12:00:00"}))
+    return jd
+
+
+def test_s9_crash_after_launch_does_not_resubmit(tmp_path, monkeypatch):
+    from tbsgen import stages_b
+    P, iid, counter, jobs = _s9_env(tmp_path)
+    real = stages_b._save_run
+
+    def crashing(it, rec):
+        if rec.get("state") == "launched":
+            raise KeyboardInterrupt("crash right after launch")
+        real(it, rec)
+    monkeypatch.setattr(stages_b, "_save_run", crashing)
+    with pytest.raises(KeyboardInterrupt):
+        P.run(only=[iid])
+    monkeypatch.setattr(stages_b, "_save_run", real)
+    it = P.store.item(iid)
+    it.state.update(stage="S9", status="active")
+    it.save()
+    P.run(only=[iid])
+    runs = json.loads((P.store.item(iid).p("calib", "runs.json")).read_text())
+    assert len(runs) == 1 and runs[0]["state"] == "launched" and runs[0].get("recovered"), runs
+    assert counter.read_text().count("x") == 1                 # launched exactly once
+
+
+def test_ingest_checks_identity_and_consumes_once(tmp_path):
+    from tbsgen.stages_b import ingest
+    P, iid, counter, jobs = _s9_env(tmp_path)
+    P.run(only=[iid])
+    it = P.store.item(iid)
+    r1 = json.loads(it.p("calib", "runs.json").read_text())[0]
+    jd1 = _finish_job(jobs, r1["job_name"], reward=1.0, cost=4.0)
+    t = ingest(P, it, None)
+    assert t["outcome"] == "pass"
+    P.run(only=[iid])                                           # GLM#1 pass -> GLM#2 submitted
+    it = P.store.item(iid)
+    runs = json.loads(it.p("calib", "runs.json").read_text())
+    assert len(runs) == 2 and runs[1]["n"] == 2
+    with pytest.raises(ValueError, match="not finished|identity|consumed"):
+        ingest(P, it, str(jd1))                                 # replaying the GLM#1 job for GLM#2
+    other = jobs / "tbsgen-doi-other-glm2"
+    (other).mkdir()
+    (other / "config.json").write_text(json.dumps({"job_name": "tbsgen-doi-other-glm2", "agents": [{}], "tasks": [{}]}))
+    _finish_job(jobs, "tbsgen-doi-other-glm2")
+    with pytest.raises(ValueError, match="identity"):
+        ingest(P, it, str(other))                               # another item's job
+    jd2 = _finish_job(jobs, runs[1]["job_name"], reward=0.0, cost=6.0)
+    assert ingest(P, it, None)["outcome"] == "fail"
+    with pytest.raises(ValueError):
+        ingest(P, it, str(jd2))                                 # consumed once
+    s = P.ledger.summary(None)
+    assert s["usd_total"] == pytest.approx(10.0)                # 4 + 6 actual, no estimate left
+
+
+def test_s9_launch_exception_settles_reservation(tmp_path):
+    P, iid, counter, jobs = _s9_env(tmp_path, tmux_bin=str(tmp_path / "no-such-tmux"))
+    P.run(only=[iid], max_steps=1)
+    runs = json.loads(P.store.item(iid).p("calib", "runs.json").read_text())
+    assert runs[0]["state"] == "launch_failed" and runs[0]["outcome"] == "infra", runs
+    with P.ledger._db() as db:
+        st, usd = db.execute("SELECT status, usd FROM calls WHERE stage='S9'").fetchone()
+    assert st == "error" and usd == 0.0
+
+
+def test_s9_launcher_immediate_failure_is_detected(tmp_path):
+    P, iid, counter, jobs = _s9_env(tmp_path, launcher_rc=2, make_job=False)
+    P.run(only=[iid], max_steps=1)
+    it = P.store.item(iid)
+    it.state.update(stage="S9", status="active")
+    it.save()
+    P.run(only=[iid], max_steps=1)                              # reconcile: launcher exited, no job
+    runs = json.loads(P.store.item(iid).p("calib", "runs.json").read_text())
+    assert runs[0]["state"] == "launch_failed" and "launcher exit 2" in runs[0]["error"], runs
+
+
+def test_s9_stops_when_actual_spend_reaches_run_cap(tmp_path):
+    from tbsgen.stages_b import ingest
+    P, iid, counter, jobs = _s9_env(tmp_path)
+    P.run(only=[iid])
+    it = P.store.item(iid)
+    r1 = json.loads(it.p("calib", "runs.json").read_text())[0]
+    _finish_job(jobs, r1["job_name"], reward=1.0, cost=150.0)  # real cost far above the $10 reservation
+    ingest(P, it, None)
+    P.run(only=[iid])
+    it = P.store.item(iid)
+    assert it.state["status"] == "paused" and it.state["reason"].startswith("budget:run_total_actual"), it.state
+    assert counter.read_text().count("x") == 1

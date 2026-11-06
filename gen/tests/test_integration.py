@@ -129,6 +129,185 @@ def test_unrepairable_is_dropped_after_two_rounds(tmp_path):
     assert st["repair_rounds"] == 2
 
 
+def test_s6a_truncated_answer_gets_one_continuation(tmp_path):
+    """e2e-iter1 regression: a real S6A answer stopped at max_tokens after generator/generate.py and the item was
+    dropped (s6a_missing_files).  Now: partial last block discarded, one continuation asks for the missing files."""
+    base = toy_script(FIX)
+    seen = {"S6A": 0}
+
+    def script(stage, system, user):
+        out = base(stage, system, user)
+        if stage != "S6A":
+            return out
+        seen["S6A"] += 1
+        if seen["S6A"] == 1:      # cut inside solution/solve.py
+            cut = out.index("=== FILE: solution/solve.py ===") + 60
+            return {"text": out[:cut], "stop": "max_tokens", "usage": {"output_tokens": 32000}}
+        assert "Files already received" in user and "solution/solve.py" in user.split("missing files")[-1]
+        return out[out.index("=== FILE: solution/solve.py ==="):]
+    P, fake = mk(tmp_path, script=script)
+    [iid] = P.ingest([make_toy_candidate(tmp_path)])
+    P.run()
+    it = P.store.item(iid)
+    assert seen["S6A"] == 2
+    calls = read_json(it.p("S6A_calls.json"))
+    assert calls[0]["stop"] == "max_tokens" and "solution/solve.py" not in calls[0]["got"] and calls[1]["cont"]
+    assert len(list(it.p("raw").glob("S6A-*.txt"))) == 2
+    assert it.state["status"] == "waiting", it.state
+
+
+def test_mid_not_separable_reworks_only_mid(tmp_path):
+    """v2.2: S6B not_separable -> S6M rewrites baselines/mid.py around another drop node (1 call), no new spec."""
+    base = toy_script(FIX)
+    seen = []
+
+    def script(stage, system, user):
+        seen.append(stage)
+        if stage == "S6A":   # mid == reference -> fails nothing -> not separable
+            out = base(stage, system, user)
+            solve = (FIX / "solution/solve.py").read_text()
+            i = out.index("=== FILE: baselines/mid.py ===")
+            j = out.index("=== FILE:", i + 10)
+            return out[:i] + "=== FILE: baselines/mid.py ===\n" + solve + out[j:]
+        if stage == "S6M":
+            assert "MID_DROP" in user and "fails NONE" in user
+            return "MID_DROP: C2\n=== FILE: baselines/mid.py ===\n" + (FIX / "baselines/mid.py").read_text() + \
+                "=== END ===\n"
+        return base(stage, system, user)
+    P, fake = mk(tmp_path, script=script)
+    [iid] = P.ingest([make_toy_candidate(tmp_path)])
+    P.run()
+    it = P.store.item(iid)
+    assert seen.count("S5") == 1 and seen.count("S6A") == 1 and seen.count("S6M") == 1, seen
+    assert it.state["status"] == "waiting", it.state
+    assert read_json(it.p("_spec", "spec.json"))["depgraph"]["mid_drop"] == ["C2"]
+
+
+def test_s6m_new_node_outside_naive_drop_keeps_inclusion(tmp_path):
+    """Review #8: S6M picking a node outside naive_drop must keep naive_drop ⊇ mid_drop (spec re-validated)."""
+    from tbsgen.spec import validate_spec
+    base = toy_script(FIX)
+
+    def script(stage, system, user):
+        if stage == "S6A":
+            out = base(stage, system, user)
+            solve = (FIX / "solution/solve.py").read_text()
+            i = out.index("=== FILE: baselines/mid.py ===")
+            j = out.index("=== FILE:", i + 10)
+            return out[:i] + "=== FILE: baselines/mid.py ===\n" + solve + out[j:]
+        if stage == "S6M":
+            return ("MID_DROP: P1\n=== FILE: baselines/mid.py ===\n" + (FIX / "baselines/mid.py").read_text() +
+                    "=== FILE: baselines/naive.py ===\n" + (FIX / "baselines/naive.py").read_text() + "=== END ===\n")
+        return base(stage, system, user)
+    P, fake = mk(tmp_path, script=script)
+    [iid] = P.ingest([make_toy_candidate(tmp_path)])
+    P.run()
+    it = P.store.item(iid)
+    spec = read_json(it.p("_spec", "spec.json"))
+    g = spec["depgraph"]
+    if it.state["status"] == "dropped":       # P1 is a given_file premise: validate_spec must refuse it
+        assert it.state["reason"].startswith("s6m_invalid_spec"), it.state
+        assert g["mid_drop"] == ["C1"]
+    else:
+        assert set(g["mid_drop"]) <= set(g["naive_drop"]) and validate_spec(spec, P.cfg) == []
+
+
+def _prog_task(root: Path, direct_exec: bool) -> tuple[Path, Path, Path]:
+    task, gen = root / "task", root / "gen"
+    (task / "tests").mkdir(parents=True)
+    for d in ("environment/data", "tests/truth", "tests/hidden/set1"):
+        (gen / d).mkdir(parents=True)
+    (gen / "environment/data/x.csv").write_text("a\n1\n")
+    (gen / "tests/hidden/set1/x.csv").write_text("a\n2\n")
+    (gen / "tests/truth/secret.csv").write_text("truth\n42\n")
+    run = ("import subprocess, sys, tempfile\n"
+           "def go():\n    o = tempfile.mkdtemp()\n"
+           "    p = subprocess.run([sys.executable, '/app/output/solution_cli.py', '/tests/hidden/set1', o],"
+           " capture_output=True, text=True)\n"
+           "    from _metrics import _record\n"
+           "    _record({'name': '_solution_cli_run', 'value': 0, 'rc': p.returncode, 'stderr_tail': p.stderr,"
+           " 'aux': True, 'passed': True, 'threshold': 1, 'direction': '<='})\n") if direct_exec else \
+        ("from _metrics import run_solution, hidden_sets\n"
+         "def go():\n    for d in hidden_sets():\n        run_solution(60, d)\n")
+    (task / "tests/measure.py").write_text(run + "def compute():\n    go()\n    return {'m': 1.0}\n")
+    (task / "tests/test_outputs.py").write_text("from measure import compute\nfrom _metrics import check\n"
+                                                "def test_m():\n    check('m', compute()['m'], 2.0, '<=')\n")
+    ref = root / "ref"
+    ref.mkdir()
+    (ref / "solution_cli.py").write_text("pass\n")
+    return task, gen, ref
+
+
+def test_verifier_sees_app_data(tmp_path):
+    """v2.1 regression (e2e-iter1): verifier steps lost the /app/data mount; Harbor's verifier has it."""
+    from tbsgen import runner
+    cfg = load_config(None, {"run": {"root": str(tmp_path)}})
+    task, gen, ref = _prog_task(tmp_path, False)
+    (task / "tests/measure.py").write_text("import json\ndef compute():\n"
+                                          "    return {'m': float(open('/app/data/x.csv').read().split()[1])}\n"
+                                          "if __name__ == '__main__':\n    print(json.dumps(compute()))\n")
+    m = runner.measure(cfg, task, gen, ref, tmp_path / "work", "ad")
+    assert m["values"] == {"m": 1.0}, m
+
+
+@pytest.mark.parametrize("direct_exec", [True, False])
+def test_truth_isolation_probe(tmp_path, direct_exec):
+    """e2e-iter1 regression: the generated measure.py ran solution_cli.py itself (as root) instead of via
+    _metrics.run_solution, so /tests/truth was readable and a truth-reading CLI got Harbor reward 1."""
+    from tbsgen import runner
+    cfg = load_config(None, {"run": {"root": str(tmp_path)}})
+    task, gen, ref = _prog_task(tmp_path, direct_exec)
+    r = runner.truth_probe(cfg, task, gen, ref, tmp_path / "work", "tp")
+    assert r["via_run_solution"]
+    assert r["ok"] is (not direct_exec), r
+
+
+def _attack_task(root: Path, cli_src: str) -> tuple[Path, Path, Path]:
+    """PROG task whose verifier runs `cli_src` (the agent program) via run_solution and reports what it read."""
+    task, gen, ref = _prog_task(root, False)
+    (task / "tests/measure.py").write_text(
+        "import json\nfrom _metrics import run_solution, hidden_sets\n"
+        "def compute():\n    for d in hidden_sets():\n        run_solution(60, d)\n    return {'m': 1.0}\n"
+        "if __name__ == '__main__':\n    print(json.dumps(compute()))\n")
+    (ref / "solution_cli.py").write_text(cli_src)
+    return task, gen, ref
+
+
+ATTACK = r'''import os, sys
+hits = []
+for p in ("/tests/truth/secret.csv", "/src/tests/truth/secret.csv", "/app/output/leak/secret.csv",
+          "/tests/measure.py", "/src/tests/measure.py"):
+    try:
+        open(p).read(); hits.append(p)
+    except Exception:
+        pass
+sys.stderr.write("ATTACK_HITS " + ",".join(hits) + "\\n")
+'''
+
+
+def test_planted_symlink_and_staging_copy_do_not_expose_truth(tmp_path):
+    """Review #1/#2 (e2e-iter1): an agent-made /app/output/leak -> /tests/truth must not get the truth chmod-ed
+    open by the workspace pass, and the /src/tests staging copy must not be readable by the agent program."""
+    from tbsgen import runner
+    cfg = load_config(None, {"run": {"root": str(tmp_path)}})
+    task, gen, ref = _attack_task(tmp_path, ATTACK)
+    (ref / "leak").symlink_to("/tests/truth")
+    m = runner.test(cfg, task, gen, ref, tmp_path / "work", "atk")
+    runs = [x for x in m["metrics"] if x.get("name") == "_solution_cli_run"]
+    assert runs and runs[0]["sandboxed"], m
+    tail = runs[0]["stderr_tail"]
+    assert "ATTACK_HITS" in tail and not any(p in tail for p in ("secret", "measure")), runs
+
+
+def test_truth_probe_reads_concrete_paths(tmp_path):
+    """Review #1: probe opens concrete target paths (no directory listing), incl. the symlink route."""
+    from tbsgen import runner
+    cfg = load_config(None, {"run": {"root": str(tmp_path)}})
+    task, gen, ref = _prog_task(tmp_path, False)
+    r = runner.truth_probe(cfg, task, gen, ref, tmp_path / "work", "tp")
+    assert r["ok"] and r["n_targets"] >= 3, r
+
+
 def test_intake_failure_routes(tmp_path):
     P, _ = mk(tmp_path)
     cands = [dict(doi="10.1/review", title="A review of things", abstract="This review surveys perspectives."),

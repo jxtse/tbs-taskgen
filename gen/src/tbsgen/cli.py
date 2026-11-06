@@ -9,6 +9,9 @@
   tbsgen breaker --run DIR --model M --reset
   tbsgen calib-ingest --run DIR --item ID --job-dir JOBDIR      attach Harbor results to the pending S9 run
   tbsgen ping    --run DIR --calls N                             real Opus connectivity check (needs budget set)
+  tbsgen harbor-local --run DIR [--item ID]                       local Harbor oracle+nop on packaged items
+  tbsgen reset   --run DIR --item ID --stage S5 [--regen]        re-activate an item at a stage (after a pipeline fix);
+                                                                 --regen also forces S6A/S6C to regenerate files
 Real model calls need budget.daily_usd_total in the config (or --budget-usd on ping).
 """
 from __future__ import annotations
@@ -16,6 +19,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from pathlib import Path
 
 from . import calib
 from .budget import BudgetStop
@@ -36,7 +40,8 @@ def _pipeline(a, overrides=None) -> Pipeline:
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="tbsgen")
     sub = ap.add_subparsers(dest="cmd", required=True)
-    for name in ("ingest", "run", "resume", "status", "report", "ledger", "breaker", "calib-ingest", "ping"):
+    for name in ("ingest", "run", "resume", "status", "report", "ledger", "breaker", "calib-ingest", "ping", "reset",
+                 "harbor-local"):
         s = sub.add_parser(name)
         s.add_argument("--run", required=True)
         s.add_argument("--config", default=None)
@@ -53,7 +58,13 @@ def main(argv=None):
             s.add_argument("--reset", action="store_true")
         if name == "calib-ingest":
             s.add_argument("--item", required=True)
-            s.add_argument("--job-dir", required=True)
+            s.add_argument("--job-dir", default=None)   # default: the pending run's own job dir
+        if name == "harbor-local":
+            s.add_argument("--item", default=None)
+        if name == "reset":
+            s.add_argument("--item", required=True)
+            s.add_argument("--stage", required=True)
+            s.add_argument("--regen", action="store_true")
         if name == "ping":
             s.add_argument("--calls", type=int, default=1)
             s.add_argument("--budget-usd", type=float, required=True)
@@ -82,20 +93,30 @@ def main(argv=None):
         if a.reset:
             P.ledger.reset_breaker(a.model)
         print(json.dumps(P.ledger.breaker(a.model)))
-    elif a.cmd == "calib-ingest":
+    elif a.cmd == "harbor-local":
+        from . import harbor_local
+        ids = [a.item] if a.item else [i for i in sorted(p.name for p in (Path(a.run) / "items").iterdir())
+                                       if (Path(a.run) / "items" / i / "pkg" / "task.toml").exists()]
+        for i in ids:
+            print(json.dumps(harbor_local.check(P.cfg, Path(a.run), P.store.item(i).dir)))
+    elif a.cmd == "reset":
         it = P.store.item(a.item)
-        runs = read_json(it.p("calib", "runs.json"), [])
-        pend = [r for r in runs if r.get("outcome") is None]
-        if not pend:
-            sys.exit("no pending calibration run for this item")
-        trials = calib.collect(__import__("pathlib").Path(a.job_dir))
-        if not trials:
-            sys.exit("no trial results in job dir")
-        t = trials[0]
-        pend[-1].update(outcome=t["outcome"], minutes=t["minutes"], trial=t)
-        write_json(it.p("calib", "runs.json"), runs)
-        it.state["stage"], it.state["status"] = "S9", "active"
+        it.state.setdefault("history", []).append(dict(stage=it.state["stage"], result="manual_reset", to=a.stage,
+                                                      prev_status=it.state["status"], prev_reason=it.state.get("reason"),
+                                                      ts=__import__("time").time()))
+        it.state.update(stage=a.stage, status="active")
+        it.state.pop("reason", None)
+        if a.regen:
+            it.state["regen_6a"] = it.state["regen_6c"] = True
         it.save()
+        P.store.event("manual_reset", item=a.item, stage=a.stage, regen=a.regen)
+        print(json.dumps(dict(item=a.item, stage=a.stage, regen=a.regen)))
+    elif a.cmd == "calib-ingest":
+        from .stages_b import ingest
+        try:
+            t = ingest(P, P.store.item(a.item), a.job_dir)
+        except ValueError as e:
+            sys.exit(str(e))
         print(json.dumps(t, ensure_ascii=False))
     return 0
 
