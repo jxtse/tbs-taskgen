@@ -233,6 +233,52 @@ def test_truth_isolation_probe(tmp_path, direct_exec):
     assert r["ok"] is (not direct_exec), r
 
 
+def _attack_task(root: Path, cli_src: str) -> tuple[Path, Path, Path]:
+    """PROG task whose verifier runs `cli_src` (the agent program) via run_solution and reports what it read."""
+    task, gen, ref = _prog_task(root, False)
+    (task / "tests/measure.py").write_text(
+        "import json\nfrom _metrics import run_solution, hidden_sets\n"
+        "def compute():\n    for d in hidden_sets():\n        run_solution(60, d)\n    return {'m': 1.0}\n"
+        "if __name__ == '__main__':\n    print(json.dumps(compute()))\n")
+    (ref / "solution_cli.py").write_text(cli_src)
+    return task, gen, ref
+
+
+ATTACK = r'''import os, sys
+hits = []
+for p in ("/tests/truth/secret.csv", "/src/tests/truth/secret.csv", "/app/output/leak/secret.csv",
+          "/tests/measure.py", "/src/tests/measure.py"):
+    try:
+        open(p).read(); hits.append(p)
+    except Exception:
+        pass
+sys.stderr.write("ATTACK_HITS " + ",".join(hits) + "\\n")
+'''
+
+
+def test_planted_symlink_and_staging_copy_do_not_expose_truth(tmp_path):
+    """Review #1/#2 (e2e-iter1): an agent-made /app/output/leak -> /tests/truth must not get the truth chmod-ed
+    open by the workspace pass, and the /src/tests staging copy must not be readable by the agent program."""
+    from tbsgen import runner
+    cfg = load_config(None, {"run": {"root": str(tmp_path)}})
+    task, gen, ref = _attack_task(tmp_path, ATTACK)
+    (ref / "leak").symlink_to("/tests/truth")
+    m = runner.test(cfg, task, gen, ref, tmp_path / "work", "atk")
+    runs = [x for x in m["metrics"] if x.get("name") == "_solution_cli_run"]
+    assert runs and runs[0]["sandboxed"], m
+    tail = runs[0]["stderr_tail"]
+    assert "ATTACK_HITS" in tail and not any(p in tail for p in ("secret", "measure")), runs
+
+
+def test_truth_probe_reads_concrete_paths(tmp_path):
+    """Review #1: probe opens concrete target paths (no directory listing), incl. the symlink route."""
+    from tbsgen import runner
+    cfg = load_config(None, {"run": {"root": str(tmp_path)}})
+    task, gen, ref = _prog_task(tmp_path, False)
+    r = runner.truth_probe(cfg, task, gen, ref, tmp_path / "work", "tp")
+    assert r["ok"] and r["n_targets"] >= 3, r
+
+
 def test_intake_failure_routes(tmp_path):
     P, _ = mk(tmp_path)
     cands = [dict(doi="10.1/review", title="A review of things", abstract="This review surveys perspectives."),
