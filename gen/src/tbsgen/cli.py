@@ -112,25 +112,11 @@ def main(argv=None):
         P.store.event("manual_reset", item=a.item, stage=a.stage, regen=a.regen)
         print(json.dumps(dict(item=a.item, stage=a.stage, regen=a.regen)))
     elif a.cmd == "calib-ingest":
-        it = P.store.item(a.item)
-        runs = read_json(it.p("calib", "runs.json"), [])
-        pend = [r for r in runs if r.get("outcome") is None]
-        if not pend:
-            sys.exit("no pending calibration run for this item")
-        job_dir = Path(a.job_dir or pend[-1].get("job_dir") or "")
-        jr = read_json(job_dir / "result.json", {})
-        if not jr.get("finished_at"):           # Harbor writes result.json at job start; finished_at marks the end
-            sys.exit(f"job not finished yet: {job_dir}")
-        trials = calib.collect(job_dir)
-        if not trials:
-            sys.exit("no trial results in job dir")
-        t = trials[0]
-        pend[-1].update(outcome=t["outcome"], minutes=t["minutes"], trial=t)
-        if pend[-1].get("ledger_call"):
-            P.ledger.settle(pend[-1]["ledger_call"], t.get("cost_usd"), note=f"harbor cost_usd, outcome={t['outcome']}")
-        write_json(it.p("calib", "runs.json"), runs)
-        it.state["stage"], it.state["status"] = "S9", "active"
-        it.save()
+        from .stages_b import ingest
+        try:
+            t = ingest(P, P.store.item(a.item), a.job_dir)
+        except ValueError as e:
+            sys.exit(str(e))
         print(json.dumps(t, ensure_ascii=False))
     return 0
 
