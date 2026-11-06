@@ -50,8 +50,9 @@ def check(cfg: dict, run_root: Path, item_dir: Path, harbor: str | None = None, 
     for agent in ("oracle", "nop"):
         job = f"{item_dir.name}-{agent}-{time.strftime('%Y%m%d%H%M%S')}"
         t0 = time.time()
+        env = {k: v for k, v in os.environ.items() if k not in ("PYTHONPATH", "PYTHONHOME", "VIRTUAL_ENV")}
         p = subprocess.run([harbor, "run", "-p", str(tdir), "-a", agent, "-o", str(base / "jobs"), "--job-name", job,
-                            "-n", "1", "-q", "--yes"], capture_output=True, text=True, timeout=timeout)
+                            "-n", "1", "-q", "--yes"], capture_output=True, text=True, timeout=timeout, env=env)
         (base / "logs").mkdir(parents=True, exist_ok=True)
         (base / "logs" / f"{job}.log").write_text(p.stdout[-20000:] + "\n--- stderr ---\n" + p.stderr[-20000:])
         res[agent] = dict(job=job, rc=p.returncode, sec=round(time.time() - t0, 1), **_reward(base / "jobs" / job))

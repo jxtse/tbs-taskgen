@@ -49,6 +49,8 @@ def next_action(runs: list[dict], cfg: dict) -> tuple[str, str | None]:
         if any(t["outcome"] == "pass" for t in tea):
             return "label", "hard"
         if len(tea) < c["teacher_runs_max"]:
+            if not c.get("teacher_available", True):
+                return "label", "parked:teacher_unavailable"
             return "run", "teacher"
         return "label", "parked:teacher_failed"
     # GLM#1 passed
@@ -58,6 +60,15 @@ def next_action(runs: list[dict], cfg: dict) -> tuple[str, str | None]:
             return "label", "easy"
         return "run", "glm"
     return "label", "unstable" if glm[1]["outcome"] == "fail" else "easy"
+
+
+def task_path(cfg: dict, item_dir: Path) -> Path:
+    """Task folder the job runs: the sandbox-prepared copy (docker_image pointing at a registered template) when
+    calib.prepared_tasks_dir has one for this item, else the item's own pkg/ (local Docker backends)."""
+    d = cfg["calib"].get("prepared_tasks_dir")
+    if d and (Path(d) / item_dir.name / "task.toml").exists():
+        return Path(d) / item_dir.name
+    return item_dir / "pkg"
 
 
 def job_config(cfg: dict, pkg: Path, who: str, job_name: str) -> dict:
@@ -77,20 +88,36 @@ def job_config(cfg: dict, pkg: Path, who: str, job_name: str) -> dict:
             "agents": [agent], "tasks": [{"path": str(pkg.resolve())}]}
 
 
-def submit(cfg: dict, item_dir: Path, who: str, n: int) -> dict:
-    """Write the job config + launcher command.  Actually launching requires calib.allow_submit=True."""
+def submit(cfg: dict, item_dir: Path, who: str, n: int, ledger=None) -> dict:
+    """Write the job config + launcher command.  With calib.allow_submit=True: reserve the run's estimated cost in
+    the ledger (refused -> BudgetStop, nothing launched) and start the launcher detached in tmux."""
     c = cfg["calib"]
     job_name = f"tbsgen-{item_dir.name}-{who}{n}-{time.strftime('%Y%m%d%H%M%S')}"
-    conf = job_config(cfg, item_dir / "pkg", who, job_name)
+    conf = job_config(cfg, task_path(cfg, item_dir), who, job_name)
     p = item_dir / "calib" / f"{job_name}.json"
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(json.dumps(conf, indent=1))
     p = p.resolve()
     launcher = c["student_launcher"] if who == "glm" else c["teacher_launcher"]
     cmd = f"cd {c['harbor_root']} && ./{launcher} run {p}"
-    rec = dict(who=who, n=n, job_name=job_name, config=str(p), command=cmd, submitted=False, ts=time.time())
-    if c.get("allow_submit"):
-        raise NotImplementedError("live submission is intentionally not wired in the MVP; run `command` by hand")
+    rec = dict(who=who, n=n, job_name=job_name, config=str(p), command=cmd, submitted=False, ts=time.time(),
+               job_dir=str(Path(c["jobs_dir"]) / job_name), task=conf["tasks"][0]["path"])
+    if not c.get("allow_submit"):
+        return rec
+    import shlex
+    import subprocess
+    model = c["student_model"] if who == "glm" else c["teacher_model"]
+    if ledger is not None:
+        rec["ledger_call"] = ledger.reserve(model, "S9", item_dir.name, True, est_usd=float(c["est_usd_per_run"]))
+    log = item_dir / "calib" / f"{job_name}.log"
+    inner = f"env -u PYTHONPATH -u VIRTUAL_ENV {cmd} > {shlex.quote(str(log))} 2>&1"
+    r = subprocess.run(["tmux", "new-session", "-d", "-s", job_name[-60:], "bash", "-lc", inner],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        if ledger is not None:
+            ledger.finish(rec["ledger_call"], error_class="launch", error=r.stderr[-300:])
+        raise RuntimeError(f"tmux launch failed: {r.stderr[-300:]}")
+    rec.update(submitted=True, tmux=job_name[-60:], log=str(log), model=model)
     return rec
 
 
@@ -132,8 +159,9 @@ def classify_trial(trial: Path) -> dict:
     else:
         outcome = "fail"
     quota = bool(msg and re.search(r"额度|quota|429", msg))
+    cost = (r.get("agent_result") or {}).get("cost_usd")
     return dict(trial=trial.name, outcome=outcome, reward=reward, exception=exc, api_status=status,
-                api_msg=msg, quota=quota, minutes=minutes)
+                api_msg=msg, quota=quota, minutes=minutes, cost_usd=cost)
 
 
 def collect(job_dir: Path) -> list[dict]:

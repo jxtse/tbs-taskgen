@@ -32,6 +32,8 @@ DEFAULTS: dict[str, Any] = {
         "daily_usd_per_model": {},          # e.g. {"claude-opus-5-5": 50.0}
         "daily_usd_per_stage": {},          # e.g. {"S6A": 20.0}
         "daily_calls_per_model": {},        # hard call caps, e.g. {"claude-opus-5-5": 6}
+        "run_usd_total": None,              # whole-run caps (all days; daily caps reset at 0:00 UTC+8)
+        "run_calls_per_model": {},
         "max_calls_per_item": 24,           # all stages, all attempts, one item
         "breaker_consecutive_errors": 4,    # N consecutive failed calls -> breaker opens for that model
         "breaker_open_on": ["quota", "auth"],  # these error classes open the breaker immediately
@@ -124,7 +126,10 @@ DEFAULTS: dict[str, Any] = {
         "jobs_dir": str(PIPELINE_V2 / "gen" / "state" / "harbor-jobs"),
         "student_launcher": "glm53-official65/run-glm65.sh",
         "teacher_launcher": "run-job-opus.sh",
-        "allow_submit": False,              # must be flipped explicitly; MVP never submits
+        "allow_submit": False,              # must be flipped explicitly; True = reserve in ledger + tmux launch
+        "est_usd_per_run": 20.0,            # ledger reservation per Harbor run (GLM-5.3 short tasks: p90 ~$19)
+        "teacher_available": True,          # False: GLM#1 fail -> parked:teacher_unavailable (no teacher run)
+        "prepared_tasks_dir": None,         # sandbox-prepared task copies (docker_image set), one dir per item
         "glm_runs_on_first_fail": 1,        # DESIGN §3.5: first GLM fail -> teacher (no 2nd GLM run)
         "teacher_runs_max": 2,
         "quick_pass_minutes": None,         # 待定: 1st-pass shortcut to "easy" (DESIGN suggests 30); None=off
