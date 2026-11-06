@@ -152,6 +152,8 @@ def s9(P, it):
         return it.finish("done", f"label:{what} (not kept; S9b variants off)")
     n = sum(1 for r in runs if r["who"] == what) + 1
     rec = calib.submit(P.cfg, it.dir, what, n, ledger=P.ledger)   # BudgetStop propagates -> item paused
+    if rec.get("blocked"):
+        return it.finish("waiting", f"calib blocked: {rec['blocked']}")
     rec["outcome"] = None
     runs.append(rec)
     write_json(it.p("calib", "runs.json"), runs)
