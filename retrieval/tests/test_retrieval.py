@@ -368,10 +368,46 @@ def test_exa_pool_rejects_other_provider_and_env_url(cfg, monkeypatch):
     monkeypatch.setenv("TBS_SEARCH_POOL_URL", "http://127.0.0.1:9/")
     cfg["sources"]["exa"]["backend"] = "pool"
     tr, seen, _ = _pool_replay(provider="tavily")
-    S, _, _ = make_sources(cfg, tr)
-    rl = S["exa"].channel("code", T)
+    S, led, _ = make_sources(cfg, tr)
+    assert S["exa"]._safe(S["exa"].channel, "code", T) is None
     assert seen[0][1] == "http://127.0.0.1:9/v1/search"
-    assert rl.papers == [] and rl.resources == [] and "provider='tavily'" in S["exa"].errors[0]
+    assert "provider='tavily'" in S["exa"].errors[0]
+    u = led.usage("exa")
+    assert u["calls"] == 1 and u["usd"] == pytest.approx(0.007)        # real cost kept ...
+    # ... but the bad 200 is not cached: once the pool is fixed, the same query is fetched again
+    tr2, seen2, _ = _pool_replay(provider="exa")
+    S2, _, _ = make_sources(cfg, tr2)
+    rl = S2["exa"].channel("code", T)
+    assert len(seen2) == 1 and (rl.papers or rl.resources)
+
+
+def test_exa_pool_404_is_an_error_not_empty(cfg, monkeypatch):
+    monkeypatch.delenv("TBS_SEARCH_POOL_URL", raising=False)
+    cfg["sources"]["exa"]["backend"] = "pool"
+    S, _, _ = make_sources(cfg, lambda m, u, h, b: (404, {}, b'{"error": {"type": "not_found"}}'))
+    assert S["exa"]._safe(S["exa"].channel, "paper", T) is None
+    assert S["exa"].errors and "404" in S["exa"].errors[0]
+
+
+@pytest.mark.parametrize("n,ok", [(0, False), (1, True), (20, True), (21, False), ("10", False), (True, False)])
+def test_exa_pool_num_results_range(cfg, n, ok):
+    cfg["sources"]["exa"]["backend"] = "pool"
+    cfg["sources"]["exa"]["num_results"] = n
+    if ok:
+        make_sources(cfg, Replay())
+    else:
+        with pytest.raises(ValueError):
+            make_sources(cfg, Replay())
+
+
+@pytest.mark.parametrize("url,ok", [
+    ("http://127.0.0.1:18150/v1/search", True), ("http://localhost:18150/x", True), ("http://LOCALHOST./x", True),
+    ("http://127.0.0.2/x", True), ("http://[::1]:18150/x", True), ("http://[0:0:0:0:0:0:0:1]/x", True),
+    ("http://[::ffff:127.0.0.1]/x", True), ("https://api.exa.ai/search", False), ("http://10.0.0.1/x", False),
+    ("http://localhost.example.com/x", False)])
+def test_is_loopback(url, ok):
+    from tbsretr.ledger import is_loopback
+    assert is_loopback(url) is ok
 
 
 def test_exa_pool_unset_url_skips(cfg, monkeypatch):

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import gzip
 import hashlib
+import ipaddress
 import json
 import random
 import sqlite3
@@ -213,6 +214,19 @@ class Response:
 
 
 _DIRECT = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def is_loopback(url: str) -> bool:
+    host = (urllib.parse.urlsplit(url).hostname or "").lower().rstrip(".")
+    if host == "localhost" or host.endswith(".localhost"):
+        return True
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    if ip.version == 6 and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+    return ip.is_loopback
 _ENV = urllib.request.build_opener()
 
 
@@ -228,9 +242,8 @@ class Http:
     def _urllib(self, method, url, headers, body):
         data = json.dumps(body).encode() if body is not None else None
         req = urllib.request.Request(url, data=data, method=method, headers=headers)
-        host = (urllib.parse.urlsplit(url).hostname or "").lower()
         # loopback services (local search pool) must bypass the system proxy; everything else follows it
-        opener = _DIRECT if host in ("127.0.0.1", "localhost", "::1") else _ENV
+        opener = _DIRECT if is_loopback(url) else _ENV
         try:
             with opener.open(req, timeout=self.cfg.get("timeout_s", 60)) as r:
                 return r.status, dict(r.headers), r.read()
@@ -241,7 +254,10 @@ class Http:
 
     def request(self, source: str, kind: str, url: str, *, method: str = "GET", headers: dict | None = None,
                 body: dict | None = None, cost_usd: float = 0.0, credits: float = 0.0, target: str = "",
-                cost_from_response=None, ok_statuses=(200,)) -> Response:
+                cost_from_response=None, ok_statuses=(200,), validate=None) -> Response:
+        """validate(body_bytes) -> None | str: called on ok-status responses before caching.  A returned string
+        rejects the response: it is booked with its real cost and the reason, never cached, and raised as
+        HTTPFailure (so a bad 200 cannot be served from cache later)."""
         scfg = self.cfg["sources"][source]
         key = Ledger.cache_key(method, url, body)
         hit = self.ledger.cache_get(key, self.cfg.get("cache_ttl_days", 30))
@@ -267,8 +283,12 @@ class Http:
             dt = time.time() - t0
             c_usd, c_cr = (cost_from_response(st, hd, b) if cost_from_response else (cost_usd, credits)) \
                 if st in ok_statuses else (0.0, 0.0)
-            self.ledger.book(source, kind, url, st, round(dt, 3), c_usd, c_cr, attempt=attempt, target=target,
-                             note="" if st in ok_statuses else b[:200].decode("utf8", "replace"))
+            rejected = validate(b) if (validate and st in ok_statuses) else None
+            note = ("rejected: " + rejected) if rejected else ("" if st in ok_statuses else b[:200].decode("utf8", "replace"))
+            self.ledger.book(source, kind, url, -st if rejected else st, round(dt, 3), c_usd, c_cr, attempt=attempt,
+                             target=target, note=note[:200])
+            if rejected:
+                raise HTTPFailure(st, redact(rejected[:300]))
             rem = {k.lower(): v for k, v in (hd or {}).items()}.get("x-ratelimit-remaining-usd")
             if rem is not None:
                 try:
