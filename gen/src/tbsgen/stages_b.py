@@ -151,11 +151,14 @@ def s9(P, it):
             return it.advance("S9", "S10", label=what)
         return it.finish("done", f"label:{what} (not kept; S9b variants off)")
     n = sum(1 for r in runs if r["who"] == what) + 1
-    rec = calib.submit(P.cfg, it.dir, what, n)
+    rec = calib.submit(P.cfg, it.dir, what, n, ledger=P.ledger)   # BudgetStop propagates -> item paused
     rec["outcome"] = None
     runs.append(rec)
     write_json(it.p("calib", "runs.json"), runs)
-    P.store.event("calib_submit_prepared", item=it.item_id, who=what, config=rec["config"])
+    P.store.event("calib_submitted" if rec["submitted"] else "calib_submit_prepared", item=it.item_id, who=what,
+                  config=rec["config"])
+    if rec["submitted"]:
+        return it.finish("waiting", f"submitted {what} run {n}: {rec['job_name']}")
     it.finish("waiting", f"prepared {what} run {n}; submit disabled (calib.allow_submit=false)")
 
 

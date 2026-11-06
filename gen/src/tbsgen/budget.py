@@ -76,9 +76,10 @@ class Ledger:
         return db
 
     # ------------------------------------------------------------------ reserve / finish
-    def reserve(self, model: str, stage: str, item: str, real: bool, prompt_sha: str = "") -> int:
+    def reserve(self, model: str, stage: str, item: str, real: bool, prompt_sha: str = "",
+                est_usd: float | None = None) -> int:
         b = self.cfg["budget"]
-        est = float(b.get("est_usd_per_call", 0.0)) if real else 0.0
+        est = (float(b.get("est_usd_per_call", 0.0)) if est_usd is None else float(est_usd)) if real else 0.0
         day = today()
         db = self._db()
         try:
@@ -96,12 +97,22 @@ class Ledger:
 
                 if spent("") + est > float(b["daily_usd_total"]) + 1e-12:
                     raise BudgetStop("daily_total", f"{b['daily_usd_total']} USD")
+                if b.get("run_usd_total") is not None:     # whole-run cap across days (daily caps reset at 0:00)
+                    allrun = db.execute("SELECT COALESCE(SUM(COALESCE(usd, est_usd)),0) FROM calls WHERE real=1"
+                                        ).fetchone()[0]
+                    if allrun + est > float(b["run_usd_total"]) + 1e-12:
+                        raise BudgetStop("run_total", f"{b['run_usd_total']} USD")
                 cap_m = (b.get("daily_usd_per_model") or {}).get(model)
                 if cap_m is not None and spent("AND model=?", model) + est > float(cap_m) + 1e-12:
                     raise BudgetStop("daily_model", f"{model} {cap_m} USD")
                 cap_s = (b.get("daily_usd_per_stage") or {}).get(stage)
                 if cap_s is not None and spent("AND stage=?", stage) + est > float(cap_s) + 1e-12:
                     raise BudgetStop("daily_stage", f"{stage} {cap_s} USD")
+            cap_r = (b.get("run_calls_per_model") or {}).get(model)
+            if cap_r is not None:
+                n = db.execute("SELECT count(*) FROM calls WHERE model=? AND real=1", (model,)).fetchone()[0]
+                if n >= int(cap_r):
+                    raise BudgetStop("run_calls", f"{model} {cap_r} calls")
             cap_c = (b.get("daily_calls_per_model") or {}).get(model)
             if cap_c is not None:
                 n = db.execute("SELECT count(*) FROM calls WHERE day=? AND model=?", (day, model)).fetchone()[0]
@@ -157,6 +168,17 @@ class Ledger:
         finally:
             db.close()
 
+    def settle(self, call_id: int, usd: float | None, status: str = "ok", note: str = "") -> None:
+        """Close a non-token reservation (e.g. an S9 Harbor run) with its recorded cost; usd=None keeps the
+        reserved estimate as the cost (unknown actual cost is never booked as 0)."""
+        db = self._db()
+        try:
+            db.execute("UPDATE calls SET ended=?, status=?, usd=COALESCE(?, est_usd), error=? WHERE id=?",
+                       (time.time(), status, usd, note[:500], call_id))
+            db.commit()
+        finally:
+            db.close()
+
     # ------------------------------------------------------------------ breaker / reports
     def breaker(self, model: str) -> dict | None:
         with self._db() as db:
@@ -174,7 +196,7 @@ class Ledger:
 
     def summary(self, day: str | None = None) -> dict:
         q = ("SELECT model, stage, real, count(*), SUM(status='error'), SUM(in_tok), SUM(out_tok), SUM(cache_read), "
-             "SUM(COALESCE(usd,0)) FROM calls {} GROUP BY model, stage, real ORDER BY model, stage")
+             "SUM(COALESCE(usd,est_usd,0)) FROM calls {} GROUP BY model, stage, real ORDER BY model, stage")  # in-flight = reserved est
         with self._db() as db:
             rows = db.execute(q.format("WHERE day=?" if day else ""), (day,) if day else ()).fetchall()
             br = db.execute("SELECT model, open, reason FROM breaker WHERE open=1").fetchall()

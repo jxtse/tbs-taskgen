@@ -44,6 +44,25 @@ def test_daily_budget_and_call_caps(tmp_path):
     assert s["calls_total"] == 3
 
 
+def test_run_caps_and_s9_reservation_settle(tmp_path):
+    cfg = cfg_with(tmp_path, daily_usd_total=500.0, run_usd_total=30.0, run_calls_per_model={"claude-opus-5-5": 2})
+    led = Ledger(tmp_path / "l.sqlite", cfg)
+    led.reserve("claude-opus-5-5", "S5", "i", True)
+    led.reserve("claude-opus-5-5", "S5", "i", True)
+    with pytest.raises(BudgetStop) as e:
+        led.reserve("claude-opus-5-5", "S5", "i", True)
+    assert e.value.reason == "run_calls"
+    cid = led.reserve("glm-5.3", "S9", "i", True, est_usd=20.0)          # 3.0 + 20 <= 30
+    with pytest.raises(BudgetStop) as e:
+        led.reserve("glm-5.3", "S9", "i", True, est_usd=20.0)
+    assert e.value.reason == "run_total"
+    led.settle(cid, 4.5)                                                  # actual Harbor cost replaces the estimate
+    led.reserve("glm-5.3", "S9", "i", True, est_usd=20.0)                 # 3.0 + 4.5 + 20 <= 30
+    cid2 = led.reserve("fake", "S9", "i", False)
+    led.settle(cid2, None)
+    assert led.summary(None)["usd_total"] == pytest.approx(3.0 + 4.5 + 20.0)
+
+
 def test_breaker_opens_on_quota_and_blocks(tmp_path):
     cfg = cfg_with(tmp_path, daily_usd_total=100.0)
     led = Ledger(tmp_path / "l.sqlite", cfg)
@@ -184,6 +203,12 @@ def test_calibration_sequence(runs, expect):
 def test_quick_pass_option():
     cfg = load_config(None, {"calib": {"quick_pass_minutes": 30}})
     assert calib.next_action([dict(who="glm", outcome="pass", minutes=12)], cfg) == ("label", "easy")
+
+
+def test_calibration_teacher_unavailable_parks():
+    cfg = load_config(None, {"calib": {"teacher_available": False}})
+    assert calib.next_action([dict(who="glm", outcome="fail", minutes=60)], cfg) == \
+        ("label", "parked:teacher_unavailable")
 
 
 def test_classify_trial_quota_is_infra_but_reward1_is_pass(tmp_path):
