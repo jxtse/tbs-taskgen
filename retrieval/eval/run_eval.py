@@ -21,7 +21,7 @@ from tbsretr.model import Target
 from tbsretr.pipeline import Retriever, to_json
 
 HERE = Path(__file__).resolve().parent
-SEL = Path(os.environ.get("TBS_OLD_PIPE", "/Volumes/Storage/hermes/workspace/tbs-datapipe-20261015")) / "literature/methodlit/selected.jsonl"
+SEL = Path(os.environ.get("TBS_OLD_PIPE") or "TBS_OLD_PIPE-not-set") / "literature/methodlit/selected.jsonl"   # earlier pipeline data, not in this repo
 CAPS = {"openalex": 300, "exa": 80, "tavily": 80, "crossref": 120, "arxiv": 60, "europepmc": 60, "s2": 150}
 
 

@@ -11,7 +11,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 SAMPLE = HERE.parents[2] / "search_api/targets_sample.json"
-ML = Path(os.environ.get("TBS_OLD_PIPE", "/Volumes/Storage/hermes/workspace/tbs-datapipe-20261015")) / "literature/methodlit/targets.json"
+ML = Path(os.environ.get("TBS_OLD_PIPE") or "TBS_OLD_PIPE-not-set") / "literature/methodlit/targets.json"   # earlier pipeline data, not in this repo
 
 TOPIC = {
     "task:ambient-rna-correction": "ambient RNA contamination removal for droplet single-cell RNA-seq",

@@ -71,20 +71,26 @@ def task_path(cfg: dict, item_dir: Path) -> Path:
     return item_dir / "pkg"
 
 
+def _ref(import_path: str | None, builtin_key: str, builtin: str) -> dict:
+    """Harbor agent/environment reference: custom import path if configured, else the built-in by name/type."""
+    return {"import_path": import_path} if import_path else {builtin_key: builtin}
+
+
 def job_config(cfg: dict, pkg: Path, who: str, job_name: str) -> dict:
     c = cfg["calib"]
     if who == "glm":
-        agent = {"import_path": c["student_agent"], "model_name": c["student_model"],
+        agent = {**_ref(c.get("student_agent"), "name", c["harness"]), "model_name": c["student_model"],
                  "kwargs": {"version": c["cc_version"], "reasoning_effort": "max"}, "env": dict(AGENT_ENV)}
     else:
-        agent = {"import_path": c["teacher_agent"], "model_name": c["teacher_model"],
+        agent = {**_ref(c.get("teacher_agent"), "name", c["harness"]), "model_name": c["teacher_model"],
                  "kwargs": {"version": c["cc_version"], "reasoning_effort": "max", "thinking_display": "summarized"},
                  "env": dict(AGENT_ENV)}
     return {"job_name": job_name, "jobs_dir": c["jobs_dir"], "n_attempts": 1, "n_concurrent_trials": 1,
             "timeout_multiplier": 1.0, "agent_timeout_multiplier": 1.0,
             "retry": {"max_retries": 2, "include_exceptions": ["AgentSetupTimeoutError", "EnvironmentStartTimeoutError",
                                                               "NetworkConnectionError"]},
-            "environment": {"import_path": c["environment"], "delete": True}, "verifier": {"disable": False},
+            "environment": {**_ref(c.get("environment"), "type", "docker"), "delete": True},
+            "verifier": {"disable": False},
             "agents": [agent], "tasks": [{"path": str(pkg.resolve())}]}
 
 
@@ -102,16 +108,21 @@ def prepare(cfg: dict, item_dir: Path, who: str, n: int) -> dict:
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(json.dumps(conf, indent=1))
     p = p.resolve()
-    launcher = c["student_launcher"] if who == "glm" else c["teacher_launcher"]
+    launcher = c.get("student_launcher") if who == "glm" else c.get("teacher_launcher")
     model = c["student_model"] if who == "glm" else c["teacher_model"]
+    command = (f"cd {c['harbor_root']} && ./{launcher} run {p}" if launcher and c.get("harbor_root")
+               else f"harbor run --config {p} --yes")
     rec = dict(who=who, n=n, item=item_dir.name, model=model, job_name=job_name, config=str(p),
-               command=f"cd {c['harbor_root']} && ./{launcher} run {p}", state="intent", submitted=False,
+               command=command, state="intent", submitted=False,
                ts=time.time(), job_dir=str(Path(c["jobs_dir"]) / job_name), task=conf["tasks"][0]["path"],
                outcome=None)
     if c.get("prepared_tasks_dir") and not rec["task"].startswith(str(Path(c["prepared_tasks_dir"]))):
         # remote sandbox backends cannot build a Dockerfile: a missing prepared template means the run would die
         # at environment start (e2e-iter1: FileUploadException, no model use) -> do not launch
         rec["blocked"] = "no prepared sandbox template for this item"
+    if c.get("allow_submit") and not (launcher and c.get("harbor_root")):
+        rec["blocked"] = (f"calib.allow_submit needs calib.harbor_root and calib.{'student' if who == 'glm' else 'teacher'}"
+                          "_launcher (or set allow_submit=false and run the printed command yourself)")
     return rec
 
 

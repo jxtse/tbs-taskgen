@@ -86,7 +86,7 @@ items/<item_id>/
 cd gen
 uv sync
 docker build -t tbsgen-base:py311-sci-v2 -f docker/Dockerfile.base docker/   # 沙箱镜像；可加 --build-arg PIP_INDEX_URL=<镜像源>
-uv run pytest -q                                                    # 65 个测试：49 单测 + 16 集成（集成测试需要 Docker 和沙箱镜像，缺了就跳过）
+uv run pytest -q                                                    # 69 个测试：53 单测 + 16 集成（集成测试需要 Docker 和沙箱镜像，缺了就跳过）
 uv run python -m tbsgen.dryrun --out runs/dryrun-X                  # fake 模型端到端干跑
 uv run python -m tbsgen.backtest --out eval/leak_backtest_X         # 泄漏门回测（需要旧批次题目数据，不在仓库里；--set holdout81 跑留出集）
 
@@ -112,7 +112,7 @@ daily_calls_per_model = { "claude-opus-5-5" = 40 }
 allow_submit = false
 ```
 
-凭据：出题阶段的 Opus 走 Anthropic 兼容端点（`models.opus.url`，可用 `TBS_OPUS_URL` 覆盖）。默认假设本机网关持有凭据，本进程不持有 key。如果改走需要 key 的端点，设置 `models.opus.key_env`，再用 `uv run tbsgen ...` 注入；key 只放在请求头里，不写日志或文件，错误信息会先脱敏。
+凭据：出题阶段的 Opus 走 Anthropic 兼容端点（`models.opus.url` 或环境变量 `TBS_OPUS_URL`，没有默认值；未设置时模型阶段以 `model:config` 暂停）。不设 `key_env` 时本进程不发送 key（适用于持有凭据的本机网关）。如果改走需要 key 的端点，设置 `models.opus.key_env`，再用 `uv run tbsgen ...` 注入；key 只放在请求头里，不写日志或文件，错误信息会先脱敏。
 
 ## 4. 配置项与待定项默认值
 
@@ -137,7 +137,9 @@ allow_submit = false
 | `calib.keep_labels` | hard, unstable | 保留的难度标签 |
 | `calib.variant_depth` | 0 | S9b 更难变体（**待定**，MVP 关闭） |
 | `calib.infra_retries` | 2 | API/沙箱异常不计入校准次数 |
-| `calib.allow_submit` | **False** | True 时：账本预留 → tmux 后台运行启动脚本；预留超总额则拒绝 |
+| `calib.allow_submit` | **False** | True 时：账本预留 → tmux 后台运行启动脚本；预留超总额则拒绝；没配 `harbor_root` 和启动脚本时拒绝提交 |
+| `calib.harbor_root / student_launcher / teacher_launcher` | None | 启动脚本目录与脚本名（`./<launcher> run <作业配置>`）；未设置时只打印 `harbor run --config ...` |
+| `calib.student_agent / teacher_agent / environment` | None | Harbor 自定义 agent/环境的 `module:Class`；未设置用内置 `claude-code` agent 和 `docker` 环境 |
 | `calib.est_usd_per_run` | 20 | 每次校准作业的预留额，`calib-ingest` 用 Harbor `cost_usd` 冲销 |
 | `calib.teacher_available` | True | False：GLM 首次失败直接记 `parked:teacher_unavailable` |
 | `calib.prepared_tasks_dir` | None | 远端沙箱已注册模板的任务副本目录；设置后缺模板的条目不提交 |
@@ -159,7 +161,7 @@ hard 和 unstable 保留。reward=1 一律算通过，即使之后报了 API 错
 
 **已验证（实际跑过）**
 
-- 测试：65 个（49 单测 + 16 个在 Docker 里执行任务代码的集成测试），每次推送由 GitHub Actions CI 运行。
+- 测试：69 个（53 单测 + 16 个在 Docker 里执行任务代码的集成测试），每次推送由 GitHub Actions CI 运行。
 - 集成测试覆盖的情况：断点续跑（中途停止，换新进程继续，已完成阶段不重复调用模型）；预算上限触发暂停，`resume` 后继续；quota 错误触发熔断并暂停；参考解崩溃 → S8 修复 → 恢复；注入泄漏 → L2 阻塞 → 修复后通过；修不好 → 2 轮后丢弃；S6A 截断续写；mid 不可区分时 S6M 只重写 mid；真值隔离探针；筛选丢弃；取不到全文 → 暂存。
 - fake 模型端到端干跑：人造条目走完 S1→S9，再用模拟的校准结果走到 S10。
 - 打包出的 Harbor 任务：用本机 Docker 实际跑 Harbor，oracle reward=1，nop reward=0（`tbsgen harbor-local`，Dockerfile 换成本地基础镜像）。

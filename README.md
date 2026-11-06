@@ -173,14 +173,13 @@ credentials). The built-in price table is a placeholder; set prices for your mod
 
 | Variable | Used by | Purpose |
 |---|---|---|
-| `TBS_OPUS_URL` | gen | Teacher endpoint URL. The default is a local gateway on `127.0.0.1`; **override it** here or with `models.opus.url`. |
+| `TBS_OPUS_URL` | gen | Teacher endpoint URL (Anthropic-compatible `/v1/messages`). No default: set it here or with `models.opus.url`; real model stages pause with `model:config` until it is set. |
 | *your `key_env`* | gen | Teacher API key, if `models.opus.key_env` is set. |
-| `TBS_WORKSPACE` | gen, retrieval eval scripts | Root of the author's workspace. The default is a machine-specific absolute path; **set it**, or set the variables below directly. |
-| `TBS_OLD_PIPE` | gen, retrieval | Data from an earlier pipeline: a full-text cache (`literature/txt`) and TB-Science task texts used for deduplication (`tasks_text`). Defaults to a path under `TBS_WORKSPACE`; missing directories are skipped. |
-| `TBS_LEAK_REFS` | retrieval | JSON file of papers that TB-Science tasks were built from; these are excluded from retrieval. Defaults to a path under `TBS_OLD_PIPE`; skipped if missing. |
-| `TBS_HARBOR_ROOT` | gen (S9) | Directory with your Harbor job launch scripts for calibration. Defaults to a path under `TBS_WORKSPACE`. |
+| `TBS_OLD_PIPE` | gen, retrieval | Data from an earlier pipeline: a full-text cache (`literature/txt`) and TB-Science task texts used for deduplication (`tasks_text`). Unset: no full-text cache and no deduplication. |
+| `TBS_LEAK_REFS` | retrieval | JSON file of papers that TB-Science tasks were built from; these are excluded from retrieval. Defaults to `$TBS_OLD_PIPE/literature/tbs_task_refs.json` when `TBS_OLD_PIPE` is set; otherwise no exclusion list. |
+| `TBS_HARBOR_ROOT` | gen (S9) | Directory with your Harbor job launch scripts for calibration (`calib.harbor_root`). Unset: S9 prints a plain `harbor run --config ...` command. |
 | `TBS_HARBOR_BIN` | gen | Path to the `harbor` binary for `tbsgen harbor-local` (otherwise looked up on `PATH`). |
-| `TBS_SEARCH_POOL_URL` | retrieval | Search-pool service for Exa (`sources.exa.backend = "pool"`, the default). The default is `127.0.0.1`; **override it**, or set `backend = "direct"` and use `EXA_API_KEY_SECONDARY`. |
+| `TBS_SEARCH_POOL_URL` | retrieval | Search-pool service for Exa (`sources.exa.backend = "pool"`, the default). No default: unset means Exa is skipped. Or set `backend = "direct"` and use `EXA_API_KEY_SECONDARY`. |
 | `OPENALEX_API_KEY` | retrieval | Optional; OpenAlex also works without a key, at lower rate limits. |
 | `SEMANTIC_SCHOLAR_API_KEY` | retrieval | Required for Semantic Scholar; the source is skipped without it. |
 | `EXA_API_KEY_SECONDARY` | retrieval | Exa key, used with `sources.exa.backend = "direct"`. |
@@ -190,14 +189,16 @@ credentials). The built-in price table is a placeholder; set prices for your mod
 Crossref, arXiv and Europe PMC need no key. `uv run tbsretr status` lists which sources are usable;
 it shows whether a key is present, never its value.
 
-### Defaults you must override on another machine
+### Optional external settings
 
-Several defaults point at the author's machine: `TBS_WORKSPACE` and every path derived from it,
-the teacher URL (`127.0.0.1:3000`), the Exa search-pool URL (`127.0.0.1:18150`), and the S9
-launcher scripts and Harbor agent classes under `[calib]` (`student_launcher`, `teacher_launcher`,
-`student_agent`, `teacher_agent`, `environment`). Set them with the environment variables above or
-in your TOML file. Leaving them unset does not affect the tests or the dry run, but a real run then
-has no full-text cache, no deduplication against TB-Science tasks and no calibration.
+There are no machine-specific defaults. Unset settings switch the corresponding feature off:
+the teacher URL (real model stages pause until it is set), the Exa search pool (Exa skipped),
+`TBS_OLD_PIPE` (no full-text cache, no deduplication against TB-Science tasks), and the S9 launcher
+settings under `[calib]` (`harbor_root`, `student_launcher`, `teacher_launcher`). Without launchers,
+S9 writes the job config and prints a plain `harbor run --config <file> --yes` command, and
+`allow_submit = true` refuses to launch. Calibration jobs use Harbor's built-in `claude-code` agent
+and `docker` environment unless `student_agent`, `teacher_agent` or `environment` name a custom
+`module:Class`. None of this affects the tests or the dry run.
 
 All other keys and their defaults are in [`gen/src/tbsgen/config.py`](gen/src/tbsgen/config.py) and
 [`retrieval/src/tbsretr/config.py`](retrieval/src/tbsretr/config.py), and are explained in the two
@@ -212,8 +213,8 @@ Research code under active development.
 
 **Tests** (run by [GitHub Actions CI](.github/workflows/ci.yml) on every push to `main` and every pull request)
 
-- `retrieval/`: 46 offline unit tests that replay recorded API responses.
-- `gen/`: 65 tests: 49 unit tests and 16 integration tests that run task code in Docker. Locally
+- `retrieval/`: 47 offline unit tests that replay recorded API responses.
+- `gen/`: 69 tests: 53 unit tests and 16 integration tests that run task code in Docker. Locally
   they are skipped when Docker or the sandbox image is missing; CI builds the image and fails if
   any of them is skipped.
 - Fake-model dry run: S1 → S10 on a synthetic toy task, including the mechanical gates and
@@ -243,7 +244,7 @@ Research code under active development.
   file-format and interactive task forms are not implemented.
 - The expert-time estimate in `task.toml` is the teacher model's own estimate.
 - Full text comes only from a local cache or open-access PDF links.
-- S9 job submission is wired to the author's Harbor launch scripts; you need to supply your own.
+- Automatic S9 job submission needs your own Harbor launch scripts (`calib.*_launcher`).
 
 ## Repository layout
 

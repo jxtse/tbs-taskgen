@@ -15,10 +15,12 @@ from pathlib import Path
 from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[3]          # repo root (gen/ and retrieval/ live here)
-# Machine-specific locations.  Override with env vars (or config.toml) on another machine.
-WORKSPACE = Path(os.environ.get("TBS_WORKSPACE", "/Volumes/Storage/hermes/workspace"))
-OLD_PIPE = Path(os.environ.get("TBS_OLD_PIPE", str(WORKSPACE / "tbs-datapipe-20261015")))
-HARBOR_ROOT = Path(os.environ.get("TBS_HARBOR_ROOT", str(WORKSPACE / "tbs-aliyun")))
+# Optional external locations.  No machine-specific defaults: unset -> the feature that needs them is off
+# (no full-text cache, no TB-Science dedup, no launcher-based calibration submit).  Set the env vars or the
+# corresponding config.toml keys.
+_OLD_PIPE = os.environ.get("TBS_OLD_PIPE") or None          # earlier pipeline data: literature/txt, tasks_text
+OLD_PIPE = Path(_OLD_PIPE) if _OLD_PIPE else None
+HARBOR_ROOT = os.environ.get("TBS_HARBOR_ROOT") or None     # directory holding your Harbor launcher scripts
 
 DEFAULTS: dict[str, Any] = {
     "run": {
@@ -53,7 +55,8 @@ DEFAULTS: dict[str, Any] = {
             "review": "rules",              # S8 preservation review (mechanical diff; cheap model 待定)
             "invert": None,                 # S7 L4b cheap-agent inversion attack (待定; disabled)
         },
-        "opus": {"model": "claude-opus-5-5", "url": os.environ.get("TBS_OPUS_URL", "http://127.0.0.1:3000/v1/messages"),
+        # url: Anthropic-compatible /v1/messages endpoint.  No default: set TBS_OPUS_URL or models.opus.url.
+        "opus": {"model": "claude-opus-5-5", "url": os.environ.get("TBS_OPUS_URL") or None,
                  "effort": "medium", "max_tokens": 32000, "timeout": 1800, "retries": 2},
         # USD per million tokens.  PLACEHOLDERS: set real prices for your model.
         "prices": {"claude-opus-5-5": {"in": 5.0, "out": 25.0, "cache_read": 0.5},
@@ -63,7 +66,7 @@ DEFAULTS: dict[str, Any] = {
     "screen": {"min_score": 2, "keep_top": 20},
     "fulltext": {
         "mode": "oa_and_cache",             # local full-text cache (read-only) then OA PDF link; else browser queue
-        "cache_dirs": [str(OLD_PIPE / "literature" / "txt")],
+        "cache_dirs": [str(OLD_PIPE / "literature" / "txt")] if OLD_PIPE else [],
         "min_chars": 8000,
         "title_match_min": 0.6,
         "max_pdf_mb": 40,
@@ -71,7 +74,7 @@ DEFAULTS: dict[str, Any] = {
         "allow_network": True,
     },
     "probe": {
-        "tbs_tasks_root": str(OLD_PIPE / "tasks_text"),
+        "tbs_tasks_root": str(OLD_PIPE / "tasks_text") if OLD_PIPE else None,   # None -> no TBS dedup
         "decontam_cos_max": 0.30,
         "min_method_hits": 2,
     },
@@ -118,14 +121,18 @@ DEFAULTS: dict[str, Any] = {
     "calib": {
         "harness": "claude-code", "cc_version": "2.1.280",      # decision 2026-11-05
         "student_model": "glm-5.3",
-        "student_agent": "harbor_ext.glm65_agents:ClaudeCodeGlm65",
+        # Agent / environment: None -> Harbor's built-in "claude-code" agent and "docker" environment;
+        # otherwise an import path "module:Class" for a custom Harbor agent / environment.
+        "student_agent": None,
         "teacher_model": "claude-opus-5-5",
-        "teacher_agent": "harbor_ext.tbs_agent:ClaudeCodeTbs",
-        "environment": "harbor_ext.sandbox:SandboxEnvironment",
-        "harbor_root": str(HARBOR_ROOT),
+        "teacher_agent": None,
+        "environment": None,
+        # Launchers: scripts under harbor_root called as `./<launcher> run <job-config.json>`.  Unset -> the
+        # printed command is a plain `harbor run --config ...`, and allow_submit=true refuses to launch.
+        "harbor_root": HARBOR_ROOT,
         "jobs_dir": str(REPO_ROOT / "gen" / "state" / "harbor-jobs"),
-        "student_launcher": "glm53-official65/run-glm65.sh",
-        "teacher_launcher": "run-job-opus.sh",
+        "student_launcher": None,
+        "teacher_launcher": None,
         "allow_submit": False,              # must be flipped explicitly; True = reserve in ledger + tmux launch
         "est_usd_per_run": 20.0,            # ledger reservation per Harbor run; settled with the job's cost_usd
         "teacher_available": True,          # False: GLM#1 fail -> parked:teacher_unavailable (no teacher run)

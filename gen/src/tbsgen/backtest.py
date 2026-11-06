@@ -10,6 +10,11 @@ Controls:
   * doi-196db5a3b2c31394 post-fix
 
     uv run python -m tbsgen.backtest --out eval/leak_backtest [--limit N] [--no-introspect]
+
+Data locations (required, no defaults):
+  TBS_BACKTEST_REVIEWED  reviewed batch: REVIEW_DECISIONS.jsonl, harbor-v07-new244/, harbor-v07-new244-fix/
+  TBS_BACKTEST_CORPUS    packaged pre-review tasks (one Harbor task dir per id) for the positives
+  TBS_BACKTEST_HOLDOUT   held-out packaged tasks (--set holdout81 only)
 """
 from __future__ import annotations
 
@@ -20,17 +25,23 @@ from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import os
+
 from .config import load_config
 from .leakcheck import leak_report
 
-from .config import OLD_PIPE, WORKSPACE
-
-FINAL = WORKSPACE / "out" / "tbs-simple-final-20261031"
-CORPUS = OLD_PIPE / "runs" / "st-corpus410-20261027" / "harbor"
 COV_ID = "doi-196db5a3b2c31394"
 
 
+def _dir(var: str) -> Path:
+    v = os.environ.get(var)
+    if not v:
+        raise SystemExit(f"{var} is not set (back-test data is not part of the repository; see module docstring)")
+    return Path(v)
+
+
 def cases():
+    FINAL, CORPUS = _dir("TBS_BACKTEST_REVIEWED"), _dir("TBS_BACKTEST_CORPUS")
     rows = [json.loads(x) for x in (FINAL / "REVIEW_DECISIONS.jsonl").read_text().splitlines() if x.strip()]
     out = []
     for r in rows:
@@ -46,13 +57,11 @@ def cases():
     return out
 
 
-HOLD = OLD_PIPE / "runs" / "harbor-v06"
-
-
 def holdout_cases():
     """81 accepted tasks from an earlier batch.  NOT looked at while tuning the
     rules (tuning used the 231 controls above), so their flag rate is an out-of-sample false-positive estimate.
     They passed Harbor oracle/nop but only part of them had human review."""
+    HOLD = _dir("TBS_BACKTEST_HOLDOUT")
     return [dict(id=d.name, label="clean", why="holdout81", dir=d) for d in sorted(HOLD.iterdir())
             if (d / "instruction.md").exists()]
 
