@@ -83,3 +83,38 @@
 - 3 题的 GLM 校准结果待回收，结论在下一节补充。
 - 教师（Opus agent）分支未跑：校准线路上的 Opus key 额度已用尽（探测返回 429），只能跑 GLM 分支。
 - L4b 反解、廉价模型角色仍未接。"专家时长"仍是 Opus 自报，未经人工核实。
+
+
+## 2026-11-06（续）代码审查（PR #2）后的修复与新发现
+
+### 审查意见处理（逐条见 PR #2 评论）
+
+1. **（阻断）符号链接让 truth 重新可读；探针遍历失败被当作通过。** 修复：
+   - 对 agent 目录放宽权限时不跟随符号链接、不处理目录外文件和硬链接；
+   - 先放宽 `/app`，再锁 `/tests`，锁完逐项核验，核验失败就不运行 agent 程序；
+   - 设置 `no_new_privs`；
+   - 探针改为由可信端写出具体文件路径逐个 `open`：`/tests/...`、`/src/tests/...`，以及经预置软链 `/app/output/leak` 访问的 truth。
+
+   本机 Harbor 实测：作弊解在 agent 阶段建好 `/app/output/leak -> /tests/truth`，再由 `solution_cli.py` 读隐藏真值。旧判分 reward 1.0，新判分 reward 0.0；参考解 oracle 1.0 / nop 0.0。
+2. **本地判分残留未加锁的 `/src/tests` 副本。** 复制完成后把 `/src` 设为 0700；测试中的攻击脚本读不到 `/src/tests/truth/*` 和 `/src/tests/measure.py`（修复前能读到，已用测试反证）。
+3. **S9 提交与回填存在崩溃窗口。** 修复：
+   - 作业名对 (条目, 角色, 第几次) 固定；
+   - 运行记录按 intent → reserved → launched 顺序逐步持久化，续跑时对账；
+   - 若作业目录或启动日志已存在，则只补记录、不再启动；
+   - 回填后若 item 状态未写入，可由 `calib-ingest` 恢复。
+4. **回填未校验作业身份。** `calib-ingest` 现在校验 job_name、agent 模型、task 路径三者都与待回填的那次运行一致，每个作业目录只能消费一次。
+5. **启动异常会泄漏预留额。** tmux 不存在、超时、返回非零时，预留按 0 结算，记录为 `launch_failed/infra`。启动脚本把退出码写到 `<log>.exit`，若脚本退出时没有生成作业目录，对账时同样处理。
+6. **`run_usd_total` 管不住真实支出。** 现在每次提交前检查已结算的实际支出，达到上限即停止后续提交（`budget:run_total_actual`）。**仍有的限制**：单个 Harbor 作业没有硬费用上限，一次运行的实际费用可能远超预留额（测试用例中 $10 预留结算为 $150）。
+7. **哨兵判断按全局绝对值，会误判。** 改为与 nop（空输出）的实测值比较：参考值等于空输出值即判为缺输出。两个方向、负值、零值、大量纲都有测试。
+8. **S6M 换 mid 节点后 naive ⊇ mid 不再成立。** 现在会把新节点并入 `naive_drop`，必要时由同一次调用重写 `naive.py`，并重新做 `validate_spec`，不合法则丢弃。提示词优先引导从 `naive_drop` 中选节点。
+9. **naive 上限被宽松取整破坏。** 取整后会重查 naive 是否仍被拒绝，不满足就增加有效位数。
+10. **截断落在下一个文件头时误丢上一个完整文件。** 改为按块的实际边界判断；截断落在文件头、正文、END 标记上的情况都有测试。
+
+测试：retrieval 29 passed；gen 65 passed（含 Docker 集成测试）。
+
+### 新发现（已知问题，未修）：网络与现成实现捷径
+
+- 打包出的 3 道已校准题 `task.toml` 均为 `network_mode = "public"`，agent 做题时可以联网。
+- DecontX 题的指令点名了 DecontX。PyPI 上有现成实现（如 `decontx-python`），agent 理论上可以直接 `pip install`；Fay–Herriot、RCESPP 也可能有公开代码可抄。
+- 在 GLM 校准中途做了只读核查（检索 `pip install`、`git clone`、`github.com`、`pypi.org`、`curl`、`wget`、WebFetch/WebSearch、`decontx` 包名），结果按题记录在下方"校准结果"一节。
+- 下一轮会默认 no-network，并加"现成库/仓库捷径"检查。在此之前不再提交新的校准作业。
