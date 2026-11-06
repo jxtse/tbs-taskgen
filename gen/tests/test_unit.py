@@ -148,6 +148,14 @@ def test_non_separating_threshold_rejects_clearly_worse_naive():
     t = set_thresholds(spec, meas, cfg)["thresholds"]["r"]
     assert not t["separating"] and t["naive_capped"]
     assert 1.0037 * 1.1 <= t["threshold"] < 1.478
+    # e2e-iter1 DecontX: correlation (>=), ref 0.9962, mid equal, naive 0.89 -> loose rule gave 0.49
+    spec = {"metrics": [{"name": "p", "direction": ">="}]}
+    meas = {"ref": {"0": {"p": 0.99623}, "1": {"p": 0.99692}}, "mid": {"0": {"p": 0.99623}, "1": {"p": 0.99692}},
+            "naive": {"0": {"p": 0.8908}, "1": {"p": 0.9238}}}
+    t = set_thresholds(spec, meas, cfg)["thresholds"]["p"]
+    # capped at the reference margin floor (0.99623*0.9 = 0.8966 -> 0.89 after loose rounding), not at 0.49;
+    # the naive (0.89-0.92) is inside the 10% reference margin here, so it is rejected by its other metrics
+    assert t["naive_capped"] and 0.85 < t["threshold"] <= 0.99623 * 0.9, t
 
 def test_validate_spec_ok_and_bad():
     cfg = load_config()
