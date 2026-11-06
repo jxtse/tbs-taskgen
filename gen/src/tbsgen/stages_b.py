@@ -7,7 +7,7 @@ from pathlib import Path
 
 from . import calib, gates, package, repair
 from .models import parse_files
-from .prompts import S6C_TESTS, S8_REPAIR, SYSTEM
+from .prompts import METRICS_API, S6C_TESTS, S8_REPAIR, SYSTEM
 from .stages_a import _write_files, chat_files, save_raw
 from .state import read_json, write_json
 
@@ -70,7 +70,8 @@ def s8(P, it):
     gate_log = read_json(last[-1]) if last and str(it.state.get("repair_from", "")).startswith("gates:") else \
         read_json(it.p("S6_failure.json"))
     slim = json.dumps(_slim(gate_log), default=str)[:20000]
-    user = S8_REPAIR.format(gates=slim, depgraph=json.dumps(spec["depgraph"]), files=repair.files_for_repair(task, gate_log))
+    user = S8_REPAIR.format(gates=slim, depgraph=json.dumps(spec["depgraph"]), files=repair.files_for_repair(task, gate_log),
+                            metrics_api=METRICS_API)
     r = P.client("repair").chat(SYSTEM, user, stage="S8", item=it.item_id,
                                 max_tokens=P.cfg["gen"].get("s6a_max_tokens"))
     save_raw(it, "S8", r)

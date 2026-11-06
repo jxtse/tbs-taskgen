@@ -156,6 +156,33 @@ def test_s6a_truncated_answer_gets_one_continuation(tmp_path):
     assert it.state["status"] == "waiting", it.state
 
 
+def test_mid_not_separable_reworks_only_mid(tmp_path):
+    """v2.2: S6B not_separable -> S6M rewrites baselines/mid.py around another drop node (1 call), no new spec."""
+    base = toy_script(FIX)
+    seen = []
+
+    def script(stage, system, user):
+        seen.append(stage)
+        if stage == "S6A":   # mid == reference -> fails nothing -> not separable
+            out = base(stage, system, user)
+            solve = (FIX / "solution/solve.py").read_text()
+            i = out.index("=== FILE: baselines/mid.py ===")
+            j = out.index("=== FILE:", i + 10)
+            return out[:i] + "=== FILE: baselines/mid.py ===\n" + solve + out[j:]
+        if stage == "S6M":
+            assert "MID_DROP" in user and "fails NONE" in user
+            return "MID_DROP: C2\n=== FILE: baselines/mid.py ===\n" + (FIX / "baselines/mid.py").read_text() + \
+                "=== END ===\n"
+        return base(stage, system, user)
+    P, fake = mk(tmp_path, script=script)
+    [iid] = P.ingest([make_toy_candidate(tmp_path)])
+    P.run()
+    it = P.store.item(iid)
+    assert seen.count("S5") == 1 and seen.count("S6A") == 1 and seen.count("S6M") == 1, seen
+    assert it.state["status"] == "waiting", it.state
+    assert read_json(it.p("_spec", "spec.json"))["depgraph"]["mid_drop"] == ["C2"]
+
+
 def _prog_task(root: Path, direct_exec: bool) -> tuple[Path, Path, Path]:
     task, gen = root / "task", root / "gen"
     (task / "tests").mkdir(parents=True)

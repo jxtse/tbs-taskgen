@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from pathlib import Path
 
 from . import intake, runner
 from .models import extract_json, parse_files  # noqa: F401
-from .prompts import PROMPT_VERSION, S5_SPEC, S6A_GEN, SYSTEM
+from .prompts import METRICS_API, PROMPT_VERSION, S5_SPEC, S6A_GEN, S6M_MID, SYSTEM
 from .spec import set_thresholds, validate_spec
 from .state import read_json, write_json
 
@@ -42,6 +43,11 @@ def s3(P, it):
 
 def s4(P, it):
     c = read_json(it.p("S1_candidate.json"))
+    if read_json(it.p("S2_screen.json"), {}).get("deferred"):
+        rec = intake.screen(c, P.cfg, fulltext_head=it.p("fulltext.txt").read_text()[:4000])
+        write_json(it.p("S2_screen.json"), dict(rec, rescreened_at="S4"))
+        if not rec["keep"]:
+            return it.finish("dropped", rec["reason"])
     rec = intake.probe(c, it.p("fulltext.txt").read_text(), read_json(it.p("S2_screen.json"), {}), P.cfg, P.tbs_index())
     write_json(it.p("S4_probe.json"), rec)
     if not rec["feasible"]:
@@ -146,7 +152,8 @@ def s6a(P, it):
     if not (task / "generator" / "generate.py").exists() or it.state.get("regen_6a"):
         need = {"generator/generate.py", "solution/solve.py", "tests/measure.py", "baselines/mid.py",
                 "baselines/naive.py"}
-        files, log = chat_files(P, it, "gen", "S6A", S6A_GEN.format(spec=json.dumps(spec, indent=1)), need,
+        files, log = chat_files(P, it, "gen", "S6A", S6A_GEN.format(spec=json.dumps(spec, indent=1),
+                                                                       metrics_api=METRICS_API), need,
                                 max_tokens=P.cfg["gen"].get("s6a_max_tokens"))
         write_json(it.p("S6A_calls.json"), log)
         if not need <= set(files):
@@ -190,6 +197,11 @@ def s6b(P, it):
     th = set_thresholds(spec, meas, P.cfg)
     write_json(it.p("thresholds.json"), th)
     if th["status"] == "not_separable":
+        # v2.2: first try a cheaper fix: rewrite only baselines/mid.py around another drop node (S6M).  In
+        # e2e-iter1 3/5 papers had a mid that failed (almost) every metric -- the dropped node was too
+        # fundamental -- and going back to S5 regenerated spec + all code (~$1.4/paper) for the same outcome.
+        if it.state.get("mid_rework", 0) < P.cfg["gen"].get("mid_rework_max", 1):
+            return it.goto("S6M", "mid_not_separable")
         back = it.state.get("back_to_spec", 0)
         if back < P.cfg["gen"]["back_to_spec_max"]:
             it.state["back_to_spec"] = back + 1
@@ -202,6 +214,39 @@ def s6b(P, it):
     if th["status"] != "ok":
         return _to_repair(P, it, th["status"], th)
     it.advance("S6B", "S6C", separating=th["separating"])
+
+
+def s6m(P, it):
+    """Rewrite baselines/mid.py around a different mid_drop node (one model call), then re-measure."""
+    spec = read_json(it.p("_spec", "spec.json"))
+    meas = read_json(it.p("S6A_measure.json"))
+    th = read_json(it.p("thresholds.json"))
+    task = it.p("task")
+    g = spec["depgraph"]
+    tried = list(dict.fromkeys(g.get("mid_drop", []) + it.state.get("avoid_mid_drop", [])))
+    n_fail = max(th.get("mid_fail", {}).values() or [0])
+    user = S6M_MID.format(spec=json.dumps(spec, indent=1), solve=(task / "solution" / "solve.py").read_text(),
+                          ref=json.dumps(meas["ref"]), mid=json.dumps(meas["mid"]), old_drop=g.get("mid_drop"),
+                          n_fail=n_fail, n_metrics=len(spec.get("metrics", [])), tried=tried)
+    if n_fail < P.cfg["thresholds"]["min_mid_fail"]:
+        user = user.replace("The current mid fails too many", "The current mid fails NONE of them (the dropped "
+                            "step does not matter enough); before it was").replace(
+            "is too\nfundamental", "has too little effect")
+    it.state["mid_rework"] = it.state.get("mid_rework", 0) + 1
+    files, log = chat_files(P, it, "gen", "S6M", user, {"baselines/mid.py"},
+                            max_tokens=P.cfg["gen"].get("s6c_max_tokens"))
+    write_json(it.p(f"S6M_calls-{it.state['mid_rework']}.json"), log)
+    raw = sorted(it.p("raw").glob("S6M-*.txt"))
+    m = re.search(r"MID_DROP:\s*([A-Za-z0-9_\-]+)", raw[-1].read_text()) if raw else None
+    if "baselines/mid.py" not in files:
+        return it.finish("dropped", "s6m_missing_file")
+    _write_files(task, {"baselines/mid.py": files["baselines/mid.py"]}, ("baselines/mid.py",))
+    if m:
+        it.state.setdefault("avoid_mid_drop", []).extend(g.get("mid_drop", []))
+        spec["depgraph"]["mid_drop"] = [m.group(1)]
+        write_json(it.p("_spec", "spec.json"), spec)
+    it.save()
+    it.advance("S6M", "S6A_run", mid_drop=m.group(1) if m else None)
 
 
 def _to_repair(P, it, why: str, info):

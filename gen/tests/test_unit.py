@@ -101,6 +101,24 @@ def test_parse_files_truncated_drops_partial_last_block():
     assert set(parse_files(done, truncated=True)) == {"a.py", "b.py"}
 
 
+# ------------------------------------------------------------------ intake screen
+def test_screen_keeps_method_papers_found_in_e2e():
+    from tbsgen.intake import screen
+    cfg = load_config()
+    ismv = dict(title="An iterative spherical mean value method for background field removal in MRI",
+                abstract="The proposed background field removal method, termed iterative SMV (iSMV), consists of "
+                         "applying the SMV operation repeatedly on the field map. It was validated in a phantom; "
+                         "truncation threshold needed for deconvolution.")
+    assert screen(ismv, cfg)["keep"]
+    noabs = dict(title="Thermal drift in room temperature nanoindentation experiments: Measurement and correction")
+    r = screen(noabs, cfg)
+    assert r["keep"] and r["deferred"]
+    r2 = screen(noabs, cfg, fulltext_head="We propose a correction algorithm; drift is estimated by least-squares "
+                                          "fitting of hold segments and validated by simulation.")
+    assert r2["keep"] and not r2.get("deferred")
+    assert not screen(dict(title="A review", abstract="This review surveys perspectives."), cfg)["keep"]
+
+
 # ------------------------------------------------------------------ spec + thresholds
 def test_non_separating_threshold_rejects_clearly_worse_naive():
     # e2e-iter1 numbers: ratio metric, ref ~1.00, mid ~1.08 (not separating at 10%), naive ~1.5 -> was 1.6 (naive passed)
