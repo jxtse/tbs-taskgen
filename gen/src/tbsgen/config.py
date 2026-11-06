@@ -95,6 +95,7 @@ DEFAULTS: dict[str, Any] = {
     },
     "thresholds": {
         "frac": 0.5,                        # 待定: threshold position between ref and mid (log-midpoint)
+        "sentinel_abs": 1e5,                # reference metric |value| >= this on a "<=" metric = missing output
         "min_ref_margin": 0.10,             # reference must clear each threshold by >=10% (relative)
         "loose_margin": 0.50,               # non-separating metrics: threshold = ref worsened by 50%
         "max_mid_fail": 2, "min_mid_fail": 1,
