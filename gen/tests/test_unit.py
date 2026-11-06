@@ -157,6 +157,20 @@ def test_non_separating_threshold_rejects_clearly_worse_naive():
     # the naive (0.89-0.92) is inside the 10% reference margin here, so it is rejected by its other metrics
     assert t["naive_capped"] and 0.85 < t["threshold"] <= 0.99623 * 0.9, t
 
+def test_mid_fail_counts_public_hidden_twins_once():
+    # e2e-iter1 RCESPP: mid fails optimal_frac on public AND hidden + mean_rel_gap = 2 criteria (was 3 -> dropped)
+    cfg = load_config()
+    spec = {"metrics": [{"name": n, "direction": d} for n, d in
+                        (("hidden_feasible_frac", ">="), ("hidden_optimal_frac", ">="), ("hidden_mean_rel_gap", "<="),
+                         ("public_optimal_frac", ">="))]}
+    ref = {"hidden_feasible_frac": 1.0, "hidden_optimal_frac": 1.0, "hidden_mean_rel_gap": 0.01,
+           "public_optimal_frac": 1.0}
+    mid = {"hidden_feasible_frac": 1.0, "hidden_optimal_frac": 0.7, "hidden_mean_rel_gap": 0.067,
+           "public_optimal_frac": 0.667}
+    th = set_thresholds(spec, {"ref": {"0": ref}, "mid": {"0": mid}, "naive": {"0": mid}}, cfg)
+    assert th["mid_fail"] == {"0": 2} and th["status"] == "ok", th
+
+
 def test_validate_spec_ok_and_bad():
     cfg = load_config()
     assert validate_spec(SPEC, cfg) == []

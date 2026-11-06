@@ -50,7 +50,8 @@ def check(cfg: dict, run_root: Path, item_dir: Path, harbor: str | None = None, 
     for agent in ("oracle", "nop"):
         job = f"{item_dir.name}-{agent}-{time.strftime('%Y%m%d%H%M%S')}"
         t0 = time.time()
-        env = {k: v for k, v in os.environ.items() if k not in ("PYTHONPATH", "PYTHONHOME", "VIRTUAL_ENV")}
+        env = {k: v for k, v in os.environ.items()     # a foreign DOCKER_CONFIG hides the compose plugin
+               if k not in ("PYTHONPATH", "PYTHONHOME", "VIRTUAL_ENV", "DOCKER_CONFIG")}
         p = subprocess.run([harbor, "run", "-p", str(tdir), "-a", agent, "-o", str(base / "jobs"), "--job-name", job,
                             "-n", "1", "-q", "--yes"], capture_output=True, text=True, timeout=timeout, env=env)
         (base / "logs").mkdir(parents=True, exist_ok=True)
