@@ -110,7 +110,10 @@ def submit(cfg: dict, item_dir: Path, who: str, n: int, ledger=None) -> dict:
     if ledger is not None:
         rec["ledger_call"] = ledger.reserve(model, "S9", item_dir.name, True, est_usd=float(c["est_usd_per_run"]))
     log = item_dir / "calib" / f"{job_name}.log"
-    inner = f"env -u PYTHONPATH -u VIRTUAL_ENV {cmd} > {shlex.quote(str(log))} 2>&1"
+    # `env` must wrap the launcher, not `cd` (env would exec /usr/bin/cd in a child and the launcher would start
+    # from the wrong directory -- first real canary launch failed this way)
+    inner = (f"cd {shlex.quote(c['harbor_root'])} && env -u PYTHONPATH -u VIRTUAL_ENV ./{launcher} run "
+             f"{shlex.quote(str(p))} > {shlex.quote(str(log))} 2>&1")
     r = subprocess.run(["tmux", "new-session", "-d", "-s", job_name[-60:], "bash", "-lc", inner],
                        capture_output=True, text=True)
     if r.returncode != 0:

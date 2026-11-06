@@ -106,9 +106,14 @@ def set_thresholds(spec: dict, measure: dict, cfg: dict) -> dict:
             nv = [v.get(name) for v in measure.get("naive", {}).values()]
             nv = [x for x in nv if x is not None and math.isfinite(x)]
             n_best = (min(nv) if d == "<=" else max(nv)) if nv else None
-            if n_best is not None and _worse(d, n_best, r) and abs(n_best - r) > margin * max(abs(r), 1e-12):
+            # v2.2: also when naive is worse by less than min_ref_margin (e2e-iter1: Pearson ref 0.996, naive 0.89,
+            # loose rule gave 0.49), but never tighter than the reference worsened by min_ref_margin
+            if n_best is not None and _worse(d, n_best, r):
                 mid_n = math.exp(math.log(r) + tc["frac"] * (math.log(n_best) - math.log(r))) \
                     if r > 0 and n_best > 0 else r + tc["frac"] * (n_best - r)
+                floor = r * (1 + margin) if (d == "<=") == (r >= 0) else r * (1 - margin)
+                if _worse(d, floor, mid_n):          # midpoint tighter than the reference margin allows
+                    mid_n = floor
                 if _worse(d, thr, mid_n):
                     thr, naive_capped = mid_n, True
         thr = _round_sig(thr, tc["sig_digits"], d, toward_loose=True)
