@@ -9,8 +9,8 @@ Decision rule:
     GLM#2 fail  -> "unstable" (keep: GLM 1/2);  GLM#2 pass -> "easy" (S9b variants disabled in MVP)
 Infra outcomes (API quota/auth/stream errors with reward 0, sandbox start/setup timeouts, cancelled) are not
 attempts; they are retried up to calib.infra_retries, then the item is parked "infra".
-A trial with reward 1 counts as a pass even if Claude Code later raised an API error (on 2026-11-02, 9 of the
-104 UnknownApiError teacher trials had reward 1).
+A trial with reward 1 counts as a pass even if Claude Code later raised an API error (this happens: the task
+can be solved before the error).
 """
 from __future__ import annotations
 

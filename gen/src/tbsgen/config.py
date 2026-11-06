@@ -62,7 +62,7 @@ DEFAULTS: dict[str, Any] = {
     # ---------------------------------------------------------------- stages
     "screen": {"min_score": 2, "keep_top": 20},
     "fulltext": {
-        "mode": "oa_and_cache",             # cache (old literature/txt, read-only) then OA PDF link; else browser queue
+        "mode": "oa_and_cache",             # local full-text cache (read-only) then OA PDF link; else browser queue
         "cache_dirs": [str(OLD_PIPE / "literature" / "txt")],
         "min_chars": 8000,
         "title_match_min": 0.6,
@@ -80,7 +80,7 @@ DEFAULTS: dict[str, Any] = {
         "prog_quota_frac": 0.5,             # 待定: max share of PROG among released tasks
         "spec_retries": 1,
         "excerpt_chars": 60000,
-        "expert_hours": [2, 6],             # target expert time stated in the S5 prompt (old pipeline: 0.4-0.6 h)
+        "expert_hours": [2, 6],             # target expert time stated in the S5 prompt
         "max_tokens": 32000,
     },
     "gen": {
@@ -127,7 +127,7 @@ DEFAULTS: dict[str, Any] = {
         "student_launcher": "glm53-official65/run-glm65.sh",
         "teacher_launcher": "run-job-opus.sh",
         "allow_submit": False,              # must be flipped explicitly; True = reserve in ledger + tmux launch
-        "est_usd_per_run": 20.0,            # ledger reservation per Harbor run (GLM-5.3 short tasks: p90 ~$19)
+        "est_usd_per_run": 20.0,            # ledger reservation per Harbor run; settled with the job's cost_usd
         "teacher_available": True,          # False: GLM#1 fail -> parked:teacher_unavailable (no teacher run)
         "prepared_tasks_dir": None,         # sandbox-prepared task copies (docker_image set), one dir per item
         "glm_runs_on_first_fail": 1,        # first GLM fail -> teacher (no 2nd GLM run)

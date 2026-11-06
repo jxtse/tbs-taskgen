@@ -1,6 +1,6 @@
 # 泄漏门回测（不调 LLM）
 
-命令：`uv run python -m tbsgen.backtest --out eval/leak_backtest_final`；留出集加 `--set holdout81`。
+命令：`uv run python -m tbsgen.backtest --out eval/leak_backtest_final`；留出集加 `--set holdout81`。回测用的是早期批次的题目，数据不在仓库里，这里只保留结果。
 结果：`leak_backtest_final/{summary.json,results.jsonl}`、`leak_backtest_final_holdout81/`。
 每题平均耗时 1.5 s。L3 自省在 Docker 里运行（`--network none`、数据只读），只有含公开 `.py` 的题才需要跑。
 
@@ -8,9 +8,9 @@
 
 | 集合 | 题数 | 来源 | 用途 |
 |---|---|---|---|
-| 正例 | 7 | 人工复审丢弃的 6 道黑盒 Oracle 泄漏题（`st-corpus410/harbor/<id>`），以及协方差可反解题 `doi-196db5a3b2c31394` 的修复前版本 | 召回 |
-| 对照 | 231 | `tbs-simple-final-20261031/harbor-v07-new244` 中复审通过的 230 题，加上 196db 的修复后版本 | 误报（**样本内**：规则是对着这批题调的） |
-| 留出 | 81 | `runs/harbor-v06`（早期 81 题，调规则时没看过） | 误报（样本外） |
+| 正例 | 7 | 早期批次中人工复审丢弃的 6 道黑盒 Oracle 泄漏题，以及协方差可反解题 `doi-196db5a3b2c31394` 的修复前版本 | 召回 |
+| 对照 | 231 | 早期批次中人工复审通过的 230 题，加上 196db 的修复后版本 | 误报（**样本内**：规则是对着这批题调的） |
+| 留出 | 81 | 更早一批的 81 题（调规则时没看过） | 误报（样本外） |
 
 ## 结果
 

@@ -1,5 +1,5 @@
-"""Sandbox runner: run a command in a resource-capped, network-less Docker container (same flags as the old
-remote/validate.py drun).  Docker only: generated task code hard-codes /app and /tests paths.
+"""Sandbox runner: run a command in a resource-capped, network-less Docker container.
+Docker only: generated task code hard-codes /app and /tests paths.
 
     run(cfg, mounts=[(host, container, "ro"|"rw")], cmd="...", timeout=300, name="tbsgen-...")
     -> {"rc", "out", "err", "sec"}

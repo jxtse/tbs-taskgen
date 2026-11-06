@@ -161,7 +161,7 @@ def rrf_scores(pool: Pool, cfg: dict, allowed_sources: set[str] | None = None) -
 def fuse(pool: Pool, cfg: dict, leak: set[str], exclude: set[str] | frozenset = frozenset(),
          allowed_sources: set[str] | None = None, top_n: int | None = None) -> tuple[list[dict], list[dict]]:
     sc = rrf_scores(pool, cfg, allowed_sources)
-    # Missing abstract is a soft signal (methodlit.py: "A missing abstract is not a reason to exclude"): such papers
+    # Missing abstract is a soft signal ("a missing abstract is not a reason to exclude"): such papers
     # stay in the ranking with score x no_abstract_factor and abstract_missing=True; the hard drop only applies
     # when prefilter.drop_no_abstract is True.
     fac = cfg["prefilter"].get("no_abstract_factor", 0.5)

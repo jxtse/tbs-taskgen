@@ -1,5 +1,5 @@
-"""Copied from tbs-datapipe-20261015/pipeline/tbsdata/templates_metrics.py (v0.3); v2 change: ENTRY can be
-overridden by TBSGEN_ENTRY (local test runner only).
+"""Verifier helper (v0.3, carried over from the previous pipeline); ENTRY can be overridden by TBSGEN_ENTRY
+(local test runner only).
 
 Injected into every generated task as tests/_metrics.py (dense sub-scores for closeness analysis).
 

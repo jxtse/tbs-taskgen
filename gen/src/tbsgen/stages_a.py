@@ -209,7 +209,7 @@ def s6b(P, it):
     if th["status"] == "not_separable":
         # v2.2: first try a cheaper fix: rewrite only baselines/mid.py around another drop node (S6M).  In
         # e2e-iter1 3/5 papers had a mid that failed (almost) every metric -- the dropped node was too
-        # fundamental -- and going back to S5 regenerated spec + all code (~$1.4/paper) for the same outcome.
+        # fundamental -- and going back to S5 regenerated spec + all code for the same outcome.
         if it.state.get("mid_rework", 0) < P.cfg["gen"].get("mid_rework_max", 1):
             return it.goto("S6M", "mid_not_separable")
         back = it.state.get("back_to_spec", 0)

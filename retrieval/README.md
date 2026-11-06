@@ -83,7 +83,7 @@ out["dropped"]     # 预筛剔除的计数：综述、非英文、无摘要、TB
 | arXiv | 2 次（只在路由命中 astro-ph / physics / cond-mat / quant-ph / stat / math / cs 时调用） | 预印本。单连接，每 3.1 s 一次 |
 | Europe PMC | 2 次（只用于生物医学目标） | 生物医学论文；OA/PMC 全文链接 |
 
-融合规则：每个源的每类列表（例如 `openalex.search`）内，一篇论文按最佳名次计 `w/(60+rank)`，其余命中按 25% 计入；然后跨列表求和。权重在 `config.py: fusion.weights`。预筛规则沿用 `methodlit.py` 的排除口径：剔除综述/教程/观点类，剔除非英文（语言字段或拉丁字符占比 < 85%），摘要不足 200 字符的论文不剔除，只把分数 ×0.5 并标记 `abstract_missing`（`drop_no_abstract=True` 时改为硬剔除），剔除 `tbs_task_refs.json` 里的 TBS 题目出处 DOI，剔除勘误/社论/数据集等类型，剔除 1985 年以前的论文。资源清单另外剔除 URL 含 `terminal-bench-science` 的条目：TBS 仓库本身会泄题，实测 Exa 和 Tavily 都返回过它。
+融合规则：每个源的每类列表（例如 `openalex.search`）内，一篇论文按最佳名次计 `w/(60+rank)`，其余命中按 25% 计入；然后跨列表求和。权重在 `config.py: fusion.weights`。预筛规则沿用早期方法文献检索的排除口径：剔除综述/教程/观点类，剔除非英文（语言字段或拉丁字符占比 < 85%），摘要不足 200 字符的论文不剔除，只把分数 ×0.5 并标记 `abstract_missing`（`drop_no_abstract=True` 时改为硬剔除），剔除 `tbs_task_refs.json` 里的 TBS 题目出处 DOI，剔除勘误/社论/数据集等类型，剔除 1985 年以前的论文。资源清单另外剔除 URL 含 `terminal-bench-science` 的条目：TBS 仓库本身会泄题，实测 Exa 和 Tavily 都返回过它。
 
 ## 凭据
 

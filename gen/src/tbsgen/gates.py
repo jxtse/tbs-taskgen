@@ -12,7 +12,7 @@ gates/attempt-<n>.json = {"gates": {name: bool}, "blocking": [names], "details":
   truth_isolation PROG: a probe solution_cli.py (reads every file under /tests except hidden inputs) must be run
                 via _metrics.run_solution and read nothing; catches verifiers that exec agent code themselves
                 (as root, truth readable) -- found in e2e-iter1 where a truth-reading CLI got reward 1
-  thresholds_stated  every threshold appears numerically in instruction.md (old G7)
+  thresholds_stated  every threshold appears numerically in instruction.md
   leak          L1-L4a (leakcheck.leak_report, with depgraph)
   isolation     no tests/, truth, generator under environment/; no python oracle module in public data for
                 non-INTERACT forms that reads a non-public file
