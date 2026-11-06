@@ -87,7 +87,7 @@ cd gen
 uv sync
 docker build --build-arg PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple \
   -t tbsgen-base:py311-sci-v2 -f docker/Dockerfile.base docker/     # 沙箱镜像（已建好）
-uv run pytest -q                                                    # 36 个测试（集成测试需要 Docker）
+uv run pytest -q                                                    # 49 个测试（集成测试需要 Docker）
 uv run python -m tbsgen.dryrun --out runs/dryrun-X                  # fake 模型端到端干跑
 uv run python -m tbsgen.backtest --out eval/leak_backtest_X         # 泄漏门回测（--set holdout81 跑留出集）
 
@@ -97,7 +97,9 @@ uv run tbsgen run    --run runs/R --config config.toml [--max-steps N] [--only I
 uv run tbsgen status --run runs/R ; uv run tbsgen report --run runs/R ; uv run tbsgen ledger --run runs/R
 uv run tbsgen resume --run runs/R --config config.toml              # 恢复因预算/熔断暂停的条目
 uv run tbsgen breaker --run runs/R --model claude-opus-5-5 --reset  # 人工解除熔断
-uv run tbsgen calib-ingest --run runs/R --item ID --job-dir <harbor job 目录>   # 回填校准结果
+uv run tbsgen calib-ingest --run runs/R --item ID [--job-dir DIR]   # 回填校准结果（默认取该次提交的作业目录；作业未结束则拒绝）
+uv run tbsgen harbor-local --run runs/R [--item ID]                  # 本机 Harbor oracle/nop（换本地基础镜像）
+uv run tbsgen reset  --run runs/R --item ID --stage S6B [--regen]    # 管线修复后让条目从某阶段重来（记入 history）
 uv run tbsgen ping --run state/ping --calls 1 --budget-usd 1        # Opus 连通性（真实调用）
 ```
 
@@ -119,20 +121,27 @@ allow_submit = false
 |---|---|---|
 | `budget.daily_usd_total` | **None** | 未设置时拒绝一切真实模型调用（预算暂不定） |
 | `budget.daily_usd_per_model / per_stage / daily_calls_per_model` | 空 | 可选的细分上限 |
-| `budget.max_calls_per_item` | 24 | 单条目所有阶段、所有尝试的调用总上限 |
+| `budget.max_calls_per_item` | 24 | 单条目出题调用（S5–S8，所有尝试）总上限；S9 不计入 |
+| `budget.run_usd_total / run_calls_per_model` | None / 空 | 整个运行目录（跨天）的总上限；S9 每次按 `calib.est_usd_per_run` 预留 |
 | `budget.breaker_open_on` | quota, auth | 出现即熔断；另有连续 4 次错误也熔断 |
 | `budget.est_usd_per_call` | 1.5 | 调用前按此金额预占，用于判断是否会超预算 |
 | `models.prices` | Opus $5/$25 每百万 token | **占位**，同 DESIGN §3.1，需用账单替换 |
 | `models.cheap` / `roles.screen/probe/review/invert` | None / rules | 廉价模型角色**待定**；S2/S4/S8 审查先用规则，L4b 跳过 |
 | `spec.allowed_forms` | ANS, PROG | DOMF 需要逐格式读写库；INTERACT 在隔离方案落地前禁止 |
 | `spec.prog_quota_frac` | 0.5 | PROG 占比上限（**待定**；当前只记录，未在调度中强制） |
-| `thresholds.frac / min_ref_margin / loose_margin` | 0.5 / 0.10 / 0.50 | 阈值位置（**待定**） |
+| `thresholds.frac / min_ref_margin / loose_margin` | 0.5 / 0.10 / 0.50 | 阈值位置（**待定**）；非区分指标若 naive 明显更差，阈值收到参考与 naive 的对数中点（不紧于参考×(1±margin)） |
+| `thresholds.sentinel_abs` | 1e5 | "≤"指标上参考值达到此量级视为缺输出（判分脚本的哨兵值） |
+| `gen.s6a_max_tokens / s6c_max_tokens / continue_calls` | 64000 / 48000 / 1 | 多文件输出上限；被截断时最多 1 次续写，只要缺的文件 |
+| `gen.mid_rework_max` | 1 | mid 不可区分时先由 S6M 只重写 `baselines/mid.py`，再不行才回 S5 |
 | `gates.max_repair_rounds` | 2 | 沿用旧上限 |
 | `calib.quick_pass_minutes` | None | GLM 首次通过且用时短时直接记 easy（DESIGN 建议 30 min，**待定**，默认关） |
 | `calib.keep_labels` | hard, unstable | decision 2026-11-05 |
 | `calib.variant_depth` | 0 | S9b 更难变体（**待定**，MVP 关闭） |
 | `calib.infra_retries` | 2 | API/沙箱异常不计入校准次数 |
-| `calib.allow_submit` | **False** | 不自动提交 Harbor 作业 |
+| `calib.allow_submit` | **False** | True 时：账本预留 → tmux 后台运行启动脚本；预留超总额则拒绝 |
+| `calib.est_usd_per_run` | 20 | 每次校准作业的预留额，`calib-ingest` 用 Harbor `cost_usd` 冲销 |
+| `calib.teacher_available` | True | False：GLM 首次失败直接记 `parked:teacher_unavailable` |
+| `calib.prepared_tasks_dir` | None | 远端沙箱已注册模板的任务副本目录；设置后缺模板的条目不提交 |
 | `fulltext.mode` | 旧文献缓存（只读）→ OA PDF 链接 | 浏览器通道（旧 `browser_fetch.py`）**未接入**，取不到全文的条目进 `S3_queue.json` 并暂存 |
 | `package.dockerfile_mode` | selfcontained | Dockerfile 里用 pip 安装固定版本；`local_base` 只用于本机检查 |
 
@@ -143,7 +152,9 @@ GLM-5.3 + Claude Code 2.1.280 先跑第 1 次：
 - 失败 → Opus 教师。教师通过记 **hard**；教师失败再跑 1 次，仍失败则暂存（`parked:teacher_failed`）。
 - 通过 → GLM 第 2 次。失败记 **unstable**，通过记 **easy**。
 
-hard 和 unstable 保留。reward=1 一律算通过，即使之后报了 API 错误。没有 reward 的 API/沙箱异常算 `infra`，不计入次数，连续超过 2 次则暂存。每次只写出作业配置和启动命令（`run-glm65.sh` 或 `run-job-opus.sh`），由人执行。结果用 `calib-ingest` 回填。
+hard 和 unstable 保留。reward=1 一律算通过，即使之后报了 API 错误。没有 reward 的 API/沙箱异常算 `infra`，不计入次数，连续超过 2 次则暂存。`allow_submit=false` 时只写出作业配置和启动命令，由人执行；`true` 时先在账本预留、再后台启动。结果用 `calib-ingest` 回填。
+
+远端沙箱不执行 Dockerfile：提交前要为每题建好模板（打包出的 Dockerfile 与旧批次相同，可用"共享基础镜像 + 数据层"的薄镜像方式），并把准备好的任务副本目录配到 `calib.prepared_tasks_dir`。
 
 ## 6. 已验证 / 未验证
 
@@ -165,7 +176,17 @@ hard 和 unstable 保留。reward=1 一律算通过，即使之后报了 API 错
 - L4b 反解攻击、廉价模型各角色、S9b 变体、DOMF/CODE/MULTI 形态。
 - 价格是占位值，美元数字不是账单。
 
-## 7. 真实 1 篇端到端烟测方案（待批准，未执行）
+## 6b. e2e-iter1（2026-11-06）新增门与检查
+
+- `truth_isolation`（PROG，阻断）：判分时把 `solution_cli.py` 换成探针，探针尝试读 `/tests` 下除隐藏输入外的所有文件。要求探针经 `_metrics.run_solution` 执行，且什么都读不到。本地判分步骤与 Harbor 一致，以 root 运行在容器内副本上（含 `/app/data`）。
+- `cli_contract`（PROG，阻断）：指令必须原样包含 `solution_cli.py <input_dir> <output_dir>`。
+- S6B：
+  - mid "只差 1–2 项"按判据计数，同名的 public/hidden 指标算一个；
+  - 参考在某指标上明显差于 naive 时记 `ref_worse_than_naive`，送去修复。
+
+真实论文结果与失败模式见 `../docs/E2E_LOG.md`。
+
+## 7. 真实 1 篇端到端烟测方案（已执行，见 docs/E2E_LOG.md）
 
 - 选 1 篇已有全文缓存、非黑盒类的旧论文（例如 `10.1007/s10182-025-00550-5`）。只跑 S1–PKG，S9 只生成配置，不提交。
 - 预计 Opus 调用 3–5 次：S5 1 次、S6A 1 次、S6C 1 次，S8 0–2 次。按占位价估算约 $2–3（S5 约 4 万输入/1 万输出，S6A 约 3 万/2.5 万，S6C 约 4.5 万/1.5 万，S8 每次约 3.5 万/0.6 万）。
