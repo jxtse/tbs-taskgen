@@ -1,9 +1,10 @@
 """Offline analysis of eval/raw/*.json -> eval/metrics.json + eval/tables.md (+ eval/to_label.jsonl for any paper
 or resource in the judged sets that has no label yet).
 
-Relevance labels (subjective, single annotator = this agent reading title + abstract; scale identical to
-search_api/review/labels.json: 0 off-topic, 1 on-topic but peripheral/application/review, 2 core method paper):
-  * reused from search_api/review (labels.json + top10_*.jsonl key mapping) when the same paper was judged there;
+Relevance labels (subjective, single annotator reading title + abstract; scale identical to the earlier
+benchmark's review/labels.json: 0 off-topic, 1 on-topic but peripheral/application/review, 2 core method paper):
+  * reused from the earlier benchmark ($TBS_EVAL_BASELINE/review: labels.json + top10_*.jsonl key mapping) when the
+    same paper was judged there;
   * new labels in eval/labels_new.json (same scale); resource labels in eval/labels_res.json
     (0 irrelevant, 1 related/generic, 2 directly usable implementation/dataset/docs for this target).
 
@@ -17,6 +18,7 @@ Arms (re-fused offline from the very same raw ranked lists, so differences are o
 from __future__ import annotations
 
 import json
+import os
 import statistics
 import sqlite3
 from collections import defaultdict
@@ -28,7 +30,8 @@ from tbsretr.model import Paper, RankedList, Resource
 from tbsretr.util import norm_doi, resource_key, title_key
 
 HERE = Path(__file__).resolve().parent
-OLD = HERE.parents[2] / "search_api"
+# earlier retrieval benchmark (targets_sample.json, review/labels.json, review/top10_*.jsonl); not in this repo
+OLD = Path(os.environ.get("TBS_EVAL_BASELINE") or "TBS_EVAL_BASELINE-not-set")
 ARMS = {
     "full7": {"openalex", "s2", "exa", "tavily", "crossref", "arxiv", "europepmc"},
     "new4": {"openalex", "s2", "exa", "tavily"},

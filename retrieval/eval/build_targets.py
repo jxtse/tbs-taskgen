@@ -1,5 +1,6 @@
-"""Build eval/targets10.json from search_api/targets_sample.json (same 10 targets, same 4 queries as the old
-OpenAlex/Crossref/arXiv benchmark) + read-only metadata from tbs-datapipe methodlit/targets.json (libs, method text).
+"""Build eval/targets10.json from $TBS_EVAL_BASELINE/targets_sample.json (same 10 targets, same 4 queries as the
+earlier OpenAlex/Crossref/arXiv benchmark) + read-only metadata from $TBS_OLD_PIPE/literature/methodlit/targets.json
+(libs, method text).  Neither input is part of this repository.
 
 `topic` (short English phrase for Exa/Tavily resource channels) is hand-written here for the 5 task targets because
 task ids are terse; in production this phrase comes from the upstream query writer together with the queries.
@@ -10,7 +11,7 @@ import os
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-SAMPLE = HERE.parents[2] / "search_api/targets_sample.json"
+SAMPLE = Path(os.environ.get("TBS_EVAL_BASELINE") or "TBS_EVAL_BASELINE-not-set") / "targets_sample.json"
 ML = Path(os.environ.get("TBS_OLD_PIPE") or "TBS_OLD_PIPE-not-set") / "literature/methodlit/targets.json"   # earlier pipeline data, not in this repo
 
 TOPIC = {
