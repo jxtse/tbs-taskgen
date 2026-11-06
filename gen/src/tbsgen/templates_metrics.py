@@ -69,13 +69,20 @@ def _sandbox_prepare(input_dir, out):
         pw = pwd.getpwnam("nobody")
     except KeyError:
         return None
-    tests_root = os.path.dirname(os.path.abspath(input_dir))
+    # v2.1: lock everything under the tests root (parent of HIDDEN, i.e. /tests) except the hidden-input tree.
+    # v0.3 locked only dirname(input_dir): with input_dir=/tests/hidden/set1 that left /tests/truth readable
+    # (e2e-iter1: a truth-reading solution_cli.py scored reward 1 under Harbor).
+    hidden_root = os.path.abspath(HIDDEN)
+    inp = os.path.abspath(input_dir)
+    if not (inp == hidden_root or inp.startswith(hidden_root + os.sep)):
+        hidden_root = inp
+    tests_root = os.path.dirname(hidden_root)
     for name in os.listdir(tests_root):  # everything in /tests except the hidden inputs becomes root-only
         pth = os.path.join(tests_root, name)
-        if os.path.abspath(pth) != os.path.abspath(input_dir):
+        if os.path.abspath(pth) != hidden_root:
             os.chmod(pth, 0o700 if os.path.isdir(pth) else 0o600)
     os.chmod(tests_root, 0o711)
-    for root, dirs, files in os.walk(input_dir):
+    for root, dirs, files in os.walk(hidden_root):
         os.chmod(root, 0o755)
         for f in files:
             os.chmod(os.path.join(root, f), 0o644)
@@ -93,8 +100,17 @@ def _sandbox_prepare(input_dir, out):
     return pw.pw_uid, pw.pw_gid, env
 
 
+def hidden_sets():
+    """Hidden input sets: subdirectories of HIDDEN if it has any (several shifted regimes), else [HIDDEN]."""
+    subs = sorted(os.path.join(HIDDEN, d) for d in os.listdir(HIDDEN) if os.path.isdir(os.path.join(HIDDEN, d))) \
+        if os.path.isdir(HIDDEN) else []
+    return subs or [HIDDEN]
+
+
 def run_solution(timeout_sec, input_dir=HIDDEN, entry=ENTRY):
     """Run `python <entry> <input_dir> <out_dir>` once per session; returns (out_dir, wall_seconds, returncode).
+    Several hidden sets: call once per set, e.g. `for d in hidden_sets(): out, sec, rc = run_solution(t, d)`.
+    This is the ONLY sanctioned way to execute agent code in the verifier (it drops to `nobody` and locks truth).
     The wall time is also recorded (not a pass/fail check by itself; tests decide whether to check() it)."""
     key = (entry, input_dir)
     if key in _CACHE:

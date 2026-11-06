@@ -9,6 +9,9 @@ gates/attempt-<n>.json = {"gates": {name: bool}, "blocking": [names], "details":
   mid           mid fails 1..2 checks and all checks were evaluated
   exploit       every baselines/exploit_*.py fails
   hidden_shift  PROG: tests/hidden exists, differs from public, >= 2 hidden checks recorded for the reference
+  truth_isolation PROG: a probe solution_cli.py (reads every file under /tests except hidden inputs) must be run
+                via _metrics.run_solution and read nothing; catches verifiers that exec agent code themselves
+                (as root, truth readable) -- found in e2e-iter1 where a truth-reading CLI got reward 1
   thresholds_stated  every threshold appears numerically in instruction.md (old G7)
   leak          L1-L4a (leakcheck.leak_report, with depgraph)
   isolation     no tests/, truth, generator under environment/; no python oracle module in public data for
@@ -22,6 +25,9 @@ from pathlib import Path
 
 from . import runner
 from .leakcheck import leak_report
+
+
+CLI_RE = re.compile(r"solution_cli\.py\s+<input_dir>\s+<output_dir>")
 
 
 def numbers_in(text: str) -> set[float]:
@@ -91,6 +97,10 @@ def run_gates(cfg: dict, item_dir: Path, spec: dict, thresholds: dict, attempt: 
             n_hidden = sum(1 for m in ref["metrics"] if not m.get("aux") and
                            (m["name"].startswith("hidden_") or m["name"] in hid_names))
             ok["hidden_shift"] &= differs and n_hidden >= 2
+            if s == seeds[0]:
+                tp = runner.truth_probe(cfg, task, gen, work / f"out-ref{s}", work, f"truthprobe{s}")
+                g["truth_isolation"] = tp["ok"]
+                det["truth_isolation"] = tp
         det["seeds"][s] = sd
     g.update(ok)
     # thresholds stated
@@ -100,6 +110,11 @@ def run_gates(cfg: dict, item_dir: Path, spec: dict, thresholds: dict, attempt: 
                 if not any(math.isclose(v, abs(t["threshold"]), rel_tol=1e-6, abs_tol=1e-12) for v in nums)]
     g["thresholds_stated"] = not unstated
     det["unstated"] = unstated
+    if spec.get("form") == "PROG":
+        # e2e-iter1: instruction said `solution_cli.py --data <csv> --out <dir>` while the verifier calls
+        # `solution_cli.py <input_dir> <output_dir>`: an agent following the text fails every hidden check
+        g["cli_contract"] = bool(CLI_RE.search(ins)) and not re.search(r"solution_cli\.py\s+--\w", ins)
+        det["cli_contract"] = dict(found=bool(CLI_RE.search(ins)))
     # leak gates on seed 0 artefacts
     gen0 = work / "detA"
     lr = leak_report(gen0 / "environment" / "data", [gen0 / "tests" / "truth"], ins, cfg,

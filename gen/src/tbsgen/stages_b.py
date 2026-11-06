@@ -97,7 +97,12 @@ def _slim(g):
     out = {k: g[k] for k in ("gates", "blocking", "nonblocking", "why") if k in g}
     det = g.get("details") or g.get("info") or {}
     if isinstance(det, dict):
-        out["details"] = {k: det[k] for k in ("determinism", "unstated", "isolation", "runs") if k in det}
+        out["details"] = {k: det[k] for k in ("determinism", "unstated", "isolation", "runs", "truth_isolation")
+                          if k in det}
+        if "truth_isolation" in out.get("blocking", []):
+            out["fix_hint"] = ("tests/measure.py must execute /app/output/solution_cli.py ONLY via "
+                               "`from _metrics import run_solution, hidden_sets` (one call per hidden set dir); "
+                               "never subprocess it directly: run_solution drops privileges and locks /tests/truth.")
         if "leak" in det:
             out["details"]["leak"] = dict(classes=det["leak"].get("classes"), findings=det["leak"].get("findings", [])[:8])
         if "seeds" in det:

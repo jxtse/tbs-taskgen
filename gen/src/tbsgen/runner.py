@@ -18,6 +18,14 @@ from . import sandbox
 METRICS_HELPER = Path(__file__).with_name("templates_metrics.py")
 
 
+# Verifier steps run as root on container-local copies of /tests and /app/output, as under Harbor, so that
+# _metrics.run_solution really drops the agent program to `nobody` and the chmod lock on /tests/truth is enforced
+# (bind mounts from the host would not enforce it).  Before v2.1 the local runner used the host uid: the lock was
+# skipped and a truth-reading solution_cli.py went unnoticed until a Harbor run (e2e-iter1).
+VERIFIER_PRE = ("mkdir -p /app && cp -a /src/tests /tests && cp -a /src/output /app/output && "
+                "chown -R root:root /tests /app/output && ")
+
+
 def tree_hash(d: Path) -> str:
     h = hashlib.sha256()
     for p in sorted(Path(d).rglob("*")):
@@ -75,8 +83,9 @@ def measure(cfg: dict, task: Path, gen: Path, outd: Path, work: Path, tag: str) 
     logs = work / f"mlogs-{tag}"
     logs.mkdir(parents=True, exist_ok=True)
     logs.chmod(0o777)
-    r = sandbox.run(cfg, [(outd, "/app/output", "ro"), (tests, "/tests", "ro"), (logs, "/logs/verifier", "rw")],
-                    "cd /tests && python /tests/measure.py", cfg["gen"]["test_timeout"], f"tbsgen-measure-{tag}")
+    r = sandbox.run(cfg, [(outd, "/src/output", "ro"), (tests, "/src/tests", "ro"), (logs, "/logs/verifier", "rw")],
+                    VERIFIER_PRE + "cd /tests && python /tests/measure.py", cfg["gen"]["test_timeout"],
+                    f"tbsgen-measure-{tag}", root=True)
     vals = {}
     for line in reversed(r["out"].strip().splitlines()):
         try:
@@ -96,12 +105,46 @@ def test(cfg: dict, task: Path, gen: Path, outd: Path, work: Path, tag: str) -> 
         shutil.rmtree(logs)
     logs.mkdir(parents=True)
     logs.chmod(0o777)
-    r = sandbox.run(cfg, [(outd, "/app/output", "ro"), (tests, "/tests", "ro"), (logs, "/logs/verifier", "rw")],
-                    "cd /tests && python -m pytest -q -p no:cacheprovider /tests/test_outputs.py",
-                    cfg["gen"]["test_timeout"], f"tbsgen-test-{tag}")
+    r = sandbox.run(cfg, [(outd, "/src/output", "ro"), (tests, "/src/tests", "ro"), (logs, "/logs/verifier", "rw")],
+                    VERIFIER_PRE + "cd /tests && python -m pytest -q -p no:cacheprovider /tests/test_outputs.py",
+                    cfg["gen"]["test_timeout"], f"tbsgen-test-{tag}", root=True)
     mf = logs / "metrics.jsonl"
     metrics = [json.loads(x) for x in mf.read_text().splitlines() if x.strip()] if mf.exists() else []
     acc = [m for m in metrics if not m.get("aux")]
     r.update(passed=r["rc"] == 0, metrics=metrics, n_checks=len(acc), n_failed=sum(not m["passed"] for m in acc),
              failed=[m["name"] for m in acc if not m["passed"]])
     return r
+
+
+TRUTH_PROBE = r'''import os, sys
+# tbsgen truth-isolation probe: an adversarial solution_cli.py that tries to read verifier-only files.
+hits = []
+for dp, dn, fn in os.walk("/tests"):
+    if "/hidden" in dp:
+        continue
+    for f in fn:
+        p = os.path.join(dp, f)
+        try:
+            open(p, "rb").read(16)
+            hits.append(p)
+        except Exception:
+            pass
+sys.stderr.write("TBSGEN_TRUTH_READABLE " + str(len(hits)) + " " + " ".join(hits[:5]) + "\\n")
+sys.exit(3)
+'''
+
+
+def truth_probe(cfg: dict, task: Path, gen: Path, ref_out: Path, work: Path, tag: str) -> dict:
+    """PROG: run the verifier on the reference's public outputs with solution_cli.py replaced by TRUTH_PROBE.
+    ok = the verifier executed the program through _metrics.run_solution (an aux record exists) and the program
+    could not read any verifier-only file under /tests (other than the hidden inputs)."""
+    outd = work / f"out-{tag}"
+    if outd.exists():
+        shutil.rmtree(outd)
+    shutil.copytree(ref_out, outd)
+    (outd / "solution_cli.py").write_text(TRUTH_PROBE)
+    t = test(cfg, task, gen, outd, work, tag)
+    runs = [m for m in t["metrics"] if m.get("name") == "_solution_cli_run"]
+    readable = [m.get("stderr_tail", "") for m in runs if "TBSGEN_TRUTH_READABLE 0" not in m.get("stderr_tail", "")]
+    return dict(ok=bool(runs) and not readable, n_runs=len(runs), via_run_solution=bool(runs),
+                readable=[x[-300:] for x in readable][:3], passed=t["passed"])
