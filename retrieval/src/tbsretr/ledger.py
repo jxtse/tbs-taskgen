@@ -20,6 +20,7 @@ import sqlite3
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -227,7 +228,9 @@ class Http:
     def _urllib(self, method, url, headers, body):
         data = json.dumps(body).encode() if body is not None else None
         req = urllib.request.Request(url, data=data, method=method, headers=headers)
-        opener = _ENV  # follow the system proxy (Clash) like the other Hermes web tools
+        host = (urllib.parse.urlsplit(url).hostname or "").lower()
+        # loopback services (local search pool) must bypass the system proxy; everything else follows it
+        opener = _DIRECT if host in ("127.0.0.1", "localhost", "::1") else _ENV
         try:
             with opener.open(req, timeout=self.cfg.get("timeout_s", 60)) as r:
                 return r.status, dict(r.headers), r.read()
