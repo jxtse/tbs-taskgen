@@ -25,7 +25,8 @@ METRICS_HELPER = Path(__file__).with_name("templates_metrics.py")
 # /app/data is present too: under Harbor the verifier runs in the agent's container (e2e-iter1: a measure.py that
 # reads /app/data/config.json got the missing-output sentinel locally after v2.1 dropped that mount)
 VERIFIER_PRE = ("mkdir -p /app && cp -a /src/tests /tests && cp -a /src/output /app/output && "
-                "cp -a /src/data /app/data && chown -R root:root /tests /app/output /app/data && ")
+                "cp -a /src/data /app/data && chown -R -h root:root /tests /app/output /app/data && "
+                "chmod 700 /src && ")   # staging mounts stay in the container: make them root-only (review #2)
 
 
 def tree_hash(d: Path) -> str:
@@ -120,35 +121,52 @@ def test(cfg: dict, task: Path, gen: Path, outd: Path, work: Path, tag: str) -> 
     return r
 
 
-TRUTH_PROBE = r'''import os, sys
-# tbsgen truth-isolation probe: an adversarial solution_cli.py that tries to read verifier-only files.
+TRUTH_PROBE = r'''import json, os, sys
+# tbsgen truth-isolation probe: an adversarial solution_cli.py.  The trusted side writes the exact paths to try
+# into probe_targets.json next to this file (verifier-only files, their /src copies, and the same files reached
+# through an agent-planted symlink /app/output/leak -> /tests/truth).  Every path is opened directly; nothing
+# relies on listing directories (a 0711 directory cannot be listed but its files may still be readable).
+here = os.path.dirname(os.path.abspath(__file__))
+targets = json.load(open(os.path.join(here, "probe_targets.json")))
 hits = []
-for dp, dn, fn in os.walk("/tests"):
-    if "/hidden" in dp:
-        continue
-    for f in fn:
-        p = os.path.join(dp, f)
-        try:
-            open(p, "rb").read(16)
-            hits.append(p)
-        except Exception:
-            pass
-sys.stderr.write("TBSGEN_TRUTH_READABLE " + str(len(hits)) + " " + " ".join(hits[:5]) + "\\n")
+for p in targets:
+    try:
+        with open(p, "rb") as f:
+            f.read(16)
+        hits.append(p)
+    except Exception:
+        pass
+sys.stderr.write("TBSGEN_TRUTH_PROBE attempted=%d readable=%d %s\\n" % (len(targets), len(hits), " ".join(hits[:5])))
 sys.exit(3)
 '''
 
 
 def truth_probe(cfg: dict, task: Path, gen: Path, ref_out: Path, work: Path, tag: str) -> dict:
     """PROG: run the verifier on the reference's public outputs with solution_cli.py replaced by TRUTH_PROBE.
-    ok = the verifier executed the program through _metrics.run_solution (an aux record exists) and the program
-    could not read any verifier-only file under /tests (other than the hidden inputs)."""
+    ok = the verifier executed the probe through _metrics.run_solution, the probe attempted every target path
+    and could read none of them.  Targets: each file under tests/ except hidden inputs (at /tests/... and at the
+    /src/tests/... staging copy) plus each truth file through a pre-planted symlink /app/output/leak."""
     outd = work / f"out-{tag}"
     if outd.exists():
         shutil.rmtree(outd)
-    shutil.copytree(ref_out, outd)
+    shutil.copytree(ref_out, outd, symlinks=True)
+    tests = work / f"tests-{tag}"
+    _verifier_tests(task, gen, tests, "test_outputs.py")
+    rel = sorted(str(p.relative_to(tests)) for p in tests.rglob("*")
+                 if p.is_file() and not str(p.relative_to(tests)).startswith("hidden"))
+    truth_rel = sorted(str(p.relative_to(tests / "truth")) for p in (tests / "truth").rglob("*") if p.is_file()) \
+        if (tests / "truth").exists() else []
+    targets = [f"/tests/{r}" for r in rel] + [f"/src/tests/{r}" for r in rel] + \
+        [f"/app/output/leak/{r}" for r in truth_rel]
     (outd / "solution_cli.py").write_text(TRUTH_PROBE)
+    (outd / "probe_targets.json").write_text(json.dumps(targets))
+    leak = outd / "leak"
+    if leak.exists() or leak.is_symlink():
+        leak.unlink()
+    leak.symlink_to("/tests/truth")
     t = test(cfg, task, gen, outd, work, tag)
     runs = [m for m in t["metrics"] if m.get("name") == "_solution_cli_run"]
-    readable = [m.get("stderr_tail", "") for m in runs if "TBSGEN_TRUTH_READABLE 0" not in m.get("stderr_tail", "")]
-    return dict(ok=bool(runs) and not readable, n_runs=len(runs), via_run_solution=bool(runs),
-                readable=[x[-300:] for x in readable][:3], passed=t["passed"])
+    want = f"TBSGEN_TRUTH_PROBE attempted={len(targets)} readable=0"
+    bad = [m.get("stderr_tail", "") for m in runs if want not in m.get("stderr_tail", "")]
+    return dict(ok=bool(runs) and bool(truth_rel) and not bad, n_runs=len(runs), via_run_solution=bool(runs),
+                n_targets=len(targets), readable=[x[-400:] for x in bad][:3], passed=t["passed"])
