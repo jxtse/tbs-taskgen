@@ -21,7 +21,10 @@ DEFAULTS: dict = {
     "parallel_sources": True,                      # one thread per source inside a target (each source keeps its own pacing)
     "timeout_s": 60,
     # TBS task-source papers (the data a TBS task was built from) must never be proposed. Read-only.
-    "leak_refs": os.environ.get("TBS_LEAK_REFS", os.path.join(os.environ.get("TBS_OLD_PIPE", "/Volumes/Storage/hermes/workspace/tbs-datapipe-20261015"), "literature", "tbs_task_refs.json")),
+    # Unset -> no exclusion list (TBS_LEAK_REFS, or <TBS_OLD_PIPE>/literature/tbs_task_refs.json if TBS_OLD_PIPE is set).
+    "leak_refs": os.environ.get("TBS_LEAK_REFS") or (
+        os.path.join(os.environ["TBS_OLD_PIPE"], "literature", "tbs_task_refs.json") if os.environ.get("TBS_OLD_PIPE")
+        else None),
     # Resources (code/data/docs) whose URL contains any of these substrings are dropped: the TBS benchmark itself
     # leaks task statements/solutions (both Exa and Tavily returned it on 3/10 targets in the 2026-11-05 eval).
     "leak_url_substrings": ["harbor-framework/terminal-bench-science", "terminal-bench-science", "tbench.ai"],
@@ -75,8 +78,9 @@ DEFAULTS: dict = {
         },
         "exa": {
             # backend "pool": local search-pool service that holds the Exa keys (POST {pool_url}/v1/search, engine=exa,
-            # no Tavily fallback; env TBS_SEARCH_POOL_URL overrides pool_url).  backend "direct": api.exa.ai + key_env.
-            "backend": "pool", "pool_url": "http://127.0.0.1:18150",
+            # no Tavily fallback; env TBS_SEARCH_POOL_URL overrides pool_url; unset -> Exa is skipped).
+            # backend "direct": api.exa.ai + key_env.
+            "backend": "pool", "pool_url": None,
             "enabled": True, "key_env": "EXA_API_KEY_SECONDARY", "require_key": True,
             "min_interval_s": 0.3, "num_results": 10, "type": "auto",
             # 2026-11-05 eval: usable resources per 100 results: code 65, docs 53, data 39. The paper channel is

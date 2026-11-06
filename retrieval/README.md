@@ -25,7 +25,7 @@ state/         运行时生成：ledger.sqlite（账本）、cache.sqlite（响�
 
 `sources.exa.backend` 有两种取值：
 
-- `pool`（默认）：请求发到本地搜索池服务 `POST {pool_url}/v1/search`，默认 `pool_url = http://127.0.0.1:18150`，可用环境变量 `TBS_SEARCH_POOL_URL` 覆盖。服务持有 Exa key 并在多个 key 之间轮换，本进程不读 key。请求固定 `engine=exa`，不回退到 Tavily；`type`、`category`、`includeDomains`、highlights 长度通过 `exa_options` 原样传给 Exa。服务把 Exa 原始结果行放在 `raw` 里返回，解析与直连完全相同；费用按服务返回的 `usage.cost_usd`（即 Exa `costDollars.total`）记账。池服务地址未设置时 Exa 自动跳过。
+- `pool`（默认）：请求发到本地搜索池服务 `POST {pool_url}/v1/search`，`pool_url` 没有默认值，用配置或环境变量 `TBS_SEARCH_POOL_URL` 设置。服务持有 Exa key 并在多个 key 之间轮换，本进程不读 key。请求固定 `engine=exa`，不回退到 Tavily；`type`、`category`、`includeDomains`、highlights 长度通过 `exa_options` 原样传给 Exa。服务把 Exa 原始结果行放在 `raw` 里返回，解析与直连完全相同；费用按服务返回的 `usage.cost_usd`（即 Exa `costDollars.total`）记账。池服务地址未设置时 Exa 自动跳过。
 - `direct`：直连 `https://api.exa.ai/search`，key 从 `key_env` 读取。离线测试的录制数据用这个后端。
 
 搜索池服务需要支持 `exa_options` 字段，接口约定：请求 `{query, limit (1–20), engine, include_contents, exa_options}`，响应 `{provider, results: [{url, title, raw}], usage: {cost_usd}}`。

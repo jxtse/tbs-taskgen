@@ -494,3 +494,49 @@ def test_s9_stops_when_actual_spend_reaches_run_cap(tmp_path):
     it = P.store.item(iid)
     assert it.state["status"] == "paused" and it.state["reason"].startswith("budget:run_total_actual"), it.state
     assert counter.read_text().count("x") == 1
+
+
+# ------------------------------------------------------------------ defaults without machine-specific paths
+def test_job_config_builtin_agent_and_env_by_default(tmp_path):
+    cfg = load_config()
+    conf = calib.job_config(cfg, tmp_path, "glm", "j")
+    assert conf["agents"][0]["name"] == "claude-code" and "import_path" not in conf["agents"][0]
+    assert conf["environment"]["type"] == "docker" and "import_path" not in conf["environment"]
+    cfg = load_config(None, {"calib": {"student_agent": "my_ext:Agent", "environment": "my_ext:Env"}})
+    conf = calib.job_config(cfg, tmp_path, "glm", "j")
+    assert conf["agents"][0]["import_path"] == "my_ext:Agent" and "name" not in conf["agents"][0]
+    assert conf["environment"]["import_path"] == "my_ext:Env" and "type" not in conf["environment"]
+
+
+def test_prepare_without_launcher_prints_plain_harbor_command(tmp_path):
+    item = tmp_path / "items" / "x"
+    (item / "pkg").mkdir(parents=True)
+    rec = calib.prepare(load_config(), item, "glm", 1)
+    assert rec["command"].startswith("harbor run --config ") and "blocked" not in rec
+    rec = calib.prepare(load_config(None, {"calib": {"allow_submit": True}}), item, "glm", 1)
+    assert "harbor_root" in rec["blocked"]
+    rec = calib.prepare(load_config(None, {"calib": {"harbor_root": "/h", "student_launcher": "run.sh"}}), item, "glm", 1)
+    assert rec["command"].startswith("cd /h && ./run.sh run ")
+
+
+def test_opus_url_unset_is_a_config_error(tmp_path):
+    from tbsgen.models import OpusClient
+    cfg = load_config(None, {"models": {"opus": {"url": None}}, "budget": {"daily_usd_total": 1.0}})
+    led = Ledger(tmp_path / "l.sqlite", cfg)
+    with pytest.raises(ModelError) as e:
+        OpusClient(led, cfg)
+    assert e.value.cls == "config" and "TBS_OPUS_URL" in str(e.value)
+
+
+def test_no_old_pipe_means_no_cache_dirs_and_no_dedup(monkeypatch):
+    import importlib
+    import tbsgen.config as gc
+    monkeypatch.delenv("TBS_OLD_PIPE", raising=False)
+    monkeypatch.delenv("TBS_HARBOR_ROOT", raising=False)
+    c = importlib.reload(gc).load_config()
+    assert c["fulltext"]["cache_dirs"] == [] and c["probe"]["tbs_tasks_root"] is None and c["calib"]["harbor_root"] is None
+    monkeypatch.setenv("TBS_OLD_PIPE", "/data/old")
+    c = importlib.reload(gc).load_config()
+    assert c["fulltext"]["cache_dirs"] == ["/data/old/literature/txt"] and c["probe"]["tbs_tasks_root"] == "/data/old/tasks_text"
+    monkeypatch.undo()
+    importlib.reload(gc)

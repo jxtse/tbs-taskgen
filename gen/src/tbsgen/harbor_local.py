@@ -19,8 +19,9 @@ from .package import DOCKERFILE_LOCAL
 
 
 def find_harbor(cfg: dict) -> str | None:
+    root = cfg["calib"].get("harbor_root")
     cand = [os.environ.get("TBS_HARBOR_BIN"), shutil.which("harbor"),
-            str(Path(cfg["calib"]["harbor_root"]) / ".venv" / "bin" / "harbor")]
+            str(Path(root) / ".venv" / "bin" / "harbor") if root else None]
     return next((c for c in cand if c and Path(c).exists()), None)
 
 

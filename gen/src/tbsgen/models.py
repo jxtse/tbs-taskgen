@@ -150,6 +150,8 @@ class OpusClient(_Base):
         super().__init__(ledger, cfg)
         self.m = cfg["models"][alias]
         self.name = self.m["model"]
+        if not self.m.get("url"):
+            raise ModelError("config", f"models.{alias}.url is not set (set TBS_OPUS_URL or models.{alias}.url)")
 
     def _call(self, system, user, *, stage, max_tokens):
         m = self.m
