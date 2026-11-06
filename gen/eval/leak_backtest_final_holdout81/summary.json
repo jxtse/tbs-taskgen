@@ -1,0 +1,20 @@
+{
+ "n_pos": 0,
+ "n_neg": 81,
+ "recall": "0/0",
+ "false_positive": "1/81",
+ "recall_incl_review": "0/0",
+ "review_only_neg": "10/81",
+ "review_by_class": {
+  "L1c": 8,
+  "L4a": 2
+ },
+ "fp_by_class": {
+  "L4a": 1
+ },
+ "pos_classes": {},
+ "errors": [],
+ "fp_ids": [
+  "st-batch2-004"
+ ]
+}

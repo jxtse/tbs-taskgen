@@ -1,0 +1,4924 @@
+{
+ "per_target": {
+  "method:column-generation-branch-and-price-for-vehicle-routing": {
+   "full7": {
+    "top20_rel": 20,
+    "top20_core": 16,
+    "top20_unlabeled": 0,
+    "pool": 352,
+    "kept": 335,
+    "sel_n": 3,
+    "sel_in_pool": 2,
+    "sel_in_head60": 1,
+    "sel_in_top20": 1,
+    "abs_missing_head60": 0.03333333333333333,
+    "oa_head60": 0.65,
+    "seeded_heldout_n": 2,
+    "seeded_heldout_in_head60": 1,
+    "pseudo_heldout_in_head60": 1
+   },
+   "new4": {
+    "top20_rel": 20,
+    "top20_core": 16,
+    "top20_unlabeled": 0,
+    "pool": 279,
+    "kept": 262,
+    "sel_n": 3,
+    "sel_in_pool": 2,
+    "sel_in_head60": 1,
+    "sel_in_top20": 1,
+    "abs_missing_head60": 0.03333333333333333,
+    "oa_head60": 0.65,
+    "seeded_heldout_n": 2,
+    "seeded_heldout_in_head60": 1,
+    "pseudo_heldout_in_head60": 1
+   },
+   "full-s2": {
+    "top20_rel": 19,
+    "top20_core": 14,
+    "top20_unlabeled": 0,
+    "pool": 296,
+    "kept": 282,
+    "sel_n": 3,
+    "sel_in_pool": 2,
+    "sel_in_head60": 1,
+    "sel_in_top20": 1,
+    "abs_missing_head60": 0.016666666666666666,
+    "oa_head60": 0.7,
+    "seeded_heldout_n": 2,
+    "seeded_heldout_in_head60": 1,
+    "pseudo_heldout_in_head60": 1
+   },
+   "new4-s2": {
+    "top20_rel": 18,
+    "top20_core": 14,
+    "top20_unlabeled": 0,
+    "pool": 215,
+    "kept": 202,
+    "sel_n": 3,
+    "sel_in_pool": 1,
+    "sel_in_head60": 1,
+    "sel_in_top20": 1,
+    "abs_missing_head60": 0.0,
+    "oa_head60": 0.7166666666666667
+   },
+   "old2": {
+    "top20_rel": 12,
+    "top20_core": 4,
+    "top20_unlabeled": 0,
+    "pool": 94,
+    "kept": 93,
+    "sel_n": 3,
+    "sel_in_pool": 2,
+    "sel_in_head60": 1,
+    "sel_in_top20": 1,
+    "abs_missing_head60": 0.0,
+    "oa_head60": 0.5833333333333334
+   },
+   "oa": {
+    "top20_rel": 18,
+    "top20_core": 13,
+    "top20_unlabeled": 0,
+    "pool": 196,
+    "kept": 184,
+    "sel_n": 3,
+    "sel_in_pool": 1,
+    "sel_in_head60": 1,
+    "sel_in_top20": 1,
+    "abs_missing_head60": 0.0,
+    "oa_head60": 0.7166666666666667,
+    "seeded_heldout_n": 2,
+    "seeded_heldout_in_head60": 1,
+    "pseudo_heldout_in_head60": 1
+   },
+   "full-crossref": {
+    "top20_rel": 20,
+    "top20_core": 16,
+    "top20_unlabeled": 0,
+    "pool": 311,
+    "kept": 294,
+    "sel_n": 3,
+    "sel_in_pool": 2,
+    "sel_in_head60": 1,
+    "sel_in_top20": 1,
+    "abs_missing_head60": 0.03333333333333333,
+    "oa_head60": 0.6666666666666666
+   },
+   "full-arxiv": {
+    "top20_rel": 20,
+    "top20_core": 16,
+    "top20_unlabeled": 0,
+    "pool": 320,
+    "kept": 303,
+    "sel_n": 3,
+    "sel_in_pool": 2,
+    "sel_in_head60": 1,
+    "sel_in_top20": 1,
+    "abs_missing_head60": 0.03333333333333333,
+    "oa_head60": 0.65
+   },
+   "full-epmc": {
+    "top20_rel": 20,
+    "top20_core": 16,
+    "top20_unlabeled": 0,
+    "pool": 352,
+    "kept": 335,
+    "sel_n": 3,
+    "sel_in_pool": 2,
+    "sel_in_head60": 1,
+    "sel_in_top20": 1,
+    "abs_missing_head60": 0.03333333333333333,
+    "oa_head60": 0.65
+   },
+   "new4+crossref": {
+    "top20_rel": 20,
+    "top20_core": 16,
+    "top20_unlabeled": 0,
+    "pool": 320,
+    "kept": 303,
+    "sel_n": 3,
+    "sel_in_pool": 2,
+    "sel_in_head60": 1,
+    "sel_in_top20": 1,
+    "abs_missing_head60": 0.03333333333333333,
+    "oa_head60": 0.65
+   },
+   "full-exa-tavily": {
+    "top20_rel": 20,
+    "top20_core": 17,
+    "top20_unlabeled": 0,
+    "pool": 336,
+    "kept": 320,
+    "sel_n": 3,
+    "sel_in_pool": 2,
+    "sel_in_head60": 1,
+    "sel_in_top20": 1,
+    "abs_missing_head60": 0.03333333333333333,
+    "oa_head60": 0.6833333333333333
+   },
+   "full7_vs_new4": {
+    "added_head60": 5,
+    "added_rel": 5,
+    "added_core": 3,
+    "added_core_not_in_openalex": 2,
+    "added_core_not_in_b_pool": 0,
+    "added_rel_not_in_b_pool": 0,
+    "added_unlabeled": 0,
+    "added_sel": 0,
+    "examples_core": [
+     "Improvements in solving resource constrained shortest path problems in column generation c",
+     "Enhanced bi-directional dynamic programming algorithm for the resource constrained shortes",
+     "Two-Stage Learning to Branch in Branch-Price-and-Cut Algorithms for Solving Vehicle Routin"
+    ]
+   },
+   "s2_extra": {
+    "added_head60": 24,
+    "added_rel": 21,
+    "added_core": 10,
+    "added_core_not_in_openalex": 7,
+    "added_core_not_in_b_pool": 3,
+    "added_rel_not_in_b_pool": 8,
+    "added_unlabeled": 0,
+    "added_sel": 0,
+    "examples_core": [
+     "Improvements in solving resource constrained shortest path problems in column generation c",
+     "Machine-learning-based arc selection for constrained shortest path problems in column gene",
+     "Pricing for the EVRPTW with Piecewise Linear Charging by a Bounding-Based Labeling Algorit",
+     "Two-Stage Learning to Branch in Branch-Price-and-Cut Algorithms for Solving Vehicle Routin",
+     "Branch-and-price-and-cut methods for the electric vehicle routing problem with time window",
+     "A branch-price-and-cut algorithm for the vehicle routing problem with time windows and mul"
+    ]
+   },
+   "s2_extra_new4": {
+    "added_head60": 24,
+    "added_rel": 21,
+    "added_core": 9,
+    "added_core_not_in_openalex": 5,
+    "added_core_not_in_b_pool": 4,
+    "added_rel_not_in_b_pool": 10,
+    "added_unlabeled": 0,
+    "added_sel": 0,
+    "examples_core": [
+     "Pricing for the EVRPTW with Piecewise Linear Charging by a Bounding-Based Labeling Algorit",
+     "Branch-and-price-and-cut methods for the electric vehicle routing problem with time window",
+     "A branch-cut-and-price algorithm for the time-dependent electric vehicle routing problem w",
+     "A branch-price-and-cut algorithm for the vehicle routing problem with time windows and mul",
+     "Branch-price-and-cut for the production routing problem with time windows",
+     "Algorithms for non-linear and stochastic resource constrained shortest path"
+    ]
+   },
+   "crossref_extra": {
+    "added_head60": 4,
+    "added_rel": 4,
+    "added_core": 3,
+    "added_core_not_in_openalex": 2,
+    "added_core_not_in_b_pool": 0,
+    "added_rel_not_in_b_pool": 0,
+    "added_unlabeled": 0,
+    "added_sel": 0,
+    "examples_core": [
+     "Improvements in solving resource constrained shortest path problems in column generation c",
+     "Enhanced bi-directional dynamic programming algorithm for the resource constrained shortes",
+     "Two-Stage Learning to Branch in Branch-Price-and-Cut Algorithms for Solving Vehicle Routin"
+    ]
+   },
+   "arxiv_extra": {
+    "added_head60": 1,
+    "added_rel": 1,
+    "added_core": 0,
+    "added_core_not_in_openalex": 0,
+    "added_core_not_in_b_pool": 0,
+    "added_rel_not_in_b_pool": 0,
+    "added_unlabeled": 0,
+    "added_sel": 0,
+    "examples_core": []
+   },
+   "epmc_extra": {
+    "added_head60": 0,
+    "added_rel": 0,
+    "added_core": 0,
+    "added_core_not_in_openalex": 0,
+    "added_core_not_in_b_pool": 0,
+    "added_rel_not_in_b_pool": 0,
+    "added_unlabeled": 0,
+    "added_sel": 0,
+    "examples_core": []
+   },
+   "exa_tavily_extra": {
+    "added_head60": 3,
+    "added_rel": 3,
+    "added_core": 2,
+    "added_core_not_in_openalex": 1,
+    "added_core_not_in_b_pool": 0,
+    "added_rel_not_in_b_pool": 0,
+    "added_unlabeled": 0,
+    "added_sel": 0,
+    "examples_core": [
+     "Branch and Price for the Time-Dependent Vehicle Routing Problem with Time Windows",
+     "Branch-and-price-and-cut methods for the electric vehicle routing problem with time window"
+    ]
+   },
+   "crossref_over_new4": {
+    "added_head60": 5,
+    "added_rel": 4,
+    "added_core": 3,
+    "added_core_not_in_openalex": 2,
+    "added_core_not_in_b_pool": 0,
+    "added_rel_not_in_b_pool": 0,
+    "added_unlabeled": 0,
+    "added_sel": 0,
+    "examples_core": [
+     "Improvements in solving resource constrained shortest path problems in column generation c",
+     "Enhanced bi-directional dynamic programming algorithm for the resource constrained shortes",
+     "Two-Stage Learning to Branch in Branch-Price-and-Cut Algorithms for Solving Vehicle Routin"
+    ]
+   }
+  },
+  "method:mixture-likelihood-contamination-and-tumor-in-normal-estimat": {
+   "full7": {
+    "top20_rel": 18,
+    "top20_core": 6,
+    "top20_unlabeled": 0,
+    "pool": 399,
+    "kept": 390,
+    "sel_n": 0,
+    "sel_in_pool": 0,
+    "sel_in_head60": 0,
+    "sel_in_top20": 0,
+    "abs_missing_head60": 0.0,
+    "oa_head60": 0.95
+   },
+   "new4": {
+    "top20_rel": 15,
+    "top20_core": 8,
+    "top20_unlabeled": 0,
+    "pool": 276,
+    "kept": 268,
+    "sel_n": 0,
+    "sel_in_pool": 0,
+    "sel_in_head60": 0,
+    "sel_in_top20": 0,
+    "abs_missing_head60": 0.0,
+    "oa_head60": 0.9666666666666667
+   },
+   "full-s2": {
+    "top20_rel": 15,
+    "top20_core": 7,
+    "top20_unlabeled": 0,
+    "pool": 323,
+    "kept": 318,
+    "sel_n": 0,
+    "sel_in_pool": 0,
+    "sel_in_head60": 0,
+    "sel_in_top20": 0,
+    "abs_missing_head60": 0.0,
+    "oa_head60": 0.9833333333333333
+   },
+   "new4-s2": {
+    "top20_rel": 12,
+    "top20_core": 8,
+    "top20_unlabeled": 0,
+    "pool": 194,
+    "kept": 190,
+    "sel_n": 0,
+    "sel_in_pool": 0,
+    "sel_in_head60": 0,
+    "sel_in_top20": 0,
+    "abs_missing_head60": 0.0,
+    "oa_head60": 1.0
+   },
+   "old2": {
+    "top20_rel": 6,
+    "top20_core": 1,
+    "top20_unlabeled": 0,
+    "pool": 95,
+    "kept": 95,
+    "sel_n": 0,
+    "sel_in_pool": 0,
+    "sel_in_head60": 0,
+    "sel_in_top20": 0,
+    "abs_missing_head60": 0.0,
+    "oa_head60": 0.5666666666666667
+   },
+   "oa": {
+    "top20_rel": 10,
+    "top20_core": 7,
+    "top20_unlabeled": 0,
+    "pool": 179,
+    "kept": 176,
+    "sel_n": 0,
+    "sel_in_pool": 0,
+    "sel_in_head60": 0,
+    "sel_in_top20": 0,
+    "abs_missing_head60": 0.0,
+    "oa_head60": 1.0
+   },
+   "full-crossref": {
+    "top20_rel": 16,
+    "top20_core": 8,
+    "top20_unlabeled": 0,
+    "pool": 352,
+    "kept": 343,
+    "sel_n": 0,
+    "sel_in_pool": 0,
+    "sel_in_head60": 0,
+    "sel_in_top20": 0,
+    "abs_missing_head60": 0.0,
+    "oa_head60": 0.9666666666666667
+   },
+   "full-arxiv": {
+    "top20_rel": 18,
+    "top20_core": 6,
+    "top20_unlabeled": 0,
+    "pool": 359,
+    "kept": 350,
+    "sel_n": 0,
+    "sel_in_pool": 0,
+    "sel_in_head60": 0,
+    "sel_in_top20": 0,
+    "abs_missing_head60": 0.0,
+    "oa_head60": 0.95
+   },
+   "full-epmc": {
+    "top20_rel": 18,
+    "top20_core": 7,
+    "top20_unlabeled": 0,
+    "pool": 363,
+    "kept": 355,
+    "sel_n": 0,
+    "sel_in_pool": 0,
+    "sel_in_head60": 0,
+    "sel_in_top20": 0,
+    "abs_missing_head60": 0.0,
+    "oa_head60": 0.95
+   },
+   "new4+crossref": {
+    "top20_rel": 18,
+    "top20_core": 7,
+    "top20_unlabeled": 0,
+    "pool": 323,
+    "kept": 315,
+    "sel_n": 0,
+    "sel_in_pool": 0,
+    "sel_in_head60": 0,
+    "sel_in_top20": 0,
+    "abs_missing_head60": 0.0,
+    "oa_head60": 0.95
+   },
+   "full-exa-tavily": {
+    "top20_rel": 16,
+    "top20_core": 6,
+    "top20_unlabeled": 0,
+    "pool": 386,
+    "kept": 378,
+    "sel_n": 0,
+    "sel_in_pool": 0,
+    "sel_in_head60": 0,
+    "sel_in_top20": 0,
+    "abs_missing_head60": 0.0,
+    "oa_head60": 0.95
+   },
+   "full7_vs_new4": {
+    "added_head60": 5,
+    "added_rel": 4,
+    "added_core": 0,
+    "added_core_not_in_openalex": 0,
+    "added_core_not_in_b_pool": 0,
+    "added_rel_not_in_b_pool": 1,
+    "added_unlabeled": 0,
+    "added_sel": 0,
+    "examples_core": []
+   },
+   "s2_extra": {
+    "added_head60": 22,
+    "added_rel": 16,
+    "added_core": 3,
+    "added_core_not_in_openalex": 2,
+    "added_core_not_in_b_pool": 2,
+    "added_rel_not_in_b_pool": 9,
+    "added_unlabeled": 0,
+    "added_sel": 0,
+    "examples_core": [
+     "CHARR efficiently estimates contamination from DNA sequencing data",
+     "A method for determining potential parental contamination: linkage disequilibrium-based lo",
+     "MICon - A Contamination Detection Workflow for NGS Laboratories using Microhaplotype Locus"
+    ]
+   },
+   "s2_extra_new4": {
+    "added_head60": 22,
+    "added_rel": 16,
+    "added_core": 4,
+    "added_core_not_in_openalex": 3,
+    "added_core_not_in_b_pool": 3,
+    "added_rel_not_in_b_pool": 13,
+    "added_unlabeled": 0,
+    "added_sel": 0,
+    "examples_core": [
+     "CHARR efficiently estimates contamination from DNA sequencing data",
+     "A method for determining potential parental contamination: linkage disequilibrium-based lo",
+     "MICon - A Contamination Detection Workflow for NGS Laboratories using Microhaplotype Locus",
+     "Maximum Likelihood Estimation of Frequencies of Known Haplotypes from Pooled Sequence Data"
+    ]
+   },
+   "crossref_extra": {
+    "added_head60": 4,
+    "added_rel": 4,
+    "added_core": 0,
+    "added_core_not_in_openalex": 0,
+    "added_core_not_in_b_pool": 0,
+    "added_rel_not_in_b_pool": 1,
+    "added_unlabeled": 0,
+    "added_sel": 0,
+    "examples_core": []
+   },
+   "arxiv_extra": {
+    "added_head60": 0,
+    "added_rel": 0,
+    "added_core": 0,
+    "added_core_not_in_openalex": 0,
+    "added_core_not_in_b_pool": 0,
+    "added_rel_not_in_b_pool": 0,
+    "added_unlabeled": 0,
+    "added_sel": 0,
+    "examples_core": []
+   },
+   "epmc_extra": {
+    "added_head60": 1,
+    "added_rel": 0,
+    "added_core": 0,
+    "added_core_not_in_openalex": 0,
+    "added_core_not_in_b_pool": 0,
+    "added_rel_not_in_b_pool": 0,
+    "added_unlabeled": 0,
+    "added_sel": 0,
+    "examples_core": []
+   },
+   "exa_tavily_extra": {
+    "added_head60": 4,
+    "added_rel": 4,
+    "added_core": 1,
+    "added_core_not_in_openalex": 1,
+    "added_core_not_in_b_pool": 1,
+    "added_rel_not_in_b_pool": 1,
+    "added_unlabeled": 0,
+    "added_sel": 0,
+    "examples_core": [
+     "Clinical application of tumour-in-normal contamination assessment from whole genome sequen"
+    ]
+   },
+   "crossref_over_new4": {
+    "added_head60": 4,
+    "added_rel": 4,
+    "added_core": 0,
+    "added_core_not_in_openalex": 0,
+    "added_core_not_in_b_pool": 0,
+    "added_rel_not_in_b_pool": 1,
+    "added_unlabeled": 0,
+    "added_sel": 0,
+    "examples_core": []
+   }
+  },
+  "method:multivariate-fay-herriot-hierarchical-small-area-models": {
+   "full7": {
+    "top20_rel": 20,
+    "top20_core": 14,
+    "top20_unlabeled": 0,
+    "pool": 217,
+    "kept": 177,
+    "sel_n": 5,
+    "sel_in_pool": 5,
+    "sel_in_head60": 4,
+    "sel_in_top20": 3,
+    "abs_missing_head60": 0.06666666666666667,
+    "oa_head60": 0.8666666666666667,
+    "seeded_heldout_n": 3,
+    "seeded_heldout_in_head60": 3,
+    "pseudo_heldout_in_head60": 3
+   },
+   "new4": {
+    "top20_rel": 20,
+    "top20_core": 15,
+    "top20_unlabeled": 0,
+    "pool": 192,
+    "kept": 153,
+    "sel_n": 5,
+    "sel_in_pool": 4,
+    "sel_in_head60": 4,
+    "sel_in_top20": 1,
+    "abs_missing_head60": 0.03333333333333333,
+    "oa_head60": 0.8666666666666667,
+    "seeded_heldout_n": 3,
+    "seeded_heldout_in_head60": 2,
+    "pseudo_heldout_in_head60": 3
+   },
+   "full-s2": {
+    "top20_rel": 20,
+    "top20_core": 14,
+    "top20_unlabeled": 0,
+    "pool": 171,
+    "kept": 155,
+    "sel_n": 5,
+    "sel_in_pool": 5,
+    "sel_in_head60": 4,
+    "sel_in_top20": 4,
+    "abs_missing_head60": 0.05,
+    "oa_head60": 0.9333333333333333,
+    "seeded_heldout_n": 3,
+    "seeded_heldout_in_head60": 3,
+    "pseudo_heldout_in_head60": 3
+   },
+   "new4-s2": {
+    "top20_rel": 18,
+    "top20_core": 12,
+    "top20_unlabeled": 0,
+    "pool": 144,
+    "kept": 129,
+    "sel_n": 5,
+    "sel_in_pool": 4,
+    "sel_in_head60": 4,
+    "sel_in_top20": 1,
+    "abs_missing_head60": 0.016666666666666666,
+    "oa_head60": 0.9
+   },
+   "old2": {
+    "top20_rel": 18,
+    "top20_core": 6,
+    "top20_unlabeled": 0,
+    "pool": 55,
+    "kept": 54,
+    "sel_n": 5,
+    "sel_in_pool": 5,
+    "sel_in_head60": 5,
+    "sel_in_top20": 3,
+    "abs_missing_head60": 0.16666666666666666,
+    "oa_head60": 0.5
+   },
+   "oa": {
+    "top20_rel": 17,
+    "top20_core": 11,
+    "top20_unlabeled": 0,
+    "pool": 133,
+    "kept": 121,
+    "sel_n": 5,
+    "sel_in_pool": 3,
+    "sel_in_head60": 3,
+    "sel_in_top20": 1,
+    "abs_missing_head60": 0.0,
+    "oa_head60": 0.9,
+    "seeded_heldout_n": 3,
+    "seeded_heldout_in_head60": 2,
+    "pseudo_heldout_in_head60": 2
+   },
+   "full-crossref": {
+    "top20_rel": 20,
+    "top20_core": 14,
+    "top20_unlabeled": 0,
+    "pool": 208,
+    "kept": 168,
+    "sel_n": 5,
+    "sel_in_pool": 4,
+    "sel_in_head60": 4,
+    "sel_in_top20": 3,
+    "abs_missing_head60": 0.03333333333333333,
+    "oa_head60": 0.8666666666666667
+   },
+   "full-arxiv": {
+    "top20_rel": 20,
+    "top20_core": 13,
+    "top20_unlabeled": 0,
+    "pool": 201,
+    "kept": 162,
+    "sel_n": 5,
+    "sel_in_pool": 5,
+    "sel_in_head60": 4,
+    "sel_in_top20": 1,
+    "abs_missing_head60": 0.06666666666666667,
+    "oa_head60": 0.8666666666666667
+   },
+   "full-epmc": {
+    "top20_rel": 20,
+    "top20_core": 14,
+    "top20_unlabeled": 0,
+    "pool": 217,
+    "kept": 177,
+    "sel_n": 5,
+    "sel_in_pool": 5,
+    "sel_in_head60": 4,
+    "sel_in_top20": 3,
+    "abs_missing_head60": 0.06666666666666667,
+    "oa_head60": 0.8666666666666667
+   },
+   "new4+crossref": {
+    "top20_rel": 20,
+    "top20_core": 13,
+    "top20_unlabeled": 0,
+    "pool": 201,
+    "kept": 162,
+    "sel_n": 5,
+    "sel_in_pool": 5,
+    "sel_in_head60": 4,
+    "sel_in_top20": 1,
+    "abs_missing_head60": 0.06666666666666667,
+    "oa_head60": 0.8666666666666667
+   },
+   "full-exa-tavily": {
+    "top20_rel": 20,
+    "top20_core": 12,
+    "top20_unlabeled": 0,
+    "pool": 209,
+    "kept": 172,
+    "sel_n": 5,
+    "sel_in_pool": 5,
+    "sel_in_head60": 4,
+    "sel_in_top20": 2,
+    "abs_missing_head60": 0.05,
+    "oa_head60": 0.8666666666666667
+   },
+   "full7_vs_new4": {
+    "added_head60": 8,
+    "added_rel": 7,
+    "added_core": 2,
+    "added_core_not_in_openalex": 1,
+    "added_core_not_in_b_pool": 0,
+    "added_rel_not_in_b_pool": 2,
+    "added_unlabeled": 0,
+    "added_sel": 0,
+    "examples_core": [
+     "A new adjusted maximum likelihood method for the Fay–Herriot small area model",
+     "Small area estimation with spatio-temporal Fay–Herriot models"
+    ]
+   },
+   "s2_extra": {
+    "added_head60": 6,
+    "added_rel": 6,
+    "added_core": 3,
+    "added_core_not_in_openalex": 1,
+    "added_core_not_in_b_pool": 1,
+    "added_rel_not_in_b_pool": 2,
+    "added_unlabeled": 0,
+    "added_sel": 0,
+    "examples_core": [
+     "Adjusted Maximum Likelihood Method Based on Shrinkage Factor Bias Reduction for Multivaria",
+     "The EM algorithm for variance component estimation in multivariate Fay-Herriot model",
+     "Hierarchical Bayes estimation in small area estimation using cross-sectional and time-seri"
+    ]
+   },
+   "s2_extra_new4": {
+    "added_head60": 11,
+    "added_rel": 11,
+    "added_core": 3,
+    "added_core_not_in_openalex": 1,
+    "added_core_not_in_b_pool": 1,
+    "added_rel_not_in_b_pool": 4,
+    "added_unlabeled": 0,
+    "added_sel": 0,
+    "examples_core": [
+     "Variational autoencoded multivariate spatial Fay–Herriot models",
+     "Adjusted Maximum Likelihood Method Based on Shrinkage Factor Bias Reduction for Multivaria",
+     "Hierarchical Bayes estimation in small area estimation using cross-sectional and time-seri"
+    ]
+   },
+   "crossref_extra": {
+    "added_head60": 6,
+    "added_rel": 5,
+    "added_core": 2,
+    "added_core_not_in_openalex": 1,
+    "added_core_not_in_b_pool": 0,
+    "added_rel_not_in_b_pool": 2,
+    "added_unlabeled": 0,
+    "added_sel": 0,
+    "examples_core": [
+     "A new adjusted maximum likelihood method for the Fay–Herriot small area model",
+     "Small area estimation with spatio-temporal Fay–Herriot models"
+    ]
+   },
+   "arxiv_extra": {
+    "added_head60": 2,
+    "added_rel": 2,
+    "added_core": 0,
+    "added_core_not_in_openalex": 0,
+    "added_core_not_in_b_pool": 0,
+    "added_rel_not_in_b_pool": 0,
+    "added_unlabeled": 0,
+    "added_sel": 0,
+    "examples_core": []
+   },
+   "epmc_extra": {
+    "added_head60": 0,
+    "added_rel": 0,
+    "added_core": 0,
+    "added_core_not_in_openalex": 0,
+    "added_core_not_in_b_pool": 0,
+    "added_rel_not_in_b_pool": 0,
+    "added_unlabeled": 0,
+    "added_sel": 0,
+    "examples_core": []
+   },
+   "exa_tavily_extra": {
+    "added_head60": 1,
+    "added_rel": 1,
+    "added_core": 1,
+    "added_core_not_in_openalex": 1,
+    "added_core_not_in_b_pool": 0,
+    "added_rel_not_in_b_pool": 0,
+    "added_unlabeled": 0,
+    "added_sel": 0,
+    "examples_core": [
+     "Small area estimation with spatio-temporal Fay–Herriot models"
+    ]
+   },
+   "crossref_over_new4": {
+    "added_head60": 6,
+    "added_rel": 5,
+    "added_core": 2,
+    "added_core_not_in_openalex": 1,
+    "added_core_not_in_b_pool": 0,
+    "added_rel_not_in_b_pool": 2,
+    "added_unlabeled": 0,
+    "added_sel": 0,
+    "examples_core": [
+     "A new adjusted maximum likelihood method for the Fay–Herriot small area model",
+     "Small area estimation with spatio-temporal Fay–Herriot models"
+    ]
+   }
+  },
+  "method:stochastic-reconfiguration-natural-gradient-for-neural-quant": {
+   "full7": {
+    "top20_rel": 20,
+    "top20_core": 12,
+    "top20_unlabeled": 0,
+    "pool": 365,
+    "kept": 349,
+    "sel_n": 3,
+    "sel_in_pool": 3,
+    "sel_in_head60": 3,
+    "sel_in_top20": 3,
+    "abs_missing_head60": 0.016666666666666666,
+    "oa_head60": 0.9333333333333333,
+    "seeded_heldout_n": 2,
+    "seeded_heldout_in_head60": 2,
+    "pseudo_heldout_in_head60": 2
+   },
+   "new4": {
+    "top20_rel": 20,
+    "top20_core": 10,
+    "top20_unlabeled": 0,
+    "pool": 282,
+    "kept": 267,
+    "sel_n": 3,
+    "sel_in_pool": 3,
+    "sel_in_head60": 3,
+    "sel_in_top20": 2,
+    "abs_missing_head60": 0.016666666666666666,
+    "oa_head60": 0.9333333333333333,
+    "seeded_heldout_n": 2,
+    "seeded_heldout_in_head60": 2,
+    "pseudo_heldout_in_head60": 2
+   },
+   "full-s2": {
+    "top20_rel": 20,
+    "top20_core": 11,
+    "top20_unlabeled": 0,
+    "pool": 305,
+    "kept": 290,
+    "sel_n": 3,
+    "sel_in_pool": 3,
+    "sel_in_head60": 3,
+    "sel_in_top20": 2,
+    "abs_missing_head60": 0.0,
+    "oa_head60": 0.9666666666666667,
+    "seeded_heldout_n": 2,
+    "seeded_heldout_in_head60": 2,
+    "pseudo_heldout_in_head60": 2
+   },
+   "new4-s2": {
+    "top20_rel": 20,
+    "top20_core": 13,
+    "top20_unlabeled": 0,
+    "pool": 221,
+    "kept": 207,
+    "sel_n": 3,
+    "sel_in_pool": 3,
+    "sel_in_head60": 2,
+    "sel_in_top20": 1,
+    "abs_missing_head60": 0.0,
+    "oa_head60": 0.9666666666666667
+   },
+   "old2": {
+    "top20_rel": 7,
+    "top20_core": 3,
+    "top20_unlabeled": 0,
+    "pool": 97,
+    "kept": 96,
+    "sel_n": 3,
+    "sel_in_pool": 3,
+    "sel_in_head60": 2,
+    "sel_in_top20": 2,
+    "abs_missing_head60": 0.1,
+    "oa_head60": 0.6333333333333333
+   },
+   "oa": {
+    "top20_rel": 19,
+    "top20_core": 9,
+    "top20_unlabeled": 0,
+    "pool": 208,
+    "kept": 197,
+    "sel_n": 3,
+    "sel_in_pool": 3,
+    "sel_in_head60": 2,
+    "sel_in_top20": 1,
+    "abs_missing_head60": 0.0,
+    "oa_head60": 0.9666666666666667,
+    "seeded_heldout_n": 2,
+    "seeded_heldout_in_head60": 1,
+    "pseudo_heldout_in_head60": 1
+   },
+   "full-crossref": {
+    "top20_rel": 20,
+    "top20_core": 11,
+    "top20_unlabeled": 0,
+    "pool": 318,
+    "kept": 302,
+    "sel_n": 3,
+    "sel_in_pool": 3,
+    "sel_in_head60": 3,
+    "sel_in_top20": 2,
+    "abs_missing_head60": 0.016666666666666666,
+    "oa_head60": 0.9333333333333333
+   },
+   "full-arxiv": {
+    "top20_rel": 20,
+    "top20_core": 12,
+    "top20_unlabeled": 0,
+    "pool": 329,
+    "kept": 314,
+    "sel_n": 3,
+    "sel_in_pool": 3,
+    "sel_in_head60": 3,
+    "sel_in_top20": 3,
+    "abs_missing_head60": 0.016666666666666666,
+    "oa_head60": 0.9333333333333333
+   },
+   "full-epmc": {
+    "top20_rel": 20,
+    "top20_core": 12,
+    "top20_unlabeled": 0,
+    "pool": 365,
+    "kept": 349,
+    "sel_n": 3,
+    "sel_in_pool": 3,
+    "sel_in_head60": 3,
+    "sel_in_top20": 3,
+    "abs_missing_head60": 0.016666666666666666,
+    "oa_head60": 0.9333333333333333
+   },
+   "new4+crossref": {
+    "top20_rel": 20,
+    "top20_core": 12,
+    "top20_unlabeled": 0,
+    "pool": 329,
+    "kept": 314,
+    "sel_n": 3,
+    "sel_in_pool": 3,
+    "sel_in_head60": 3,
+    "sel_in_top20": 3,
+    "abs_missing_head60": 0.016666666666666666,
+    "oa_head60": 0.9333333333333333
+   },
+   "full-exa-tavily": {
+    "top20_rel": 20,
+    "top20_core": 11,
+    "top20_unlabeled": 0,
+    "pool": 352,
+    "kept": 339,
+    "sel_n": 3,
+    "sel_in_pool": 3,
+    "sel_in_head60": 3,
+    "sel_in_top20": 3,
+    "abs_missing_head60": 0.016666666666666666,
+    "oa_head60": 0.9166666666666666
+   },
+   "full7_vs_new4": {
+    "added_head60": 7,
+    "added_rel": 5,
+    "added_core": 0,
+    "added_core_not_in_openalex": 0,
+    "added_core_not_in_b_pool": 0,
+    "added_rel_not_in_b_pool": 0,
+    "added_unlabeled": 0,
+    "added_sel": 0,
+    "examples_core": []
+   },
+   "s2_extra": {
+    "added_head60": 18,
+    "added_rel": 14,
+    "added_core": 2,
+    "added_core_not_in_openalex": 0,
+    "added_core_not_in_b_pool": 0,
+    "added_rel_not_in_b_pool": 1,
+    "added_unlabeled": 0,
+    "added_sel": 0,
+    "examples_core": [
+     "Quantum Geometric Tensor Preconditioning for Stable Training of Recurrent Neural Quantum S",
+     "Projected Inverse Iteration: An Eigenvalue Approach to Ground-State Computation with Neura"
+    ]
+   },
+   "s2_extra_new4": {
+    "added_head60": 20,
+    "added_rel": 16,
+    "added_core": 4,
+    "added_core_not_in_openalex": 0,
+    "added_core_not_in_b_pool": 0,
+    "added_rel_not_in_b_pool": 2,
+    "added_unlabeled": 0,
+    "added_sel": 1,
+    "examples_core": [
+     "Quantum Geometric Tensor Preconditioning for Stable Training of Recurrent Neural Quantum S",
+     "Neural network quantum state with proximal optimization: a ground-state searching scheme b",
+     "Quantum Algorithms for the Variational Optimization of Correlated Electronic States with S",
+     "Projected Inverse Iteration: An Eigenvalue Approach to Ground-State Computation with Neura"
+    ]
+   },
+   "crossref_extra": {
+    "added_head60": 6,
+    "added_rel": 4,
+    "added_core": 0,
+    "added_core_not_in_openalex": 0,
+    "added_core_not_in_b_pool": 0,
+    "added_rel_not_in_b_pool": 0,
+    "added_unlabeled": 0,
+    "added_sel": 0,
+    "examples_core": []
+   },
+   "arxiv_extra": {
+    "added_head60": 1,
+    "added_rel": 1,
+    "added_core": 0,
+    "added_core_not_in_openalex": 0,
+    "added_core_not_in_b_pool": 0,
+    "added_rel_not_in_b_pool": 0,
+    "added_unlabeled": 0,
+    "added_sel": 0,
+    "examples_core": []
+   },
+   "epmc_extra": {
+    "added_head60": 0,
+    "added_rel": 0,
+    "added_core": 0,
+    "added_core_not_in_openalex": 0,
+    "added_core_not_in_b_pool": 0,
+    "added_rel_not_in_b_pool": 0,
+    "added_unlabeled": 0,
+    "added_sel": 0,
+    "examples_core": []
+   },
+   "exa_tavily_extra": {
+    "added_head60": 2,
+    "added_rel": 2,
+    "added_core": 2,
+    "added_core_not_in_openalex": 0,
+    "added_core_not_in_b_pool": 0,
+    "added_rel_not_in_b_pool": 0,
+    "added_unlabeled": 0,
+    "added_sel": 0,
+    "examples_core": [
+     "Improved optimization for the neural-network quantum states and tests on the chromium dime",
+     "An accelerated linear method for optimizing non-linear wavefunctions in variational Monte "
+    ]
+   },
+   "crossref_over_new4": {
+    "added_head60": 6,
+    "added_rel": 4,
+    "added_core": 0,
+    "added_core_not_in_openalex": 0,
+    "added_core_not_in_b_pool": 0,
+    "added_rel_not_in_b_pool": 0,
+    "added_unlabeled": 0,
+    "added_sel": 0,
+    "examples_core": []
+   }
+  },
+  "method:strong-constraint-4d-var-with-window-lengthening-warm-starte": {
+   "full7": {
+    "top20_rel": 20,
+    "top20_core": 7,
+    "top20_unlabeled": 0,
+    "pool": 323,
+    "kept": 304,
+    "sel_n": 5,
+    "sel_in_pool": 5,
+    "sel_in_head60": 4,
+    "sel_in_top20": 4,
+    "abs_missing_head60": 0.016666666666666666,
+    "oa_head60": 0.9166666666666666,
+    "seeded_heldout_n": 3,
+    "seeded_heldout_in_head60": 2,
+    "pseudo_heldout_in_head60": 2
+   },
+   "new4": {
+    "top20_rel": 20,
+    "top20_core": 6,
+    "top20_unlabeled": 0,
+    "pool": 274,
+    "kept": 256,
+    "sel_n": 5,
+    "sel_in_pool": 5,
+    "sel_in_head60": 4,
+    "sel_in_top20": 3,
+    "abs_missing_head60": 0.016666666666666666,
+    "oa_head60": 0.8833333333333333,
+    "seeded_heldout_n": 3,
+    "seeded_heldout_in_head60": 2,
+    "pseudo_heldout_in_head60": 2
+   },
+   "full-s2": {
+    "top20_rel": 19,
+    "top20_core": 6,
+    "top20_unlabeled": 0,
+    "pool": 258,
+    "kept": 245,
+    "sel_n": 5,
+    "sel_in_pool": 5,
+    "sel_in_head60": 4,
+    "sel_in_top20": 3,
+    "abs_missing_head60": 0.0,
+    "oa_head60": 0.9333333333333333,
+    "seeded_heldout_n": 3,
+    "seeded_heldout_in_head60": 2,
+    "pseudo_heldout_in_head60": 2
+   },
+   "new4-s2": {
+    "top20_rel": 20,
+    "top20_core": 5,
+    "top20_unlabeled": 0,
+    "pool": 204,
+    "kept": 192,
+    "sel_n": 5,
+    "sel_in_pool": 5,
+    "sel_in_head60": 4,
+    "sel_in_top20": 3,
+    "abs_missing_head60": 0.016666666666666666,
+    "oa_head60": 0.95
+   },
+   "old2": {
+    "top20_rel": 17,
+    "top20_core": 2,
+    "top20_unlabeled": 0,
+    "pool": 73,
+    "kept": 72,
+    "sel_n": 5,
+    "sel_in_pool": 4,
+    "sel_in_head60": 4,
+    "sel_in_top20": 2,
+    "abs_missing_head60": 0.05,
+    "oa_head60": 0.5666666666666667
+   },
+   "oa": {
+    "top20_rel": 19,
+    "top20_core": 3,
+    "top20_unlabeled": 0,
+    "pool": 187,
+    "kept": 178,
+    "sel_n": 5,
+    "sel_in_pool": 4,
+    "sel_in_head60": 4,
+    "sel_in_top20": 2,
+    "abs_missing_head60": 0.016666666666666666,
+    "oa_head60": 0.95,
+    "seeded_heldout_n": 3,
+    "seeded_heldout_in_head60": 3,
+    "pseudo_heldout_in_head60": 2
+   },
+   "full-crossref": {
+    "top20_rel": 20,
+    "top20_core": 7,
+    "top20_unlabeled": 0,
+    "pool": 300,
+    "kept": 281,
+    "sel_n": 5,
+    "sel_in_pool": 5,
+    "sel_in_head60": 4,
+    "sel_in_top20": 3,
+    "abs_missing_head60": 0.016666666666666666,
+    "oa_head60": 0.9166666666666666
+   },
+   "full-arxiv": {
+    "top20_rel": 20,
+    "top20_core": 8,
+    "top20_unlabeled": 0,
+    "pool": 297,
+    "kept": 279,
+    "sel_n": 5,
+    "sel_in_pool": 5,
+    "sel_in_head60": 4,
+    "sel_in_top20": 4,
+    "abs_missing_head60": 0.016666666666666666,
+    "oa_head60": 0.8833333333333333
+   },
+   "full-epmc": {
+    "top20_rel": 20,
+    "top20_core": 7,
+    "top20_unlabeled": 0,
+    "pool": 323,
+    "kept": 304,
+    "sel_n": 5,
+    "sel_in_pool": 5,
+    "sel_in_head60": 4,
+    "sel_in_top20": 4,
+    "abs_missing_head60": 0.016666666666666666,
+    "oa_head60": 0.9166666666666666
+   },
+   "new4+crossref": {
+    "top20_rel": 20,
+    "top20_core": 8,
+    "top20_unlabeled": 0,
+    "pool": 297,
+    "kept": 279,
+    "sel_n": 5,
+    "sel_in_pool": 5,
+    "sel_in_head60": 4,
+    "sel_in_top20": 4,
+    "abs_missing_head60": 0.016666666666666666,
+    "oa_head60": 0.8833333333333333
+   },
+   "full-exa-tavily": {
+    "top20_rel": 20,
+    "top20_core": 6,
+    "top20_unlabeled": 0,
+    "pool": 311,
+    "kept": 295,
+    "sel_n": 5,
+    "sel_in_pool": 5,
+    "sel_in_head60": 4,
+    "sel_in_top20": 4,
+    "abs_missing_head60": 0.016666666666666666,
+    "oa_head60": 0.9
+   },
+   "full7_vs_new4": {
+    "added_head60": 14,
+    "added_rel": 11,
+    "added_core": 3,
+    "added_core_not_in_openalex": 3,
+    "added_core_not_in_b_pool": 0,
+    "added_rel_not_in_b_pool": 3,
+    "added_unlabeled": 0,
+    "added_sel": 0,
+    "examples_core": [
+     "4DVAR by ensemble Kalman smoother",
+     "An ensemble-based explicit four-dimensional variational assimilation method",
+     "E4DVar: Coupling an Ensemble Kalman Filter with Four-Dimensional Variational Data Assimila"
+    ]
+   },
+   "s2_extra": {
+    "added_head60": 14,
+    "added_rel": 13,
+    "added_core": 6,
+    "added_core_not_in_openalex": 4,
+    "added_core_not_in_b_pool": 1,
+    "added_rel_not_in_b_pool": 4,
+    "added_unlabeled": 0,
+    "added_sel": 0,
+    "examples_core": [
+     "Quasi static ensemble variational data assimilation",
+     "Data assimilation challenges posed by nonlinear operators: A comparative study of ensemble",
+     "Intercomparison of an Ensemble Kalman Filter with Three- and Four-Dimensional Variational ",
+     "An ensemble-based explicit four-dimensional variational assimilation method",
+     "A 4DEnVar‐Based Ensemble Four‐Dimensional Variational (En4DVar) Hybrid Data Assimilation S",
+     "Application of the Quasi Static Variational Assimilation (QSVA) Method to Heavy Rainfall C"
+    ]
+   },
+   "s2_extra_new4": {
+    "added_head60": 21,
+    "added_rel": 20,
+    "added_core": 7,
+    "added_core_not_in_openalex": 5,
+    "added_core_not_in_b_pool": 2,
+    "added_rel_not_in_b_pool": 12,
+    "added_unlabeled": 0,
+    "added_sel": 1,
+    "examples_core": [
+     "Quasi static ensemble variational data assimilation",
+     "An iterative ensemble Kalman smoother",
+     "Data assimilation challenges posed by nonlinear operators: A comparative study of ensemble",
+     "Four-dimensional ensemble variational data assimilation and the unstable subspace",
+     "A 4DEnVar‐Based Ensemble Four‐Dimensional Variational (En4DVar) Hybrid Data Assimilation S",
+     "Application of the Quasi Static Variational Assimilation (QSVA) Method to Heavy Rainfall C"
+    ]
+   },
+   "crossref_extra": {
+    "added_head60": 9,
+    "added_rel": 9,
+    "added_core": 2,
+    "added_core_not_in_openalex": 2,
+    "added_core_not_in_b_pool": 0,
+    "added_rel_not_in_b_pool": 3,
+    "added_unlabeled": 0,
+    "added_sel": 0,
+    "examples_core": [
+     "An ensemble-based explicit four-dimensional variational assimilation method",
+     "E4DVar: Coupling an Ensemble Kalman Filter with Four-Dimensional Variational Data Assimila"
+    ]
+   },
+   "arxiv_extra": {
+    "added_head60": 5,
+    "added_rel": 2,
+    "added_core": 1,
+    "added_core_not_in_openalex": 1,
+    "added_core_not_in_b_pool": 0,
+    "added_rel_not_in_b_pool": 0,
+    "added_unlabeled": 0,
+    "added_sel": 0,
+    "examples_core": [
+     "4DVAR by ensemble Kalman smoother"
+    ]
+   },
+   "epmc_extra": {
+    "added_head60": 0,
+    "added_rel": 0,
+    "added_core": 0,
+    "added_core_not_in_openalex": 0,
+    "added_core_not_in_b_pool": 0,
+    "added_rel_not_in_b_pool": 0,
+    "added_unlabeled": 0,
+    "added_sel": 0,
+    "examples_core": []
+   },
+   "exa_tavily_extra": {
+    "added_head60": 4,
+    "added_rel": 4,
+    "added_core": 2,
+    "added_core_not_in_openalex": 2,
+    "added_core_not_in_b_pool": 0,
+    "added_rel_not_in_b_pool": 0,
+    "added_unlabeled": 0,
+    "added_sel": 0,
+    "examples_core": [
+     "4DVAR by ensemble Kalman smoother",
+     "E4DVar: Coupling an Ensemble Kalman Filter with Four-Dimensional Variational Data Assimila"
+    ]
+   },
+   "crossref_over_new4": {
+    "added_head60": 9,
+    "added_rel": 9,
+    "added_core": 2,
+    "added_core_not_in_openalex": 2,
+    "added_core_not_in_b_pool": 0,
+    "added_rel_not_in_b_pool": 3,
+    "added_unlabeled": 0,
+    "added_sel": 0,
+    "examples_core": [
+     "An ensemble-based explicit four-dimensional variational assimilation method",
+     "E4DVar: Coupling an Ensemble Kalman Filter with Four-Dimensional Variational Data Assimila"
+    ]
+   }
+  },
+  "task:3x2pt-inference": {
+   "full7": {
+    "top20_rel": 20,
+    "top20_core": 11,
+    "top20_unlabeled": 0,
+    "pool": 335,
+    "kept": 271,
+    "sel_n": 3,
+    "sel_in_pool": 3,
+    "sel_in_head60": 3,
+    "sel_in_top20": 2,
+    "abs_missing_head60": 0.0,
+    "oa_head60": 1.0,
+    "seeded_heldout_n": 2,
+    "seeded_heldout_in_head60": 2,
+    "pseudo_heldout_in_head60": 2
+   },
+   "new4": {
+    "top20_rel": 18,
+    "top20_core": 11,
+    "top20_unlabeled": 0,
+    "pool": 275,
+    "kept": 217,
+    "sel_n": 3,
+    "sel_in_pool": 3,
+    "sel_in_head60": 3,
+    "sel_in_top20": 2,
+    "abs_missing_head60": 0.0,
+    "oa_head60": 0.9666666666666667,
+    "seeded_heldout_n": 2,
+    "seeded_heldout_in_head60": 2,
+    "pseudo_heldout_in_head60": 2
+   },
+   "full-s2": {
+    "top20_rel": 18,
+    "top20_core": 11,
+    "top20_unlabeled": 0,
+    "pool": 279,
+    "kept": 243,
+    "sel_n": 3,
+    "sel_in_pool": 3,
+    "sel_in_head60": 3,
+    "sel_in_top20": 2,
+    "abs_missing_head60": 0.0,
+    "oa_head60": 1.0,
+    "seeded_heldout_n": 2,
+    "seeded_heldout_in_head60": 2,
+    "pseudo_heldout_in_head60": 2
+   },
+   "new4-s2": {
+    "top20_rel": 17,
+    "top20_core": 11,
+    "top20_unlabeled": 0,
+    "pool": 218,
+    "kept": 188,
+    "sel_n": 3,
+    "sel_in_pool": 3,
+    "sel_in_head60": 3,
+    "sel_in_top20": 3,
+    "abs_missing_head60": 0.0,
+    "oa_head60": 1.0
+   },
+   "old2": {
+    "top20_rel": 8,
+    "top20_core": 4,
+    "top20_unlabeled": 0,
+    "pool": 78,
+    "kept": 73,
+    "sel_n": 3,
+    "sel_in_pool": 2,
+    "sel_in_head60": 2,
+    "sel_in_top20": 2,
+    "abs_missing_head60": 0.21666666666666667,
+    "oa_head60": 0.5833333333333334
+   },
+   "oa": {
+    "top20_rel": 16,
+    "top20_core": 9,
+    "top20_unlabeled": 0,
+    "pool": 203,
+    "kept": 178,
+    "sel_n": 3,
+    "sel_in_pool": 3,
+    "sel_in_head60": 3,
+    "sel_in_top20": 3,
+    "abs_missing_head60": 0.0,
+    "oa_head60": 1.0,
+    "seeded_heldout_n": 2,
+    "seeded_heldout_in_head60": 2,
+    "pseudo_heldout_in_head60": 2
+   },
+   "full-crossref": {
+    "top20_rel": 18,
+    "top20_core": 11,
+    "top20_unlabeled": 0,
+    "pool": 305,
+    "kept": 242,
+    "sel_n": 3,
+    "sel_in_pool": 3,
+    "sel_in_head60": 3,
+    "sel_in_top20": 2,
+    "abs_missing_head60": 0.0,
+    "oa_head60": 0.9833333333333333
+   },
+   "full-arxiv": {
+    "top20_rel": 20,
+    "top20_core": 11,
+    "top20_unlabeled": 0,
+    "pool": 308,
+    "kept": 249,
+    "sel_n": 3,
+    "sel_in_pool": 3,
+    "sel_in_head60": 3,
+    "sel_in_top20": 2,
+    "abs_missing_head60": 0.0,
+    "oa_head60": 0.9833333333333333
+   },
+   "full-epmc": {
+    "top20_rel": 20,
+    "top20_core": 11,
+    "top20_unlabeled": 0,
+    "pool": 335,
+    "kept": 271,
+    "sel_n": 3,
+    "sel_in_pool": 3,
+    "sel_in_head60": 3,
+    "sel_in_top20": 2,
+    "abs_missing_head60": 0.0,
+    "oa_head60": 1.0
+   },
+   "new4+crossref": {
+    "top20_rel": 20,
+    "top20_core": 11,
+    "top20_unlabeled": 0,
+    "pool": 308,
+    "kept": 249,
+    "sel_n": 3,
+    "sel_in_pool": 3,
+    "sel_in_head60": 3,
+    "sel_in_top20": 2,
+    "abs_missing_head60": 0.0,
+    "oa_head60": 0.9833333333333333
+   },
+   "full-exa-tavily": {
+    "top20_rel": 18,
+    "top20_core": 10,
+    "top20_unlabeled": 0,
+    "pool": 321,
+    "kept": 262,
+    "sel_n": 3,
+    "sel_in_pool": 3,
+    "sel_in_head60": 3,
+    "sel_in_top20": 2,
+    "abs_missing_head60": 0.0,
+    "oa_head60": 0.9833333333333333
+   },
+   "full7_vs_new4": {
+    "added_head60": 9,
+    "added_rel": 5,
+    "added_core": 2,
+    "added_core_not_in_openalex": 1,
+    "added_core_not_in_b_pool": 1,
+    "added_rel_not_in_b_pool": 2,
+    "added_unlabeled": 0,
+    "added_sel": 0,
+    "examples_core": [
+     "Cosmological perturbation theory using the FFTLog: formalism and connection to QFT loop in",
+     "Integrated perturbation theory and one-loop power spectra of biased tracers"
+    ]
+   },
+   "s2_extra": {
+    "added_head60": 17,
+    "added_rel": 10,
+    "added_core": 2,
+    "added_core_not_in_openalex": 0,
+    "added_core_not_in_b_pool": 0,
+    "added_rel_not_in_b_pool": 1,
+    "added_unlabeled": 0,
+    "added_sel": 0,
+    "examples_core": [
+     "PowerFull: fast and accurate computation of the relativistic angular galaxy power spectrum",
+     "Blast.jl: Differentiable Non-Limber Power Spectra for Joint Clustering, Shear, and CMB len"
+    ]
+   },
+   "s2_extra_new4": {
+    "added_head60": 16,
+    "added_rel": 10,
+    "added_core": 3,
+    "added_core_not_in_openalex": 1,
+    "added_core_not_in_b_pool": 1,
+    "added_rel_not_in_b_pool": 2,
+    "added_unlabeled": 0,
+    "added_sel": 0,
+    "examples_core": [
+     "PowerFull: fast and accurate computation of the relativistic angular galaxy power spectrum",
+     "Blast.jl: Differentiable Non-Limber Power Spectra for Joint Clustering, Shear, and CMB len",
+     "Modelling the large scale structure of the Universe as a function of cosmology and baryoni"
+    ]
+   },
+   "crossref_extra": {
+    "added_head60": 6,
+    "added_rel": 3,
+    "added_core": 1,
+    "added_core_not_in_openalex": 1,
+    "added_core_not_in_b_pool": 0,
+    "added_rel_not_in_b_pool": 0,
+    "added_unlabeled": 0,
+    "added_sel": 0,
+    "examples_core": [
+     "Integrated perturbation theory and one-loop power spectra of biased tracers"
+    ]
+   },
+   "arxiv_extra": {
+    "added_head60": 7,
+    "added_rel": 5,
+    "added_core": 2,
+    "added_core_not_in_openalex": 1,
+    "added_core_not_in_b_pool": 0,
+    "added_rel_not_in_b_pool": 0,
+    "added_unlabeled": 0,
+    "added_sel": 0,
+    "examples_core": [
+     "Cosmological perturbation theory using the FFTLog: formalism and connection to QFT loop in",
+     "Integrated perturbation theory and one-loop power spectra of biased tracers"
+    ]
+   },
+   "epmc_extra": {
+    "added_head60": 0,
+    "added_rel": 0,
+    "added_core": 0,
+    "added_core_not_in_openalex": 0,
+    "added_core_not_in_b_pool": 0,
+    "added_rel_not_in_b_pool": 0,
+    "added_unlabeled": 0,
+    "added_sel": 0,
+    "examples_core": []
+   },
+   "exa_tavily_extra": {
+    "added_head60": 3,
+    "added_rel": 3,
+    "added_core": 2,
+    "added_core_not_in_openalex": 1,
+    "added_core_not_in_b_pool": 1,
+    "added_rel_not_in_b_pool": 1,
+    "added_unlabeled": 0,
+    "added_sel": 0,
+    "examples_core": [
+     "Nonlinear perturbation theory extension of the Boltzmann code CLASS",
+     "JAX-COSMO: An End-to-End Differentiable and GPU Accelerated Cosmology Library"
+    ]
+   },
+   "crossref_over_new4": {
+    "added_head60": 2,
+    "added_rel": 0,
+    "added_core": 0,
+    "added_core_not_in_openalex": 0,
+    "added_core_not_in_b_pool": 0,
+    "added_rel_not_in_b_pool": 0,
+    "added_unlabeled": 0,
+    "added_sel": 0,
+    "examples_core": []
+   }
+  },
+  "task:ambient-rna-correction": {
+   "full7": {
+    "top20_rel": 17,
+    "top20_core": 12,
+    "top20_unlabeled": 0,
+    "pool": 357,
+    "kept": 349,
+    "sel_n": 5,
+    "sel_in_pool": 5,
+    "sel_in_head60": 4,
+    "sel_in_top20": 3,
+    "abs_missing_head60": 0.0,
+    "oa_head60": 0.9666666666666667,
+    "seeded_heldout_n": 3,
+    "seeded_heldout_in_head60": 2,
+    "pseudo_heldout_in_head60": 2
+   },
+   "new4": {
+    "top20_rel": 19,
+    "top20_core": 11,
+    "top20_unlabeled": 0,
+    "pool": 255,
+    "kept": 251,
+    "sel_n": 5,
+    "sel_in_pool": 4,
+    "sel_in_head60": 4,
+    "sel_in_top20": 4,
+    "abs_missing_head60": 0.0,
+    "oa_head60": 0.9666666666666667,
+    "seeded_heldout_n": 3,
+    "seeded_heldout_in_head60": 2,
+    "pseudo_heldout_in_head60": 2
+   },
+   "full-s2": {
+    "top20_rel": 20,
+    "top20_core": 13,
+    "top20_unlabeled": 0,
+    "pool": 297,
+    "kept": 291,
+    "sel_n": 5,
+    "sel_in_pool": 5,
+    "sel_in_head60": 4,
+    "sel_in_top20": 4,
+    "abs_missing_head60": 0.0,
+    "oa_head60": 1.0,
+    "seeded_heldout_n": 3,
+    "seeded_heldout_in_head60": 2,
+    "pseudo_heldout_in_head60": 2
+   },
+   "new4-s2": {
+    "top20_rel": 19,
+    "top20_core": 10,
+    "top20_unlabeled": 0,
+    "pool": 191,
+    "kept": 189,
+    "sel_n": 5,
+    "sel_in_pool": 4,
+    "sel_in_head60": 4,
+    "sel_in_top20": 4,
+    "abs_missing_head60": 0.0,
+    "oa_head60": 1.0
+   },
+   "old2": {
+    "top20_rel": 8,
+    "top20_core": 6,
+    "top20_unlabeled": 0,
+    "pool": 94,
+    "kept": 91,
+    "sel_n": 5,
+    "sel_in_pool": 4,
+    "sel_in_head60": 3,
+    "sel_in_top20": 3,
+    "abs_missing_head60": 0.0,
+    "oa_head60": 0.5666666666666667
+   },
+   "oa": {
+    "top20_rel": 17,
+    "top20_core": 10,
+    "top20_unlabeled": 0,
+    "pool": 185,
+    "kept": 184,
+    "sel_n": 5,
+    "sel_in_pool": 3,
+    "sel_in_head60": 3,
+    "sel_in_top20": 3,
+    "abs_missing_head60": 0.0,
+    "oa_head60": 1.0,
+    "seeded_heldout_n": 3,
+    "seeded_heldout_in_head60": 1,
+    "pseudo_heldout_in_head60": 1
+   },
+   "full-crossref": {
+    "top20_rel": 17,
+    "top20_core": 11,
+    "top20_unlabeled": 0,
+    "pool": 312,
+    "kept": 305,
+    "sel_n": 5,
+    "sel_in_pool": 4,
+    "sel_in_head60": 4,
+    "sel_in_top20": 2,
+    "abs_missing_head60": 0.0,
+    "oa_head60": 0.9666666666666667
+   },
+   "full-arxiv": {
+    "top20_rel": 17,
+    "top20_core": 12,
+    "top20_unlabeled": 0,
+    "pool": 317,
+    "kept": 311,
+    "sel_n": 5,
+    "sel_in_pool": 5,
+    "sel_in_head60": 4,
+    "sel_in_top20": 3,
+    "abs_missing_head60": 0.0,
+    "oa_head60": 0.9666666666666667
+   },
+   "full-epmc": {
+    "top20_rel": 17,
+    "top20_core": 11,
+    "top20_unlabeled": 0,
+    "pool": 340,
+    "kept": 333,
+    "sel_n": 5,
+    "sel_in_pool": 5,
+    "sel_in_head60": 4,
+    "sel_in_top20": 3,
+    "abs_missing_head60": 0.0,
+    "oa_head60": 0.9666666666666667
+   },
+   "new4+crossref": {
+    "top20_rel": 17,
+    "top20_core": 11,
+    "top20_unlabeled": 0,
+    "pool": 300,
+    "kept": 295,
+    "sel_n": 5,
+    "sel_in_pool": 5,
+    "sel_in_head60": 4,
+    "sel_in_top20": 3,
+    "abs_missing_head60": 0.0,
+    "oa_head60": 0.9666666666666667
+   },
+   "full-exa-tavily": {
+    "top20_rel": 15,
+    "top20_core": 11,
+    "top20_unlabeled": 0,
+    "pool": 353,
+    "kept": 346,
+    "sel_n": 5,
+    "sel_in_pool": 5,
+    "sel_in_head60": 3,
+    "sel_in_top20": 2,
+    "abs_missing_head60": 0.0,
+    "oa_head60": 0.9666666666666667
+   },
+   "full7_vs_new4": {
+    "added_head60": 9,
+    "added_rel": 3,
+    "added_core": 1,
+    "added_core_not_in_openalex": 1,
+    "added_core_not_in_b_pool": 0,
+    "added_rel_not_in_b_pool": 0,
+    "added_unlabeled": 0,
+    "added_sel": 0,
+    "examples_core": [
+     "CellClear: Enhancing Single-cell RNA Data Quality via Biologically-Informed Ambient RNA Co"
+    ]
+   },
+   "s2_extra": {
+    "added_head60": 16,
+    "added_rel": 4,
+    "added_core": 0,
+    "added_core_not_in_openalex": 0,
+    "added_core_not_in_b_pool": 0,
+    "added_rel_not_in_b_pool": 3,
+    "added_unlabeled": 0,
+    "added_sel": 0,
+    "examples_core": []
+   },
+   "s2_extra_new4": {
+    "added_head60": 17,
+    "added_rel": 4,
+    "added_core": 0,
+    "added_core_not_in_openalex": 0,
+    "added_core_not_in_b_pool": 0,
+    "added_rel_not_in_b_pool": 3,
+    "added_unlabeled": 0,
+    "added_sel": 0,
+    "examples_core": []
+   },
+   "crossref_extra": {
+    "added_head60": 3,
+    "added_rel": 1,
+    "added_core": 1,
+    "added_core_not_in_openalex": 1,
+    "added_core_not_in_b_pool": 0,
+    "added_rel_not_in_b_pool": 0,
+    "added_unlabeled": 0,
+    "added_sel": 0,
+    "examples_core": [
+     "CellClear: Enhancing Single-cell RNA Data Quality via Biologically-Informed Ambient RNA Co"
+    ]
+   },
+   "arxiv_extra": {
+    "added_head60": 0,
+    "added_rel": 0,
+    "added_core": 0,
+    "added_core_not_in_openalex": 0,
+    "added_core_not_in_b_pool": 0,
+    "added_rel_not_in_b_pool": 0,
+    "added_unlabeled": 0,
+    "added_sel": 0,
+    "examples_core": []
+   },
+   "epmc_extra": {
+    "added_head60": 7,
+    "added_rel": 3,
+    "added_core": 1,
+    "added_core_not_in_openalex": 0,
+    "added_core_not_in_b_pool": 0,
+    "added_rel_not_in_b_pool": 0,
+    "added_unlabeled": 0,
+    "added_sel": 0,
+    "examples_core": [
+     "Integrated ambient modeling and genetic demultiplexing of single-cell RNA+ATAC multiome ex"
+    ]
+   },
+   "exa_tavily_extra": {
+    "added_head60": 3,
+    "added_rel": 3,
+    "added_core": 2,
+    "added_core_not_in_openalex": 2,
+    "added_core_not_in_b_pool": 0,
+    "added_rel_not_in_b_pool": 0,
+    "added_unlabeled": 0,
+    "added_sel": 1,
+    "examples_core": [
+     "Unsupervised removal of systematic background noise from droplet-based single-cell experim",
+     "CellClear: Enhancing Single-cell RNA Data Quality via Biologically-Informed Ambient RNA Co"
+    ]
+   },
+   "crossref_over_new4": {
+    "added_head60": 3,
+    "added_rel": 1,
+    "added_core": 1,
+    "added_core_not_in_openalex": 1,
+    "added_core_not_in_b_pool": 0,
+    "added_rel_not_in_b_pool": 0,
+    "added_unlabeled": 0,
+    "added_sel": 0,
+    "examples_core": [
+     "CellClear: Enhancing Single-cell RNA Data Quality via Biologically-Informed Ambient RNA Co"
+    ]
+   }
+  },
+  "task:nanoindentation-property-extraction": {
+   "full7": {
+    "top20_rel": 19,
+    "top20_core": 10,
+    "top20_unlabeled": 0,
+    "pool": 364,
+    "kept": 347,
+    "sel_n": 5,
+    "sel_in_pool": 5,
+    "sel_in_head60": 3,
+    "sel_in_top20": 2,
+    "abs_missing_head60": 0.1,
+    "oa_head60": 0.6666666666666666,
+    "seeded_heldout_n": 3,
+    "seeded_heldout_in_head60": 2,
+    "pseudo_heldout_in_head60": 2
+   },
+   "new4": {
+    "top20_rel": 19,
+    "top20_core": 11,
+    "top20_unlabeled": 0,
+    "pool": 276,
+    "kept": 259,
+    "sel_n": 5,
+    "sel_in_pool": 3,
+    "sel_in_head60": 3,
+    "sel_in_top20": 2,
+    "abs_missing_head60": 0.15,
+    "oa_head60": 0.6833333333333333,
+    "seeded_heldout_n": 3,
+    "seeded_heldout_in_head60": 2,
+    "pseudo_heldout_in_head60": 2
+   },
+   "full-s2": {
+    "top20_rel": 19,
+    "top20_core": 11,
+    "top20_unlabeled": 0,
+    "pool": 302,
+    "kept": 288,
+    "sel_n": 5,
+    "sel_in_pool": 4,
+    "sel_in_head60": 2,
+    "sel_in_top20": 2,
+    "abs_missing_head60": 0.03333333333333333,
+    "oa_head60": 0.9166666666666666,
+    "seeded_heldout_n": 3,
+    "seeded_heldout_in_head60": 1,
+    "pseudo_heldout_in_head60": 1
+   },
+   "new4-s2": {
+    "top20_rel": 18,
+    "top20_core": 9,
+    "top20_unlabeled": 0,
+    "pool": 213,
+    "kept": 199,
+    "sel_n": 5,
+    "sel_in_pool": 2,
+    "sel_in_head60": 1,
+    "sel_in_top20": 1,
+    "abs_missing_head60": 0.03333333333333333,
+    "oa_head60": 0.95
+   },
+   "old2": {
+    "top20_rel": 9,
+    "top20_core": 3,
+    "top20_unlabeled": 0,
+    "pool": 99,
+    "kept": 99,
+    "sel_n": 5,
+    "sel_in_pool": 4,
+    "sel_in_head60": 1,
+    "sel_in_top20": 1,
+    "abs_missing_head60": 0.0,
+    "oa_head60": 0.6166666666666667
+   },
+   "oa": {
+    "top20_rel": 18,
+    "top20_core": 8,
+    "top20_unlabeled": 0,
+    "pool": 194,
+    "kept": 187,
+    "sel_n": 5,
+    "sel_in_pool": 1,
+    "sel_in_head60": 1,
+    "sel_in_top20": 1,
+    "abs_missing_head60": 0.0,
+    "oa_head60": 0.9666666666666667,
+    "seeded_heldout_n": 3,
+    "seeded_heldout_in_head60": 1,
+    "pseudo_heldout_in_head60": 1
+   },
+   "full-crossref": {
+    "top20_rel": 19,
+    "top20_core": 10,
+    "top20_unlabeled": 0,
+    "pool": 314,
+    "kept": 297,
+    "sel_n": 5,
+    "sel_in_pool": 3,
+    "sel_in_head60": 3,
+    "sel_in_top20": 2,
+    "abs_missing_head60": 0.15,
+    "oa_head60": 0.6833333333333333
+   },
+   "full-arxiv": {
+    "top20_rel": 19,
+    "top20_core": 10,
+    "top20_unlabeled": 0,
+    "pool": 326,
+    "kept": 309,
+    "sel_n": 5,
+    "sel_in_pool": 5,
+    "sel_in_head60": 3,
+    "sel_in_top20": 2,
+    "abs_missing_head60": 0.1,
+    "oa_head60": 0.6666666666666666
+   },
+   "full-epmc": {
+    "top20_rel": 19,
+    "top20_core": 10,
+    "top20_unlabeled": 0,
+    "pool": 364,
+    "kept": 347,
+    "sel_n": 5,
+    "sel_in_pool": 5,
+    "sel_in_head60": 3,
+    "sel_in_top20": 2,
+    "abs_missing_head60": 0.1,
+    "oa_head60": 0.6666666666666666
+   },
+   "new4+crossref": {
+    "top20_rel": 19,
+    "top20_core": 10,
+    "top20_unlabeled": 0,
+    "pool": 326,
+    "kept": 309,
+    "sel_n": 5,
+    "sel_in_pool": 5,
+    "sel_in_head60": 3,
+    "sel_in_top20": 2,
+    "abs_missing_head60": 0.1,
+    "oa_head60": 0.6666666666666666
+   },
+   "full-exa-tavily": {
+    "top20_rel": 19,
+    "top20_core": 9,
+    "top20_unlabeled": 0,
+    "pool": 347,
+    "kept": 337,
+    "sel_n": 5,
+    "sel_in_pool": 5,
+    "sel_in_head60": 3,
+    "sel_in_top20": 3,
+    "abs_missing_head60": 0.08333333333333333,
+    "oa_head60": 0.6666666666666666
+   },
+   "full7_vs_new4": {
+    "added_head60": 4,
+    "added_rel": 4,
+    "added_core": 2,
+    "added_core_not_in_openalex": 1,
+    "added_core_not_in_b_pool": 0,
+    "added_rel_not_in_b_pool": 0,
+    "added_unlabeled": 0,
+    "added_sel": 0,
+    "examples_core": [
+     "Effective indenter radius and frame compliance in instrumented indentation testing using a",
+     "On the novel finding of two modified-Nix-Gao models for indentation size effect"
+    ]
+   },
+   "s2_extra": {
+    "added_head60": 25,
+    "added_rel": 16,
+    "added_core": 7,
+    "added_core_not_in_openalex": 4,
+    "added_core_not_in_b_pool": 3,
+    "added_rel_not_in_b_pool": 5,
+    "added_unlabeled": 0,
+    "added_sel": 1,
+    "examples_core": [
+     "On the Size Effect in Hardness by Nanoindentation Method",
+     "On the novel finding of two modified-Nix-Gao models for indentation size effect",
+     "Thermal drift in room temperature nanoindentation experiments: Measurement and correction",
+     "Description of the nanoindentation unloading curves with a universal function: Theoretical",
+     "Experimental Verification of the Strain-Gradient Plasticity Model for Indentation",
+     "On extracting mechanical properties from nanoindentation at temperatures up to 1000 °C"
+    ]
+   },
+   "s2_extra_new4": {
+    "added_head60": 28,
+    "added_rel": 18,
+    "added_core": 9,
+    "added_core_not_in_openalex": 6,
+    "added_core_not_in_b_pool": 4,
+    "added_rel_not_in_b_pool": 6,
+    "added_unlabeled": 0,
+    "added_sel": 2,
+    "examples_core": [
+     "On the Size Effect in Hardness by Nanoindentation Method",
+     "Thermal drift in room temperature nanoindentation experiments: Measurement and correction",
+     "Description of the nanoindentation unloading curves with a universal function: Theoretical",
+     "Experimental Verification of the Strain-Gradient Plasticity Model for Indentation",
+     "Simple method and critical comparison of frame compliance and indenter area function for n",
+     "On extracting mechanical properties from nanoindentation at temperatures up to 1000 °C"
+    ]
+   },
+   "crossref_extra": {
+    "added_head60": 3,
+    "added_rel": 3,
+    "added_core": 2,
+    "added_core_not_in_openalex": 1,
+    "added_core_not_in_b_pool": 0,
+    "added_rel_not_in_b_pool": 0,
+    "added_unlabeled": 0,
+    "added_sel": 0,
+    "examples_core": [
+     "Effective indenter radius and frame compliance in instrumented indentation testing using a",
+     "On the novel finding of two modified-Nix-Gao models for indentation size effect"
+    ]
+   },
+   "arxiv_extra": {
+    "added_head60": 1,
+    "added_rel": 1,
+    "added_core": 0,
+    "added_core_not_in_openalex": 0,
+    "added_core_not_in_b_pool": 0,
+    "added_rel_not_in_b_pool": 0,
+    "added_unlabeled": 0,
+    "added_sel": 0,
+    "examples_core": []
+   },
+   "epmc_extra": {
+    "added_head60": 0,
+    "added_rel": 0,
+    "added_core": 0,
+    "added_core_not_in_openalex": 0,
+    "added_core_not_in_b_pool": 0,
+    "added_rel_not_in_b_pool": 0,
+    "added_unlabeled": 0,
+    "added_sel": 0,
+    "examples_core": []
+   },
+   "exa_tavily_extra": {
+    "added_head60": 1,
+    "added_rel": 1,
+    "added_core": 1,
+    "added_core_not_in_openalex": 0,
+    "added_core_not_in_b_pool": 0,
+    "added_rel_not_in_b_pool": 0,
+    "added_unlabeled": 0,
+    "added_sel": 0,
+    "examples_core": [
+     "A new approach of the Oliver and Pharr model to fit the unloading curve from instrumented "
+    ]
+   },
+   "crossref_over_new4": {
+    "added_head60": 3,
+    "added_rel": 3,
+    "added_core": 2,
+    "added_core_not_in_openalex": 1,
+    "added_core_not_in_b_pool": 0,
+    "added_rel_not_in_b_pool": 0,
+    "added_unlabeled": 0,
+    "added_sel": 0,
+    "examples_core": [
+     "Effective indenter radius and frame compliance in instrumented indentation testing using a",
+     "On the novel finding of two modified-Nix-Gao models for indentation size effect"
+    ]
+   }
+  },
+  "task:qsm-reconstruction": {
+   "full7": {
+    "top20_rel": 20,
+    "top20_core": 18,
+    "top20_unlabeled": 0,
+    "pool": 374,
+    "kept": 361,
+    "sel_n": 5,
+    "sel_in_pool": 3,
+    "sel_in_head60": 3,
+    "sel_in_top20": 2,
+    "abs_missing_head60": 0.0,
+    "oa_head60": 0.9333333333333333,
+    "seeded_heldout_n": 3,
+    "seeded_heldout_in_head60": 2,
+    "pseudo_heldout_in_head60": 3
+   },
+   "new4": {
+    "top20_rel": 20,
+    "top20_core": 19,
+    "top20_unlabeled": 0,
+    "pool": 271,
+    "kept": 262,
+    "sel_n": 5,
+    "sel_in_pool": 3,
+    "sel_in_head60": 2,
+    "sel_in_top20": 1,
+    "abs_missing_head60": 0.0,
+    "oa_head60": 0.9333333333333333,
+    "seeded_heldout_n": 3,
+    "seeded_heldout_in_head60": 2,
+    "pseudo_heldout_in_head60": 2
+   },
+   "full-s2": {
+    "top20_rel": 19,
+    "top20_core": 16,
+    "top20_unlabeled": 0,
+    "pool": 311,
+    "kept": 300,
+    "sel_n": 5,
+    "sel_in_pool": 3,
+    "sel_in_head60": 2,
+    "sel_in_top20": 1,
+    "abs_missing_head60": 0.0,
+    "oa_head60": 0.95,
+    "seeded_heldout_n": 3,
+    "seeded_heldout_in_head60": 0,
+    "pseudo_heldout_in_head60": 2
+   },
+   "new4-s2": {
+    "top20_rel": 19,
+    "top20_core": 14,
+    "top20_unlabeled": 0,
+    "pool": 207,
+    "kept": 200,
+    "sel_n": 5,
+    "sel_in_pool": 3,
+    "sel_in_head60": 0,
+    "sel_in_top20": 0,
+    "abs_missing_head60": 0.0,
+    "oa_head60": 0.9666666666666667
+   },
+   "old2": {
+    "top20_rel": 10,
+    "top20_core": 7,
+    "top20_unlabeled": 0,
+    "pool": 84,
+    "kept": 82,
+    "sel_n": 5,
+    "sel_in_pool": 2,
+    "sel_in_head60": 1,
+    "sel_in_top20": 0,
+    "abs_missing_head60": 0.2,
+    "oa_head60": 0.55
+   },
+   "oa": {
+    "top20_rel": 18,
+    "top20_core": 12,
+    "top20_unlabeled": 0,
+    "pool": 193,
+    "kept": 188,
+    "sel_n": 5,
+    "sel_in_pool": 3,
+    "sel_in_head60": 0,
+    "sel_in_top20": 0,
+    "abs_missing_head60": 0.0,
+    "oa_head60": 0.9666666666666667,
+    "seeded_heldout_n": 3,
+    "seeded_heldout_in_head60": 0,
+    "pseudo_heldout_in_head60": 0
+   },
+   "full-crossref": {
+    "top20_rel": 20,
+    "top20_core": 18,
+    "top20_unlabeled": 0,
+    "pool": 332,
+    "kept": 320,
+    "sel_n": 5,
+    "sel_in_pool": 3,
+    "sel_in_head60": 2,
+    "sel_in_top20": 1,
+    "abs_missing_head60": 0.0,
+    "oa_head60": 0.9333333333333333
+   },
+   "full-arxiv": {
+    "top20_rel": 20,
+    "top20_core": 19,
+    "top20_unlabeled": 0,
+    "pool": 344,
+    "kept": 332,
+    "sel_n": 5,
+    "sel_in_pool": 3,
+    "sel_in_head60": 3,
+    "sel_in_top20": 2,
+    "abs_missing_head60": 0.0,
+    "oa_head60": 0.9333333333333333
+   },
+   "full-epmc": {
+    "top20_rel": 20,
+    "top20_core": 19,
+    "top20_unlabeled": 0,
+    "pool": 343,
+    "kept": 332,
+    "sel_n": 5,
+    "sel_in_pool": 3,
+    "sel_in_head60": 3,
+    "sel_in_top20": 2,
+    "abs_missing_head60": 0.0,
+    "oa_head60": 0.9333333333333333
+   },
+   "new4+crossref": {
+    "top20_rel": 20,
+    "top20_core": 20,
+    "top20_unlabeled": 0,
+    "pool": 313,
+    "kept": 303,
+    "sel_n": 5,
+    "sel_in_pool": 3,
+    "sel_in_head60": 3,
+    "sel_in_top20": 2,
+    "abs_missing_head60": 0.0,
+    "oa_head60": 0.9166666666666666
+   },
+   "full-exa-tavily": {
+    "top20_rel": 20,
+    "top20_core": 18,
+    "top20_unlabeled": 0,
+    "pool": 360,
+    "kept": 349,
+    "sel_n": 5,
+    "sel_in_pool": 3,
+    "sel_in_head60": 3,
+    "sel_in_top20": 2,
+    "abs_missing_head60": 0.0,
+    "oa_head60": 0.9333333333333333
+   },
+   "full7_vs_new4": {
+    "added_head60": 7,
+    "added_rel": 6,
+    "added_core": 5,
+    "added_core_not_in_openalex": 0,
+    "added_core_not_in_b_pool": 0,
+    "added_rel_not_in_b_pool": 0,
+    "added_unlabeled": 0,
+    "added_sel": 1,
+    "examples_core": [
+     "Multistage Background Field Removal (MUBAFIRE)—Compensating for B0 Distortions at Ultra-Hi",
+     "Instant tissue field and magnetic susceptibility mapping from MRI raw phase using Laplacia",
+     "Background field removal by solving the Laplacian boundary value problem",
+     "An iterative spherical mean value method for background field removal in MRI",
+     "Nonlinear inversion model-driven deep learning method for magnetic resonance imaging (MRI)"
+    ]
+   },
+   "s2_extra": {
+    "added_head60": 14,
+    "added_rel": 12,
+    "added_core": 8,
+    "added_core_not_in_openalex": 0,
+    "added_core_not_in_b_pool": 0,
+    "added_rel_not_in_b_pool": 0,
+    "added_unlabeled": 0,
+    "added_sel": 1,
+    "examples_core": [
+     "DeepQSM - using deep learning to solve the dipole inversion for quantitative susceptibilit",
+     "Quantitative susceptibility mapping using deep neural network: QSMnet",
+     "Background field removal using a region adaptive kernel for quantitative susceptibility ma",
+     "Whole head quantitative susceptibility mapping using a least-norm direct dipole inversion ",
+     "Quantitative Susceptibility Mapping Using the Multiple Dipole-inversion Combination with k",
+     "xQSM: quantitative susceptibility mapping with octave convolutional and noise‐regularized "
+    ]
+   },
+   "s2_extra_new4": {
+    "added_head60": 17,
+    "added_rel": 13,
+    "added_core": 8,
+    "added_core_not_in_openalex": 0,
+    "added_core_not_in_b_pool": 0,
+    "added_rel_not_in_b_pool": 0,
+    "added_unlabeled": 0,
+    "added_sel": 2,
+    "examples_core": [
+     "DeepQSM - using deep learning to solve the dipole inversion for quantitative susceptibilit",
+     "Quantitative susceptibility mapping using deep neural network: QSMnet",
+     "Background field removal using a region adaptive kernel for quantitative susceptibility ma",
+     "Whole head quantitative susceptibility mapping using a least-norm direct dipole inversion ",
+     "Quantitative Susceptibility Mapping Using the Multiple Dipole-inversion Combination with k",
+     "Quantitative susceptibility mapping through model-based deep image prior (MoDIP)"
+    ]
+   },
+   "crossref_extra": {
+    "added_head60": 4,
+    "added_rel": 3,
+    "added_core": 3,
+    "added_core_not_in_openalex": 0,
+    "added_core_not_in_b_pool": 0,
+    "added_rel_not_in_b_pool": 0,
+    "added_unlabeled": 0,
+    "added_sel": 1,
+    "examples_core": [
+     "Multistage Background Field Removal (MUBAFIRE)—Compensating for B0 Distortions at Ultra-Hi",
+     "Background field removal by solving the Laplacian boundary value problem",
+     "An iterative spherical mean value method for background field removal in MRI"
+    ]
+   },
+   "arxiv_extra": {
+    "added_head60": 2,
+    "added_rel": 2,
+    "added_core": 1,
+    "added_core_not_in_openalex": 0,
+    "added_core_not_in_b_pool": 0,
+    "added_rel_not_in_b_pool": 0,
+    "added_unlabeled": 0,
+    "added_sel": 0,
+    "examples_core": [
+     "Instant tissue field and magnetic susceptibility mapping from MRI raw phase using Laplacia"
+    ]
+   },
+   "epmc_extra": {
+    "added_head60": 1,
+    "added_rel": 1,
+    "added_core": 1,
+    "added_core_not_in_openalex": 0,
+    "added_core_not_in_b_pool": 0,
+    "added_rel_not_in_b_pool": 0,
+    "added_unlabeled": 0,
+    "added_sel": 0,
+    "examples_core": [
+     "Nonlinear inversion model-driven deep learning method for magnetic resonance imaging (MRI)"
+    ]
+   },
+   "exa_tavily_extra": {
+    "added_head60": 2,
+    "added_rel": 2,
+    "added_core": 2,
+    "added_core_not_in_openalex": 0,
+    "added_core_not_in_b_pool": 0,
+    "added_rel_not_in_b_pool": 0,
+    "added_unlabeled": 0,
+    "added_sel": 0,
+    "examples_core": [
+     "Phase processing for quantitative susceptibility mapping of regions with large susceptibil",
+     "SEPIA—Susceptibility mapping pipeline tool for phase images"
+    ]
+   },
+   "crossref_over_new4": {
+    "added_head60": 4,
+    "added_rel": 3,
+    "added_core": 3,
+    "added_core_not_in_openalex": 0,
+    "added_core_not_in_b_pool": 0,
+    "added_rel_not_in_b_pool": 0,
+    "added_unlabeled": 0,
+    "added_sel": 1,
+    "examples_core": [
+     "Multistage Background Field Removal (MUBAFIRE)—Compensating for B0 Distortions at Ultra-Hi",
+     "Background field removal by solving the Laplacian boundary value problem",
+     "An iterative spherical mean value method for background field removal in MRI"
+    ]
+   }
+  },
+  "task:tumor-immune-interface": {
+   "full7": {
+    "top20_rel": 20,
+    "top20_core": 13,
+    "top20_unlabeled": 0,
+    "pool": 369,
+    "kept": 354,
+    "sel_n": 1,
+    "sel_in_pool": 1,
+    "sel_in_head60": 1,
+    "sel_in_top20": 1,
+    "abs_missing_head60": 0.0,
+    "oa_head60": 0.9666666666666667,
+    "seeded_heldout_n": 0,
+    "seeded_heldout_in_head60": 0,
+    "pseudo_heldout_in_head60": 0
+   },
+   "new4": {
+    "top20_rel": 20,
+    "top20_core": 13,
+    "top20_unlabeled": 0,
+    "pool": 263,
+    "kept": 252,
+    "sel_n": 1,
+    "sel_in_pool": 1,
+    "sel_in_head60": 1,
+    "sel_in_top20": 1,
+    "abs_missing_head60": 0.0,
+    "oa_head60": 0.95,
+    "seeded_heldout_n": 0,
+    "seeded_heldout_in_head60": 0,
+    "pseudo_heldout_in_head60": 0
+   },
+   "full-s2": {
+    "top20_rel": 20,
+    "top20_core": 13,
+    "top20_unlabeled": 0,
+    "pool": 308,
+    "kept": 302,
+    "sel_n": 1,
+    "sel_in_pool": 1,
+    "sel_in_head60": 1,
+    "sel_in_top20": 1,
+    "abs_missing_head60": 0.0,
+    "oa_head60": 0.9833333333333333,
+    "seeded_heldout_n": 0,
+    "seeded_heldout_in_head60": 0,
+    "pseudo_heldout_in_head60": 0
+   },
+   "new4-s2": {
+    "top20_rel": 20,
+    "top20_core": 13,
+    "top20_unlabeled": 0,
+    "pool": 195,
+    "kept": 193,
+    "sel_n": 1,
+    "sel_in_pool": 1,
+    "sel_in_head60": 1,
+    "sel_in_top20": 0,
+    "abs_missing_head60": 0.0,
+    "oa_head60": 1.0
+   },
+   "old2": {
+    "top20_rel": 10,
+    "top20_core": 3,
+    "top20_unlabeled": 0,
+    "pool": 92,
+    "kept": 89,
+    "sel_n": 1,
+    "sel_in_pool": 1,
+    "sel_in_head60": 0,
+    "sel_in_top20": 0,
+    "abs_missing_head60": 0.0,
+    "oa_head60": 0.5
+   },
+   "oa": {
+    "top20_rel": 20,
+    "top20_core": 12,
+    "top20_unlabeled": 0,
+    "pool": 182,
+    "kept": 181,
+    "sel_n": 1,
+    "sel_in_pool": 1,
+    "sel_in_head60": 1,
+    "sel_in_top20": 0,
+    "abs_missing_head60": 0.0,
+    "oa_head60": 1.0,
+    "seeded_heldout_n": 0,
+    "seeded_heldout_in_head60": 0,
+    "pseudo_heldout_in_head60": 0
+   },
+   "full-crossref": {
+    "top20_rel": 20,
+    "top20_core": 13,
+    "top20_unlabeled": 0,
+    "pool": 335,
+    "kept": 323,
+    "sel_n": 1,
+    "sel_in_pool": 1,
+    "sel_in_head60": 1,
+    "sel_in_top20": 1,
+    "abs_missing_head60": 0.0,
+    "oa_head60": 0.9666666666666667
+   },
+   "full-arxiv": {
+    "top20_rel": 20,
+    "top20_core": 13,
+    "top20_unlabeled": 0,
+    "pool": 332,
+    "kept": 318,
+    "sel_n": 1,
+    "sel_in_pool": 1,
+    "sel_in_head60": 1,
+    "sel_in_top20": 1,
+    "abs_missing_head60": 0.0,
+    "oa_head60": 0.9666666666666667
+   },
+   "full-epmc": {
+    "top20_rel": 20,
+    "top20_core": 13,
+    "top20_unlabeled": 0,
+    "pool": 335,
+    "kept": 320,
+    "sel_n": 1,
+    "sel_in_pool": 1,
+    "sel_in_head60": 1,
+    "sel_in_top20": 1,
+    "abs_missing_head60": 0.0,
+    "oa_head60": 0.9666666666666667
+   },
+   "new4+crossref": {
+    "top20_rel": 20,
+    "top20_core": 13,
+    "top20_unlabeled": 0,
+    "pool": 298,
+    "kept": 284,
+    "sel_n": 1,
+    "sel_in_pool": 1,
+    "sel_in_head60": 1,
+    "sel_in_top20": 1,
+    "abs_missing_head60": 0.0,
+    "oa_head60": 0.9666666666666667
+   },
+   "full-exa-tavily": {
+    "top20_rel": 20,
+    "top20_core": 12,
+    "top20_unlabeled": 0,
+    "pool": 358,
+    "kept": 344,
+    "sel_n": 1,
+    "sel_in_pool": 1,
+    "sel_in_head60": 1,
+    "sel_in_top20": 1,
+    "abs_missing_head60": 0.0,
+    "oa_head60": 0.9666666666666667
+   },
+   "full7_vs_new4": {
+    "added_head60": 11,
+    "added_rel": 9,
+    "added_core": 3,
+    "added_core_not_in_openalex": 1,
+    "added_core_not_in_b_pool": 1,
+    "added_rel_not_in_b_pool": 1,
+    "added_unlabeled": 0,
+    "added_sel": 0,
+    "examples_core": [
+     "Spatial analysis for highly multiplexed imaging data to identify tissue microenvironments",
+     "Pushing the Limits of Cell Segmentation Models for Imaging Mass Cytometry",
+     "CytoPb: Segmentation-free and threshold-free analysis of highly multiplexed images of biol"
+    ]
+   },
+   "s2_extra": {
+    "added_head60": 17,
+    "added_rel": 15,
+    "added_core": 5,
+    "added_core_not_in_openalex": 1,
+    "added_core_not_in_b_pool": 0,
+    "added_rel_not_in_b_pool": 2,
+    "added_unlabeled": 0,
+    "added_sel": 0,
+    "examples_core": [
+     "Compensation of Signal Spillover in Suspension and Imaging Mass Cytometry",
+     "Cell Spotter (CSPOT): A machine-learning approach to automated cell spotting and quantific",
+     "SCLN: Stacked Channel Learning Network for Imaging Mass Cytometry (IMC) cell segmentation",
+     "SPACEc: a streamlined, interactive Python workflow for multiplexed image processing and an",
+     "histoCAT: analysis of cell phenotypes and interactions in multiplex image cytometry data"
+    ]
+   },
+   "s2_extra_new4": {
+    "added_head60": 18,
+    "added_rel": 15,
+    "added_core": 5,
+    "added_core_not_in_openalex": 2,
+    "added_core_not_in_b_pool": 2,
+    "added_rel_not_in_b_pool": 8,
+    "added_unlabeled": 0,
+    "added_sel": 0,
+    "examples_core": [
+     "Cell Spotter (CSPOT): A machine-learning approach to automated cell spotting and quantific",
+     "SPACEc: a streamlined, interactive Python workflow for multiplexed image processing and an",
+     "Compensation of Signal Spillover in Suspension and Imaging Mass Cytometry",
+     "spillR: spillover compensation in mass cytometry data",
+     "histoCAT: analysis of cell phenotypes and interactions in multiplex image cytometry data"
+    ]
+   },
+   "crossref_extra": {
+    "added_head60": 9,
+    "added_rel": 9,
+    "added_core": 4,
+    "added_core_not_in_openalex": 1,
+    "added_core_not_in_b_pool": 0,
+    "added_rel_not_in_b_pool": 0,
+    "added_unlabeled": 0,
+    "added_sel": 0,
+    "examples_core": [
+     "Dice-XMBD: Deep Learning-Based Cell Segmentation for Imaging Mass Cytometry",
+     "Spatial analysis for highly multiplexed imaging data to identify tissue microenvironments",
+     "Pushing the Limits of Cell Segmentation Models for Imaging Mass Cytometry",
+     "CytoPb: Segmentation-free and threshold-free analysis of highly multiplexed images of biol"
+    ]
+   },
+   "arxiv_extra": {
+    "added_head60": 3,
+    "added_rel": 3,
+    "added_core": 1,
+    "added_core_not_in_openalex": 1,
+    "added_core_not_in_b_pool": 0,
+    "added_rel_not_in_b_pool": 0,
+    "added_unlabeled": 0,
+    "added_sel": 0,
+    "examples_core": [
+     "Pushing the Limits of Cell Segmentation Models for Imaging Mass Cytometry"
+    ]
+   },
+   "epmc_extra": {
+    "added_head60": 2,
+    "added_rel": 0,
+    "added_core": 0,
+    "added_core_not_in_openalex": 0,
+    "added_core_not_in_b_pool": 0,
+    "added_rel_not_in_b_pool": 0,
+    "added_unlabeled": 0,
+    "added_sel": 0,
+    "examples_core": []
+   },
+   "exa_tavily_extra": {
+    "added_head60": 3,
+    "added_rel": 3,
+    "added_core": 1,
+    "added_core_not_in_openalex": 0,
+    "added_core_not_in_b_pool": 0,
+    "added_rel_not_in_b_pool": 0,
+    "added_unlabeled": 0,
+    "added_sel": 0,
+    "examples_core": [
+     "LOCATOR: feature extraction and spatial analysis of the cancer tissue microenvironment usi"
+    ]
+   },
+   "crossref_over_new4": {
+    "added_head60": 6,
+    "added_rel": 6,
+    "added_core": 2,
+    "added_core_not_in_openalex": 0,
+    "added_core_not_in_b_pool": 0,
+    "added_rel_not_in_b_pool": 0,
+    "added_unlabeled": 0,
+    "added_sel": 0,
+    "examples_core": [
+     "Spatial analysis for highly multiplexed imaging data to identify tissue microenvironments",
+     "CytoPb: Segmentation-free and threshold-free analysis of highly multiplexed images of biol"
+    ]
+   }
+  }
+ },
+ "arms": {
+  "full7": {
+   "top20_rel": 194.0,
+   "top20_core": 119.0,
+   "top20_unlabeled": 0.0,
+   "pool": 3455.0,
+   "kept": 3237.0,
+   "sel_n": 35.0,
+   "sel_in_pool": 32.0,
+   "sel_in_head60": 26.0,
+   "sel_in_top20": 21.0,
+   "abs_missing_head60": 0.23333333333333334,
+   "oa_head60": 8.850000000000001,
+   "seeded_heldout_n": 21.0,
+   "seeded_heldout_in_head60": 16.0,
+   "pseudo_heldout_in_head60": 17.0
+  },
+  "new4": {
+   "top20_rel": 191.0,
+   "top20_core": 120.0,
+   "top20_unlabeled": 0.0,
+   "pool": 2643.0,
+   "kept": 2447.0,
+   "sel_n": 35.0,
+   "sel_in_pool": 28.0,
+   "sel_in_head60": 25.0,
+   "sel_in_top20": 17.0,
+   "abs_missing_head60": 0.25,
+   "oa_head60": 8.8,
+   "seeded_heldout_n": 21.0,
+   "seeded_heldout_in_head60": 15.0,
+   "pseudo_heldout_in_head60": 16.0
+  },
+  "full-s2": {
+   "top20_rel": 189.0,
+   "top20_core": 116.0,
+   "top20_unlabeled": 0.0,
+   "pool": 2850.0,
+   "kept": 2714.0,
+   "sel_n": 35.0,
+   "sel_in_pool": 31.0,
+   "sel_in_head60": 24.0,
+   "sel_in_top20": 20.0,
+   "abs_missing_head60": 0.1,
+   "oa_head60": 9.366666666666665,
+   "seeded_heldout_n": 21.0,
+   "seeded_heldout_in_head60": 13.0,
+   "pseudo_heldout_in_head60": 15.0
+  },
+  "new4-s2": {
+   "top20_rel": 181.0,
+   "top20_core": 109.0,
+   "top20_unlabeled": 0.0,
+   "pool": 2002.0,
+   "kept": 1889.0,
+   "sel_n": 35.0,
+   "sel_in_pool": 26.0,
+   "sel_in_head60": 20.0,
+   "sel_in_top20": 14.0,
+   "abs_missing_head60": 0.06666666666666667,
+   "oa_head60": 9.45
+  },
+  "old2": {
+   "top20_rel": 105.0,
+   "top20_core": 39.0,
+   "top20_unlabeled": 0.0,
+   "pool": 861.0,
+   "kept": 844.0,
+   "sel_n": 35.0,
+   "sel_in_pool": 27.0,
+   "sel_in_head60": 19.0,
+   "sel_in_top20": 14.0,
+   "abs_missing_head60": 0.7333333333333334,
+   "oa_head60": 5.666666666666667
+  },
+  "oa": {
+   "top20_rel": 172.0,
+   "top20_core": 94.0,
+   "top20_unlabeled": 0.0,
+   "pool": 1860.0,
+   "kept": 1774.0,
+   "sel_n": 35.0,
+   "sel_in_pool": 22.0,
+   "sel_in_head60": 18.0,
+   "sel_in_top20": 12.0,
+   "abs_missing_head60": 0.016666666666666666,
+   "oa_head60": 9.466666666666667,
+   "seeded_heldout_n": 21.0,
+   "seeded_heldout_in_head60": 11.0,
+   "pseudo_heldout_in_head60": 10.0
+  },
+  "full-crossref": {
+   "top20_rel": 190.0,
+   "top20_core": 119.0,
+   "top20_unlabeled": 0.0,
+   "pool": 3087.0,
+   "kept": 2875.0,
+   "sel_n": 35.0,
+   "sel_in_pool": 28.0,
+   "sel_in_head60": 25.0,
+   "sel_in_top20": 17.0,
+   "abs_missing_head60": 0.25,
+   "oa_head60": 8.883333333333335
+  },
+  "full-arxiv": {
+   "top20_rel": 194.0,
+   "top20_core": 120.0,
+   "top20_unlabeled": 0.0,
+   "pool": 3133.0,
+   "kept": 2927.0,
+   "sel_n": 35.0,
+   "sel_in_pool": 32.0,
+   "sel_in_head60": 26.0,
+   "sel_in_top20": 19.0,
+   "abs_missing_head60": 0.23333333333333334,
+   "oa_head60": 8.8
+  },
+  "full-epmc": {
+   "top20_rel": 194.0,
+   "top20_core": 120.0,
+   "top20_unlabeled": 0.0,
+   "pool": 3337.0,
+   "kept": 3123.0,
+   "sel_n": 35.0,
+   "sel_in_pool": 32.0,
+   "sel_in_head60": 26.0,
+   "sel_in_top20": 21.0,
+   "abs_missing_head60": 0.23333333333333334,
+   "oa_head60": 8.850000000000001
+  },
+  "new4+crossref": {
+   "top20_rel": 194.0,
+   "top20_core": 121.0,
+   "top20_unlabeled": 0.0,
+   "pool": 3015.0,
+   "kept": 2813.0,
+   "sel_n": 35.0,
+   "sel_in_pool": 32.0,
+   "sel_in_head60": 26.0,
+   "sel_in_top20": 19.0,
+   "abs_missing_head60": 0.23333333333333334,
+   "oa_head60": 8.783333333333333
+  },
+  "full-exa-tavily": {
+   "top20_rel": 188.0,
+   "top20_core": 112.0,
+   "top20_unlabeled": 0.0,
+   "pool": 3333.0,
+   "kept": 3142.0,
+   "sel_n": 35.0,
+   "sel_in_pool": 32.0,
+   "sel_in_head60": 25.0,
+   "sel_in_top20": 20.0,
+   "abs_missing_head60": 0.2,
+   "oa_head60": 8.833333333333334
+  }
+ },
+ "resources": {
+  "method:column-generation-branch-and-price-for-vehicle-routing": {
+   "exa.code": {
+    "n": 10,
+    "kinds": {
+     "code": 10
+    },
+    "repos": 10,
+    "datasets": 0,
+    "good": 7,
+    "ok": 10,
+    "unlabeled": 0,
+    "paper_with_id": 0
+   },
+   "exa.data": {
+    "n": 10,
+    "kinds": {
+     "web": 6,
+     "code": 4
+    },
+    "repos": 4,
+    "datasets": 0,
+    "good": 9,
+    "ok": 10,
+    "unlabeled": 0,
+    "paper_with_id": 0
+   },
+   "exa.docs": {
+    "n": 10,
+    "kinds": {
+     "web": 3,
+     "code": 3,
+     "docs": 1,
+     "paper": 3
+    },
+    "repos": 3,
+    "datasets": 0,
+    "good": 4,
+    "ok": 8,
+    "unlabeled": 0,
+    "paper_with_id": 2
+   },
+   "exa.paper": {
+    "n": 10,
+    "kinds": {
+     "paper": 10
+    },
+    "repos": 0,
+    "datasets": 0,
+    "good": 0,
+    "ok": 0,
+    "unlabeled": 0,
+    "paper_with_id": 9
+   },
+   "tavily.code": {
+    "n": 10,
+    "kinds": {
+     "code": 10
+    },
+    "repos": 10,
+    "datasets": 0,
+    "good": 5,
+    "ok": 8,
+    "unlabeled": 0,
+    "paper_with_id": 0
+   },
+   "tavily.data": {
+    "n": 10,
+    "kinds": {
+     "web": 6,
+     "paper": 3,
+     "code": 1
+    },
+    "repos": 1,
+    "datasets": 0,
+    "good": 1,
+    "ok": 9,
+    "unlabeled": 0,
+    "paper_with_id": 1
+   },
+   "tavily.docs": {
+    "n": 10,
+    "kinds": {
+     "web": 7,
+     "paper": 2,
+     "code": 1
+    },
+    "repos": 1,
+    "datasets": 0,
+    "good": 1,
+    "ok": 10,
+    "unlabeled": 0,
+    "paper_with_id": 0
+   },
+   "tavily.paper": {
+    "n": 10,
+    "kinds": {
+     "paper": 10
+    },
+    "repos": 0,
+    "datasets": 0,
+    "good": 0,
+    "ok": 0,
+    "unlabeled": 0,
+    "paper_with_id": 6
+   },
+   "code_overlap": {
+    "exa": 14,
+    "tavily": 10,
+    "both": 4
+   },
+   "good_code_union": {
+    "exa": 11,
+    "tavily": 5,
+    "both": 2
+   },
+   "good_any_union": {
+    "exa": 18,
+    "tavily": 5,
+    "both": 2,
+    "union": 21
+   },
+   "ok_any_union": {
+    "exa": 25,
+    "tavily": 22,
+    "exa_n": 25,
+    "tavily_n": 24
+   },
+   "exa_papers_head60": {
+    "n": 3,
+    "core": 2,
+    "only_this_source": 0,
+    "only_core": 0
+   },
+   "tavily_papers_head60": {
+    "n": 3,
+    "core": 2,
+    "only_this_source": 0,
+    "only_core": 0
+   }
+  },
+  "method:mixture-likelihood-contamination-and-tumor-in-normal-estimat": {
+   "exa.code": {
+    "n": 10,
+    "kinds": {
+     "code": 10
+    },
+    "repos": 9,
+    "datasets": 0,
+    "good": 8,
+    "ok": 10,
+    "unlabeled": 0,
+    "paper_with_id": 0
+   },
+   "exa.data": {
+    "n": 10,
+    "kinds": {
+     "docs": 5,
+     "web": 2,
+     "data": 1,
+     "paper": 2
+    },
+    "repos": 0,
+    "datasets": 1,
+    "good": 4,
+    "ok": 8,
+    "unlabeled": 0,
+    "paper_with_id": 1
+   },
+   "exa.docs": {
+    "n": 10,
+    "kinds": {
+     "code": 3,
+     "docs": 4,
+     "web": 3
+    },
+    "repos": 3,
+    "datasets": 0,
+    "good": 5,
+    "ok": 9,
+    "unlabeled": 0,
+    "paper_with_id": 0
+   },
+   "exa.paper": {
+    "n": 10,
+    "kinds": {
+     "docs": 2,
+     "paper": 8
+    },
+    "repos": 0,
+    "datasets": 0,
+    "good": 0,
+    "ok": 0,
+    "unlabeled": 2,
+    "paper_with_id": 7
+   },
+   "tavily.code": {
+    "n": 10,
+    "kinds": {
+     "code": 10
+    },
+    "repos": 10,
+    "datasets": 0,
+    "good": 2,
+    "ok": 6,
+    "unlabeled": 0,
+    "paper_with_id": 0
+   },
+   "tavily.data": {
+    "n": 10,
+    "kinds": {
+     "docs": 2,
+     "web": 2,
+     "paper": 6
+    },
+    "repos": 0,
+    "datasets": 0,
+    "good": 2,
+    "ok": 8,
+    "unlabeled": 0,
+    "paper_with_id": 2
+   },
+   "tavily.docs": {
+    "n": 10,
+    "kinds": {
+     "docs": 4,
+     "paper": 2,
+     "web": 4
+    },
+    "repos": 0,
+    "datasets": 0,
+    "good": 1,
+    "ok": 7,
+    "unlabeled": 0,
+    "paper_with_id": 0
+   },
+   "tavily.paper": {
+    "n": 10,
+    "kinds": {
+     "paper": 10
+    },
+    "repos": 0,
+    "datasets": 0,
+    "good": 0,
+    "ok": 0,
+    "unlabeled": 0,
+    "paper_with_id": 2
+   },
+   "code_overlap": {
+    "exa": 10,
+    "tavily": 10,
+    "both": 3
+   },
+   "good_code_union": {
+    "exa": 8,
+    "tavily": 2,
+    "both": 2
+   },
+   "good_any_union": {
+    "exa": 12,
+    "tavily": 4,
+    "both": 4,
+    "union": 12
+   },
+   "ok_any_union": {
+    "exa": 22,
+    "tavily": 17,
+    "exa_n": 24,
+    "tavily_n": 24
+   },
+   "exa_papers_head60": {
+    "n": 5,
+    "core": 2,
+    "only_this_source": 1,
+    "only_core": 1
+   },
+   "tavily_papers_head60": {
+    "n": 2,
+    "core": 1,
+    "only_this_source": 0,
+    "only_core": 0
+   }
+  },
+  "method:multivariate-fay-herriot-hierarchical-small-area-models": {
+   "exa.code": {
+    "n": 10,
+    "kinds": {
+     "code": 10
+    },
+    "repos": 10,
+    "datasets": 0,
+    "good": 5,
+    "ok": 10,
+    "unlabeled": 0,
+    "paper_with_id": 0
+   },
+   "exa.data": {
+    "n": 10,
+    "kinds": {
+     "web": 4,
+     "code": 2,
+     "docs": 2,
+     "paper": 2
+    },
+    "repos": 2,
+    "datasets": 0,
+    "good": 3,
+    "ok": 8,
+    "unlabeled": 0,
+    "paper_with_id": 2
+   },
+   "exa.docs": {
+    "n": 10,
+    "kinds": {
+     "web": 1,
+     "docs": 6,
+     "code": 3
+    },
+    "repos": 3,
+    "datasets": 0,
+    "good": 4,
+    "ok": 10,
+    "unlabeled": 0,
+    "paper_with_id": 0
+   },
+   "exa.paper": {
+    "n": 10,
+    "kinds": {
+     "docs": 1,
+     "paper": 9
+    },
+    "repos": 0,
+    "datasets": 0,
+    "good": 0,
+    "ok": 0,
+    "unlabeled": 1,
+    "paper_with_id": 9
+   },
+   "tavily.code": {
+    "n": 10,
+    "kinds": {
+     "code": 10
+    },
+    "repos": 9,
+    "datasets": 0,
+    "good": 2,
+    "ok": 4,
+    "unlabeled": 0,
+    "paper_with_id": 0
+   },
+   "tavily.data": {
+    "n": 10,
+    "kinds": {
+     "paper": 3,
+     "web": 3,
+     "docs": 3,
+     "data": 1
+    },
+    "repos": 0,
+    "datasets": 1,
+    "good": 1,
+    "ok": 8,
+    "unlabeled": 0,
+    "paper_with_id": 2
+   },
+   "tavily.docs": {
+    "n": 10,
+    "kinds": {
+     "paper": 2,
+     "docs": 3,
+     "data": 1,
+     "web": 4
+    },
+    "repos": 0,
+    "datasets": 1,
+    "good": 2,
+    "ok": 9,
+    "unlabeled": 0,
+    "paper_with_id": 1
+   },
+   "tavily.paper": {
+    "n": 10,
+    "kinds": {
+     "paper": 10
+    },
+    "repos": 0,
+    "datasets": 0,
+    "good": 0,
+    "ok": 0,
+    "unlabeled": 0,
+    "paper_with_id": 3
+   },
+   "code_overlap": {
+    "exa": 11,
+    "tavily": 9,
+    "both": 4
+   },
+   "good_code_union": {
+    "exa": 6,
+    "tavily": 2,
+    "both": 2
+   },
+   "good_any_union": {
+    "exa": 9,
+    "tavily": 4,
+    "both": 3,
+    "union": 10
+   },
+   "ok_any_union": {
+    "exa": 22,
+    "tavily": 14,
+    "exa_n": 22,
+    "tavily_n": 19
+   },
+   "exa_papers_head60": {
+    "n": 7,
+    "core": 7,
+    "only_this_source": 0,
+    "only_core": 0
+   },
+   "tavily_papers_head60": {
+    "n": 7,
+    "core": 4,
+    "only_this_source": 0,
+    "only_core": 0
+   }
+  },
+  "method:stochastic-reconfiguration-natural-gradient-for-neural-quant": {
+   "exa.code": {
+    "n": 10,
+    "kinds": {
+     "code": 10
+    },
+    "repos": 9,
+    "datasets": 0,
+    "good": 6,
+    "ok": 10,
+    "unlabeled": 0,
+    "paper_with_id": 0
+   },
+   "exa.data": {
+    "n": 10,
+    "kinds": {
+     "data": 2,
+     "web": 3,
+     "code": 1,
+     "paper": 4
+    },
+    "repos": 1,
+    "datasets": 2,
+    "good": 1,
+    "ok": 5,
+    "unlabeled": 0,
+    "paper_with_id": 3
+   },
+   "exa.docs": {
+    "n": 10,
+    "kinds": {
+     "docs": 7,
+     "code": 2,
+     "web": 1
+    },
+    "repos": 2,
+    "datasets": 0,
+    "good": 7,
+    "ok": 10,
+    "unlabeled": 0,
+    "paper_with_id": 0
+   },
+   "exa.paper": {
+    "n": 10,
+    "kinds": {
+     "paper": 10
+    },
+    "repos": 0,
+    "datasets": 0,
+    "good": 0,
+    "ok": 0,
+    "unlabeled": 0,
+    "paper_with_id": 10
+   },
+   "tavily.code": {
+    "n": 10,
+    "kinds": {
+     "code": 10
+    },
+    "repos": 10,
+    "datasets": 0,
+    "good": 0,
+    "ok": 1,
+    "unlabeled": 0,
+    "paper_with_id": 0
+   },
+   "tavily.data": {
+    "n": 10,
+    "kinds": {
+     "web": 5,
+     "paper": 3,
+     "code": 1,
+     "docs": 1
+    },
+    "repos": 1,
+    "datasets": 0,
+    "good": 0,
+    "ok": 8,
+    "unlabeled": 0,
+    "paper_with_id": 1
+   },
+   "tavily.docs": {
+    "n": 10,
+    "kinds": {
+     "web": 6,
+     "docs": 1,
+     "code": 1,
+     "paper": 2
+    },
+    "repos": 1,
+    "datasets": 0,
+    "good": 0,
+    "ok": 8,
+    "unlabeled": 0,
+    "paper_with_id": 1
+   },
+   "tavily.paper": {
+    "n": 10,
+    "kinds": {
+     "paper": 10
+    },
+    "repos": 0,
+    "datasets": 0,
+    "good": 0,
+    "ok": 0,
+    "unlabeled": 0,
+    "paper_with_id": 8
+   },
+   "code_overlap": {
+    "exa": 10,
+    "tavily": 11,
+    "both": 1
+   },
+   "good_code_union": {
+    "exa": 5,
+    "tavily": 0,
+    "both": 0
+   },
+   "good_any_union": {
+    "exa": 12,
+    "tavily": 0,
+    "both": 0,
+    "union": 12
+   },
+   "ok_any_union": {
+    "exa": 21,
+    "tavily": 12,
+    "exa_n": 23,
+    "tavily_n": 22
+   },
+   "exa_papers_head60": {
+    "n": 6,
+    "core": 6,
+    "only_this_source": 0,
+    "only_core": 0
+   },
+   "tavily_papers_head60": {
+    "n": 5,
+    "core": 5,
+    "only_this_source": 0,
+    "only_core": 0
+   }
+  },
+  "method:strong-constraint-4d-var-with-window-lengthening-warm-starte": {
+   "exa.code": {
+    "n": 10,
+    "kinds": {
+     "code": 10
+    },
+    "repos": 10,
+    "datasets": 0,
+    "good": 7,
+    "ok": 9,
+    "unlabeled": 0,
+    "paper_with_id": 0
+   },
+   "exa.data": {
+    "n": 10,
+    "kinds": {
+     "paper": 6,
+     "data": 2,
+     "web": 2
+    },
+    "repos": 0,
+    "datasets": 2,
+    "good": 0,
+    "ok": 5,
+    "unlabeled": 0,
+    "paper_with_id": 4
+   },
+   "exa.docs": {
+    "n": 10,
+    "kinds": {
+     "web": 2,
+     "docs": 5,
+     "data": 1,
+     "paper": 2
+    },
+    "repos": 0,
+    "datasets": 1,
+    "good": 1,
+    "ok": 8,
+    "unlabeled": 0,
+    "paper_with_id": 2
+   },
+   "exa.paper": {
+    "n": 10,
+    "kinds": {
+     "paper": 10
+    },
+    "repos": 0,
+    "datasets": 0,
+    "good": 0,
+    "ok": 0,
+    "unlabeled": 0,
+    "paper_with_id": 8
+   },
+   "tavily.code": {
+    "n": 10,
+    "kinds": {
+     "code": 10
+    },
+    "repos": 7,
+    "datasets": 0,
+    "good": 4,
+    "ok": 7,
+    "unlabeled": 0,
+    "paper_with_id": 0
+   },
+   "tavily.data": {
+    "n": 10,
+    "kinds": {
+     "web": 3,
+     "paper": 5,
+     "data": 2
+    },
+    "repos": 0,
+    "datasets": 2,
+    "good": 0,
+    "ok": 5,
+    "unlabeled": 0,
+    "paper_with_id": 3
+   },
+   "tavily.docs": {
+    "n": 10,
+    "kinds": {
+     "docs": 1,
+     "web": 4,
+     "paper": 3,
+     "data": 2
+    },
+    "repos": 0,
+    "datasets": 2,
+    "good": 0,
+    "ok": 6,
+    "unlabeled": 0,
+    "paper_with_id": 2
+   },
+   "tavily.paper": {
+    "n": 10,
+    "kinds": {
+     "paper": 10
+    },
+    "repos": 0,
+    "datasets": 0,
+    "good": 0,
+    "ok": 0,
+    "unlabeled": 0,
+    "paper_with_id": 5
+   },
+   "code_overlap": {
+    "exa": 10,
+    "tavily": 7,
+    "both": 0
+   },
+   "good_code_union": {
+    "exa": 7,
+    "tavily": 1,
+    "both": 0
+   },
+   "good_any_union": {
+    "exa": 8,
+    "tavily": 1,
+    "both": 0,
+    "union": 9
+   },
+   "ok_any_union": {
+    "exa": 22,
+    "tavily": 14,
+    "exa_n": 24,
+    "tavily_n": 19
+   },
+   "exa_papers_head60": {
+    "n": 7,
+    "core": 5,
+    "only_this_source": 0,
+    "only_core": 0
+   },
+   "tavily_papers_head60": {
+    "n": 5,
+    "core": 3,
+    "only_this_source": 0,
+    "only_core": 0
+   }
+  },
+  "task:3x2pt-inference": {
+   "exa.code": {
+    "n": 10,
+    "kinds": {
+     "code": 10
+    },
+    "repos": 10,
+    "datasets": 0,
+    "good": 4,
+    "ok": 8,
+    "unlabeled": 0,
+    "paper_with_id": 0
+   },
+   "exa.data": {
+    "n": 10,
+    "kinds": {
+     "web": 4,
+     "code": 2,
+     "paper": 4
+    },
+    "repos": 2,
+    "datasets": 0,
+    "good": 4,
+    "ok": 5,
+    "unlabeled": 0,
+    "paper_with_id": 4
+   },
+   "exa.docs": {
+    "n": 10,
+    "kinds": {
+     "docs": 7,
+     "code": 1,
+     "web": 1,
+     "paper": 1
+    },
+    "repos": 1,
+    "datasets": 0,
+    "good": 3,
+    "ok": 6,
+    "unlabeled": 0,
+    "paper_with_id": 1
+   },
+   "exa.paper": {
+    "n": 10,
+    "kinds": {
+     "paper": 10
+    },
+    "repos": 0,
+    "datasets": 0,
+    "good": 0,
+    "ok": 0,
+    "unlabeled": 0,
+    "paper_with_id": 10
+   },
+   "tavily.code": {
+    "n": 10,
+    "kinds": {
+     "code": 9,
+     "data": 1
+    },
+    "repos": 8,
+    "datasets": 1,
+    "good": 3,
+    "ok": 5,
+    "unlabeled": 0,
+    "paper_with_id": 0
+   },
+   "tavily.data": {
+    "n": 10,
+    "kinds": {
+     "web": 8,
+     "paper": 2
+    },
+    "repos": 0,
+    "datasets": 0,
+    "good": 1,
+    "ok": 3,
+    "unlabeled": 0,
+    "paper_with_id": 2
+   },
+   "tavily.docs": {
+    "n": 10,
+    "kinds": {
+     "web": 7,
+     "data": 1,
+     "paper": 2
+    },
+    "repos": 0,
+    "datasets": 1,
+    "good": 1,
+    "ok": 3,
+    "unlabeled": 0,
+    "paper_with_id": 2
+   },
+   "tavily.paper": {
+    "n": 10,
+    "kinds": {
+     "paper": 10
+    },
+    "repos": 0,
+    "datasets": 0,
+    "good": 0,
+    "ok": 0,
+    "unlabeled": 0,
+    "paper_with_id": 8
+   },
+   "code_overlap": {
+    "exa": 13,
+    "tavily": 8,
+    "both": 2
+   },
+   "good_code_union": {
+    "exa": 5,
+    "tavily": 1,
+    "both": 1
+   },
+   "good_any_union": {
+    "exa": 11,
+    "tavily": 3,
+    "both": 2,
+    "union": 12
+   },
+   "ok_any_union": {
+    "exa": 19,
+    "tavily": 9,
+    "exa_n": 25,
+    "tavily_n": 21
+   },
+   "exa_papers_head60": {
+    "n": 6,
+    "core": 6,
+    "only_this_source": 1,
+    "only_core": 1
+   },
+   "tavily_papers_head60": {
+    "n": 6,
+    "core": 3,
+    "only_this_source": 0,
+    "only_core": 0
+   }
+  },
+  "task:ambient-rna-correction": {
+   "exa.code": {
+    "n": 10,
+    "kinds": {
+     "code": 10
+    },
+    "repos": 10,
+    "datasets": 0,
+    "good": 10,
+    "ok": 10,
+    "unlabeled": 0,
+    "paper_with_id": 0
+   },
+   "exa.data": {
+    "n": 10,
+    "kinds": {
+     "code": 4,
+     "docs": 2,
+     "paper": 4
+    },
+    "repos": 4,
+    "datasets": 0,
+    "good": 4,
+    "ok": 7,
+    "unlabeled": 0,
+    "paper_with_id": 3
+   },
+   "exa.docs": {
+    "n": 10,
+    "kinds": {
+     "docs": 5,
+     "code": 4,
+     "web": 1
+    },
+    "repos": 4,
+    "datasets": 0,
+    "good": 8,
+    "ok": 10,
+    "unlabeled": 0,
+    "paper_with_id": 0
+   },
+   "exa.paper": {
+    "n": 10,
+    "kinds": {
+     "docs": 1,
+     "paper": 9
+    },
+    "repos": 0,
+    "datasets": 0,
+    "good": 0,
+    "ok": 1,
+    "unlabeled": 0,
+    "paper_with_id": 8
+   },
+   "tavily.code": {
+    "n": 10,
+    "kinds": {
+     "code": 10
+    },
+    "repos": 10,
+    "datasets": 0,
+    "good": 5,
+    "ok": 9,
+    "unlabeled": 0,
+    "paper_with_id": 0
+   },
+   "tavily.data": {
+    "n": 10,
+    "kinds": {
+     "web": 5,
+     "docs": 2,
+     "code": 1,
+     "paper": 2
+    },
+    "repos": 1,
+    "datasets": 0,
+    "good": 1,
+    "ok": 6,
+    "unlabeled": 0,
+    "paper_with_id": 2
+   },
+   "tavily.docs": {
+    "n": 10,
+    "kinds": {
+     "code": 2,
+     "docs": 1,
+     "paper": 2,
+     "web": 5
+    },
+    "repos": 2,
+    "datasets": 0,
+    "good": 1,
+    "ok": 6,
+    "unlabeled": 0,
+    "paper_with_id": 1
+   },
+   "tavily.paper": {
+    "n": 10,
+    "kinds": {
+     "paper": 10
+    },
+    "repos": 0,
+    "datasets": 0,
+    "good": 0,
+    "ok": 0,
+    "unlabeled": 0,
+    "paper_with_id": 7
+   },
+   "code_overlap": {
+    "exa": 14,
+    "tavily": 12,
+    "both": 4
+   },
+   "good_code_union": {
+    "exa": 12,
+    "tavily": 5,
+    "both": 4
+   },
+   "good_any_union": {
+    "exa": 18,
+    "tavily": 6,
+    "both": 5,
+    "union": 19
+   },
+   "ok_any_union": {
+    "exa": 23,
+    "tavily": 17,
+    "exa_n": 23,
+    "tavily_n": 21
+   },
+   "exa_papers_head60": {
+    "n": 9,
+    "core": 7,
+    "only_this_source": 0,
+    "only_core": 0
+   },
+   "tavily_papers_head60": {
+    "n": 8,
+    "core": 6,
+    "only_this_source": 0,
+    "only_core": 0
+   }
+  },
+  "task:nanoindentation-property-extraction": {
+   "exa.code": {
+    "n": 10,
+    "kinds": {
+     "code": 10
+    },
+    "repos": 10,
+    "datasets": 0,
+    "good": 6,
+    "ok": 9,
+    "unlabeled": 0,
+    "paper_with_id": 0
+   },
+   "exa.data": {
+    "n": 10,
+    "kinds": {
+     "data": 4,
+     "code": 2,
+     "docs": 1,
+     "paper": 3
+    },
+    "repos": 2,
+    "datasets": 4,
+    "good": 3,
+    "ok": 6,
+    "unlabeled": 0,
+    "paper_with_id": 3
+   },
+   "exa.docs": {
+    "n": 10,
+    "kinds": {
+     "docs": 7,
+     "web": 1,
+     "code": 1,
+     "paper": 1
+    },
+    "repos": 1,
+    "datasets": 0,
+    "good": 4,
+    "ok": 6,
+    "unlabeled": 0,
+    "paper_with_id": 1
+   },
+   "exa.paper": {
+    "n": 10,
+    "kinds": {
+     "paper": 10
+    },
+    "repos": 0,
+    "datasets": 0,
+    "good": 0,
+    "ok": 0,
+    "unlabeled": 0,
+    "paper_with_id": 8
+   },
+   "tavily.code": {
+    "n": 10,
+    "kinds": {
+     "code": 10
+    },
+    "repos": 10,
+    "datasets": 0,
+    "good": 3,
+    "ok": 6,
+    "unlabeled": 0,
+    "paper_with_id": 0
+   },
+   "tavily.data": {
+    "n": 10,
+    "kinds": {
+     "web": 8,
+     "docs": 1,
+     "paper": 1
+    },
+    "repos": 0,
+    "datasets": 0,
+    "good": 1,
+    "ok": 10,
+    "unlabeled": 0,
+    "paper_with_id": 0
+   },
+   "tavily.docs": {
+    "n": 10,
+    "kinds": {
+     "web": 7,
+     "docs": 1,
+     "paper": 2
+    },
+    "repos": 0,
+    "datasets": 0,
+    "good": 1,
+    "ok": 8,
+    "unlabeled": 0,
+    "paper_with_id": 0
+   },
+   "tavily.paper": {
+    "n": 10,
+    "kinds": {
+     "paper": 10
+    },
+    "repos": 0,
+    "datasets": 0,
+    "good": 0,
+    "ok": 0,
+    "unlabeled": 0,
+    "paper_with_id": 1
+   },
+   "code_overlap": {
+    "exa": 11,
+    "tavily": 10,
+    "both": 4
+   },
+   "good_code_union": {
+    "exa": 6,
+    "tavily": 3,
+    "both": 3
+   },
+   "good_any_union": {
+    "exa": 12,
+    "tavily": 4,
+    "both": 3,
+    "union": 13
+   },
+   "ok_any_union": {
+    "exa": 19,
+    "tavily": 18,
+    "exa_n": 24,
+    "tavily_n": 24
+   },
+   "exa_papers_head60": {
+    "n": 4,
+    "core": 4,
+    "only_this_source": 0,
+    "only_core": 0
+   },
+   "tavily_papers_head60": {
+    "n": 0,
+    "core": 0,
+    "only_this_source": 0,
+    "only_core": 0
+   }
+  },
+  "task:qsm-reconstruction": {
+   "exa.code": {
+    "n": 10,
+    "kinds": {
+     "code": 10
+    },
+    "repos": 10,
+    "datasets": 0,
+    "good": 6,
+    "ok": 10,
+    "unlabeled": 0,
+    "paper_with_id": 0
+   },
+   "exa.data": {
+    "n": 10,
+    "kinds": {
+     "web": 5,
+     "docs": 2,
+     "paper": 3
+    },
+    "repos": 0,
+    "datasets": 0,
+    "good": 5,
+    "ok": 7,
+    "unlabeled": 0,
+    "paper_with_id": 3
+   },
+   "exa.docs": {
+    "n": 10,
+    "kinds": {
+     "docs": 8,
+     "code": 1,
+     "web": 1
+    },
+    "repos": 1,
+    "datasets": 0,
+    "good": 8,
+    "ok": 10,
+    "unlabeled": 0,
+    "paper_with_id": 0
+   },
+   "exa.paper": {
+    "n": 10,
+    "kinds": {
+     "docs": 3,
+     "paper": 7
+    },
+    "repos": 0,
+    "datasets": 0,
+    "good": 0,
+    "ok": 0,
+    "unlabeled": 3,
+    "paper_with_id": 6
+   },
+   "tavily.code": {
+    "n": 10,
+    "kinds": {
+     "code": 10
+    },
+    "repos": 7,
+    "datasets": 0,
+    "good": 5,
+    "ok": 8,
+    "unlabeled": 0,
+    "paper_with_id": 0
+   },
+   "tavily.data": {
+    "n": 10,
+    "kinds": {
+     "docs": 2,
+     "paper": 5,
+     "code": 1,
+     "web": 2
+    },
+    "repos": 1,
+    "datasets": 0,
+    "good": 2,
+    "ok": 8,
+    "unlabeled": 0,
+    "paper_with_id": 1
+   },
+   "tavily.docs": {
+    "n": 10,
+    "kinds": {
+     "web": 5,
+     "docs": 2,
+     "code": 1,
+     "paper": 2
+    },
+    "repos": 1,
+    "datasets": 0,
+    "good": 1,
+    "ok": 6,
+    "unlabeled": 0,
+    "paper_with_id": 2
+   },
+   "tavily.paper": {
+    "n": 10,
+    "kinds": {
+     "paper": 10
+    },
+    "repos": 0,
+    "datasets": 0,
+    "good": 0,
+    "ok": 0,
+    "unlabeled": 0,
+    "paper_with_id": 2
+   },
+   "code_overlap": {
+    "exa": 10,
+    "tavily": 7,
+    "both": 2
+   },
+   "good_code_union": {
+    "exa": 6,
+    "tavily": 3,
+    "both": 2
+   },
+   "good_any_union": {
+    "exa": 18,
+    "tavily": 4,
+    "both": 2,
+    "union": 20
+   },
+   "ok_any_union": {
+    "exa": 25,
+    "tavily": 17,
+    "exa_n": 25,
+    "tavily_n": 22
+   },
+   "exa_papers_head60": {
+    "n": 3,
+    "core": 3,
+    "only_this_source": 0,
+    "only_core": 0
+   },
+   "tavily_papers_head60": {
+    "n": 1,
+    "core": 1,
+    "only_this_source": 0,
+    "only_core": 0
+   }
+  },
+  "task:tumor-immune-interface": {
+   "exa.code": {
+    "n": 10,
+    "kinds": {
+     "code": 10
+    },
+    "repos": 10,
+    "datasets": 0,
+    "good": 6,
+    "ok": 10,
+    "unlabeled": 0,
+    "paper_with_id": 0
+   },
+   "exa.data": {
+    "n": 10,
+    "kinds": {
+     "data": 7,
+     "code": 1,
+     "paper": 2
+    },
+    "repos": 1,
+    "datasets": 7,
+    "good": 6,
+    "ok": 8,
+    "unlabeled": 0,
+    "paper_with_id": 2
+   },
+   "exa.docs": {
+    "n": 10,
+    "kinds": {
+     "docs": 5,
+     "code": 3,
+     "web": 1,
+     "paper": 1
+    },
+    "repos": 3,
+    "datasets": 0,
+    "good": 9,
+    "ok": 10,
+    "unlabeled": 0,
+    "paper_with_id": 0
+   },
+   "exa.paper": {
+    "n": 10,
+    "kinds": {
+     "docs": 2,
+     "paper": 8
+    },
+    "repos": 0,
+    "datasets": 0,
+    "good": 0,
+    "ok": 0,
+    "unlabeled": 2,
+    "paper_with_id": 6
+   },
+   "tavily.code": {
+    "n": 10,
+    "kinds": {
+     "code": 10
+    },
+    "repos": 10,
+    "datasets": 0,
+    "good": 0,
+    "ok": 2,
+    "unlabeled": 0,
+    "paper_with_id": 0
+   },
+   "tavily.data": {
+    "n": 10,
+    "kinds": {
+     "docs": 3,
+     "paper": 3,
+     "web": 3,
+     "code": 1
+    },
+    "repos": 1,
+    "datasets": 0,
+    "good": 3,
+    "ok": 5,
+    "unlabeled": 0,
+    "paper_with_id": 2
+   },
+   "tavily.docs": {
+    "n": 10,
+    "kinds": {
+     "docs": 2,
+     "web": 5,
+     "code": 1,
+     "paper": 2
+    },
+    "repos": 1,
+    "datasets": 0,
+    "good": 2,
+    "ok": 4,
+    "unlabeled": 0,
+    "paper_with_id": 1
+   },
+   "tavily.paper": {
+    "n": 10,
+    "kinds": {
+     "paper": 10
+    },
+    "repos": 0,
+    "datasets": 0,
+    "good": 0,
+    "ok": 0,
+    "unlabeled": 0,
+    "paper_with_id": 3
+   },
+   "code_overlap": {
+    "exa": 12,
+    "tavily": 11,
+    "both": 0
+   },
+   "good_code_union": {
+    "exa": 7,
+    "tavily": 0,
+    "both": 0
+   },
+   "good_any_union": {
+    "exa": 19,
+    "tavily": 4,
+    "both": 2,
+    "union": 21
+   },
+   "ok_any_union": {
+    "exa": 26,
+    "tavily": 10,
+    "exa_n": 26,
+    "tavily_n": 23
+   },
+   "exa_papers_head60": {
+    "n": 4,
+    "core": 4,
+    "only_this_source": 0,
+    "only_core": 0
+   },
+   "tavily_papers_head60": {
+    "n": 6,
+    "core": 4,
+    "only_this_source": 0,
+    "only_core": 0
+   }
+  }
+ },
+ "cost": {
+  "method:column-generation-branch-and-price-for-vehicle-routing": {
+   "arxiv": {
+    "calls": 4,
+    "n429": 0,
+    "usd": 0.0,
+    "credits": 0.0
+   },
+   "crossref": {
+    "calls": 4,
+    "n429": 0,
+    "usd": 0.0,
+    "credits": 0.0
+   },
+   "exa": {
+    "calls": 4,
+    "n429": 0,
+    "usd": 0.028,
+    "credits": 0.0
+   },
+   "openalex": {
+    "calls": 9,
+    "n429": 0,
+    "usd": 0.0045000000000000005,
+    "credits": 0.0
+   },
+   "s2": {
+    "calls": 11,
+    "n429": 4,
+    "usd": 0.0,
+    "credits": 0.0
+   },
+   "tavily": {
+    "calls": 4,
+    "n429": 0,
+    "usd": 0.0,
+    "credits": 4.0
+   }
+  },
+  "method:mixture-likelihood-contamination-and-tumor-in-normal-estimat": {
+   "arxiv": {
+    "calls": 4,
+    "n429": 0,
+    "usd": 0.0,
+    "credits": 0.0
+   },
+   "crossref": {
+    "calls": 4,
+    "n429": 0,
+    "usd": 0.0,
+    "credits": 0.0
+   },
+   "europepmc": {
+    "calls": 10,
+    "n429": 0,
+    "usd": 0.0,
+    "credits": 0.0
+   },
+   "exa": {
+    "calls": 4,
+    "n429": 0,
+    "usd": 0.028,
+    "credits": 0.0
+   },
+   "openalex": {
+    "calls": 8,
+    "n429": 0,
+    "usd": 0.0044,
+    "credits": 0.0
+   },
+   "s2": {
+    "calls": 13,
+    "n429": 7,
+    "usd": 0.0,
+    "credits": 0.0
+   },
+   "tavily": {
+    "calls": 4,
+    "n429": 0,
+    "usd": 0.0,
+    "credits": 4.0
+   }
+  },
+  "method:multivariate-fay-herriot-hierarchical-small-area-models": {
+   "arxiv": {
+    "calls": 4,
+    "n429": 0,
+    "usd": 0.0,
+    "credits": 0.0
+   },
+   "crossref": {
+    "calls": 4,
+    "n429": 0,
+    "usd": 0.0,
+    "credits": 0.0
+   },
+   "exa": {
+    "calls": 4,
+    "n429": 0,
+    "usd": 0.028,
+    "credits": 0.0
+   },
+   "openalex": {
+    "calls": 9,
+    "n429": 0,
+    "usd": 0.0045000000000000005,
+    "credits": 0.0
+   },
+   "s2": {
+    "calls": 9,
+    "n429": 2,
+    "usd": 0.0,
+    "credits": 0.0
+   },
+   "tavily": {
+    "calls": 4,
+    "n429": 0,
+    "usd": 0.0,
+    "credits": 4.0
+   }
+  },
+  "method:stochastic-reconfiguration-natural-gradient-for-neural-quant": {
+   "arxiv": {
+    "calls": 4,
+    "n429": 0,
+    "usd": 0.0,
+    "credits": 0.0
+   },
+   "crossref": {
+    "calls": 3,
+    "n429": 0,
+    "usd": 0.0,
+    "credits": 0.0
+   },
+   "exa": {
+    "calls": 4,
+    "n429": 0,
+    "usd": 0.028,
+    "credits": 0.0
+   },
+   "openalex": {
+    "calls": 9,
+    "n429": 0,
+    "usd": 0.0045000000000000005,
+    "credits": 0.0
+   },
+   "s2": {
+    "calls": 11,
+    "n429": 4,
+    "usd": 0.0,
+    "credits": 0.0
+   },
+   "tavily": {
+    "calls": 4,
+    "n429": 0,
+    "usd": 0.0,
+    "credits": 4.0
+   }
+  },
+  "method:strong-constraint-4d-var-with-window-lengthening-warm-starte": {
+   "arxiv": {
+    "calls": 4,
+    "n429": 0,
+    "usd": 0.0,
+    "credits": 0.0
+   },
+   "crossref": {
+    "calls": 4,
+    "n429": 0,
+    "usd": 0.0,
+    "credits": 0.0
+   },
+   "exa": {
+    "calls": 4,
+    "n429": 0,
+    "usd": 0.028,
+    "credits": 0.0
+   },
+   "openalex": {
+    "calls": 9,
+    "n429": 0,
+    "usd": 0.0045000000000000005,
+    "credits": 0.0
+   },
+   "s2": {
+    "calls": 8,
+    "n429": 1,
+    "usd": 0.0,
+    "credits": 0.0
+   },
+   "tavily": {
+    "calls": 4,
+    "n429": 0,
+    "usd": 0.0,
+    "credits": 4.0
+   }
+  },
+  "task:3x2pt-inference": {
+   "arxiv": {
+    "calls": 4,
+    "n429": 0,
+    "usd": 0.0,
+    "credits": 0.0
+   },
+   "crossref": {
+    "calls": 3,
+    "n429": 0,
+    "usd": 0.0,
+    "credits": 0.0
+   },
+   "exa": {
+    "calls": 4,
+    "n429": 0,
+    "usd": 0.028,
+    "credits": 0.0
+   },
+   "openalex": {
+    "calls": 9,
+    "n429": 0,
+    "usd": 0.0045000000000000005,
+    "credits": 0.0
+   },
+   "s2": {
+    "calls": 8,
+    "n429": 1,
+    "usd": 0.0,
+    "credits": 0.0
+   },
+   "tavily": {
+    "calls": 4,
+    "n429": 0,
+    "usd": 0.0,
+    "credits": 4.0
+   }
+  },
+  "task:ambient-rna-correction": {
+   "arxiv": {
+    "calls": 4,
+    "n429": 0,
+    "usd": 0.0,
+    "credits": 0.0
+   },
+   "crossref": {
+    "calls": 3,
+    "n429": 0,
+    "usd": 0.0,
+    "credits": 0.0
+   },
+   "europepmc": {
+    "calls": 2,
+    "n429": 0,
+    "usd": 0.0,
+    "credits": 0.0
+   },
+   "exa": {
+    "calls": 4,
+    "n429": 0,
+    "usd": 0.028,
+    "credits": 0.0
+   },
+   "openalex": {
+    "calls": 12,
+    "n429": 0,
+    "usd": 0.0039000000000000003,
+    "credits": 0.0
+   },
+   "s2": {
+    "calls": 13,
+    "n429": 5,
+    "usd": 0.0,
+    "credits": 0.0
+   },
+   "tavily": {
+    "calls": 4,
+    "n429": 0,
+    "usd": 0.0,
+    "credits": 4.0
+   }
+  },
+  "task:nanoindentation-property-extraction": {
+   "arxiv": {
+    "calls": 4,
+    "n429": 0,
+    "usd": 0.0,
+    "credits": 0.0
+   },
+   "crossref": {
+    "calls": 3,
+    "n429": 0,
+    "usd": 0.0,
+    "credits": 0.0
+   },
+   "exa": {
+    "calls": 4,
+    "n429": 0,
+    "usd": 0.028,
+    "credits": 0.0
+   },
+   "openalex": {
+    "calls": 9,
+    "n429": 0,
+    "usd": 0.0045000000000000005,
+    "credits": 0.0
+   },
+   "s2": {
+    "calls": 15,
+    "n429": 8,
+    "usd": 0.0,
+    "credits": 0.0
+   },
+   "tavily": {
+    "calls": 4,
+    "n429": 0,
+    "usd": 0.0,
+    "credits": 4.0
+   }
+  },
+  "task:qsm-reconstruction": {
+   "arxiv": {
+    "calls": 4,
+    "n429": 0,
+    "usd": 0.0,
+    "credits": 0.0
+   },
+   "crossref": {
+    "calls": 4,
+    "n429": 0,
+    "usd": 0.0,
+    "credits": 0.0
+   },
+   "europepmc": {
+    "calls": 10,
+    "n429": 0,
+    "usd": 0.0,
+    "credits": 0.0
+   },
+   "exa": {
+    "calls": 4,
+    "n429": 0,
+    "usd": 0.028,
+    "credits": 0.0
+   },
+   "openalex": {
+    "calls": 12,
+    "n429": 0,
+    "usd": 0.0048000000000000004,
+    "credits": 0.0
+   },
+   "s2": {
+    "calls": 20,
+    "n429": 11,
+    "usd": 0.0,
+    "credits": 0.0
+   },
+   "tavily": {
+    "calls": 4,
+    "n429": 0,
+    "usd": 0.0,
+    "credits": 4.0
+   }
+  },
+  "task:tumor-immune-interface": {
+   "arxiv": {
+    "calls": 4,
+    "n429": 0,
+    "usd": 0.0,
+    "credits": 0.0
+   },
+   "crossref": {
+    "calls": 4,
+    "n429": 0,
+    "usd": 0.0,
+    "credits": 0.0
+   },
+   "europepmc": {
+    "calls": 2,
+    "n429": 0,
+    "usd": 0.0,
+    "credits": 0.0
+   },
+   "exa": {
+    "calls": 4,
+    "n429": 0,
+    "usd": 0.028,
+    "credits": 0.0
+   },
+   "openalex": {
+    "calls": 9,
+    "n429": 0,
+    "usd": 0.0045000000000000005,
+    "credits": 0.0
+   },
+   "s2": {
+    "calls": 12,
+    "n429": 5,
+    "usd": 0.0,
+    "credits": 0.0
+   },
+   "tavily": {
+    "calls": 4,
+    "n429": 0,
+    "usd": 0.0,
+    "credits": 4.0
+   }
+  }
+ },
+ "latency": {
+  "method:column-generation-branch-and-price-for-vehicle-routing": {
+   "wall_s": 122.6,
+   "openalex": 28.19,
+   "s2": 14.43,
+   "crossref": 6.64,
+   "arxiv": 6.22,
+   "europepmc": 0.0,
+   "exa": 17.01,
+   "tavily": 14.78,
+   "stage1_wall": 28.19,
+   "stage2": 6.36,
+   "enrich": 50.47,
+   "total": 85.03
+  },
+  "method:mixture-likelihood-contamination-and-tumor-in-normal-estimat": {
+   "wall_s": 35.1,
+   "openalex": 0.11,
+   "s2": 0.11,
+   "crossref": 0.06,
+   "arxiv": 0.03,
+   "europepmc": 10.79,
+   "exa": 0.12,
+   "tavily": 0.11,
+   "stage1_wall": 10.79,
+   "stage2": 3.96,
+   "enrich": 20.34,
+   "total": 35.11
+  },
+  "method:multivariate-fay-herriot-hierarchical-small-area-models": {
+   "wall_s": 58.0,
+   "openalex": 17.67,
+   "s2": 17.87,
+   "crossref": 9.28,
+   "arxiv": 4.03,
+   "europepmc": 0.0,
+   "exa": 17.67,
+   "tavily": 12.15,
+   "stage1_wall": 17.88,
+   "stage2": 6.42,
+   "enrich": 17.33,
+   "total": 41.64
+  },
+  "method:stochastic-reconfiguration-natural-gradient-for-neural-quant": {
+   "wall_s": 143.5,
+   "openalex": 54.84,
+   "s2": 8.72,
+   "crossref": 7.9,
+   "arxiv": 13.94,
+   "europepmc": 0.0,
+   "exa": 21.25,
+   "tavily": 17.4,
+   "stage1_wall": 54.84,
+   "stage2": 33.63,
+   "enrich": 10.71,
+   "total": 99.19
+  },
+  "method:strong-constraint-4d-var-with-window-lengthening-warm-starte": {
+   "wall_s": 96.4,
+   "openalex": 52.86,
+   "s2": 8.58,
+   "crossref": 6.23,
+   "arxiv": 4.36,
+   "europepmc": 0.0,
+   "exa": 21.59,
+   "tavily": 14.47,
+   "stage1_wall": 52.86,
+   "stage2": 6.49,
+   "enrich": 16.02,
+   "total": 75.38
+  },
+  "task:3x2pt-inference": {
+   "wall_s": 82.5,
+   "openalex": 37.2,
+   "s2": 9.14,
+   "crossref": 7.38,
+   "arxiv": 5.67,
+   "europepmc": 0.0,
+   "exa": 26.7,
+   "tavily": 16.76,
+   "stage1_wall": 37.2,
+   "stage2": 16.52,
+   "enrich": 8.94,
+   "total": 62.66
+  },
+  "task:ambient-rna-correction": {
+   "wall_s": 56.7,
+   "openalex": 0.12,
+   "s2": 0.08,
+   "crossref": 0.07,
+   "arxiv": 0.04,
+   "europepmc": 0.05,
+   "exa": 0.09,
+   "tavily": 0.12,
+   "stage1_wall": 0.13,
+   "stage2": 7.91,
+   "enrich": 25.59,
+   "total": 33.64
+  },
+  "task:nanoindentation-property-extraction": {
+   "wall_s": 271.5,
+   "openalex": 35.64,
+   "s2": 8.67,
+   "crossref": 7.16,
+   "arxiv": 4.2,
+   "europepmc": 0.0,
+   "exa": 24.58,
+   "tavily": 16.68,
+   "stage1_wall": 35.64,
+   "stage2": 8.92,
+   "enrich": 6.84,
+   "total": 51.42
+  },
+  "task:qsm-reconstruction": {
+   "wall_s": 48.9,
+   "openalex": 0.11,
+   "s2": 0.06,
+   "crossref": 0.07,
+   "arxiv": 0.03,
+   "europepmc": 6.14,
+   "exa": 0.08,
+   "tavily": 0.09,
+   "stage1_wall": 6.14,
+   "stage2": 5.18,
+   "enrich": 20.98,
+   "total": 32.31
+  },
+  "task:tumor-immune-interface": {
+   "wall_s": 138.9,
+   "openalex": 41.32,
+   "s2": 17.76,
+   "crossref": 8.34,
+   "arxiv": 5.75,
+   "europepmc": 14.56,
+   "exa": 23.0,
+   "tavily": 14.42,
+   "stage1_wall": 41.32,
+   "stage2": 52.13,
+   "enrich": 11.02,
+   "total": 104.48
+  }
+ },
+ "call_latency_median": {
+  "crossref": 2.13,
+  "arxiv": 2.49,
+  "tavily": 3.81,
+  "exa": 5.65,
+  "openalex": 6.73,
+  "s2": 3.25,
+  "europepmc": 5.72
+ },
+ "cost_total": {
+  "arxiv": {
+   "calls": 40,
+   "n429": 0,
+   "usd": 0.0,
+   "credits": 0.0
+  },
+  "crossref": {
+   "calls": 36,
+   "n429": 0,
+   "usd": 0.0,
+   "credits": 0.0
+  },
+  "exa": {
+   "calls": 40,
+   "n429": 0,
+   "usd": 0.28,
+   "credits": 0.0
+  },
+  "openalex": {
+   "calls": 95,
+   "n429": 0,
+   "usd": 0.0446,
+   "credits": 0.0
+  },
+  "s2": {
+   "calls": 120,
+   "n429": 48,
+   "usd": 0.0,
+   "credits": 0.0
+  },
+  "tavily": {
+   "calls": 40,
+   "n429": 0,
+   "usd": 0.0,
+   "credits": 40.0
+  },
+  "europepmc": {
+   "calls": 24,
+   "n429": 0,
+   "usd": 0.0,
+   "credits": 0.0
+  }
+ },
+ "extra_total": {
+  "full7_vs_new4": {
+   "added_head60": 79,
+   "added_rel": 59,
+   "added_core": 21,
+   "added_core_not_in_openalex": 10,
+   "added_core_not_in_b_pool": 2,
+   "added_rel_not_in_b_pool": 9,
+   "added_unlabeled": 0,
+   "added_sel": 1
+  },
+  "s2_extra": {
+   "added_head60": 173,
+   "added_rel": 127,
+   "added_core": 46,
+   "added_core_not_in_openalex": 19,
+   "added_core_not_in_b_pool": 10,
+   "added_rel_not_in_b_pool": 35,
+   "added_unlabeled": 0,
+   "added_sel": 2
+  },
+  "s2_extra_new4": {
+   "added_head60": 194,
+   "added_rel": 144,
+   "added_core": 52,
+   "added_core_not_in_openalex": 23,
+   "added_core_not_in_b_pool": 17,
+   "added_rel_not_in_b_pool": 60,
+   "added_unlabeled": 0,
+   "added_sel": 6
+  },
+  "crossref_extra": {
+   "added_head60": 54,
+   "added_rel": 45,
+   "added_core": 18,
+   "added_core_not_in_openalex": 9,
+   "added_core_not_in_b_pool": 0,
+   "added_rel_not_in_b_pool": 6,
+   "added_unlabeled": 0,
+   "added_sel": 1
+  },
+  "arxiv_extra": {
+   "added_head60": 22,
+   "added_rel": 17,
+   "added_core": 5,
+   "added_core_not_in_openalex": 3,
+   "added_core_not_in_b_pool": 0,
+   "added_rel_not_in_b_pool": 0,
+   "added_unlabeled": 0,
+   "added_sel": 0
+  },
+  "epmc_extra": {
+   "added_head60": 11,
+   "added_rel": 4,
+   "added_core": 2,
+   "added_core_not_in_openalex": 0,
+   "added_core_not_in_b_pool": 0,
+   "added_rel_not_in_b_pool": 0,
+   "added_unlabeled": 0,
+   "added_sel": 0
+  },
+  "exa_tavily_extra": {
+   "added_head60": 26,
+   "added_rel": 26,
+   "added_core": 16,
+   "added_core_not_in_openalex": 8,
+   "added_core_not_in_b_pool": 2,
+   "added_rel_not_in_b_pool": 2,
+   "added_unlabeled": 0,
+   "added_sel": 1
+  },
+  "crossref_over_new4": {
+   "added_head60": 48,
+   "added_rel": 39,
+   "added_core": 15,
+   "added_core_not_in_openalex": 7,
+   "added_core_not_in_b_pool": 0,
+   "added_rel_not_in_b_pool": 6,
+   "added_unlabeled": 0,
+   "added_sel": 1
+  }
+ }
+}

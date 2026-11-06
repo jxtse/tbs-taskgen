@@ -1,0 +1,56 @@
+{
+ "n_pos": 7,
+ "n_neg": 231,
+ "recall": "7/7",
+ "false_positive": "6/231",
+ "recall_incl_review": "7/7",
+ "review_only_neg": "40/231",
+ "review_by_class": {
+  "L1c": 34,
+  "L4a": 9,
+  "L2": 1
+ },
+ "fp_by_class": {
+  "L2": 5,
+  "L4a": 1
+ },
+ "pos_classes": {
+  "doi-038800bc86eac11a": [
+   "L1b",
+   "L3"
+  ],
+  "doi-3eb1a8320ce05319": [
+   "L1b",
+   "L3"
+  ],
+  "doi-42f972878ac729b9": [
+   "L1b",
+   "L1c",
+   "L3"
+  ],
+  "doi-851f175aa5503aad": [
+   "L1b",
+   "L1c",
+   "L3"
+  ],
+  "doi-e8ff62edc68aa90f": [
+   "L1b"
+  ],
+  "doi-fa4fa8fc76fc1b10": [
+   "L1b",
+   "L3"
+  ],
+  "doi-196db5a3b2c31394@prefix": [
+   "L4a"
+  ]
+ },
+ "errors": [],
+ "fp_ids": [
+  "doi-057241498f670f3f",
+  "doi-344a0c7c9c3fcc0f",
+  "doi-478eb4f5e10b856a",
+  "doi-70cf4e0036025530",
+  "doi-a88443a7f1c9289d",
+  "doi-f474d9fae99d8159"
+ ]
+}

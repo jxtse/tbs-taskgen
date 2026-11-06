@@ -1,0 +1,21 @@
+[project]
+name = "tbsretr"
+version = "0.1.0"
+description = "TB-Science retrieval layer v2 (OpenAlex, S2, Exa, Tavily, Crossref, arXiv, Europe PMC)"
+requires-python = ">=3.12"
+dependencies = []
+
+[build-system]
+requires = ["uv_build>=0.12.3,<0.13.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.2.0",
+]
+
+[project.scripts]
+tbsretr = "tbsretr.cli:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

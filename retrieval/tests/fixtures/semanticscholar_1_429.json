@@ -1,0 +1,10 @@
+{
+ "method": "GET",
+ "url": "https://api.semanticscholar.org/graph/v1/paper/search?query=ambient+RNA+removal+droplet+single-cell+RNA-seq&limit=20&fields=paperId%2CexternalIds%2Ctitle%2Cabstract%2Cyear%2Cvenue%2CcitationCount%2CopenAccessPdf%2CisOpenAccess%2CpublicationTypes%2Curl",
+ "body": null,
+ "status": 429,
+ "headers": {
+  "Content-Type": "application/json"
+ },
+ "response": "{\"message\": \"Too Many Requests. Please wait and try again or apply for a key for higher rate limits. https://www.semanticscholar.org/product/api#api-key-form\", \"code\": \"429\"}"
+}

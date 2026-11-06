@@ -1,0 +1,10 @@
+{
+ "method": "GET",
+ "url": "https://export.arxiv.org/api/query?search_query=%28cat%3Aquant-ph+OR+cat%3Acond-mat%2A%29+AND+all%3A%28neural+quantum+states+stochastic+reconfiguration%29&max_results=20&sortBy=relevance",
+ "body": null,
+ "status": 429,
+ "headers": {
+  "content-type": "text/html"
+ },
+ "response": "Rate exceeded."
+}
