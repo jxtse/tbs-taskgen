@@ -1,0 +1,84 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+# Tests are offline. Blank every credential the code knows about so nothing can reach a real
+# service, and point the local-service URLs at nothing.
+env:
+  UV_PYTHON: "3.12"            # both pyproject.toml files: requires-python = ">=3.12"
+  OPENALEX_API_KEY: ""
+  SEMANTIC_SCHOLAR_API_KEY: ""
+  EXA_API_KEY_SECONDARY: ""
+  TAVILY_API_KEY_SECONDARY: ""
+  ANTHROPIC_API_KEY: ""
+  TBS_SEARCH_POOL_URL: ""
+  TBS_OPUS_URL: "http://127.0.0.1:9/unused"
+
+jobs:
+  retrieval:
+    name: retrieval (all tests)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: retrieval
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10
+        with:
+          enable-cache: true
+          cache-dependency-glob: retrieval/uv.lock
+      - run: uv sync --locked
+      - run: uv run --locked pytest -q
+
+  gen-unit:
+    name: gen (unit tests)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: gen
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10
+        with:
+          enable-cache: true
+          cache-dependency-glob: gen/uv.lock
+      - run: uv sync --locked
+      - run: uv run --locked pytest -q tests/test_unit.py
+
+  gen-integration:
+    name: gen (Docker integration tests)
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10
+        with:
+          enable-cache: true
+          cache-dependency-glob: gen/uv.lock
+      - name: Build sandbox image
+        run: docker build -t tbsgen-base:py311-sci-v2 -f gen/docker/Dockerfile.base gen/docker
+      - name: Sync
+        working-directory: gen
+        run: uv sync --locked
+      - name: Integration tests (must not be skipped)
+        working-directory: gen
+        # test_integration.py skips itself when Docker or the image is missing; fail instead.
+        run: |
+          set -o pipefail
+          uv run --locked pytest -q -rs tests/test_integration.py | tee "$RUNNER_TEMP/pytest.txt"
+          if grep -qE '[0-9]+ skipped' "$RUNNER_TEMP/pytest.txt"; then
+            echo "::error::integration tests were skipped"; exit 1
+          fi
