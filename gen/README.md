@@ -59,7 +59,7 @@ items/<item_id>/
 |---|---|---|---|---|
 | S1 | 检索层输出（`tbsretr` 的 `papers` 或 `eval/raw/*.json` 的 `selected`）或候选 JSONL | `S1_candidate.json` | 无 | — |
 | S2 | 题录 + 摘要 | `S2_screen.json`（`score`、`keep`、`form_hint`、`method`、`reason`、`deferred`；Jev 模式另有各问题概率 `probabilities`、`decision`（keep/drop/uncertain）、`uncertain`、`jev_model`、`input_tokens`）；`S2_jev.json` 为按请求键缓存的 Jev 结果 | `roles.screen`：`rules`（默认）或 `jev`（TypeSafe Jev，失败回退规则） | `dropped: low_screen_score`（规则）/ `jev_*`（Jev）；无摘要时 `deferred`，S4 用全文开头重判 |
-| S3 | DOI、OA 链接 | `fulltext.txt` + `S3_fulltext.json` | 无 | `parked: fulltext_unavailable`，写 `S3_queue.json` 并加入全文队列；`tbsgen fetch` 取到后条目回到 S3 |
+| S3 | DOI、OA 链接 | `fulltext.txt` + `S3_fulltext.json` | 无 | `parked: fulltext_unavailable`，写 `S3_queue.json` 并加入全文队列；`tbsgen fetch` 取到后写入 `fulltext.txt` 并推进到 S4 |
 | S4 | 全文 + 筛选记录 | `S4_probe.json`（计算核心线索、与官方 70 题去重、形态禁令） | 规则（沙箱探针待定） | `dropped: no_compute_core / tbs_duplicate / interact_form_banned_until_isolation` |
 | S5 | 全文摘录 + 探针卡 | `_spec/spec.json`、`depgraph.json`、`coverage.json`、`provenance.json` | Opus | 校验不过重试 1 次，仍不过 `dropped: spec_invalid` |
 | S6A | 规格 | `task/generator/`、`solution/`、`baselines/{mid,naive}.py`、`tests/measure.py` | Opus | 缺文件 `dropped` |
@@ -101,7 +101,7 @@ uv run tbsgen status --run runs/R ; uv run tbsgen report --run runs/R ; uv run t
 uv run tbsgen resume --run runs/R --config config.toml              # 恢复因预算/熔断暂停的条目
 uv run tbsgen breaker --run runs/R --model claude-opus-5-5 --reset  # 人工解除熔断
 uv run tbsgen fetch --run runs/R --config config.toml [--max N] [--channels oa,browser] [--no-browser] [--dry-run]
-                                                                    # 清全文队列（含 ego-browser 通道），取到的条目回到 S3
+                                                                    # 清全文队列（含 ego-browser 通道），取到全文后交给等待的条目并推进到 S4
 uv run tbsgen fetch --run runs/R --status                          # 今日下载用量、冷却、熔断
 uv run tbsgen fetch --run runs/R --finish-browser                  # 关闭本工具的 ego TaskSpace
 uv run tbsgen calib-ingest --run runs/R --item ID [--job-dir DIR]   # 回填校准结果（默认取该次提交的作业目录；作业未结束则拒绝）

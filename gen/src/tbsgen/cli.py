@@ -146,8 +146,8 @@ def _fetch(P: Pipeline, a) -> int:
         return 0
 
     def reactivate(entry, out, sub) -> bool:
-        """Put one waiting item back to S3 (it re-runs S3 and finds the text in the write cache).  True when
-        the item is (now) past the parked state, so the queue entry may be dropped for it."""
+        """Deliver the fetched text to one waiting item and move it on to S4 (the same transition S3 makes), so
+        items of other runs (other caches) get the text too.  True when the item no longer waits for it."""
         run, iid = sub
         run = Path(run or P.store.root)
         if not (run / "items" / iid / "state.json").exists():
@@ -155,20 +155,16 @@ def _fetch(P: Pipeline, a) -> int:
         it = Store(run).item(iid)
         st = it.state
         if st.get("stage") == "S3" and st.get("status") == "parked" and st.get("reason") == "fulltext_unavailable":
-            st.setdefault("history", []).append(dict(stage="S3", result="fulltext_fetched",
-                                                     source=out.rec.get("source"), ts=__import__("time").time()))
-            st["status"] = "active"
-            st.pop("reason", None)
-            it.save()
-            return True
-        # already re-activated (another fetch) or moved on: nothing left to do for this item.  An item still
-        # active at S3 (S3 running right now) has not parked yet; S3 parks before it enqueues, so a later
-        # enqueue re-adds it if it parks again.
-        return True
+            write_json(it.p("S3_fulltext.json"), dict(out.rec, delivered_by="tbsgen fetch"))
+            it.p("fulltext.txt").write_text(out.text)
+            it.advance("S3", "S4", source=out.rec.get("source"), chars=len(out.text), via="tbsgen fetch")
+        return True                                        # delivered now, or already past S3 / not waiting
 
+    readded = fulltext.reconcile(P.store, fulltext.queue_path(P.cfg)) if not a.dry_run else 0
     stats = fulltext.drain_queue(f, max_papers=a.max, channels=[x for x in a.channels.split(",") if x] or None,
                                  browser=not a.no_browser, dry_run=a.dry_run, on_success=reactivate,
                                  log=lambda s: print(s, file=sys.stderr))
+    stats["requeued_from_items"] = readded
     print(json.dumps(stats, indent=1, ensure_ascii=False))
     return 0
 

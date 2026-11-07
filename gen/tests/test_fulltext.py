@@ -12,6 +12,14 @@ from tbsgen.config import load_config
 from tbsgen.dlledger import DownloadLedger, LimitReached, block_signal, challenge_page
 from tbsgen.fulltext import Fetcher, Resp
 
+@pytest.fixture(autouse=True)
+def _no_real_credentials(monkeypatch):
+    """Tests must not see credentials of the machine they run on."""
+    for k in ("ELSEVIER_API_KEY", "ELSEVIER_INSTTOKEN", "WILEY_TDM_TOKEN", "HTTP_PROXY", "HTTPS_PROXY", "http_proxy",
+              "https_proxy", "ALL_PROXY", "all_proxy"):
+        monkeypatch.delenv(k, raising=False)
+
+
 TITLE = "Robust estimation of drift in noisy sensor arrays"
 BODY = ("Introduction. " + "We study robust estimation of drift in noisy sensor arrays with a least-squares "
         "method. " * 120 + " Methods. Results. Discussion. Conclusions. References.")
@@ -507,7 +515,8 @@ def test_queue_keeps_retrieval_fields_and_doi_less_papers(tmp_path):
     e = fulltext.queue_entry(c, subscribers=[["r", "i"]])
     assert fulltext.enqueue(qp, e)
     [got] = fulltext.read_queue(qp)
-    assert got["openAccessPdf"]["url"] == "https://repo.example/p.pdf" and got["pmcid"] == "PMC1" and got["key"]
+    assert got["openAccessPdf"]["url"] == "https://repo.example/p.pdf" and got["pmcid"] == "PMC1"
+    assert got["ident"] == "arxiv:2101.1"
 
 
 def test_s3_parks_and_queues_then_fetch_reactivates(tmp_path, monkeypatch):
@@ -536,11 +545,9 @@ def test_s3_parks_and_queues_then_fetch_reactivates(tmp_path, monkeypatch):
     monkeypatch.setattr(sys_mod(), "stderr", open("/dev/null", "w"))
     cli._fetch(P, A())
     it = P.store.item(iid)
-    assert it.state["status"] == "active" and it.state["stage"] == "S3"
-    from tbsgen import stages_a
-    stages_a.s3(P, it)
-    it = P.store.item(iid)
-    assert it.state["stage"] == "S4" and it.state["history"][-1]["source"] == "cache"
+    assert it.state["status"] == "active" and it.state["stage"] == "S4"
+    assert it.p("fulltext.txt").read_text().startswith(TITLE) and it.state["history"][-1]["source"] == "browser"
+    assert fulltext.read_queue(fulltext.queue_path(cfg)) == []
 
 
 def sys_mod():
@@ -635,9 +642,11 @@ def test_caps_count_on_the_day_of_the_slot(tmp_path):
     t = dt.datetime(2026, 11, 7, 23, 59, 30).timestamp()
     clock = FakeClock(t)
     led = DownloadLedger(tmp_path / "l.sqlite", {"browser": {"daily_ok": 1, "gap_s": 60, "jitter_s": 0}},
-                         clock=clock, sleep=lambda s: None)          # does not advance: slots stay in the future
-    led.acquire("browser", "chrome:10.1021", "a")                  # today
+                         clock=clock, sleep=clock.sleep)
+    led.acquire("browser", "chrome:10.1021", "a")                  # today, still pending
     led.acquire("browser", "chrome:10.1021", "b")                  # slot after midnight: tomorrow's quota
+    days = [r[0] for r in sqlite3.connect(tmp_path / "l.sqlite").execute("select day from attempts order by ts")]
+    assert days == ["2026-11-07", "2026-11-08"]
     with pytest.raises(LimitReached, match="daily success cap"):
         led.acquire("browser", "chrome:10.1021", "c")              # tomorrow's single slot is taken
 
@@ -712,3 +721,211 @@ def test_host_cap_on_one_oa_source_does_not_stop_others(tmp_path, monkeypatch):
     led.meta["daily_calls"] = 0                                      # metadata host refused
     out = f.fetch(dict(doi="10.9/x", title=TITLE, oa_url="https://good.example.org/a.pdf"))
     assert out.rec["source"] == "oa" and any("metadata cap" in s for s in out.rec["skipped"])
+
+
+def test_egress_check_reads_cloudflare_trace():
+    trace = b"fl=12f\nh=pub.example\nip=198.51.100.9\nts=1.0\nloc=CN\n"
+    tr = lambda u, h, t, m: Resp(200, {}, trace, u)                  # noqa: E731
+    assert fulltext.check_egress({"allow_cidrs": ["198.51.100.0/24"], "urls": ["https://pub.example/cdn-cgi/trace"]},
+                                 tr)["ip"] == "198.51.100.9"
+
+
+
+# ------------------------------------------------------------------ review round 2 regressions
+def test_redirect_hop_is_booked_and_capped(tmp_path):
+    routes = {"oa.example.org": Resp(302, {"Location": "https://cdn.example.net/p.pdf"}, b"", "x"),
+              "cdn.example.net": FAKE_PDF}
+    f, net, led, _ = mkfetcher(tmp_path, routes, SECRETS, host_caps={"cdn.example.net": 0})
+    out = f.fetch(dict(doi="10.9/x", title=TITLE, oa_url="https://oa.example.org/p"))
+    assert out.text is None and not any("cdn.example.net" in u for u in net.hosts())
+    assert "redirect target refused" in out.rec["errors"][-1]
+    f, net, led, _ = mkfetcher(tmp_path / "b", routes, SECRETS)
+    f.fetch(dict(doi="10.9/x", title=TITLE, oa_url="https://oa.example.org/p"))
+    hops = sqlite3.connect(tmp_path / "b" / "dl.sqlite").execute(
+        "select host, status from attempts where status='hop'").fetchall()
+    assert hops == [("cdn.example.net", "hop")]
+
+
+def test_publisher_prefixes_share_pacing_and_caps(tmp_path):
+    clock = FakeClock()
+    led = DownloadLedger(tmp_path / "l.sqlite", {"browser": {"gap_s": 60, "jitter_s": 0, "host_daily_attempts": 2}},
+                         clock=clock, sleep=clock.sleep)
+    wiley = ("chrome:10.1002", "chrome:10.1111", "chrome:10.1029")
+    t0 = clock.t
+    for i, k in enumerate(wiley[:2]):
+        r = led.acquire("browser", k, f"d{i}", group=tuple(x for x in wiley if x != k))
+        led.record("browser", k, f"d{i}", "ok", 200, 1, reservation=r)
+    assert clock.t - t0 >= 60                                       # second prefix waited for the first
+    with pytest.raises(LimitReached, match="daily attempt cap 2"):
+        led.acquire("browser", "chrome:10.1029", "d3", group=wiley[:2])
+
+
+def test_late_wakeup_is_repaced(tmp_path):
+    clock = FakeClock()
+    led = DownloadLedger(tmp_path / "l.sqlite", {"oa": {"gap_s": 10, "jitter_s": 0}}, clock=clock, sleep=lambda s: None)
+    r1 = led.acquire("oa", "h.example", "a")        # sends now
+    clock.t += 30                                  # r1 still running; a second booking was made long ago...
+    sent = []
+
+    def sleep(s):
+        clock.t += s
+        sent.append(clock.t)
+    led.sleep = sleep
+    led.record("oa", "h.example", "a", "ok", 200, 1, reservation=r1)
+    db = sqlite3.connect(tmp_path / "l.sqlite")
+    db.execute("update attempts set ts=? where rowid=?", (clock.t, r1))      # r1 actually sent late
+    db.commit()
+    t_before = clock.t
+    led.acquire("oa", "h.example", "b")
+    assert clock.t - t_before >= 10
+
+
+def test_wakeup_after_midnight_counts_on_new_day(tmp_path):
+    import datetime as dt
+    clock = FakeClock(dt.datetime(2026, 11, 7, 23, 59, 50).timestamp())
+    led = DownloadLedger(tmp_path / "l.sqlite", {"browser": {"daily_ok": 1, "gap_s": 0, "jitter_s": 0}},
+                         clock=clock, sleep=clock.sleep)
+    db = sqlite3.connect(tmp_path / "l.sqlite")
+    tomorrow = (dt.datetime(2026, 11, 8, 0, 0, 5)).timestamp()
+    db.execute("insert into attempts values(?,?,?,?,?,?,?,?,?)",
+               (tomorrow, "2026-11-08", "browser", "chrome:10.1093", "x", "ok", 200, 1, ""))
+    db.execute("insert into attempts values(?,?,?,?,?,?,?,?,?)",          # forces a wait before the next send
+               (clock.t, "2026-11-07", "browser", "chrome:10.1021", "y", "fail", 404, 0, ""))
+    db.commit()
+    real_sleep = clock.sleep
+    led.sleep = lambda s: real_sleep(s + 30)        # wakes after midnight
+    led.limits["browser"]["gap_s"] = 5
+    with pytest.raises(LimitReached, match="daily success cap"):
+        led.acquire("browser", "chrome:10.1021", "a")
+    row = db.execute("select status, note from attempts where doi='a'").fetchone()
+    assert row[0] == "fail" and row[1].startswith("cancelled")
+
+
+def test_cooldown_is_never_shortened(tmp_path):
+    clock = FakeClock()
+    led = DownloadLedger(tmp_path / "l.sqlite", clock=clock, sleep=clock.sleep)
+    led.block("h.example", "challenge", seconds=24 * 3600)
+    led.block("h.example", "429", seconds=6 * 3600)
+    clock.t += 7 * 3600
+    assert led.cooling("h.example")
+
+
+def test_tdm_api_and_website_cooldowns_are_independent(tmp_path):
+    """Declined review item: API throttling and website bot walls are separate signals (see PUBLISHERS)."""
+    run, calls = fake_browser({"status": "downloaded", "_body": FAKE_PDF})
+    f, _, led, _ = mkfetcher(tmp_path, {}, SECRETS, browser_runner=run, browser={"enabled": True})
+    led.block("api.wiley.com", "429 on api")
+    f.fetch(dict(doi="10.1002/x", title=TITLE), browser=True, channels=["browser"])
+    assert len(calls) == 1
+
+
+def test_block_reasons_and_egress_errors_are_redacted(tmp_path):
+    run, _ = fake_browser({"status": "challenge", "title": "Just a moment k-els-test"})
+    f, _, led, _ = mkfetcher(tmp_path, {"ip.example": b"203.0.113.7"}, SECRETS, browser_runner=run,
+                             browser={"enabled": True})
+    f.fetch(dict(doi="10.1021/a", title=TITLE), browser=True)
+    blob = " ".join(str(r) for r in sqlite3.connect(tmp_path / "dl.sqlite").execute("select * from cooldown"))
+    blob += " ".join(str(r) for r in sqlite3.connect(tmp_path / "dl.sqlite").execute("select * from blocks"))
+    assert "k-els-test" not in blob
+    f2, _, _, _ = mkfetcher(tmp_path / "e", {"ip.example": b"203.0.113.7"}, SECRETS, egress_check={
+        "enabled": True, "allow_cidrs": ["198.51.100.0/24"], "urls": ["https://ip.example/?key=k-els-test"]})
+    out = f2.fetch(dict(doi="10.1016/j.x", title=TITLE))
+    assert "k-els-test" not in json.dumps(out.rec)
+
+
+def test_reactivation_delivers_text_across_runs(tmp_path, monkeypatch):
+    from tbsgen import cli
+    from tbsgen.pipeline import Pipeline
+    monkeypatch.setattr(fulltext, "pdf_to_text", lambda b: TITLE + "\n" + BODY)
+    shared_q = str(tmp_path / "shared_q.jsonl")
+    Ps = []
+    for name in ("A", "B"):
+        cfg = mkcfg(tmp_path / name, oa={"enabled": False}, browser={"enabled": True}, queue_path=shared_q,
+                    ledger_path=str(tmp_path / "shared.sqlite"))
+        P = Pipeline(cfg)
+        P.fetcher = Fetcher(cfg, transport=FakeNet({}), secrets={})
+        [iid] = P.ingest([dict(doi="10.1021/acs.9", title=TITLE,
+                               abstract="We propose an estimation algorithm with simulation benchmark; code on github.")])
+        P.run(max_steps=3)
+        Ps.append((P, iid))
+    assert len(fulltext.read_queue(Path(shared_q))[0]["subscribers"]) == 2
+    run, _ = fake_browser({"status": "downloaded", "_body": FAKE_PDF})
+    Ps[0][0].fetcher.browser_runner = run
+
+    class A:
+        status = finish_browser = dry_run = no_browser = False
+        max, channels = 5, ""
+    monkeypatch.setattr(sys_mod(), "stderr", open("/dev/null", "w"))
+    cli._fetch(Ps[0][0], A())
+    for P, iid in Ps:
+        it = P.store.item(iid)
+        assert it.state["stage"] == "S4" and it.p("fulltext.txt").exists()
+
+
+def test_reconcile_requeues_parked_items(tmp_path):
+    from tbsgen.pipeline import Pipeline
+    cfg = mkcfg(tmp_path, oa={"enabled": False}, browser={"enabled": True})
+    P = Pipeline(cfg)
+    P.fetcher = Fetcher(cfg, transport=FakeNet({}), secrets={})
+    [iid] = P.ingest([dict(doi="10.1021/acs.9", title=TITLE,
+                           abstract="We propose an estimation algorithm with simulation benchmark; code on github.")])
+    P.run(max_steps=3)
+    qp = fulltext.queue_path(cfg)
+    qp.unlink()                                                     # simulate a crash before the enqueue
+    assert fulltext.reconcile(P.store, qp) == 1 and fulltext.read_queue(qp)[0]["subscribers"][0][1] == iid
+    assert fulltext.reconcile(P.store, qp) == 0
+
+
+def test_doi_key_collision_does_not_mix_papers(tmp_path, monkeypatch):
+    monkeypatch.setattr(fulltext, "pdf_to_text", lambda b: TITLE + "\n" + BODY)
+    f, _, _, _ = mkfetcher(tmp_path, {"oa.example.org": FAKE_PDF}, SECRETS)
+    a = dict(doi="10.1234/a/b", title=TITLE, oa_url="https://oa.example.org/1.pdf")
+    b = dict(doi="10.1234/a_b", title=TITLE, oa_url="https://oa.example.org/2.pdf")
+    assert f.fetch(a).rec["source"] == "oa"
+    out_b = f.fetch(b)
+    assert out_b.rec["source"] == "oa"                             # not served a's cache file
+    assert f.fetch(a).rec["source"] == "cache" and f.fetch(b).rec["source"] == "cache"
+    qp = tmp_path / "q.jsonl"
+    fulltext.enqueue(qp, fulltext.queue_entry(a, subscribers=[["r", "1"]]))
+    fulltext.enqueue(qp, fulltext.queue_entry(b, subscribers=[["r", "2"]]))
+    assert len(fulltext.read_queue(qp)) == 2
+
+
+def test_enqueue_merges_new_retrieval_fields(tmp_path):
+    qp = tmp_path / "q.jsonl"
+    fulltext.enqueue(qp, fulltext.queue_entry(dict(doi="10.1/x", title="t"), subscribers=[["r", "1"]]))
+    with fulltext.queue_lock(qp):
+        q = fulltext.read_queue(qp)
+        q[0]["next_try"] = 9e12
+        fulltext.write_queue(qp, q)
+    fulltext.enqueue(qp, fulltext.queue_entry(dict(doi="10.1/x", title="t", oa_url="https://oa/x.pdf"),
+                                              subscribers=[["r", "1"]]))
+    [e] = fulltext.read_queue(qp)
+    assert e["oa_url"] == "https://oa/x.pdf" and e["next_try"] == 0
+
+
+def test_metadata_cooldown_keeps_oa_links(tmp_path, monkeypatch):
+    monkeypatch.setattr(fulltext, "pdf_to_text", lambda b: TITLE + "\n" + BODY)
+    f, _, led, _ = mkfetcher(tmp_path, {"good.example.org": FAKE_PDF}, SECRETS, oa={"europepmc": True})
+    led.block("www.ebi.ac.uk", "429")
+    out = f.fetch(dict(doi="10.9/x", title=TITLE, oa_url="https://good.example.org/a.pdf"))
+    assert out.rec["source"] == "oa"
+
+
+def test_html_references_do_not_count(tmp_path):
+    refs = "".join(f"<li>Ref {i}: {TITLE} et al. Journal {i}</li>" for i in range(400))
+    page = ("<html><head><title>" + TITLE + "</title></head><body><h1>" + TITLE + "</h1><p>Short abstract.</p>"
+            "<h2>Introduction</h2><h2>Methods</h2><h2>Results</h2><h2>References</h2><ol>" + refs + "</ol></body></html>")
+    f, _, _, _ = mkfetcher(tmp_path, {}, SECRETS)
+    txt, why, _ = f._validate(TITLE, "any", page.encode())
+    assert txt is None and "short text" in why
+
+
+def test_concurrent_drains_do_not_overlap(tmp_path):
+    import fcntl
+    f, _, _, _ = mkfetcher(tmp_path, {}, SECRETS)
+    qp = fulltext.queue_path(f.cfg)
+    qp.parent.mkdir(parents=True, exist_ok=True)
+    with open(qp.with_name(qp.name + ".drain.lock"), "a+") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        assert fulltext.drain_queue(f, log=lambda s: None).get("busy")

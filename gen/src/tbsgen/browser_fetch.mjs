@@ -70,17 +70,22 @@ async function navStatus(page) {
 
 async function tryUrl(page, url, file) {
   out.tried.push(url.slice(0, 200));
-  // Download waits cover the whole navigation: short waits are re-armed back to back while goto is pending,
-  // plus one more after it settles.  Each wait settles before the next is armed (a Page allows one at a time),
-  // so nothing is left pending when the next navigation starts.
+  // A download wait is armed before the navigation starts and re-armed back to back while it is pending; after
+  // the navigation settles, waiting continues until download_wait_ms past its end.  A Page allows one wait at a
+  // time, so each wait settles before the next one is armed (the hand-over is a few microseconds).
   let navDone = false;
+  let navEnd = 0;
+  let w = page.waitForEvent("download", { timeout: INPUT.download_wait_ms }).catch(() => null);
   const gotoP = page.goto(url, { timeout: INPUT.nav_timeout_ms, waitUntil: "domcontentloaded" })
     .catch(() => null)                 // a navigation that turns into a download aborts the document
-    .finally(() => { navDone = true; });
+    .finally(() => { navDone = true; navEnd = Date.now(); });
   let dl = null;
   for (;;) {
-    dl = await page.waitForEvent("download", { timeout: INPUT.download_wait_ms }).catch(() => null);
-    if (dl || navDone) break;
+    dl = await w;
+    if (dl) break;
+    const left = navDone ? navEnd + INPUT.download_wait_ms - Date.now() : INPUT.download_wait_ms;
+    if (navDone && left <= 0) break;
+    w = page.waitForEvent("download", { timeout: Math.max(500, left) }).catch(() => null);
   }
   await gotoP;
   if (dl) {
@@ -88,12 +93,13 @@ async function tryUrl(page, url, file) {
     return { kind: "download", url: dl.url() };
   }
   out.http = await navStatus(page);
-  if (out.http === 429) return { kind: "challenge", title: "HTTP 429" };
+  if (out.http === 429) { out.http429 = true; return { kind: "challenge", title: "HTTP 429" }; }
   let i = await waitChallenge(page);
   if (isChallenge(i)) return { kind: "challenge", title: i.title || i.text.slice(0, 80) };
   if (/pdf/i.test(i.ctype)) {
     const g = await grabPdfDocument(page, i, file);
     out.http = g.status;
+    if (g.status === 429) { out.http429 = true; return { kind: "challenge", title: "HTTP 429" }; }
     return g.ok ? { kind: "pdfdoc", url: i.url } : { kind: "http", status: g.status };
   }
   // HTML wrapper pages
@@ -104,6 +110,7 @@ async function tryUrl(page, url, file) {
       i = await info(page);
       if (/pdf/i.test(i.ctype)) {
         const g = await grabPdfDocument(page, i, file);
+        if (g.status === 429) { out.http429 = true; return { kind: "challenge", title: "HTTP 429" }; }
         if (g.ok) return { kind: "pdfdoc", url: i.url };
       }
     } catch (e) { /* fall through */ }
@@ -169,21 +176,16 @@ try {
     for (let step = 0; step < INPUT.max_navigations && (queue.length || !landed); step++) {
       let url = queue.shift();
       if (!url) {
-        // no (more) direct PDF URL: open the DOI landing page and read its PDF links
+        // no (more) direct PDF URL: open the DOI landing page (it may itself be a PDF or a download)
         landed = true;
-        const landingUrl = (INPUT.landing_base || "https://doi.org/") + INPUT.doi;
-        out.tried.push(landingUrl);
-        try {
-          await page.goto(landingUrl, { timeout: INPUT.nav_timeout_ms, waitUntil: "domcontentloaded" });
-        } catch (e) { last = { kind: "nav", error: String(e).slice(0, 200) }; continue; }
-        out.http = await navStatus(page);
-        if (out.http === 429) { last = { kind: "challenge", title: "HTTP 429" }; break; }
-        const i = await waitChallenge(page);
-        if (isChallenge(i)) { last = { kind: "challenge", title: i.title }; break; }
-        out.landing = i.url;
+        url = (INPUT.landing_base || "https://doi.org/") + INPUT.doi;
+        last = await tryUrl(page, url, file);
+        if (last.kind === "download" || last.kind === "pdfdoc" || last.kind === "challenge") break;
+        if (last.kind === "follow") { queue.unshift(...last.urls.filter((u) => !out.tried.includes(u.slice(0, 200)))); continue; }
+        out.landing = last.url || "";
         const cands = await landingCandidates(page);
         queue.push(...cands.filter((u) => !out.tried.includes(u.slice(0, 200))));
-        if (!queue.length) { last = { kind: "html", url: i.url, title: i.title, note: "no PDF link on landing page" }; break; }
+        if (!queue.length) { last = { kind: "html", url: last.url, title: last.title, note: "no PDF link on landing page" }; break; }
         continue;
       }
       last = await tryUrl(page, url, file);
@@ -195,7 +197,7 @@ try {
     let st = await fs.stat(file).catch(() => null);
     if (st && st.size > INPUT.max_bytes) { await fs.unlink(file).catch(() => {}); out.error = "too large"; st = null; }
     out.bytes = st ? st.size : 0;
-    if (last && last.kind === "challenge") { out.status = "challenge"; out.title = last.title || ""; }
+    if (out.http429 || (last && last.kind === "challenge")) { out.status = "challenge"; out.title = (last && last.title) || "HTTP 429"; }
     else if (st && st.size > 0) { out.status = "downloaded"; out.path = file; out.final_url = last && last.url || ""; }
     else { out.status = last ? last.kind : "nothing"; out.error = JSON.stringify(last || {}).slice(0, 300); }
     try { await page.goto("about:blank", { timeout: 5000 }); } catch (e) {}

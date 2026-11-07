@@ -11,7 +11,10 @@ set while it slept; a refused reservation is finalised as "fail" with note "canc
 reservation=id)` finalises the row.  Two processes sharing the file cannot both take the last slot of a cap or the
 same host slot.  Caps are counted over the day of the booked slot (a slot after midnight counts for the next day),
 and a reservation is never booked more than `max_wait_s` ahead.  A pending row keeps its quota until it is
-finalised, or until it is older than PENDING_TTL_S (a crashed run; longer than any single download may take).
+finalised, or until it is older than PENDING_TTL_S (a crashed run).  That is safe because every download is
+bounded well below it: HTTP requests have a total deadline per hop (fulltext.timeout) and at most 5 redirect hops
+with at most `hop_max_wait_s` pacing each; a browser run is killed after `browser.script_timeout_s`.
+Status values: ok / fail / pending (note "booked" while waiting for its slot) / hop (a redirect to another host).
 
 Schema: the three tables `attempts`, `cooldown`, `hosts` (and their meaning) are those of an earlier
 literature pipeline, so both pipelines can point at one file and their usage of a publisher adds up instead
@@ -121,6 +124,7 @@ class DownloadLedger:
         self.g = {**DEFAULT_GLOBAL, **(global_limits or {})}
         self.host_caps = {**DEFAULT_HOST_CAPS, **(host_caps or {})}
         self.meta = dict(META_LIMITS)
+        self._exclude: int | None = None
         self.clock, self.sleep = clock, sleep
         self._local = threading.local()      # one sqlite connection per thread (browser workers run in threads)
         self.db.executescript("""
@@ -158,7 +162,13 @@ class DownloadLedger:
         return local_day(self.clock())
 
     def _n(self, where: str, args: tuple = ()) -> int:
+        if self._exclude is not None:                       # the reservation being re-checked
+            where, args = f"({where}) and rowid != ?", (*args, self._exclude)
         return self.db.execute(f"select count(*) from attempts where {where}", args).fetchone()[0]
+
+    @staticmethod
+    def _in(keys: tuple) -> str:
+        return "host in (" + ",".join("?" * len(keys)) + ")"
 
     def _ok_or_pending(self, where: str, args: tuple, day: str | None = None, since_ts: float | None = None) -> int:
         """Successes plus live reservations (a pending row may still succeed) on `day` or since `since_ts`."""
@@ -190,8 +200,9 @@ class DownloadLedger:
         return None
 
     # ------------------------------------------------------------------ checks
-    def check(self, channel: str, host: str, related: tuple = (), slot: float | None = None):
-        """Raise LimitReached unless one more request on (channel, host) fits, counting over the day of `slot`."""
+    def check(self, channel: str, host: str, related: tuple = (), slot: float | None = None, group: tuple = ()):
+        """Raise LimitReached unless one more request on (channel, host) fits, counting over the day of `slot`.
+        `group`: further keys that share the host's caps and pacing (one publisher under several keys)."""
         if channel not in self.limits:
             raise LimitReached(f"unknown channel {channel}")
         lim = self.limits[channel]
@@ -211,10 +222,11 @@ class DownloadLedger:
             raise LimitReached(f"{channel} hourly success cap {lim['hourly_ok']} reached")
         if self._n("day=? and channel=?", (day, channel)) >= lim["daily_attempts"]:
             raise LimitReached(f"{channel} daily attempt cap {lim['daily_attempts']} reached")
+        keys = (host, *group)
         host_day = self.host_caps.get(host, lim.get("host_daily_attempts") or self.g["per_host_daily_attempts"])
-        if self._n("day=? and host=?", (day, host)) >= host_day:
+        if self._n(f"day=? and {self._in(keys)}", (day, *keys)) >= host_day:
             raise LimitReached(f"{host} daily attempt cap {host_day} reached", "cap", "host")
-        if self._n("ts>? and host=?", (now - 3600, host)) >= lim["host_hourly_attempts"]:
+        if self._n(f"ts>? and {self._in(keys)}", (now - 3600, *keys)) >= lim["host_hourly_attempts"]:
             raise LimitReached(f"{host} hourly attempt cap {lim['host_hourly_attempts']} reached", "cap", "host")
 
     def acquire_meta(self, host: str) -> None:
@@ -222,8 +234,7 @@ class DownloadLedger:
         key = f"meta:{host}"
         with self._tx():
             if (msg := self.cooling(host)):
-                raise LimitReached(msg, "cooldown")
-
+                raise LimitReached(msg, "cooldown", "host")
             now = self.clock()
             n_day = self.db.execute("select count(*) from meta_calls where day=? and host=?",
                                     (self.today(), host)).fetchone()[0]
@@ -239,37 +250,106 @@ class DownloadLedger:
         if (wait := slot - self.clock()) > 0:
             self.sleep(wait)
 
-    def acquire(self, channel: str, host: str, doi: str = "", related: tuple = ()) -> int:
-        """Check caps, book a pending attempt and the next per-host slot, sleep until the slot, then re-check
-        cooldowns / breakers.  Returns a reservation id for record().  `related`: further cooldown keys that
-        must also be clear (same publisher under other names)."""
+    def _last_sent(self, keys: tuple, exclude: int | None = None) -> float:
+        """Latest send time on these keys: finished rows and in-flight ones, not rows still waiting for their
+        slot (note 'booked') and not cancelled ones."""
+        q = (f"select max(ts) from attempts where {self._in(keys)} and not (status='pending' and note='booked') "
+             "and note not like 'cancelled%'")
+        args: tuple = keys
+        if exclude is not None:
+            q += " and rowid != ?"
+            args = (*keys, exclude)
+        return self.db.execute(q, args).fetchone()[0] or 0.0
+
+    def _next_slot(self, keys: tuple, gap: float) -> float:
+        nxt = max((r[0] for r in self.db.execute(f"select next_ts from hosts where {self._in(keys)}", keys)),
+                  default=0.0)
+        booked = self.db.execute(f"select max(ts) from attempts where {self._in(keys)} and status='pending' "
+                                 "and note='booked'", keys).fetchone()[0] or 0.0
+        return max(self.clock(), nxt, self._last_sent(keys) + gap, booked + gap if booked else 0.0)
+
+    def acquire(self, channel: str, host: str, doi: str = "", related: tuple = (), group: tuple = ()) -> int:
+        """Check caps, book a pending attempt and the next slot of `host` (+ `group`: keys sharing its caps and
+        pacing), sleep until the slot, then — in a transaction — re-check cooldowns / breakers, the gap to the
+        last real send on the group (another booking may have woken late) and, if the day changed while
+        waiting, the caps of the new day.  Returns a reservation id for record().  `related`: further cooldown
+        keys that must also be clear."""
         lim = self.limits[channel]
+        keys = (host, *group)
+        gap = float(lim["gap_s"])
         with self._tx():
             now = self.clock()
-            nxt = self.db.execute("select next_ts from hosts where host=?", (host,)).fetchone()
-            last = self.db.execute("select max(ts) from attempts where host=?", (host,)).fetchone()[0] or 0
-            slot = max(now, nxt[0] if nxt else 0.0, last + lim["gap_s"])
+            slot = self._next_slot(keys, gap)
             if slot - now > float(lim.get("max_wait_s", MAX_WAIT_S)):
                 raise LimitReached(f"{host}: next slot in {slot - now:.0f}s exceeds max_wait_s", "cap", "host")
-            self.check(channel, host, related, slot)
+            self.check(channel, host, related, slot, group)
             self.db.execute("insert or replace into hosts values(?,?)",
-                            (host, slot + lim["gap_s"] + random.uniform(0, lim["jitter_s"])))
+                            (host, slot + gap + random.uniform(0, lim["jitter_s"])))
             rid = self.db.execute("insert into attempts values(?,?,?,?,?,?,?,?,?)",
-                                  (slot, local_day(slot), channel, host, doi, "pending", None, 0, "")).lastrowid
+                                  (slot, local_day(slot), channel, host, doi, "pending", None, 0,
+                                   "booked")).lastrowid
+        booked_day = local_day(slot)
+        for _ in range(50):                                     # re-paced at most a few times in practice
+            if (wait := slot - self.clock()) > 0:
+                self.sleep(wait)
+            with self._tx():
+                msg, kind, scope = self.cooling(host, *related), "cooldown", "host"
+                if not msg:
+                    msg, scope = self.cooling(f"channel:{channel}"), "channel"
+                if not msg and (msg := self.breaker(channel)):
+                    kind = "breaker"
+                now = self.clock()
+                if not msg:
+                    last = self._last_sent(keys, exclude=rid)
+                    if last and now < last + gap:              # another booking woke late and just sent
+                        slot = last + gap + random.uniform(0, lim["jitter_s"])
+                        if slot - now > float(lim.get("max_wait_s", MAX_WAIT_S)):
+                            msg, kind, scope = f"{host}: re-paced slot too far ahead", "cap", "host"
+                        else:
+                            continue
+                if not msg and local_day(now) != booked_day:   # woke after midnight: count on the new day
+                    self._exclude = rid
+                    try:
+                        self.check(channel, host, related, now, group)
+                    except LimitReached as e:
+                        msg, kind, scope = str(e), e.kind, e.scope
+                    finally:
+                        self._exclude = None
+                if msg:
+                    self.db.execute("update attempts set status='fail', note=? where rowid=?",
+                                    (f"cancelled: {msg}"[:300], rid))
+                else:
+                    self.db.execute("update attempts set ts=?, day=?, note='' where rowid=?",
+                                    (now, local_day(now), rid))
+            if msg:                                     # raised after the commit, so the cancellation is kept
+                raise LimitReached(msg, kind, scope)
+            return rid
+        self.record(channel, host, doi, "fail", None, 0, "cancelled: could not get a paced slot", reservation=rid)
+        raise LimitReached(f"{host}: could not get a paced slot", "cap", "host")
+
+    def acquire_hop(self, channel: str, host: str, doi: str = "", related: tuple = ()) -> None:
+        """A redirect hop to another host inside one download: checks the target's cooldown and per-host caps,
+        paces it, and books it as status 'hop' (counts as an attempt on that host, never as a success)."""
+        lim = self.limits[channel]
+        gap = float(lim["gap_s"])
+        with self._tx():
+            if (msg := self.cooling(host, *related)):
+                raise LimitReached(msg, "cooldown", "host")
+            now = self.clock()
+            slot = self._next_slot((host,), gap)
+            if slot - now > float(lim.get("hop_max_wait_s", 120)):
+                raise LimitReached(f"{host}: redirect target busy for {slot - now:.0f}s", "cap", "host")
+            day = local_day(slot)
+            cap = self.host_caps.get(host, lim.get("host_daily_attempts") or self.g["per_host_daily_attempts"])
+            if self._n("day=? and host=?", (day, host)) >= cap or \
+                    self._n("ts>? and host=?", (now - 3600, host)) >= lim["host_hourly_attempts"]:
+                raise LimitReached(f"{host}: attempt cap reached (redirect target)", "cap", "host")
+            self.db.execute("insert or replace into hosts values(?,?)",
+                            (host, slot + gap + random.uniform(0, lim["jitter_s"])))
+            self.db.execute("insert into attempts values(?,?,?,?,?,?,?,?,?)",
+                            (slot, day, channel, host, doi, "hop", None, 0, "redirect"))
         if (wait := slot - self.clock()) > 0:
             self.sleep(wait)
-        # whatever happened while we slept (a block on this host / publisher, an open breaker) wins
-        msg, kind, scope = self.cooling(host, *related), "cooldown", "host"
-        if not msg:
-            msg, scope = self.cooling(f"channel:{channel}"), "channel"
-        if not msg and (msg := self.breaker(channel)):
-            kind = "breaker"
-        if msg:
-            self.record(channel, host, doi, "fail", None, 0, f"cancelled: {msg}", reservation=rid)
-            raise LimitReached(msg, kind, scope)
-        with self._tx():   # the real send time (late wake-ups keep the next gap honest)
-            self.db.execute("update attempts set ts=? where rowid=?", (max(slot, self.clock()), rid))
-        return rid
 
     def record(self, channel: str, host: str, doi: str, status: str, http: int | None = None, nbytes: int = 0,
                note: str = "", reservation: int | None = None):
@@ -287,9 +367,12 @@ class DownloadLedger:
             self.record(channel, host, doi, "fail", None, 0, note, reservation=reservation)
 
     def block(self, host: str, reason: str, seconds: float = COOLDOWN_S, channel: str | None = None):
+        """Cool `host` for `seconds`; an existing longer cooldown is kept (responses may arrive out of order)."""
+        until = self.clock() + seconds
         with self._tx():
-            self.db.execute("insert or replace into cooldown values(?,?,?)",
-                            (host, self.clock() + seconds, reason[:200]))
+            self.db.execute("insert into cooldown values(?,?,?) on conflict(host) do update set "
+                            "reason = case when excluded.until > until then excluded.reason else reason end, "
+                            "until = max(until, excluded.until)", (host, until, reason[:200]))
             if channel:
                 self.db.execute("insert into blocks values(?,?,?,?,?)",
                                 (self.clock(), self.today(), channel, host, reason[:200]))

@@ -135,8 +135,9 @@ On a fresh machine both items may stop at S3 as `parked: fulltext_unavailable` (
 `S3_queue.json` and in the run's full-text queue): the pipeline needs the paper's full text. S3 tries a
 configurable cascade (see [Full text (S3)](#full-text-s3)); by default only a local cache and open-access copies
 are used. `tbsgen fetch --run runs/R` retries the queue later (failed entries back off, doubling from
-`fulltext.queue_backoff_s`) and puts fetched items back to S3; an entry leaves the queue only after its items were
-re-activated. With full text, a teacher endpoint and a
+`fulltext.queue_backoff_s`), hands the text to every waiting item (also items of other runs sharing the queue) and
+moves them on to S4; an entry leaves the queue only after that. Only one `tbsgen fetch` drains a queue (and uses a
+browser TaskSpace) at a time. With full text, a teacher endpoint and a
 budget in `my.toml` (see below), `tbsgen run` continues into the model stages. The other commands
 (`resume`, `reset`, `breaker`, `calib-ingest`, `harbor-local`, `ping`) are documented in
 [`gen/README.md`](gen/README.md) §3.
@@ -238,8 +239,11 @@ Akamai "Access Denied") cools it for 24 hours and is never clicked through; a pl
 By default a channel's breaker opens for the day after 3 block signals or 8 failures in a row; the `oa` channel,
 whose links point at many unrelated hosts, opens only after 10 block signals and never on failures alone (both
 configurable per channel: `breaker_blocks_per_day`, `breaker_consecutive_fail`). A cooldown also stops requests that
-were already waiting for their slot. Cooldowns are shared per publisher: a block on one of its web hosts or DOI
-prefixes stops both the HTTP channels and the browser for that publisher. Metadata lookups (Europe PMC search,
+were already waiting for their slot, and a longer cooldown is never shortened by a later, shorter one. All DOI
+prefixes of one publisher share the browser's pacing, caps and cooldowns, and a block on one of the publisher's web
+hosts stops both the HTTP channels and the browser for it. The TDM API hosts are kept separate: an API throttle
+does not stop the browser, and a website block does not stop the API. Redirect hops to other hosts are paced and
+counted against those hosts. Metadata lookups (Europe PMC search,
 Unpaywall) are paced at 1 request per second per host and never count as downloads. The ledger uses the
 tables `attempts`, `cooldown` and `hosts`, so another tool with the same schema can share the file and the usage
 of both adds up. `tbsgen fetch --status` prints today's usage.
@@ -322,7 +326,7 @@ Research code under active development.
 **Tests** (run by [GitHub Actions CI](.github/workflows/ci.yml) on every push to `main` and every pull request)
 
 - `retrieval/`: 47 offline unit tests that replay recorded API responses.
-- `gen/`: 133 tests: 117 unit tests (17 of them for the Jev screen and 47 for the S3 full-text channels, using
+- `gen/`: 148 tests: 132 unit tests (17 of them for the Jev screen and 62 for the S3 full-text channels, using
   recorded and scripted responses; no network, no browser) and 16 integration tests that run task code in Docker. Locally
   they are skipped when Docker or the sandbox image is missing; CI builds the image and fails if
   any of them is skipped.

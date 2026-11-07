@@ -124,11 +124,14 @@ def html_fulltext(body: bytes) -> str | None:
     kinds = {m.group(1).lower()[:5] for h in heads if (m := _SECTION.match(h))}
     if len(kinds) < 3:
         return None
+    ref = re.search(r"<h[1-4][^>]*>\s*(?:<[^>]+>\s*)*(?:\d+\.?\s*)?(references|bibliography|literature cited)\b",
+                    doc, re.I)
+    if ref:
+        doc = doc[: ref.start()]                    # body only: the length check must not count references
     txt = _strip_tags(doc)
     if _PAYWALL.search(txt):
         return None
-    cut = re.search(r"\n\s*(references|bibliography)\s*\n", txt, re.I)
-    return txt[: cut.start()] if cut else txt
+    return txt
 
 
 def safe_url(u: str) -> str:
@@ -157,14 +160,28 @@ def redact(s: str, secrets: tuple = ()) -> str:
     return _TOKENISH.sub(lambda m: m.group(0)[:8] + "***", s)
 
 
+def paper_ident(c: dict) -> str:
+    """Exact identity of a paper (queue key): "doi:<normalised DOI>", else "arxiv:<id>", else a title/URL hash."""
+    if (d := norm_doi(c.get("doi"))):
+        return "doi:" + d
+    if c.get("arxiv"):
+        return "arxiv:" + str(c["arxiv"]).lower().strip()
+    ident = (c.get("title") or c.get("oa_url") or c.get("pdf_url") or "").lower().strip()
+    return "h:" + hashlib.sha256(ident.encode()).hexdigest()[:16] if ident else ""
+
+
 def paper_key(c: dict) -> str:
-    """Stable key of a paper for the cache and the queue: DOI, else arXiv id, else a hash of title/URL."""
+    """Cache file stem: doi_key(DOI) (the earlier pipeline's naming, so its cache is readable), else a key from
+    the identity.  doi_key is lossy ("/" and "_" both map to "_"): cache reads verify the DOI in the provenance
+    json, and a write that would collide with another DOI's file uses `<stem>-<sha8>` instead."""
     if (d := norm_doi(c.get("doi"))):
         return doi_key(d)
-    if c.get("arxiv"):
-        return doi_key("arxiv_" + str(c["arxiv"]))
-    ident = (c.get("title") or c.get("oa_url") or c.get("pdf_url") or "").lower().strip()
-    return "untitled_" + hashlib.sha256(ident.encode()).hexdigest()[:16] if ident else ""
+    ident = paper_ident(c)
+    return doi_key(ident.replace(":", "_")) if ident else ""
+
+
+def _alt_key(stem: str, ident: str) -> str:
+    return f"{stem}-{hashlib.sha256(ident.encode()).hexdigest()[:8]}"
 
 
 def _atomic_write(path: Path, data: bytes | str):
@@ -198,15 +215,26 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 
 def make_transport(use_env_proxy: bool = False) -> Transport:
     """One request, no automatic redirects (Fetcher follows them hop by hop).  Environment proxies are ignored
-    unless use_env_proxy."""
+    unless use_env_proxy.  `timeout` is a total deadline for the whole request (socket ops are bounded by it
+    too), so a slowly dripping response cannot keep a reservation alive."""
     handlers = [_NoRedirect()] + ([] if use_env_proxy else [urllib.request.ProxyHandler({})])
     opener = urllib.request.build_opener(*handlers)
 
     def transport(url: str, headers: dict, timeout: float, max_bytes: int) -> Resp:
         req = urllib.request.Request(url, headers=headers)
+        deadline = time.monotonic() + timeout
         try:
             with opener.open(req, timeout=timeout) as r:
-                body = r.read(max_bytes + 1)
+                chunks, n = [], 0
+                while n <= max_bytes:
+                    if time.monotonic() > deadline:
+                        return Resp(0, {}, b"", url, f"total deadline {timeout:.0f}s exceeded")
+                    b = r.read(min(1 << 16, max_bytes + 1 - n))
+                    if not b:
+                        break
+                    chunks.append(b)
+                    n += len(b)
+                body = b"".join(chunks)
                 return Resp(r.status, dict(r.headers), body[:max_bytes], r.geturl(), truncated=len(body) > max_bytes)
         except urllib.error.HTTPError as e:
             return Resp(e.code, dict(e.headers or {}), e.read(20000) if e.fp else b"", url)
@@ -227,7 +255,11 @@ def check_egress(ec: dict, transport: Transport) -> dict:
     errs = []
     for u in ec.get("urls") or []:
         r = transport(u, {"User-Agent": "tbsgen-egress-check"}, float(ec.get("timeout", 15)), 4096)
-        m = re.search(r"\b(\d{1,3}(?:\.\d{1,3}){3})\b", r.body.decode("ascii", "replace")) if r.status == 200 else None
+        txt = r.body.decode("ascii", "replace") if r.status == 200 else ""
+        # Cloudflare /cdn-cgi/trace ("ip=...") on a publisher's own domain shows the IP that publisher sees,
+        # which is what matters when a proxy routes per domain; plain echo services return the bare IP.
+        m = re.search(r"^ip=(\d{1,3}(?:\.\d{1,3}){3})\s*$", txt, re.M) or \
+            re.search(r"\b(\d{1,3}(?:\.\d{1,3}){3})\b", txt)
         if not m:
             errs.append(f"{safe_url(u)}: HTTP {r.status} {r.error}")
             continue
@@ -242,6 +274,10 @@ def check_egress(ec: dict, transport: Transport) -> dict:
 # One publisher can own several DOI prefixes and web hosts.  Browser downloads are booked under the earlier
 # pipeline's key "chrome:<DOI prefix>"; all prefixes of one publisher share pacing, caps and cooldowns (aliases),
 # and a cooldown on any of its web hosts (set by the HTTP channels) also stops the browser, and vice versa.
+# The TDM API hosts (api.elsevier.com, api.wiley.com) are deliberately NOT in these groups: they are a separate
+# service with per-key quotas, and the publishers ask text miners to use them instead of the website.  An API
+# 429 means "slow down on the API", not "the campus IP is flagged on the website"; coupling them would let one
+# throttle stop the other channel for 6-24 h.  A website block, likewise, must not stop the sanctioned API.
 PUBLISHERS: dict[str, dict] = {
     "elsevier": dict(prefixes=["10.1016", "10.1006", "10.1053", "10.1067"],
                      hosts=["www.sciencedirect.com", "pdf.sciencedirectassets.com", "linkinghub.elsevier.com"]),
@@ -304,6 +340,7 @@ class Fetcher:
         self._egress: dict | None = None
         self._egress_browser: dict | None = None
         self._egress_lock = threading.Lock()
+        self._tl = threading.local()
 
     @property
     def ft(self) -> dict:
@@ -326,22 +363,30 @@ class Fetcher:
     def write_dir(self) -> Path | None:
         return write_cache_dir(self.cfg)
 
-    def cached(self, key: str) -> tuple[str, dict] | None:
+    def cached(self, c: dict) -> tuple[str, dict] | None:
+        """Cached text for this paper.  A file whose provenance names another DOI (doi_key collision) is
+        skipped; the collision-safe `<stem>-<sha8>` name is tried too.  Files without provenance (the earlier
+        pipeline's cache always has one; hand-made caches may not) are accepted by name."""
+        key, ident, doi = paper_key(c), paper_ident(c), norm_doi(c.get("doi"))
         if not key:
             return None
         dirs = [Path(d) for d in self.ft.get("cache_dirs") or []]
         if (w := self.write_dir()):
             dirs.append(w)
         for d in dirs:
-            p = d / f"{key}.txt"
-            if p.exists():
+            for stem in (key, _alt_key(key, ident)):
+                p = d / f"{stem}.txt"
+                if not p.exists():
+                    continue
+                prov: dict = {}
+                with contextlib.suppress(OSError, ValueError):
+                    j = json.loads((d / f"{stem}.json").read_text())
+                    prov = j if isinstance(j, dict) else {}
+                if doi and prov.get("doi") and norm_doi(prov["doi"]) != doi:
+                    continue
                 txt = p.read_text(errors="replace")
                 if len(txt) >= self.ft["min_chars"]:
-                    prov = {}
-                    with contextlib.suppress(OSError, ValueError):
-                        prov = json.loads((d / f"{key}.json").read_text())
-                    return txt, dict(source="cache", path=str(p),
-                                     cached_channel=prov.get("channel") if isinstance(prov, dict) else None)
+                    return txt, dict(source="cache", path=str(p), cached_channel=prov.get("channel"))
         return None
 
     def _ua(self) -> str:
@@ -420,21 +465,26 @@ class Fetcher:
             return txt, "", tm
         return txt, "", None
 
-    def _save(self, key: str, doi: str, channel: str, url: str, body: bytes, txt: str, tm: float | None,
-              kind: str) -> dict:
-        prov = dict(doi=doi, key=key, channel=channel, url=safe_url(url), kind=kind, bytes=len(body),
+    def _save(self, c: dict, channel: str, url: str, body: bytes, txt: str, tm: float | None, kind: str) -> dict:
+        key, ident, doi = paper_key(c), paper_ident(c), norm_doi(c.get("doi"))
+        prov = dict(doi=doi, ident=ident, channel=channel, url=self._r(safe_url(url)), kind=kind, bytes=len(body),
                     sha256=hashlib.sha256(body).hexdigest(), text_chars=len(txt),
                     title_match=None if tm is None else round(tm, 3), fetched_at=time.strftime("%Y-%m-%dT%H:%M:%S%z"))
         if (w := self.write_dir()) and key:
             w.mkdir(parents=True, exist_ok=True)
+            stem = key
+            with contextlib.suppress(OSError, ValueError):
+                other = json.loads((w / f"{key}.json").read_text())
+                if isinstance(other, dict) and other.get("ident", "doi:" + norm_doi(other.get("doi"))) != ident:
+                    stem = _alt_key(key, ident)          # another paper owns this file name
             if self.ft.get("keep_raw", True):
                 ext = {"pdf": "pdf", "jats": "xml", "elsevier_xml": "xml", "html": "html"}.get(kind, "bin")
                 (w / "raw").mkdir(exist_ok=True)
-                _atomic_write(w / "raw" / f"{key}.{ext}", body)
+                _atomic_write(w / "raw" / f"{stem}.{ext}", body)
             # provenance first, text last: a text file always has its (complete) provenance next to it
-            _atomic_write(w / f"{key}.json", json.dumps(prov, indent=1))
-            _atomic_write(w / f"{key}.txt", txt)
-            prov["path"] = str(w / f"{key}.txt")
+            _atomic_write(w / f"{stem}.json", json.dumps(prov, indent=1))
+            _atomic_write(w / f"{stem}.txt", txt)
+            prov["path"] = str(w / f"{stem}.txt")
         return prov
 
     def _related(self, host: str) -> tuple:
@@ -459,13 +509,25 @@ class Fetcher:
                 return Resp(0, {}, b"", url, "refused redirect https -> http")
             if sp.scheme not in ("http", "https"):
                 return Resp(0, {}, b"", url, "refused redirect to non-http URL")
-            if self.ledger and (msg := self.ledger.cooling(sp.hostname or "", *self._related(sp.hostname or ""))):
-                return Resp(0, {}, b"", url, f"redirect target cooling: {msg}")
+            cur_host = urllib.parse.urlsplit(url).hostname or ""
+            if self.ledger and sp.hostname and sp.hostname != cur_host:
+                hop = getattr(self._tl, "hop", None)
+                try:
+                    if hop:
+                        self.ledger.acquire_hop(hop[0], sp.hostname, hop[1], related=self._related(sp.hostname))
+                    elif (msg := self.ledger.cooling(sp.hostname, *self._related(sp.hostname))):
+                        return Resp(0, {}, b"", url, f"redirect target cooling: {msg}")
+                except LimitReached as e:
+                    return Resp(0, {}, b"", url, f"redirect target refused: {e}")
             if sp[:2] != origin:
                 hdr = {k: v for k, v in hdr.items() if k.lower() not in CRED_HEADERS}
             rec.setdefault("redirects", []).append(safe_url(nxt))
             url = nxt
         return Resp(0, {}, b"", url, "too many redirects")
+
+    @property
+    def _cur(self) -> dict:
+        return getattr(self._tl, "c", {})
 
     def _download(self, channel: str, key: str, doi: str, title: str, url: str, headers: dict, kind: str,
                   rec: dict, ledger_host: str | None = None) -> str | None:
@@ -474,6 +536,7 @@ class Fetcher:
         if self.ledger is None:
             raise LimitReached("no download ledger configured (fulltext.ledger_path)", "cap")
         rid = self.ledger.acquire(channel, host, doi or key, related=self._related(host))
+        self._tl.hop = (channel, doi or key)
         rec["tried"].append(f"{channel}:{safe_url(url)}")
         r = Resp(0, {}, b"", url, "not started")
         txt = None
@@ -489,9 +552,9 @@ class Fetcher:
             if cool:
                 why = f"block signal HTTP {r.status}"
                 for h in {host, urllib.parse.urlsplit(r.url).hostname or ""} - {""}:
-                    self.ledger.block(h, f"{why} on {channel}", seconds=cool, channel=channel)
+                    self.ledger.block(h, self._r(f"{why} on {channel}"), seconds=cool, channel=channel)
             if txt is not None:
-                prov = self._save(key, doi, channel, r.url, r.body, txt, tm, kind)
+                prov = self._save(self._cur, channel, r.url, r.body, txt, tm, kind)
                 rec.update(source=channel, url=prov["url"], title_match=prov["title_match"], provenance=prov)
             else:
                 rec["errors"].append(self._r(f"{channel}: {why}"))
@@ -507,6 +570,7 @@ class Fetcher:
         host = urllib.parse.urlsplit(url).hostname or ""
         if self.ledger is not None:
             self.ledger.acquire_meta(host)
+        self._tl.hop = None
         r = self._get(url, {"User-Agent": self._ua(), "Accept": "application/json"}, {})
         if self.ledger is not None and (cool := block_signal(r.status, r.body)):
             self.ledger.block(host, f"block signal HTTP {r.status} on metadata", seconds=cool)
@@ -609,7 +673,7 @@ class Fetcher:
         aliases = tuple(k for k in keys if k != lkey)
         if self.ledger is None:
             raise LimitReached("no download ledger configured (fulltext.ledger_path)", "cap")
-        rid = self.ledger.acquire("browser", lkey, doi, related=aliases + tuple(web_hosts))
+        rid = self.ledger.acquire("browser", lkey, doi, related=tuple(web_hosts), group=aliases)
         rec["tried"].append(f"browser:{lkey}")
         res: dict = {}
         ok = False
@@ -623,13 +687,13 @@ class Fetcher:
                 rec["errors"].append(f"browser: too large ({size} bytes)")
                 return None
             body = p.read_bytes() if size else b""
-            http = res.get("http")
+            http = 429 if res.get("http429") else res.get("http")
             cool = block_signal(http if isinstance(http, int) else None, body)
             if res.get("status") == "challenge" or cool:
                 secs = cool or float(b.get("challenge_cooldown_s", 24 * 3600))
                 if http == 429:
                     secs = COOLDOWN_429_S
-                why = f"HTTP {http}" if http == 429 else f"challenge: {res.get('title', '')[:60]}"
+                why = self._r(f"HTTP {http}" if http == 429 else f"challenge: {res.get('title', '')[:60]}")
                 for h in {lkey, *aliases, *web_hosts}:
                     self.ledger.block(h, f"browser {why}", seconds=secs, channel="browser" if h == lkey else None)
                 rec["errors"].append(self._r(f"browser: {why}"))
@@ -641,7 +705,7 @@ class Fetcher:
             if txt is None:
                 rec["errors"].append(self._r(f"browser: {why}"))
                 return None
-            prov = self._save(key, doi, "browser", res.get("final_url") or "", body, txt, tm,
+            prov = self._save(c, "browser", res.get("final_url") or "", body, txt, tm,
                               "pdf" if body[:5] == b"%PDF-" else "html")
             rec.update(source="browser", url=prov["url"], title_match=prov["title_match"], provenance=prov)
             ok = True
@@ -677,14 +741,15 @@ class Fetcher:
               slot: int = 0) -> Outcome:
         doi = norm_doi(c.get("doi"))
         key = paper_key(c)
+        self._tl.c = c
         title = c.get("title") or ""
-        rec: dict = dict(doi=doi, key=key, tried=[], errors=[], skipped=[], source=None)
+        rec: dict = dict(doi=doi, key=paper_ident(c), tried=[], errors=[], skipped=[], source=None)
         order = [ch for ch in (channels or self.ft.get("cascade") or CHANNELS) if ch in CHANNELS]
         if browser is None:
             browser = bool((self.ft.get("browser") or {}).get("inline"))
         for ch in order:
             if ch == "cache":
-                if (hit := self.cached(key)):
+                if (hit := self.cached(c)):
                     rec.update(hit[1])
                     return Outcome(hit[0], rec)
                 continue
@@ -707,8 +772,8 @@ class Fetcher:
                 rec["skipped"].append(self._r(f"{ch}: {e}"))
                 continue
             except EgressRefused as e:
-                rec["skipped"].append(f"{ch}: egress refused: {e}")
-                rec["egress_refused"] = str(e)
+                rec["skipped"].append(self._r(f"{ch}: egress refused: {e}"))
+                rec["egress_refused"] = self._r(str(e))
                 continue
             if txt is not None:
                 return Outcome(txt, rec)
@@ -762,7 +827,7 @@ def queue_lock(path: Path):
 
 
 def _entry_key(e: dict) -> str:
-    return e.get("key") or paper_key(e)
+    return e.get("ident") or paper_ident(e)
 
 
 def read_queue(path: Path) -> list[dict]:
@@ -792,33 +857,61 @@ def queue_entry(c: dict, **extra) -> dict:
     e = {k: c.get(k) for k in QUEUE_FIELDS if c.get(k)}
     if e.get("doi"):
         e["doi"] = norm_doi(e["doi"])
-    e["key"] = paper_key(c)
+    e["ident"] = paper_ident(c)
     e.update(extra)
     return e
 
 
 def enqueue(path: Path, entry: dict) -> bool:
-    """Idempotent (by paper key); a later entry for the same paper adds its item_ids / runs."""
-    entry = dict(entry, key=_entry_key(entry))
-    if not entry["key"]:
+    """Idempotent (by paper identity).  For a paper already queued: new subscribers are added, retrieval fields
+    that were missing or changed (a new OA link, a PMCID) are merged, and if anything changed the entry becomes
+    due again (its backoff is reset)."""
+    entry = dict(entry, ident=_entry_key(entry))
+    entry.pop("key", None)
+    if not entry["ident"]:
         return False
+    if "item_ids" in entry:
+        entry["subscribers"] = _subs(entry)
+        entry.pop("item_ids")
     with queue_lock(path):
         q = read_queue(path)
         for e in q:
-            if _entry_key(e) == entry["key"]:
-                subs = {tuple(s) for s in _subs(e)} | {tuple(s) for s in _subs(entry)}
-                if subs != {tuple(s) for s in _subs(e)}:
-                    e["subscribers"] = sorted([list(s) for s in subs])
+            if _entry_key(e) == entry["ident"]:
+                changed = False
+                old_subs = [list(s) for s in _subs(e)]
+                subs = old_subs + [list(s) for s in _subs(entry) if list(s) not in old_subs]
+                if subs != old_subs:
+                    e["subscribers"] = subs
                     e.pop("item_ids", None)
+                    changed = True
+                for k in QUEUE_FIELDS:
+                    if entry.get(k) and entry[k] != e.get(k):
+                        e[k] = entry[k]
+                        changed = True
+                if changed:
                     e["next_try"] = 0
                     write_queue(path, q)
                 return False
-        if "item_ids" in entry:
-            entry["subscribers"] = _subs(entry)
-            entry.pop("item_ids")
         q.append(entry)
         write_queue(path, q)
         return True
+
+
+def reconcile(store, path: Path) -> int:
+    """Re-queue items parked with fulltext_unavailable whose queue write never happened (crash between parking
+    and enqueueing, or a failed write).  Idempotent.  Returns the number of entries (re)added or updated."""
+    from .state import read_json
+    n = 0
+    for it in store.items():
+        st = it.state
+        if st.get("stage") == "S3" and st.get("status") == "parked" and st.get("reason") == "fulltext_unavailable":
+            q = read_json(it.p("S3_queue.json"), None)
+            if q and (q.get("ident") or paper_ident(q)):
+                e = {k: v for k, v in q.items() if k in (*QUEUE_FIELDS, "ident", "subscribers", "failed_channels",
+                                                         "queued_at")}
+                e.setdefault("subscribers", [[str(store.root), it.item_id]])
+                n += bool(enqueue(path, e))
+    return n
 
 
 def _subs(e: dict) -> list[list[str]]:
@@ -841,11 +934,30 @@ def drain_queue(fetcher: Fetcher, *, max_papers: int = 10, channels: list[str] |
     the queue only after `on_success(entry, outcome)` returned True for all of its subscribers (the CLI's
     re-activation); subscribers added meanwhile keep the entry.
     """
+    import fcntl
     from collections import defaultdict
 
     from . import browser_ego
     now = time.time() if now is None else now
     qp = queue_path(fetcher.cfg)
+    qp.parent.mkdir(parents=True, exist_ok=True)
+    # one drain at a time per queue (and so per browser TaskSpace / Page set); others return immediately
+    drain_fh = open(qp.with_name(qp.name + ".drain.lock"), "a+")
+    try:
+        fcntl.flock(drain_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        drain_fh.close()
+        return dict(busy=True, note="another `tbsgen fetch` is draining this queue")
+    try:
+        return _drain_locked(fetcher, qp, now, max_papers, channels, browser, dry_run, on_success, log,
+                             defaultdict, browser_ego)
+    finally:
+        fcntl.flock(drain_fh, fcntl.LOCK_UN)
+        drain_fh.close()
+
+
+def _drain_locked(fetcher, qp, now, max_papers, channels, browser, dry_run, on_success, log, defaultdict,
+                  browser_ego) -> dict:
     with queue_lock(qp):
         queue = read_queue(qp)
     due = sorted((e for e in queue if float(e.get("next_try") or 0) <= now),
@@ -853,7 +965,7 @@ def drain_queue(fetcher: Fetcher, *, max_papers: int = 10, channels: list[str] |
     todo = due[:max_papers] if max_papers else due
     stats = dict(queued=len(queue), due=len(due), considered=len(todo), ok=0, failed=0, by_channel={}, errors=[])
     if dry_run:
-        stats["plan"] = [dict(key=_entry_key(e), doi=e.get("doi"), publisher=publisher_of(e.get("doi") or "")[0],
+        stats["plan"] = [dict(ident=_entry_key(e), doi=e.get("doi"), publisher=publisher_of(e.get("doi") or "")[0],
                               channels=[ch for ch in (channels or fetcher.ft["cascade"])
                                         if ch == "cache" or fetcher.channel_applies(ch, e.get("doi") or "")])
                          for e in todo]
@@ -897,6 +1009,50 @@ def drain_queue(fetcher: Fetcher, *, max_papers: int = 10, channels: list[str] |
                                 errors=out.rec.get("errors", [])[-2:], skipped=out.rec.get("skipped", [])[-2:]),
                            ensure_ascii=False))
 
+    space_fh = None
+    if use_browser:
+        # one drainer per browser TaskSpace, even across different queues / runs (they would share its Pages)
+        import fcntl
+        space = re.sub(r"[^A-Za-z0-9_.-]", "_", str(bconf.get("space", "tbsgen-s3-fulltext")))
+        space_fh = open(Path(tempfile.gettempdir()) / f"tbsgen-ego-{space}.lock", "a+")
+        try:
+            fcntl.flock(space_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            space_fh.close()
+            space_fh = None
+            use_browser = False
+            stats["note"] = f"browser TaskSpace {space} is in use by another fetch; browser channel skipped"
+    try:
+        _run_entries(fetcher, todo, use_browser, bconf, one, defaultdict, browser_ego)
+    finally:
+        if space_fh:
+            import fcntl
+            fcntl.flock(space_fh, fcntl.LOCK_UN)
+            space_fh.close()
+    with queue_lock(qp):
+        q = read_queue(qp)
+        keep = []
+        for e in q:
+            k = _entry_key(e)
+            if k in results:
+                fetched, acked = results[k]
+                rest = [s for s in _subs(e) if s not in acked]
+                if fetched and not rest:
+                    continue                                   # all subscribers re-activated: done
+                if fetched:
+                    e["subscribers"] = rest                    # new / unacknowledged subscribers stay
+                    e.pop("item_ids", None)
+                    e["next_try"] = 0
+                else:
+                    n_try = int(e.get("tries") or 0) + 1
+                    e.update(tries=n_try, last_try=now, next_try=now + backoff * min(8, 2 ** (n_try - 1)))
+            keep.append(e)
+        write_queue(qp, keep)
+        stats["remaining"] = len(keep)
+    return stats
+
+
+def _run_entries(fetcher, todo, use_browser, bconf, one, defaultdict, browser_ego):
     if use_browser and int(bconf.get("concurrency", 1)) > 1:
         groups: dict[str, list[dict]] = defaultdict(list)
         for e in todo:
@@ -923,24 +1079,3 @@ def drain_queue(fetcher: Fetcher, *, max_papers: int = 10, channels: list[str] |
     else:
         for e in todo:
             one(e, 0)
-    with queue_lock(qp):
-        q = read_queue(qp)
-        keep = []
-        for e in q:
-            k = _entry_key(e)
-            if k in results:
-                fetched, acked = results[k]
-                rest = [s for s in _subs(e) if s not in acked]
-                if fetched and not rest:
-                    continue                                   # all subscribers re-activated: done
-                if fetched:
-                    e["subscribers"] = rest                    # new / unacknowledged subscribers stay
-                    e.pop("item_ids", None)
-                    e["next_try"] = 0
-                else:
-                    n_try = int(e.get("tries") or 0) + 1
-                    e.update(tries=n_try, last_try=now, next_try=now + backoff * min(8, 2 ** (n_try - 1)))
-            keep.append(e)
-        write_queue(qp, keep)
-        stats["remaining"] = len(keep)
-    return stats

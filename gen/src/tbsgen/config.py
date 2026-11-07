@@ -106,7 +106,10 @@ DEFAULTS: dict[str, Any] = {
         "use_env_proxy": False,             # False: urllib ignores HTTP(S)_PROXY (ProxyHandler({}))
         "mailto": None,                     # contact address put in the User-Agent
         # Refuse network downloads unless the public egress IP is inside allow_cidrs (e.g. the institution's
-        # ranges, so subscription access and IP-based TDM entitlements apply).  Checked once per ttl_s.
+        # ranges, so subscription access and IP-based TDM entitlements apply).  Checked once per ttl_s, for
+        # urllib and (separately, through the browser) for the browser channel.  When a proxy routes per domain,
+        # list a publisher-domain URL that echoes the client IP (e.g. a Cloudflare-fronted publisher's
+        # "/cdn-cgi/trace") first, so the check sees the route the downloads take.
         "egress_check": {"enabled": False, "allow_cidrs": [], "ttl_s": 600, "timeout": 15,
                          "urls": ["https://api.ipify.org", "https://checkip.amazonaws.com"]},
         "oa": {"enabled": True, "europepmc": True, "unpaywall_email": None, "max_urls": 3, "skip_hosts": []},

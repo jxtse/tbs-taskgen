@@ -65,11 +65,12 @@ def s3(P, it):
         entry = fulltext.queue_entry(c, subscribers=[[str(P.store.root.resolve()), it.item_id]],
                                      failed_channels=sorted(failed_channels(rec)),
                                      queued_at=time.strftime("%Y-%m-%d %H:%M:%S"))
-        # park first, then queue: a queue entry always points at an item that `tbsgen fetch` can re-activate
+        # 1. intent record, 2. park, 3. queue.  A crash between 2 and 3 is repaired by `tbsgen fetch`, which
+        # first re-queues every item parked with fulltext_unavailable from its S3_queue.json (fulltext.reconcile).
         write_json(it.p("S3_queue.json"), dict(entry, route="tbsgen fetch", errors=rec.get("errors"),
                                                skipped=rec.get("skipped")))
         it.finish("parked", "fulltext_unavailable")
-        if entry["key"]:
+        if entry["ident"]:
             fulltext.enqueue(fulltext.queue_path(P.cfg), entry)
         return None
     it.p("fulltext.txt").write_text(txt)
