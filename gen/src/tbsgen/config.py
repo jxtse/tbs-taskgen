@@ -46,7 +46,7 @@ DEFAULTS: dict[str, Any] = {
         "teacher": "opus",                  # decision 2026-11-05: Opus
         "cheap": None,                      # 待定: cheap-model role; None -> rules-only fallbacks
         "roles": {                          # stage role -> model alias ("teacher"/"cheap"/"rules"/explicit)
-            "screen": "rules",              # S2 (待定 cheap model)
+            "screen": "rules",              # S2: "rules" (screen.rules_version) | "jev" (TypeSafe Jev, see screen.jev)
             "probe": "rules",               # S4 (待定 cheap agent; sandbox repro not implemented in MVP)
             "spec": "teacher",              # S5
             "gen": "teacher",               # S6A
@@ -60,10 +60,34 @@ DEFAULTS: dict[str, Any] = {
                  "effort": "medium", "max_tokens": 32000, "timeout": 1800, "retries": 2},
         # USD per million tokens.  PLACEHOLDERS: set real prices for your model.
         "prices": {"claude-opus-5-5": {"in": 5.0, "out": 25.0, "cache_read": 0.5},
+                   # TypeSafe list price: input tokens only, $0.042 per million (output not billed)
+                   "jev-1.14.0": {"in": 0.042, "out": 0.0, "cache_read": 0.0},
+                   "jev-latest": {"in": 0.042, "out": 0.0, "cache_read": 0.0},
                    "fake": {"in": 0.0, "out": 0.0}},
     },
     # ---------------------------------------------------------------- stages
-    "screen": {"min_score": 2, "keep_top": 20},
+    "screen": {
+        "rules_version": "v2",              # v2: each cue stem once, "survey" negative only as literature survey
+        # rules keep threshold.  rules-v2 counts each cue stem once, so its scores are lower than rules-v1's for
+        # the same text; 1 was picked on the dev half of the S2 reference set (gen/eval/screen_jev/).
+        "min_score": 1,
+        "min_score_v1": 2,                  # rules-v1 threshold (unchanged)
+        "jev": {
+            "model": "jev-1.14.0",          # pinned version (thresholds were set on it); "jev-latest" = alias
+            "url": "https://api.typesafe.ai/v1/systemone",
+            "key_env": "TYPESAFE_API_KEY",  # env var holding the key; inject from your secret store
+            "proxy": "env",                 # "env": honour HTTPS_PROXY; "none": direct connection
+            "timeout": 30,                  # seconds per HTTP attempt
+            "max_retries": 4,               # 429 / 529 / 5xx / network: exponential backoff + retry-after
+            "backoff_base": 1.0, "backoff_max": 30.0, "retry_after_max": 120,
+            "concurrency": 4,               # parallel requests when prefetching a batch of S2 items
+            "uncertain": "keep",            # "keep" (flagged uncertain=true) | "drop"
+            "on_unavailable": "rules",      # no key / breaker open / API down: "rules" (rules fallback) | "park"
+            "est_usd_per_call": 0.001,      # ledger reservation per call (actual ~1.3k input tokens ~ $0.00006)
+            "max_chars": 4000,              # full-text opening sent when the record has no abstract (S4 re-screen)
+            "thresholds": {},               # overrides of screen_jev.THRESHOLDS
+        },
+    },
     "fulltext": {
         "mode": "oa_and_cache",             # local full-text cache (read-only) then OA PDF link; else browser queue
         "cache_dirs": [str(OLD_PIPE / "literature" / "txt")] if OLD_PIPE else [],

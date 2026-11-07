@@ -119,8 +119,11 @@ class Ledger:
                 if n >= int(cap_c):
                     raise BudgetStop("daily_calls", f"{model} {cap_c} calls")
             cap_i = b.get("max_calls_per_item")
-            if cap_i is not None and item and stage != "S9":   # authoring calls only; S9 runs have their own caps
-                n = db.execute("SELECT count(*) FROM calls WHERE item=? AND stage!='S9'", (item,)).fetchone()[0]
+            # authoring calls only: S9 runs have their own caps; S2/S4 screening calls (Jev, ~$0.0001) do not
+            # use up an item's authoring budget
+            if cap_i is not None and item and stage not in ("S9", "S2", "S4"):
+                n = db.execute("SELECT count(*) FROM calls WHERE item=? AND stage NOT IN ('S9','S2','S4')",
+                               (item,)).fetchone()[0]
                 if n >= int(cap_i):
                     raise BudgetStop("item_calls", f"{item} {cap_i} calls")
             cur = db.execute(

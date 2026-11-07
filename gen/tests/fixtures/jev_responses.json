@@ -1,0 +1,122 @@
+{
+ "fay_herriot": {
+  "model": "jev-1.14.0",
+  "answers": {
+   "paper_type": {
+    "type": "choice",
+    "choice": "new_method",
+    "confidence": 0.99,
+    "probabilities": {
+     "new_method": 0.99,
+     "software_tool": 0.0,
+     "dataset_or_benchmark": 0.0,
+     "applied_study": 0.01,
+     "experimental_study": 0.0,
+     "clinical_or_qualitative": 0.0,
+     "review": 0.0,
+     "theory": 0.0
+    }
+   },
+   "paper_type_fits": {
+    "type": "noul",
+    "noul": 0.76
+   },
+   "computational_method": {
+    "type": "noul",
+    "noul": 0.89
+   },
+   "quantitative_check": {
+    "type": "noul",
+    "noul": 0.91
+   },
+   "single_machine": {
+    "type": "noul",
+    "noul": 0.93
+   },
+   "data_public": {
+    "type": "noul",
+    "noul": 0.36
+   },
+   "data_simulatable": {
+    "type": "noul",
+    "noul": 0.95
+   },
+   "black_box_queries": {
+    "type": "noul",
+    "noul": 0.02
+   },
+   "is_review": {
+    "type": "noul",
+    "noul": 0.03
+   },
+   "enough_info": {
+    "type": "noul",
+    "noul": 0.94
+   }
+  },
+  "usage": {
+   "input_tokens": 1300,
+   "output_tokens": 257
+  }
+ },
+ "ismv": {
+  "model": "jev-1.14.0",
+  "answers": {
+   "paper_type": {
+    "type": "choice",
+    "choice": "new_method",
+    "confidence": 1.0,
+    "probabilities": {
+     "new_method": 1.0,
+     "software_tool": 0.0,
+     "dataset_or_benchmark": 0.0,
+     "applied_study": 0.0,
+     "experimental_study": 0.0,
+     "clinical_or_qualitative": 0.0,
+     "review": 0.0,
+     "theory": 0.0
+    }
+   },
+   "paper_type_fits": {
+    "type": "noul",
+    "noul": 0.93
+   },
+   "computational_method": {
+    "type": "noul",
+    "noul": 0.86
+   },
+   "quantitative_check": {
+    "type": "noul",
+    "noul": 0.7
+   },
+   "single_machine": {
+    "type": "noul",
+    "noul": 0.92
+   },
+   "data_public": {
+    "type": "noul",
+    "noul": 0.13
+   },
+   "data_simulatable": {
+    "type": "noul",
+    "noul": 0.91
+   },
+   "black_box_queries": {
+    "type": "noul",
+    "noul": 0.03
+   },
+   "is_review": {
+    "type": "noul",
+    "noul": 0.03
+   },
+   "enough_info": {
+    "type": "noul",
+    "noul": 0.94
+   }
+  },
+  "usage": {
+   "input_tokens": 1395,
+   "output_tokens": 257
+  }
+ }
+}

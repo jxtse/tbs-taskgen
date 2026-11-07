@@ -169,12 +169,45 @@ The key is read from the named variable at call time, sent only in a request hea
 from error messages. Without `key_env`, no key is sent (useful behind a local gateway that holds
 credentials). The built-in price table is a placeholder; set prices for your model.
 
+### S2 abstract screen
+
+S2 decides from the bibliographic record (title, abstract, venue, year, code/data links) whether a paper is worth
+downloading and probing. Two modes, chosen with `models.roles.screen`:
+
+- `"rules"` (default): keyword cues in title and abstract (`screen.rules_version = "v2"`, keep at
+  `screen.min_score`). No network, no cost.
+- `"jev"`: one request per paper to TypeSafe Jev (`https://api.typesafe.ai/v1/systemone`). Ten narrow questions are
+  answered in parallel (paper type, whether there is a re-implementable computational method, whether it runs on one
+  machine, whether data are public or can be simulated, black-box query budget, review, enough information); code in
+  [`gen/src/tbsgen/screen_jev.py`](gen/src/tbsgen/screen_jev.py) combines the probabilities into keep, drop or
+  uncertain. Uncertain papers are kept and flagged by default. The rules screen is the fallback when the key is
+  missing, the circuit breaker is open or the API is down (`method = "rules-v2-fallback"` in `S2_screen.json`).
+  Answers are cached per item, so a resumed run does not call again.
+
+In both modes, papers without an abstract are passed on and re-screened at S4 on the first 4000 characters of the
+full text. Evaluation: [`gen/eval/screen_jev/`](gen/eval/screen_jev/).
+
+```toml
+[models.roles]
+screen = "jev"
+[screen.jev]
+model = "jev-1.14.0"        # pinned: thresholds were set on this version; the response model is checked
+uncertain = "keep"          # or "drop"
+on_unavailable = "rules"    # or "park" (item paused with model:jev_unavailable, `tbsgen resume` retries)
+concurrency = 4
+```
+
+Jev is billed on input tokens only ($0.042 per million at the time of writing; about 1,400 tokens, i.e. well under
+$0.001, per paper). Calls are recorded in the budget ledger like any other model call, so `budget.daily_usd_total`
+must be set.
+
 ### Environment variables
 
 | Variable | Used by | Purpose |
 |---|---|---|
 | `TBS_OPUS_URL` | gen | Teacher endpoint URL (Anthropic-compatible `/v1/messages`). No default: set it here or with `models.opus.url`; real model stages pause with `model:config` until it is set. |
 | *your `key_env`* | gen | Teacher API key, if `models.opus.key_env` is set. |
+| `TYPESAFE_API_KEY` | gen (S2) | TypeSafe key for the Jev screen (`models.roles.screen = "jev"`). The variable name is `screen.jev.key_env`. Unset: S2 falls back to the rules screen (or parks, see `screen.jev.on_unavailable`). |
 | `TBS_OLD_PIPE` | gen, retrieval | Data from an earlier pipeline: a full-text cache (`literature/txt`) and TB-Science task texts used for deduplication (`tasks_text`). Unset: no full-text cache and no deduplication. |
 | `TBS_LEAK_REFS` | retrieval | JSON file of papers that TB-Science tasks were built from; these are excluded from retrieval. Defaults to `$TBS_OLD_PIPE/literature/tbs_task_refs.json` when `TBS_OLD_PIPE` is set; otherwise no exclusion list. |
 | `TBS_HARBOR_ROOT` | gen (S9) | Directory with your Harbor job launch scripts for calibration (`calib.harbor_root`). Unset: S9 prints a plain `harbor run --config ...` command. |
@@ -214,7 +247,8 @@ Research code under active development.
 **Tests** (run by [GitHub Actions CI](.github/workflows/ci.yml) on every push to `main` and every pull request)
 
 - `retrieval/`: 47 offline unit tests that replay recorded API responses.
-- `gen/`: 69 tests: 53 unit tests and 16 integration tests that run task code in Docker. Locally
+- `gen/`: 86 tests: 70 unit tests (17 of them for the Jev screen, using recorded and scripted API responses)
+  and 16 integration tests that run task code in Docker. Locally
   they are skipped when Docker or the sandbox image is missing; CI builds the image and fails if
   any of them is skipped.
 - Fake-model dry run: S1 → S10 on a synthetic toy task, including the mechanical gates and
@@ -226,6 +260,9 @@ Research code under active development.
   ([`gen/eval/LEAK_BACKTEST.md`](gen/eval/LEAK_BACKTEST.md)): 7/7 known leaking tasks caught;
   0/231 blocking false positives in-sample (the rules were tuned on this set) and 1/81 on a
   held-out set.
+- S2 screen evaluation ([`gen/eval/screen_jev/`](gen/eval/screen_jev/README.md)): rules vs Jev on 200 sampled
+  abstracts with reference labels from a teacher model (not human labels), and on a larger set of papers whose
+  downstream outcome in an earlier pipeline is known.
 - Retrieval evaluation on 10 targets ([`retrieval/eval/REPORT.md`](retrieval/eval/REPORT.md)).
   Relevance labels come from a single annotator and are subjective.
 - End-to-end runs on 6 real papers: 3 became packaged
@@ -240,7 +277,7 @@ Research code under active development.
   implementation of the paper's method. Offline-by-default and a check for ready-made
   implementations are planned, not implemented.
 - The teacher-agent branch of calibration has not been run on real tasks.
-- The L4b inversion attack, the cheap-model roles, harder-variant generation (S9b) and the
+- The L4b inversion attack, the cheap-model roles other than the S2 screen, harder-variant generation (S9b) and the
   file-format and interactive task forms are not implemented.
 - The expert-time estimate in `task.toml` is the teacher model's own estimate.
 - Full text comes only from a local cache or open-access PDF links.

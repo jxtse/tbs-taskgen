@@ -14,7 +14,7 @@ import time
 import traceback
 from pathlib import Path
 
-from . import intake, stages_a as A, stages_b as B
+from . import intake, screen_jev, stages_a as A, stages_b as B
 from .budget import BudgetStop, Ledger, today
 from .config import resolve_role
 from .models import ModelError, get_client
@@ -36,6 +36,8 @@ class Pipeline:
         self._clients = dict(clients or {})
         self.fetcher = fetcher
         self._tbs = None
+        self._jev = None
+        self.jev_transport = None           # tests inject a fake HTTP transport here
         self.stopped_models: set[str] = set()
 
     # ------------------------------------------------------------------ helpers
@@ -50,6 +52,26 @@ class Pipeline:
             raise ModelError("config", f"role {role} has no model (alias {alias})")
         self._clients[role] = c
         return c
+
+    def jev_client(self) -> screen_jev.JevClient:
+        if self._jev is None:
+            self._jev = screen_jev.JevClient(self.ledger, self.cfg, transport=self.jev_transport)
+        return self._jev
+
+    def prefetch_screen(self, only: list[str] | None = None) -> int:
+        """roles.screen = jev: ask Jev about every active S2 item with an abstract, `screen.jev.concurrency`
+        requests at a time; S2 then reads the cached answers.  Failures are left for S2's fallback."""
+        if resolve_role(self.cfg, "screen") != "jev":
+            return 0
+        its = [i for i in self.store.items() if i.state["status"] == "active" and i.state["stage"] == "S2"
+               and (not only or i.item_id in only)]
+        if not its:
+            return 0
+        try:
+            self.jev_client().key()
+        except ModelError:
+            return 0                        # no key: S2 falls back per item (and records why)
+        return screen_jev.prefetch(self.jev_client(), its, self.cfg)
 
     def tbs_index(self):
         if self._tbs is None:
@@ -118,6 +140,7 @@ class Pipeline:
     def run(self, max_steps: int = 10000, only: list[str] | None = None) -> dict:
         steps = 0
         progress = True
+        self.prefetch_screen(only)
         while progress and steps < max_steps:
             progress = False
             for it in self.store.items():
