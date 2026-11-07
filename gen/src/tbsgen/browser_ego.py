@@ -107,7 +107,9 @@ def run_one(job: dict) -> dict:
                max_bytes=int(job.get("max_bytes") or 40e6))
     if cfg.get("landing_base"):                     # tests: a local stand-in for https://doi.org/
         inp["landing_base"] = cfg["landing_base"]
-    return _exec(cfg, inp, float(cfg.get("script_timeout_s", 420)))
+    res = _exec(cfg, inp, float(cfg.get("script_timeout_s", 420)))
+    res["out_file"] = out_file                     # the caller removes it in every outcome
+    return res
 
 
 def ensure_pages(cfg: dict, n: int) -> dict:

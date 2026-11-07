@@ -71,6 +71,7 @@ def mkcfg(tmp_path, **ft):
             "queue_path": str(tmp_path / "q.jsonl"), "allow_network": True,
             "oa": {"enabled": True, "europepmc": False},
             "elsevier": {"enabled": True}, "wiley": {"enabled": True},
+            "browser": {"space": "t-" + str(abs(hash(str(tmp_path))))},
             "limits": {ch: {"gap_s": 0.0, "jitter_s": 0.0} for ch in ("oa", "elsevier", "wiley", "inst", "browser")}}
     for k, v in ft.items():
         if isinstance(v, dict) and isinstance(base.get(k), dict):
@@ -929,3 +930,99 @@ def test_concurrent_drains_do_not_overlap(tmp_path):
     with open(qp.with_name(qp.name + ".drain.lock"), "a+") as fh:
         fcntl.flock(fh, fcntl.LOCK_EX)
         assert fulltext.drain_queue(f, log=lambda s: None).get("busy")
+
+
+
+# ------------------------------------------------------------------ review round 3 regressions
+def test_hop_rechecks_cooldown_and_gap_after_waiting(tmp_path):
+    clock = FakeClock()
+    led = DownloadLedger(tmp_path / "l.sqlite", {"oa": {"gap_s": 10, "jitter_s": 0}}, clock=clock)
+    r = led.acquire("oa", "cdn.example", "a")
+    led.record("oa", "cdn.example", "a", "ok", 200, 1, reservation=r)
+
+    def sleep_then_block(s):
+        clock.t += s
+        led.block("cdn.example", "429 seen elsewhere", seconds=6 * 3600)
+    led.sleep = sleep_then_block
+    with pytest.raises(LimitReached, match="cooldown"):
+        led.acquire_hop("oa", "cdn.example", "b")
+    assert not sqlite3.connect(tmp_path / "l.sqlite").execute(
+        "select count(*) from attempts where status='hop'").fetchone()[0]
+
+
+def test_hops_do_not_use_channel_attempts(tmp_path):
+    clock = FakeClock()
+    led = DownloadLedger(tmp_path / "l.sqlite", {"oa": {"gap_s": 0, "jitter_s": 0, "daily_attempts": 1}},
+                         clock=clock, sleep=clock.sleep)
+    r = led.acquire("oa", "a.example", "x")
+    led.acquire_hop("oa", "b.example", "x")
+    led.record("oa", "a.example", "x", "ok", 200, 1, reservation=r)
+    assert led.usage()["oa"]["attempts"] == 1
+
+
+def test_cooldown_on_any_publisher_prefix_blocks_the_others(tmp_path):
+    run, calls = fake_browser({"status": "downloaded", "_body": FAKE_PDF})
+    f, _, led, _ = mkfetcher(tmp_path, {}, SECRETS, browser_runner=run, browser={"enabled": True})
+    led.block("chrome:10.1002", "challenge (written by the old pipeline)")
+    out = f.fetch(dict(doi="10.1111/x.1", title=TITLE), browser=True, channels=["browser"])
+    assert calls == [] and any("cooldown" in s for s in out.rec["skipped"])
+
+
+def test_blocked_flag_from_script_wins_over_later_success(tmp_path):
+    run, _ = fake_browser({"status": "downloaded", "_body": FAKE_PDF, "blocked": True})
+    f, _, led, _ = mkfetcher(tmp_path, {}, SECRETS, browser_runner=run, browser={"enabled": True})
+    out = f.fetch(dict(doi="10.1021/a", title=TITLE), browser=True)
+    assert out.text is None and led.cooling("chrome:10.1021")
+
+
+def test_browser_temp_file_removed_on_failure(tmp_path):
+    def run(job):
+        p = Path(job["out_dir"]) / "leftover.bin"
+        p.write_bytes(CF)
+        return {"status": "challenge", "title": "Just a moment...", "out_file": str(p)}
+    f, _, _, _ = mkfetcher(tmp_path, {}, SECRETS, browser_runner=run, browser={"enabled": True})
+    f.fetch(dict(doi="10.1021/a", title=TITLE), browser=True)
+    assert not list((tmp_path / "wc" / "_browser_tmp").iterdir())
+
+
+def test_pdftotext_gets_no_credentials(monkeypatch):
+    seen = {}
+
+    def fake_run(cmd, **kw):
+        seen.update(kw)
+
+        class P:
+            stdout = b"text"
+        return P()
+    monkeypatch.setenv("ELSEVIER_API_KEY", "should-not-leak")
+    monkeypatch.setattr(fulltext.subprocess, "run", fake_run)
+    fulltext.pdf_to_text(b"%PDF-1.4")
+    assert "ELSEVIER_API_KEY" not in seen["env"] and "PATH" in seen["env"]
+
+
+def test_requeued_entry_stays_due_after_older_failed_attempt(tmp_path):
+    hold = {}
+
+    def run_and_update(job):
+        fulltext.enqueue(hold["qp"], fulltext.queue_entry(dict(doi="10.1021/a", title=TITLE,
+                                                               oa_url="https://oa.example/new.pdf"),
+                                                          subscribers=[["r", "1"]]))
+        return {"status": "html", "error": "no PDF link"}
+    f, _, _, _ = mkfetcher(tmp_path, {}, SECRETS, browser_runner=run_and_update, browser={"enabled": True},
+                           oa={"enabled": False})
+    hold["qp"] = qp = fulltext.queue_path(f.cfg)
+    fulltext.enqueue(qp, fulltext.queue_entry(dict(doi="10.1021/a", title=TITLE), subscribers=[["r", "1"]]))
+    fulltext.drain_queue(f, log=lambda s: None, now=1000.0)
+    [e] = fulltext.read_queue(qp)
+    assert e["next_try"] == 0 and e["oa_url"] == "https://oa.example/new.pdf"
+
+
+def test_inline_browser_respects_taskspace_lock(tmp_path):
+    import fcntl
+    run, calls = fake_browser({"status": "downloaded", "_body": FAKE_PDF})
+    f, _, _, _ = mkfetcher(tmp_path, {}, SECRETS, browser_runner=run, browser={"enabled": True, "inline": True,
+                                                                               "space": f"t-{tmp_path.name}"})
+    with open(f.space_lock_path(), "a+") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        out = f.fetch(dict(doi="10.1021/a", title=TITLE))
+    assert calls == [] and any("in use" in s for s in out.rec["skipped"])

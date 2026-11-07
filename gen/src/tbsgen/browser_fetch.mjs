@@ -53,10 +53,27 @@ async function waitChallenge(page) {
   return i;
 }
 
+async function savedIsChallenge(file) {
+  // a saved body that is not a PDF but a bot-wall page: a block, whatever the status code
+  const fs = await import("node:fs/promises");
+  try {
+    const fh = await fs.open(file, "r");
+    const buf = Buffer.alloc(20000);
+    const { bytesRead } = await fh.read(buf, 0, 20000, 0);
+    await fh.close();
+    const head = buf.subarray(0, bytesRead).toString("latin1");
+    if (head.startsWith("%PDF-")) return false;
+    const t = /<title[^>]*>([^<]*)/i.exec(head);
+    return (t && CHALLENGE.test(t[1])) || /cf-chl|cf_chl_opt|challenge-platform|px-captcha|\/cdn-cgi\/challenge/i.test(head);
+  } catch (e) { return false; }
+}
+
 async function grabPdfDocument(page, i, file) {
   // the Page shows a PDF (Chrome viewer): re-read the same URL same-origin with the Page's cookies
   const r = await page.fetch(i.url, { saveAs: file, timeout: INPUT.download_timeout_ms });
-  return { ok: r.ok, status: r.status, ctype: (r.headers && (r.headers["content-type"] || r.headers["Content-Type"])) || "" };
+  const blocked = r.status === 429 || await savedIsChallenge(file);
+  return { ok: r.ok && !blocked, status: r.status, blocked,
+           ctype: (r.headers && (r.headers["content-type"] || r.headers["Content-Type"])) || "" };
 }
 
 async function navStatus(page) {
@@ -90,16 +107,17 @@ async function tryUrl(page, url, file) {
   await gotoP;
   if (dl) {
     await dl.saveAs(file);
+    if (await savedIsChallenge(file)) { out.blocked = true; return { kind: "challenge", title: "downloaded bot-wall page" }; }
     return { kind: "download", url: dl.url() };
   }
   out.http = await navStatus(page);
-  if (out.http === 429) { out.http429 = true; return { kind: "challenge", title: "HTTP 429" }; }
+  if (out.http === 429) { out.http429 = true; out.blocked = true; return { kind: "challenge", title: "HTTP 429" }; }
   let i = await waitChallenge(page);
   if (isChallenge(i)) return { kind: "challenge", title: i.title || i.text.slice(0, 80) };
   if (/pdf/i.test(i.ctype)) {
     const g = await grabPdfDocument(page, i, file);
     out.http = g.status;
-    if (g.status === 429) { out.http429 = true; return { kind: "challenge", title: "HTTP 429" }; }
+    if (g.blocked) { out.blocked = true; out.http429 = g.status === 429; return { kind: "challenge", title: `HTTP ${g.status} (bot wall)` }; }
     return g.ok ? { kind: "pdfdoc", url: i.url } : { kind: "http", status: g.status };
   }
   // HTML wrapper pages
@@ -110,7 +128,7 @@ async function tryUrl(page, url, file) {
       i = await info(page);
       if (/pdf/i.test(i.ctype)) {
         const g = await grabPdfDocument(page, i, file);
-        if (g.status === 429) { out.http429 = true; return { kind: "challenge", title: "HTTP 429" }; }
+        if (g.blocked) { out.blocked = true; out.http429 = g.status === 429; return { kind: "challenge", title: `HTTP ${g.status} (bot wall)` }; }
         if (g.ok) return { kind: "pdfdoc", url: i.url };
       }
     } catch (e) { /* fall through */ }
@@ -197,7 +215,11 @@ try {
     let st = await fs.stat(file).catch(() => null);
     if (st && st.size > INPUT.max_bytes) { await fs.unlink(file).catch(() => {}); out.error = "too large"; st = null; }
     out.bytes = st ? st.size : 0;
-    if (out.http429 || (last && last.kind === "challenge")) { out.status = "challenge"; out.title = (last && last.title) || "HTTP 429"; }
+    if (out.blocked || out.http429 || (last && last.kind === "challenge")) {
+      // a block anywhere in this run wins over a later success; the saved body is not used
+      out.status = "challenge"; out.title = (last && last.title) || "bot wall";
+      await fs.unlink(file).catch(() => {});
+    }
     else if (st && st.size > 0) { out.status = "downloaded"; out.path = file; out.final_url = last && last.url || ""; }
     else { out.status = last ? last.kind : "nothing"; out.error = JSON.stringify(last || {}).slice(0, 300); }
     try { await page.goto("about:blank", { timeout: 5000 }); } catch (e) {}

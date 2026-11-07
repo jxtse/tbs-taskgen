@@ -75,7 +75,9 @@ def pdf_to_text(pdf: bytes) -> str:
     with tempfile.TemporaryDirectory() as td:
         p = Path(td) / "a.pdf"
         p.write_bytes(pdf)
-        r = subprocess.run(["pdftotext", "-layout", "-enc", "UTF-8", str(p), "-"], capture_output=True, timeout=180)
+        env = {k: v for k, v in os.environ.items() if k in ("PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR")}
+        r = subprocess.run(["pdftotext", "-layout", "-enc", "UTF-8", str(p), "-"], capture_output=True, timeout=180,
+                           env=env)
         return r.stdout.decode("utf-8", "replace")
 
 
@@ -184,6 +186,19 @@ def _alt_key(stem: str, ident: str) -> str:
     return f"{stem}-{hashlib.sha256(ident.encode()).hexdigest()[:8]}"
 
 
+@contextlib.contextmanager
+def _dir_lock(d: Path):
+    """Exclusive lock for choosing + publishing a cache file name (writes are rare; reads need no lock because a
+    file name is only ever published for one identity)."""
+    import fcntl
+    with open(d / ".write.lock", "a+") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+
+
 def _atomic_write(path: Path, data: bytes | str):
     tmp = path.with_name(f".{path.name}.tmp{os.getpid()}.{threading.get_ident()}")
     if isinstance(data, str):
@@ -229,7 +244,9 @@ def make_transport(use_env_proxy: bool = False) -> Transport:
                 while n <= max_bytes:
                     if time.monotonic() > deadline:
                         return Resp(0, {}, b"", url, f"total deadline {timeout:.0f}s exceeded")
-                    b = r.read(min(1 << 16, max_bytes + 1 - n))
+                    # read1: at most one socket recv (each bounded by the socket timeout), so a trickling body
+                    # cannot hold a read past the deadline by more than one timeout
+                    b = r.read1(min(1 << 16, max_bytes + 1 - n))
                     if not b:
                         break
                     chunks.append(b)
@@ -237,7 +254,14 @@ def make_transport(use_env_proxy: bool = False) -> Transport:
                 body = b"".join(chunks)
                 return Resp(r.status, dict(r.headers), body[:max_bytes], r.geturl(), truncated=len(body) > max_bytes)
         except urllib.error.HTTPError as e:
-            return Resp(e.code, dict(e.headers or {}), e.read(20000) if e.fp else b"", url)
+            body = b""
+            with contextlib.suppress(Exception):
+                while e.fp and len(body) < 20000 and time.monotonic() < deadline:
+                    b = e.read1(20000 - len(body))
+                    if not b:
+                        break
+                    body += b
+            return Resp(e.code, dict(e.headers or {}), body, url)
         except Exception as e:  # noqa: BLE001
             return Resp(0, {}, b"", url, f"{type(e).__name__}: {str(e)[:200]}")
     return transport
@@ -341,6 +365,28 @@ class Fetcher:
         self._egress_browser: dict | None = None
         self._egress_lock = threading.Lock()
         self._tl = threading.local()
+        self._space_held = False            # set by drain_queue while it holds the TaskSpace lock
+        self._space_fh = None
+
+    def space_lock_path(self) -> Path:
+        space = re.sub(r"[^A-Za-z0-9_.-]", "_", str((self.ft.get("browser") or {}).get("space", "tbsgen-s3-fulltext")))
+        return Path(tempfile.gettempdir()) / f"tbsgen-ego-{space}.lock"
+
+    def _try_space_lock(self) -> bool:
+        """Inline browser use (browser.inline=true): take the TaskSpace lock for the rest of this process, or
+        give up immediately if a `tbsgen fetch` (or another process) holds it."""
+        import fcntl
+        if self._space_fh is not None:
+            return True
+        fh = open(self.space_lock_path(), "a+")
+        try:
+            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            fh.close()
+            return False
+        self._space_fh = fh
+        self._space_held = True
+        return True
 
     @property
     def ft(self) -> dict:
@@ -472,19 +518,24 @@ class Fetcher:
                     title_match=None if tm is None else round(tm, 3), fetched_at=time.strftime("%Y-%m-%dT%H:%M:%S%z"))
         if (w := self.write_dir()) and key:
             w.mkdir(parents=True, exist_ok=True)
-            stem = key
-            with contextlib.suppress(OSError, ValueError):
-                other = json.loads((w / f"{key}.json").read_text())
-                if isinstance(other, dict) and other.get("ident", "doi:" + norm_doi(other.get("doi"))) != ident:
-                    stem = _alt_key(key, ident)          # another paper owns this file name
-            if self.ft.get("keep_raw", True):
-                ext = {"pdf": "pdf", "jats": "xml", "elsevier_xml": "xml", "html": "html"}.get(kind, "bin")
-                (w / "raw").mkdir(exist_ok=True)
-                _atomic_write(w / "raw" / f"{stem}.{ext}", body)
-            # provenance first, text last: a text file always has its (complete) provenance next to it
-            _atomic_write(w / f"{stem}.json", json.dumps(prov, indent=1))
-            _atomic_write(w / f"{stem}.txt", txt)
-            prov["path"] = str(w / f"{stem}.txt")
+            with _dir_lock(w):
+                return self._save_locked(w, key, ident, prov, body, txt, kind)
+        return prov
+
+    def _save_locked(self, w: Path, key: str, ident: str, prov: dict, body: bytes, txt: str, kind: str) -> dict:
+        stem = key
+        with contextlib.suppress(OSError, ValueError):
+            other = json.loads((w / f"{key}.json").read_text())
+            if isinstance(other, dict) and other.get("ident", "doi:" + norm_doi(other.get("doi"))) != ident:
+                stem = _alt_key(key, ident)          # another paper owns this file name
+        if self.ft.get("keep_raw", True):
+            ext = {"pdf": "pdf", "jats": "xml", "elsevier_xml": "xml", "html": "html"}.get(kind, "bin")
+            (w / "raw").mkdir(exist_ok=True)
+            _atomic_write(w / "raw" / f"{stem}.{ext}", body)
+        # provenance first, text last: a text file always has its (complete) provenance next to it
+        _atomic_write(w / f"{stem}.json", json.dumps(prov, indent=1))
+        _atomic_write(w / f"{stem}.txt", txt)
+        prov["path"] = str(w / f"{stem}.txt")
         return prov
 
     def _related(self, host: str) -> tuple:
@@ -673,6 +724,8 @@ class Fetcher:
         aliases = tuple(k for k in keys if k != lkey)
         if self.ledger is None:
             raise LimitReached("no download ledger configured (fulltext.ledger_path)", "cap")
+        if not self._space_held and not self._try_space_lock():
+            raise LimitReached("browser TaskSpace is in use by another process (e.g. `tbsgen fetch`)", "cap", "host")
         rid = self.ledger.acquire("browser", lkey, doi, related=tuple(web_hosts), group=aliases)
         rec["tried"].append(f"browser:{lkey}")
         res: dict = {}
@@ -689,7 +742,7 @@ class Fetcher:
             body = p.read_bytes() if size else b""
             http = 429 if res.get("http429") else res.get("http")
             cool = block_signal(http if isinstance(http, int) else None, body)
-            if res.get("status") == "challenge" or cool:
+            if res.get("status") == "challenge" or res.get("blocked") or cool:
                 secs = cool or float(b.get("challenge_cooldown_s", 24 * 3600))
                 if http == 429:
                     secs = COOLDOWN_429_S
@@ -715,8 +768,9 @@ class Fetcher:
             http = res.get("http")
             self.ledger.record("browser", lkey, doi, "ok" if ok else "fail", http if isinstance(http, int) else None,
                                int(res.get("bytes") or 0), note[:300], reservation=rid)
-            if res.get("path"):
-                Path(res["path"]).unlink(missing_ok=True)
+            for k in ("path", "out_file"):
+                if res.get(k):
+                    Path(res[k]).unlink(missing_ok=True)
 
     def _browser_tmp(self) -> Path:
         base = self.write_dir() or Path(tempfile.gettempdir())
@@ -890,6 +944,7 @@ def enqueue(path: Path, entry: dict) -> bool:
                         changed = True
                 if changed:
                     e["next_try"] = 0
+                    e["ver"] = int(e.get("ver") or 0) + 1      # a drain that read an older version keeps it due
                     write_queue(path, q)
                 return False
         q.append(entry)
@@ -963,6 +1018,7 @@ def _drain_locked(fetcher, qp, now, max_papers, channels, browser, dry_run, on_s
     due = sorted((e for e in queue if float(e.get("next_try") or 0) <= now),
                  key=lambda e: (float(e.get("last_try") or 0), queue.index(e)))
     todo = due[:max_papers] if max_papers else due
+    vers = {_entry_key(e): int(e.get("ver") or 0) for e in todo}
     stats = dict(queued=len(queue), due=len(due), considered=len(todo), ok=0, failed=0, by_channel={}, errors=[])
     if dry_run:
         stats["plan"] = [dict(ident=_entry_key(e), doi=e.get("doi"), publisher=publisher_of(e.get("doi") or "")[0],
@@ -1010,23 +1066,24 @@ def _drain_locked(fetcher, qp, now, max_papers, channels, browser, dry_run, on_s
                            ensure_ascii=False))
 
     space_fh = None
-    if use_browser:
-        # one drainer per browser TaskSpace, even across different queues / runs (they would share its Pages)
+    if use_browser and not fetcher._space_held:
+        # one user of a browser TaskSpace at a time, across processes (fetch, inline S3): they share its Pages
         import fcntl
-        space = re.sub(r"[^A-Za-z0-9_.-]", "_", str(bconf.get("space", "tbsgen-s3-fulltext")))
-        space_fh = open(Path(tempfile.gettempdir()) / f"tbsgen-ego-{space}.lock", "a+")
+        space_fh = open(fetcher.space_lock_path(), "a+")
         try:
             fcntl.flock(space_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fetcher._space_held = True
         except BlockingIOError:
             space_fh.close()
             space_fh = None
             use_browser = False
-            stats["note"] = f"browser TaskSpace {space} is in use by another fetch; browser channel skipped"
+            stats["note"] = "browser TaskSpace is in use by another process; browser channel skipped"
     try:
         _run_entries(fetcher, todo, use_browser, bconf, one, defaultdict, browser_ego)
     finally:
         if space_fh:
             import fcntl
+            fetcher._space_held = False
             fcntl.flock(space_fh, fcntl.LOCK_UN)
             space_fh.close()
     with queue_lock(qp):
@@ -1043,9 +1100,11 @@ def _drain_locked(fetcher, qp, now, max_papers, channels, browser, dry_run, on_s
                     e["subscribers"] = rest                    # new / unacknowledged subscribers stay
                     e.pop("item_ids", None)
                     e["next_try"] = 0
-                else:
+                elif int(e.get("ver") or 0) == vers.get(k, 0):   # unchanged since we read it: back off
                     n_try = int(e.get("tries") or 0) + 1
                     e.update(tries=n_try, last_try=now, next_try=now + backoff * min(8, 2 ** (n_try - 1)))
+                else:                                            # updated meanwhile (new link): stay due
+                    e.update(last_try=now, next_try=0)
             keep.append(e)
         write_queue(qp, keep)
         stats["remaining"] = len(keep)

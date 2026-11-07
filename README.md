@@ -136,8 +136,8 @@ On a fresh machine both items may stop at S3 as `parked: fulltext_unavailable` (
 configurable cascade (see [Full text (S3)](#full-text-s3)); by default only a local cache and open-access copies
 are used. `tbsgen fetch --run runs/R` retries the queue later (failed entries back off, doubling from
 `fulltext.queue_backoff_s`), hands the text to every waiting item (also items of other runs sharing the queue) and
-moves them on to S4; an entry leaves the queue only after that. Only one `tbsgen fetch` drains a queue (and uses a
-browser TaskSpace) at a time. With full text, a teacher endpoint and a
+moves them on to S4; an entry leaves the queue only after that. Only one `tbsgen fetch` drains a queue at a time, and only one
+process at a time uses a browser TaskSpace (a second one skips the browser channel). With full text, a teacher endpoint and a
 budget in `my.toml` (see below), `tbsgen run` continues into the model stages. The other commands
 (`resume`, `reset`, `breaker`, `calib-ingest`, `harbor-local`, `ping`) are documented in
 [`gen/README.md`](gen/README.md) §3.
@@ -326,7 +326,7 @@ Research code under active development.
 **Tests** (run by [GitHub Actions CI](.github/workflows/ci.yml) on every push to `main` and every pull request)
 
 - `retrieval/`: 47 offline unit tests that replay recorded API responses.
-- `gen/`: 148 tests: 132 unit tests (17 of them for the Jev screen and 62 for the S3 full-text channels, using
+- `gen/`: 156 tests: 140 unit tests (17 of them for the Jev screen and 70 for the S3 full-text channels, using
   recorded and scripted responses; no network, no browser) and 16 integration tests that run task code in Docker. Locally
   they are skipped when Docker or the sandbox image is missing; CI builds the image and fails if
   any of them is skipped.
