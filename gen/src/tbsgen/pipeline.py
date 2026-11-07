@@ -53,8 +53,8 @@ class Pipeline:
 
     def tbs_index(self):
         if self._tbs is None:
-            root = Path(self.cfg["probe"]["tbs_tasks_root"])
-            self._tbs = intake.TBSIndex(root) if root.exists() else None
+            root = self.cfg["probe"].get("tbs_tasks_root")
+            self._tbs = intake.TBSIndex(Path(root)) if root and Path(root).exists() else None
         return self._tbs
 
     def item_cost(self, item_id: str) -> dict:
@@ -97,7 +97,7 @@ class Pipeline:
         except ModelError as e:
             n = it.bump(f"err:{st}")
             self.store.event("stage_error", item=it.item_id, stage=st, cls=e.cls, err=str(e)[:300])
-            if e.cls in ("quota", "auth", "model_mismatch"):
+            if e.cls in ("quota", "auth", "model_mismatch", "config"):
                 it.finish("paused", f"model:{e.cls}", paused_stage=st)
                 self.stopped_models.add(alias if role else st)
                 return "paused"

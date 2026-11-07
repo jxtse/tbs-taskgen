@@ -1,9 +1,10 @@
 """Extra analysis: (1) can the new 4 sources cover what the old sources find?  Uses the *independently judged*
-core papers from search_api/review (top-10 of Crossref / arXiv / Europe PMC with the same queries, judged before
+core papers from the earlier benchmark's review ($TBS_EVAL_BASELINE/review: top-10 of Crossref / arXiv / Europe PMC with the same queries, judged before
 this layer existed) and the 35 frozen selected papers as reference sets, and checks at which depth the new arms
 contain them.  (2) per-target table for REPORT.md.
 """
 import json
+import os
 from collections import defaultdict
 from pathlib import Path
 
@@ -12,7 +13,7 @@ from tbsretr.config import load_config
 from tbsretr.fusion import load_leak
 
 HERE = Path(__file__).resolve().parent
-OLD = HERE.parents[2] / "search_api"
+OLD = Path(os.environ.get("TBS_EVAL_BASELINE") or "TBS_EVAL_BASELINE-not-set")   # earlier benchmark, not in this repo
 
 
 def main():

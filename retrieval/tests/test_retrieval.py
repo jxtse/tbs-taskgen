@@ -344,6 +344,7 @@ def test_exa_pool_backend_same_parse_as_direct(cfg, monkeypatch):
     monkeypatch.delenv("EXA_API_KEY_SECONDARY", raising=False)     # pool backend needs no key in this process
     monkeypatch.delenv("TBS_SEARCH_POOL_URL", raising=False)
     cfg["sources"]["exa"]["backend"] = "pool"
+    cfg["sources"]["exa"]["pool_url"] = "http://127.0.0.1:18150"
     tr, seen, rec = _pool_replay()
     S, led, _ = make_sources(cfg, tr)
     assert S["exa"].available() == (True, "")
@@ -416,3 +417,19 @@ def test_exa_pool_unset_url_skips(cfg, monkeypatch):
     cfg["sources"]["exa"]["pool_url"] = ""
     S, _, _ = make_sources(cfg, Replay())
     assert S["exa"].available()[0] is False
+
+
+def test_no_machine_specific_defaults(monkeypatch):
+    """Default pool URL and leak-refs path are unset unless the environment provides them."""
+    import importlib
+    import tbsretr.config as rc
+    for k in ("TBS_SEARCH_POOL_URL", "TBS_LEAK_REFS", "TBS_OLD_PIPE"):
+        monkeypatch.delenv(k, raising=False)
+    c = importlib.reload(rc).load_config(path="/nonexistent.toml")
+    assert c["sources"]["exa"]["pool_url"] is None and c["leak_refs"] is None
+    monkeypatch.setenv("TBS_OLD_PIPE", "/data/old")
+    assert importlib.reload(rc).load_config(path="/nonexistent.toml")["leak_refs"] == "/data/old/literature/tbs_task_refs.json"
+    monkeypatch.setenv("TBS_LEAK_REFS", "/x/refs.json")
+    assert importlib.reload(rc).load_config(path="/nonexistent.toml")["leak_refs"] == "/x/refs.json"
+    monkeypatch.undo()
+    importlib.reload(rc)
