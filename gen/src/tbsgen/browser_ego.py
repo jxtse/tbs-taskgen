@@ -15,6 +15,7 @@ import json
 import os
 import shutil
 import subprocess
+import time
 import uuid
 from pathlib import Path
 
@@ -73,15 +74,33 @@ def render(inp: dict) -> str:
     return "const INPUT = " + json.dumps(inp) + ";\n" + SCRIPT.read_text()
 
 
-def _exec(cfg: dict, inp: dict, timeout: float) -> dict:
+def _exec(cfg: dict, inp: dict, timeout: float, cancel=None) -> dict:
+    """Run the script; `cancel` (a threading.Event) kills it early (browser batches: the egress changed)."""
     exe = binary(cfg)
     if not exe:
         return dict(status="unavailable", error="ego-browser binary not found (fulltext.browser.binary)")
+    p = subprocess.Popen([exe, "nodejs"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                         text=True, env=child_env())
+    t_end = time.monotonic() + timeout
+    so = se = ""
     try:
-        p = subprocess.run([exe, "nodejs"], input=render(inp), capture_output=True, text=True, timeout=timeout,
-                           env=child_env())
+        so, se = p.communicate(render(inp), timeout=min(1.0, timeout))
     except subprocess.TimeoutExpired:
-        return dict(status="timeout", error=f"ego-browser script exceeded {timeout:.0f}s")
+        while True:
+            if cancel is not None and cancel.is_set():
+                p.kill()
+                p.communicate()
+                return dict(status="cancelled", error="cancelled (batch stopped)")
+            if time.monotonic() > t_end:
+                p.kill()
+                p.communicate()
+                return dict(status="timeout", error=f"ego-browser script exceeded {timeout:.0f}s")
+            try:
+                so, se = p.communicate(timeout=1.0)
+                break
+            except subprocess.TimeoutExpired:
+                continue
+    p = subprocess.CompletedProcess(p.args, p.returncode, so or "", se or "")
     for line in reversed((p.stdout + "\n" + p.stderr).splitlines()):     # the CLI may print to either stream
         if line.startswith("TBSGEN_RESULT "):
             try:
@@ -102,12 +121,17 @@ def run_one(job: dict) -> dict:
                 max_navigations=int(cfg.get("max_navigations", 5)))
     if job.get("mode") == "egress":                 # on a temporary Page of its own, closed afterwards
         return _exec(cfg, dict(base, mode="egress", urls=job["urls"]), 120)
+    if job.get("mode") == "probe":                  # egress watcher: own TaskSpace (cfg.space), reused Page
+        return _exec(cfg, dict(base, mode="probe", urls=job["urls"], probe_timeout_ms=int(job.get("timeout_ms", 8000))),
+                     float(job.get("timeout_s", 30)))
+    if job.get("mode") == "finish":
+        return finish(cfg)
     out_file = str(Path(job["out_dir"]).resolve() / f"dl-{uuid.uuid4().hex[:12]}.bin")
     inp = dict(base, mode="fetch", doi=job["doi"], pdf_urls=job.get("pdf_url") or [], out_file=out_file,
                max_bytes=int(job.get("max_bytes") or 40e6))
     if cfg.get("landing_base"):                     # tests: a local stand-in for https://doi.org/
         inp["landing_base"] = cfg["landing_base"]
-    res = _exec(cfg, inp, float(cfg.get("script_timeout_s", 420)))
+    res = _exec(cfg, inp, float(cfg.get("script_timeout_s", 420)), job.get("cancel"))
     res["out_file"] = out_file                     # the caller removes it in every outcome
     return res
 

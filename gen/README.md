@@ -15,6 +15,8 @@ src/tbsgen/
   fulltext.py      S3 下载级联（cache/oa/elsevier/wiley/inst/browser）、校验、写入缓存、全文队列
   dlledger.py      S3 下载账本：每日/每小时上限、同站点间隔、冷却、熔断
   browser_ego.py   ego-browser 通道（运行 browser_fetch.mjs 脚本模板）
+  browser_agent.py 浏览器批次：出口门控、按出口窗口定批次规模、脚本优先、Hermes CLI agent 兜底（提示模板 browser_agent_prompt.md，guard 脚本 browser_agent_guard.mjs）
+  remote.py        远程模式：HTTP 通道经 ssh 在另一台主机上运行，账本以本机为准
   screen_jev.py    S2 的 Jev 模式：问题原文、阈值、组合规则、HTTP 客户端（重试/记账/熔断）、并发预取
   prompts.py       S5/S6A/S6C/S8 提示词（版本号写进 provenance）
   spec.py          S5 规格校验（依赖图规则）；S6B 按实测定阈值
@@ -104,6 +106,7 @@ uv run tbsgen fetch --run runs/R --config config.toml [--max N] [--channels oa,b
                                                                     # 清全文队列（含 ego-browser 通道），取到全文后交给等待的条目并推进到 S4
 uv run tbsgen fetch --run runs/R --status                          # 今日下载用量、冷却、熔断
 uv run tbsgen fetch --run runs/R --finish-browser                  # 关闭本工具的 ego TaskSpace
+uv run tbsgen fetch --run runs/R --browser --wait-for-egress         # 等出口进入 allow_cidrs 后跑一个浏览器批次
 uv run tbsgen calib-ingest --run runs/R --item ID [--job-dir DIR]   # 回填校准结果（默认取该次提交的作业目录；作业未结束则拒绝）
 uv run tbsgen harbor-local --run runs/R [--item ID]                  # 本机 Harbor oracle/nop（换本地基础镜像）
 uv run tbsgen reset  --run runs/R --item ID --stage S6B [--regen]    # 管线修复后让条目从某阶段重来（记入 history）
@@ -165,6 +168,8 @@ allow_submit = false
 | `fulltext.egress_check` | 关闭 | 开启后，出口 IP 不在 `allow_cidrs` 内则拒绝所有网络通道 |
 | `fulltext.use_env_proxy` | False | 下载不读 `HTTP(S)_PROXY` |
 | `fulltext.browser.*` | 关闭；并发 2；验证页等 40 秒 | ego-browser 通道；S3 只入队，`tbsgen fetch` 执行；同一出版商间隔 60–120 秒，不点击任何验证 |
+| `fulltext.browser.batch` / `.agent` | 窗口 600 s、余量 60 s；agent 关闭 | `tbsgen fetch --browser [--wait-for-egress]`：出口门控的限时批次；agent 为 Hermes CLI |
+| `fulltext.remote` | 关闭 | HTTP 通道（oa/elsevier/wiley/inst）经 ssh 在 `host` 上运行；远端须开启 egress_check |
 | `package.dockerfile_mode` | selfcontained | Dockerfile 里用 pip 安装固定版本；`local_base` 只用于本机检查 |
 
 ## 5. S9 校准规则

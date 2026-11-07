@@ -598,14 +598,14 @@ def test_browser_child_env_allowlist(monkeypatch):
     assert "PATH" in env and not ({"ELSEVIER_INSTTOKEN", "EXA_API_KEY_SECONDARY", "MY_CUSTOM_CREDENTIAL"} & set(env))
     seen = {}
 
-    def fake_run(cmd, **kw):
-        seen.update(kw)
+    class FakePopen:
+        def __init__(self, cmd, **kw):
+            seen.update(kw)
+            self.args, self.returncode = cmd, 0
 
-        class P:
-            stdout = 'TBSGEN_RESULT {"status": "ok"}'
-            stderr = ""
-        return P()
-    monkeypatch.setattr(browser_ego.subprocess, "run", fake_run)
+        def communicate(self, inp=None, timeout=None):
+            return 'TBSGEN_RESULT {"status": "ok"}', ""
+    monkeypatch.setattr(browser_ego.subprocess, "Popen", FakePopen)
     monkeypatch.setattr(browser_ego, "binary", lambda cfg: "/bin/true")
     assert browser_ego.finish({})["status"] == "ok"
     assert "ELSEVIER_INSTTOKEN" not in seen["env"]

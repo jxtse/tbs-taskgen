@@ -129,7 +129,59 @@ DEFAULTS: dict[str, Any] = {
             "challenge_cooldown_s": 86400,
             "nav_timeout_s": 45, "download_timeout_s": 120, "script_timeout_s": 420, "max_navigations": 5,
             "download_wait_s": 6,           # extra wait for a download after the navigation settled
+            "batch_only": False,            # true: the browser runs only in egress-gated batches (--browser)
+            # Batch mode (`tbsgen fetch --browser`): the reviewed script first, then (agent.enabled) one Hermes CLI
+            # agent run for the papers the script could not get.  See browser_agent.py.
+            "batch": {
+                "window_s": 600,            # egress window opened by the user (e.g. a VPN client paused for 10 min)
+                "margin_s": 60,             # stop this long before the window ends
+                "batch_max": 8,
+                "per_publisher_max": 2,
+                "require_http_first": True, # only papers the HTTP channels already tried (browser quota is small)
+                "est_script_s": 60,         # planning estimates per paper (script run, agent run)
+                "est_agent_s": 120,
+                "agent_fraction": 0.5,      # expected share of papers the script cannot get
+                "poll_s": 5,                # --wait-for-egress: egress probe interval (>= 5 s; not a download)
+                "max_wait_s": 1800,         # --wait-for-egress: give up (exit 0) after this
+                "recheck_s": 30,            # egress re-check interval during a batch
+                "probe_host_gap_s": 15,     # per echo host; rotate over several watch_urls for 5 s polling
+                "watch_urls": [],           # IP-echo pages for the probes (rotated); [] -> egress_check.urls
+                "refuse_hint": "",          # extra text printed when the browser egress is outside allow_cidrs
+            },
+            "agent": {
+                "enabled": False,
+                "hermes_bin": "hermes",
+                "provider": None,           # hermes --provider
+                "model": None,              # hermes -m
+                "skills": ["ego-browser"],
+                "toolsets": ["terminal"],
+                "max_turns": 80,
+                "run_budget_s": 420,        # hermes --run-budget (also capped by the egress window)
+                "space": "tbsgen-s3-agent", # the agent's own TaskSpace (closed by code afterwards)
+                "extra_domains": ["doi.org"],   # always allowed besides the queued papers' publisher domains
+                "gate_max_wait_s": 150,     # the per-paper gate waits at most this long for the publisher's slot
+                "prompt_template": None,    # None -> packaged browser_agent_prompt.md
+                "max_calls_per_paper": 8,   # ego-browser calls the agent may make per paper
+                "call_timeout_s": 150,      # one ego-browser call of the agent
+                "keep_batch_dir": False,    # keep prompt / wrapper state after the batch (debugging)
+            },
         },
+        # Remote mode: run the HTTP channels (oa / elsevier / wiley / inst) on another host over ssh, e.g. a
+        # machine on the institution's network.  The local ledger stays the only persistent ledger; see remote.py.
+        "remote": {
+            "enabled": False,
+            "host": None,                   # ssh destination (alias from ~/.ssh/config)
+            "python": None,                 # remote interpreter with tbsgen installed (absolute path)
+            "workdir": None,                # remote data dir (job dirs live in <workdir>/jobs)
+            "pdftotext": None,              # remote pdftotext binary (None -> "pdftotext" on PATH)
+            "ssh": ["ssh", "-o", "BatchMode=yes", "-o", "ServerAliveInterval=30", "-o", "ServerAliveCountMax=4"],
+            "max_job_s": 7200,              # a remote job starts no new paper after this (< ledger PENDING_TTL_S)
+            "batch_max": 50,
+            # Command printing a JSON object of secrets on stdout; it gets the wanted names (JSON list) on stdin.
+            # None -> read them from this process's environment.  Secrets go to the remote worker on ssh stdin.
+            "secrets_cmd": None,
+        },
+        "pdftotext": None,                  # pdftotext binary; None -> "pdftotext" on PATH
         # Caps / pacing (dlledger.DEFAULT_LIMITS etc.); dicts merge per channel / host.
         "limits": {},
         "global_limits": {},

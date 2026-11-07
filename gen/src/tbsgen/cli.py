@@ -14,7 +14,12 @@
                                                                  --regen also forces S6A/S6C to regenerate files
   tbsgen fetch   --run DIR [--max N] [--channels a,b] [--no-browser] [--dry-run] [--status] [--finish-browser]
                                                                  drain the S3 full-text queue (incl. the ego-browser
-                                                                 channel); fetched items go back to S3
+                                                                 channel; HTTP channels on fulltext.remote.host when
+                                                                 remote mode is on); fetched items go back to S3
+  tbsgen fetch   --run DIR --browser [--wait-for-egress] [--max-wait S]
+                                                                 one egress-gated, time-boxed browser batch (script,
+                                                                 then a Hermes CLI agent); --wait-for-egress polls the
+                                                                 browser egress and starts when it is allowed
 Real model calls need budget.daily_usd_total in the config (or --budget-usd on ping).
 """
 from __future__ import annotations
@@ -75,6 +80,9 @@ def main(argv=None):
             s.add_argument("--dry-run", action="store_true")
             s.add_argument("--status", action="store_true")
             s.add_argument("--finish-browser", action="store_true")
+            s.add_argument("--browser", action="store_true", help="run one egress-gated browser batch")
+            s.add_argument("--wait-for-egress", action="store_true")
+            s.add_argument("--max-wait", type=float, default=None)
         if name == "ping":
             s.add_argument("--calls", type=int, default=1)
             s.add_argument("--budget-usd", type=float, required=True)
@@ -161,6 +169,13 @@ def _fetch(P: Pipeline, a) -> int:
         return True                                        # delivered now, or already past S3 / not waiting
 
     readded = fulltext.reconcile(P.store, fulltext.queue_path(P.cfg)) if not a.dry_run else 0
+    if getattr(a, "browser", False):
+        from . import browser_agent
+        stats = browser_agent.run_batch(f, wait_for_egress=a.wait_for_egress, max_wait_s=a.max_wait,
+                                        on_success=reactivate, log=lambda s: print(s, file=sys.stderr, flush=True))
+        stats["requeued_from_items"] = readded
+        print(json.dumps(stats, indent=1, ensure_ascii=False, default=str))
+        return 2 if stats.get("refused") else 0
     stats = fulltext.drain_queue(f, max_papers=a.max, channels=[x for x in a.channels.split(",") if x] or None,
                                  browser=not a.no_browser, dry_run=a.dry_run, on_success=reactivate,
                                  log=lambda s: print(s, file=sys.stderr))

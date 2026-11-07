@@ -71,13 +71,16 @@ def title_match(title: str, text: str) -> float:
     return sum(w in head for w in words) / len(words)
 
 
+PDFTOTEXT = "pdftotext"          # set from `fulltext.pdftotext` (a binary outside PATH, e.g. a user-level install)
+
+
 def pdf_to_text(pdf: bytes) -> str:
     with tempfile.TemporaryDirectory() as td:
         p = Path(td) / "a.pdf"
         p.write_bytes(pdf)
         env = {k: v for k, v in os.environ.items() if k in ("PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR")}
         try:
-            r = subprocess.run(["pdftotext", "-layout", "-enc", "UTF-8", str(p), "-"], capture_output=True,
+            r = subprocess.run([PDFTOTEXT or "pdftotext", "-layout", "-enc", "UTF-8", str(p), "-"], capture_output=True,
                                timeout=180, env=env)
         except FileNotFoundError:
             raise RuntimeError("pdftotext not found (install poppler)") from None
@@ -370,6 +373,14 @@ class Fetcher:
         self._tl = threading.local()
         self._space_held = False            # set by drain_queue while it holds the TaskSpace lock
         self._space_fh = None
+        # remote mode: results of the HTTP channels collected from the remote host, by paper identity
+        self.remote_results: dict[str, dict] = {}
+        global PDFTOTEXT
+        if ft.get("pdftotext"):
+            PDFTOTEXT = ft["pdftotext"]
+
+    def remote_mode(self) -> bool:
+        return bool((self.ft.get("remote") or {}).get("enabled"))
 
     def space_lock_path(self) -> Path:
         space = re.sub(r"[^A-Za-z0-9_.-]", "_", str((self.ft.get("browser") or {}).get("space", "tbsgen-s3-fulltext")))
@@ -517,15 +528,27 @@ class Fetcher:
             return txt, "", tm
         return txt, "", None
 
-    def _save(self, c: dict, channel: str, url: str, body: bytes, txt: str, tm: float | None, kind: str) -> dict:
+    def _save(self, c: dict, channel: str, url: str, body: bytes, txt: str, tm: float | None, kind: str,
+              **extra) -> dict:
         key, ident, doi = paper_key(c), paper_ident(c), norm_doi(c.get("doi"))
         prov = dict(doi=doi, ident=ident, channel=channel, url=self._r(safe_url(url)), kind=kind, bytes=len(body),
                     sha256=hashlib.sha256(body).hexdigest(), text_chars=len(txt),
-                    title_match=None if tm is None else round(tm, 3), fetched_at=time.strftime("%Y-%m-%dT%H:%M:%S%z"))
+                    title_match=None if tm is None else round(tm, 3), fetched_at=time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                    **extra)
         if (w := self.write_dir()) and key:
             w.mkdir(parents=True, exist_ok=True)
             with _dir_lock(w):
                 return self._save_locked(w, key, ident, prov, body, txt, kind)
+        return prov
+
+    def save_imported(self, c: dict, prov: dict, txt: str, raw: bytes | None) -> dict:
+        """Write a text fetched elsewhere (remote mode) to the write cache, with the same collision-safe naming."""
+        key, ident = paper_key(c), paper_ident(c)
+        prov = dict(prov, ident=ident)
+        if (w := self.write_dir()) and key:
+            w.mkdir(parents=True, exist_ok=True)
+            with _dir_lock(w):
+                return self._save_locked(w, key, ident, prov, raw or b"", txt, prov.get("kind") or "bin")
         return prov
 
     def _save_locked(self, w: Path, key: str, ident: str, prov: dict, body: bytes, txt: str, kind: str) -> dict:
@@ -534,7 +557,7 @@ class Fetcher:
             other = json.loads((w / f"{key}.json").read_text())
             if isinstance(other, dict) and other.get("ident", "doi:" + norm_doi(other.get("doi"))) != ident:
                 stem = _alt_key(key, ident)          # another paper owns this file name
-        if self.ft.get("keep_raw", True):
+        if self.ft.get("keep_raw", True) and body:
             ext = {"pdf": "pdf", "jats": "xml", "elsevier_xml": "xml", "html": "html"}.get(kind, "bin")
             (w / "raw").mkdir(exist_ok=True)
             _atomic_write(w / "raw" / f"{stem}.{ext}", body)
@@ -807,6 +830,7 @@ class Fetcher:
         order = [ch for ch in (channels or self.ft.get("cascade") or CHANNELS) if ch in CHANNELS]
         if browser is None:
             browser = bool((self.ft.get("browser") or {}).get("inline"))
+        remote_used = False
         for ch in order:
             if ch == "cache":
                 if (hit := self.cached(c)):
@@ -817,6 +841,24 @@ class Fetcher:
                 continue
             if ch == "browser" and not browser:
                 rec["skipped"].append("browser: queued (run `tbsgen fetch`)")
+                continue
+            if ch != "browser" and self.remote_mode():
+                # remote mode: the HTTP channels run on the remote host (`tbsgen fetch`); use its result if any
+                r = self.remote_results.get(paper_ident(c))
+                if r is None:
+                    rec["skipped"].append(f"{ch}: remote (run `tbsgen fetch`)")
+                    continue
+                if remote_used:                 # one remote run covered all HTTP channels
+                    continue
+                remote_used = True
+                rr = r.get("rec") or {}
+                for k in ("tried", "errors", "skipped"):
+                    rec[k].extend(rr.get(k) or [])
+                rec["remote_job"] = rr.get("remote_job")
+                if r.get("ok") and r.get("text") is not None:
+                    rec.update(source=rr.get("source"), url=rr.get("url"), title_match=rr.get("title_match"),
+                               provenance=rr.get("provenance"))
+                    return Outcome(r["text"], rec)
                 continue
             if not self.ft.get("allow_network"):
                 rec["skipped"].append(f"{ch}: allow_network=false")
@@ -1033,10 +1075,22 @@ def _drain_locked(fetcher, qp, now, max_papers, channels, browser, dry_run, on_s
                          for e in todo]
         return stats
     bconf = fetcher.ft.get("browser") or {}
-    use_browser = browser and bool(bconf.get("enabled"))
+    # browser.batch_only: the browser runs only in egress-gated batches (`tbsgen fetch --browser`)
+    use_browser = browser and bool(bconf.get("enabled")) and not bconf.get("batch_only")
     backoff = float(fetcher.ft.get("queue_backoff_s", 6 * 3600))
     lock = threading.Lock()
     results: dict[str, tuple[bool, list]] = {}     # key -> (fetched, acknowledged subscribers)
+    deferred: set[str] = set()                     # not tried (remote job not collected yet): stays due
+    if fetcher.remote_mode():
+        # the HTTP channels of every due paper run as one job on the remote host; results feed the cascade
+        from . import remote
+        want = [ch for ch in (channels or fetcher.ft.get("cascade") or CHANNELS) if ch in remote.HTTP_CHANNELS]
+        rjob = remote.run_job(fetcher, [e for e in todo if not fetcher.cached(e)], want or None,
+                              log=lambda m: log(m)) if want else dict(results={}, jobs=[])
+        fetcher.remote_results.update(rjob.get("results") or {})
+        stats["remote"] = {k: v for k, v in rjob.items() if k != "results"}
+        for j in stats["remote"].get("jobs") or []:
+            j.pop("results", None)
 
     def one(e: dict, slot: int):
         k = _entry_key(e)
@@ -1067,6 +1121,9 @@ def _drain_locked(fetcher, qp, now, max_papers, channels, browser, dry_run, on_s
                 stats["failed"] += 1
                 stats["errors"].append(dict(key=k, errors=out.rec.get("errors", [])[-3:],
                                             skipped=out.rec.get("skipped", [])[-3:]))
+            if out.text is None and not out.rec.get("tried") and any(
+                    " remote (run `tbsgen fetch`)" in x for x in out.rec.get("skipped") or []):
+                deferred.add(k)
             log(json.dumps(dict(key=k, ok=out.text is not None, source=src, seconds=dt,
                                 errors=out.rec.get("errors", [])[-2:], skipped=out.rec.get("skipped", [])[-2:]),
                            ensure_ascii=False))
@@ -1097,7 +1154,7 @@ def _drain_locked(fetcher, qp, now, max_papers, channels, browser, dry_run, on_s
         keep = []
         for e in q:
             k = _entry_key(e)
-            if k in results:
+            if k in results and k not in deferred:
                 fetched, acked = results[k]
                 rest = [s for s in _subs(e) if s not in acked]
                 if fetched and not rest:

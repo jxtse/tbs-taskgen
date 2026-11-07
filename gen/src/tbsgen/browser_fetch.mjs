@@ -174,6 +174,19 @@ try {
   } else if (INPUT.mode === "finish") {
     await task.finish({ keep: [] });
     out.status = "ok";
+  } else if (INPUT.mode === "probe") {
+    // egress watcher: one IP-echo page on a reused Page of its own TaskSpace (no download, no ledger row)
+    const pages = await task.pages();
+    const page = pages.length ? pages[0] : await task.newPage();
+    out.bodies = {};
+    for (const u of INPUT.urls) {
+      try {
+        await page.goto(u, { timeout: INPUT.probe_timeout_ms || 8000 });
+        out.bodies[u] = (await page.evaluate(() => document.body ? document.body.innerText : "")).slice(0, 2000);
+      } catch (e) { out.bodies[u] = ""; }
+    }
+    try { await page.goto("about:blank", { timeout: 3000 }); } catch (e) {}
+    out.status = "ok";
   } else if (INPUT.mode === "egress") {
     const page = await task.newPage();               // own Page: never disturbs a download slot
     out.bodies = {};

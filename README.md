@@ -256,6 +256,57 @@ browser process gets only a short allowlist of environment variables. With
 network channels are refused unless it lies in `fulltext.egress_check.allow_cidrs`; the browser's egress is checked
 through the browser. Use this when subscription access depends on the IP range.
 
+#### Remote mode (HTTP channels on another host)
+
+When the machine running the pipeline is not on the institution's network but another host you can reach with
+`ssh` is, set `fulltext.remote` (`enabled`, `host`, `python`, `workdir`). `tbsgen fetch` then sends the due papers
+as one job to that host, which runs the same tbsgen code (`python -m tbsgen.remote`; both sides compare a hash of
+the package sources and the job is refused on a mismatch) through the `oa` / `elsevier` / `wiley` / `inst`
+channels, and copies the texts back into the local `write_cache_dir`. The local side makes no publisher request.
+
+- The remote host must have `egress_check` on with `allow_cidrs`; the job is refused otherwise.
+- Secrets (`ELSEVIER_API_KEY`, `WILEY_TDM_TOKEN`) are read locally (environment, or the command in
+  `fulltext.remote.secrets_cmd`, which gets the wanted names on stdin and prints a JSON object) and sent on the
+  ssh connection's stdin. The remote worker keeps them in memory; they are never in a command line, file or log.
+- One ledger: the local `ledger_path` stays the only authority. Before a job, the local ledger books one lease row
+  per paper (counts against the global daily cap, so the browser cannot use the same quota) and sends a snapshot of
+  today's usage, live cooldowns and pacing state; the remote job works on a copy seeded from it, so channel caps,
+  breakers and cooldowns include the local usage. Afterwards the remote job's new rows are merged into the local
+  ledger exactly once and the lease is dropped. One remote job runs at a time per queue.
+- Interruptions: the remote worker is detached, so an ssh drop does not stop it. The local job file
+  (`<queue>.remote/<job>.json`) records the stage; the next `tbsgen fetch` first collects unfinished jobs. Results
+  are written per paper, so a worker that dies keeps what it finished; the rest stays queued and due.
+- `fulltext.pdftotext` points at a `pdftotext` outside `PATH` (e.g. installed in a user directory).
+
+#### Browser batches
+
+`fulltext.browser.batch_only = true` keeps the browser out of normal `tbsgen fetch` runs; it then only runs in
+`tbsgen fetch --browser`, one batch sized to an egress window that is open for a limited time (`browser.batch`):
+
+```bash
+uv run tbsgen fetch --run runs/R --config config.toml --browser --wait-for-egress   # then open the egress
+```
+
+- The browser's egress is read from an IP-echo page (`batch.watch_urls`, e.g. a publisher's `/cdn-cgi/trace`)
+  opened in the browser itself, every `poll_s` (>= 5) seconds, each echo host at most every `probe_host_gap_s`.
+  Probes are not downloads. Without `--wait-for-egress` one probe decides and an outside egress refuses the batch
+  (exit 2); with it the command waits up to `max_wait_s` and exits 0 if the egress never becomes allowed.
+- The window starts at the first allowed probe and ends `window_s - margin_s` later. The batch takes at most
+  `window / (est_script_s + agent_fraction * est_agent_s)` papers (and `batch_max`, `per_publisher_max`, the
+  ledger's remaining browser quota), publishers interleaved. During the batch the egress is checked every
+  `recheck_s` and after every download; when it leaves `allow_cidrs` the batch stops, files obtained since the
+  last good probe are discarded and the remaining papers stay queued.
+- Each paper is first tried with the reviewed script. With `browser.agent.enabled`, the papers the script could
+  not get go to one Hermes CLI run (`hermes chat --oneshot`, `agent.provider` / `model` / `skills` /
+  `max_turns` / `run_budget_s`) with a prompt generated from
+  [`browser_agent_prompt.md`](gen/src/tbsgen/browser_agent_prompt.md). The agent reaches the browser only
+  through a per-batch `ego-browser` wrapper that books the paper in the ledger before its first call, refuses
+  scripts that use other TaskSpaces, user tabs, keyboard / mouse input, cookies or storage, and prepends
+  [`browser_agent_guard.mjs`](gen/src/tbsgen/browser_agent_guard.mjs) (publisher domains only, no typing, no
+  interaction with verification pages, files only in the paper's directory). Shell commands other than
+  `ego-browser` end the run. Saved files are validated and booked by code; the agent's own report is not used.
+  Model usage per run is appended to `<queue>.browser/usage.jsonl`.
+
 Terms: use only content your own subscriptions and API licences allow. The Elsevier and Wiley TDM licences are
 for non-commercial text mining by subscribers; do not redistribute full texts. This pipeline only uses the text
 to ground generated tasks and does not copy it into task files. No channel bypasses access control.
