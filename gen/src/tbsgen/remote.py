@@ -396,6 +396,7 @@ def import_export(fetcher, job: str, blob: bytes) -> dict:
             saved = fetcher.save_imported(r["entry"], prov, text, raw)
             prov = dict(prov, path=saved.get("path"))
             rec = dict(rec, provenance=prov, remote_job=job)
+        rec = dict(rec, remote_seconds=r.get("seconds"))
         results[r["ident"]] = dict(ok=text is not None, text=text, rec=rec)
     rows = json.loads(files.get("ledger.json", b"{}"))
     merged = merge_rows(fetcher.ledger, job, rows)
