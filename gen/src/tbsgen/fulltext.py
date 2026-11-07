@@ -656,7 +656,8 @@ class Fetcher:
                 for h in {host, urllib.parse.urlsplit(r.url).hostname or ""} - {""}:
                     self.ledger.block(h, self._r(f"{why} on {channel}"), seconds=cool, channel=channel)
             if txt is not None:
-                prov = self._save(self._cur, channel, r.url, r.body, txt, tm, kind)
+                # the reservation id travels with the text: a crash before record() can still be booked as ok
+                prov = self._save(self._cur, channel, r.url, r.body, txt, tm, kind, reservation=rid)
                 rec.update(source=channel, url=prov["url"], title_match=prov["title_match"], provenance=prov)
             else:
                 rec["errors"].append(self._r(f"{channel}: {why}"))

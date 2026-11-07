@@ -159,7 +159,6 @@ DEFAULTS: dict[str, Any] = {
                 "max_violations": 3,        # blocked commands before the run is ended
                 "max_turns": 80,
                 "run_budget_s": 420,        # hermes --run-budget (also capped by the egress window)
-                "space": None,              # agent TaskSpace; None -> "<browser.space>-agent" (closed afterwards)
                 "extra_domains": ["doi.org"],   # always allowed besides the queued papers' publisher domains
                 "gate_max_wait_s": 150,     # the per-paper gate waits at most this long for the publisher's slot
                 "prompt_template": None,    # None -> packaged browser_agent_prompt.md

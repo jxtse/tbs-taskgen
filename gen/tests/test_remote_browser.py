@@ -604,6 +604,9 @@ if inp.get("action") == "open":
         f = os.path.join(inp["files_dir"], "dl.bin")
         open(f, "wb").write(b"%PDF-1.7 fake" if mode == "pdf" else b"<html>login</html>")
         out["files"] = [f]
+        if mode == "rejected":                   # a refused PDF whose deletion did not happen
+            open(f, "wb").write(b"%PDF-1.7 fake")
+            out = {"status": "refused", "files": [], "rejected": [f]}
 print("TBSGEN_RESULT " + json.dumps(out))
 """
 
@@ -969,3 +972,35 @@ def test_no_script_starts_after_stop_or_too_close_to_deadline(tmp_path):
     pr = browser_agent.Prober(f.ft, probe_fn=Seq(TRACE_OK), clock=clock, sleep=clock.sleep)
     st = browser_agent.run_batch(f, prober=pr, clock=clock, sleep=clock.sleep, log=lambda m: None)
     assert len(calls) == 1 and st["deferred"] >= 1               # the 2nd paper's slot is past the deadline
+
+
+def test_rejected_or_unreported_files_are_never_validated(tmp_path, monkeypatch):
+    f, led, pr, calls = mk_agent(tmp_path, monkeypatch, ego_mode="rejected")
+    st = browser_agent.run_batch(f, prober=pr, sleep=lambda s: None, log=lambda m: None)
+    assert st["ok"] == 0 and not list(Path(f.ft["write_cache_dir"]).glob("*.txt"))
+
+
+def test_recovery_by_reservation_is_idempotent_and_doi_less(tmp_path):
+    """Recovery books by reservation id (no DOI needed); a second export after an interrupted one still books."""
+    d = tmp_path / "jobs" / "j"
+    (d / "results").mkdir(parents=True)
+    (d / "cache").mkdir()
+    led = DownloadLedger(d / "ledger.sqlite", limits={"oa": {"gap_s": 0.0, "jitter_s": 0.0}})
+    rid = led.acquire("oa", "repo.example", "title:abc")
+    e = dict(title=TITLE, oa_url="https://repo.example/a.pdf")              # no DOI
+    ident = fulltext.paper_ident(e)
+    (d / "cache" / "k.json").write_text(json.dumps(dict(ident=ident, channel="oa", reservation=rid)))
+    (d / "cache" / "k.txt").write_text(TITLE + " " + BODY)
+    (d / "spec.json").write_text(json.dumps(dict(entries=[e], marks={})))
+    (d / "status.json").write_text(json.dumps(dict(state="running", ts=0)))
+    # first export: recovery result written, then "crash" before booking -> simulate by writing result only
+    remote._recover_results(d, json.loads((d / "spec.json").read_text()))
+    assert (d / "results" / "0000.json").exists()
+    buf = io.BytesIO()
+    remote.cmd_export(str(tmp_path), "j", buf)                               # second export still books it
+    db = sqlite3.connect(d / "ledger.sqlite")
+    assert db.execute("select status from attempts where rowid=?", (rid,)).fetchone()[0] == "ok"
+
+
+def test_agent_space_cannot_be_overridden():
+    assert browser_agent.agent_space({"space": "a", "agent": {"space": "shared"}}) == "a-agent"

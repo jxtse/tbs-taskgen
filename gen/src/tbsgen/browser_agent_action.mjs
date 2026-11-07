@@ -211,7 +211,12 @@ try {
         const f = fileName();
         const r = await page.fetch(i.url, { saveAs: f, timeout: INPUT.download_timeout_ms });
         out.http = r.status;
-        if (r.url && !hostOk(r.url)) { (await import("node:fs/promises")).unlink(f).catch(() => {}); out.status = "refused"; out.error = "PDF redirected outside the allowed domains"; console.log("TBSGEN_RESULT " + JSON.stringify(out)); process.exit(0); }
+        if (r.url && !hostOk(r.url)) {
+          await (await import("node:fs/promises")).unlink(f).catch(() => {});
+          out.rejected = [f];                       // the wrapper deletes it too and never validates it
+          out.status = "refused"; out.error = "PDF redirected outside the allowed domains";
+          console.log("TBSGEN_RESULT " + JSON.stringify(out)); process.exit(0);
+        }
         if (r.status === 429 || await savedIsChallenge(f)) { out.blocked = r.status === 429 ? "HTTP 429" : "bot-wall page"; out.http429 = r.status === 429; }
         else if (r.ok) out.files.push(f);
         out.status = "ok";

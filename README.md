@@ -306,7 +306,10 @@ uv run tbsgen fetch --run runs/R --config config.toml --browser --wait-for-egres
   `finish`), each call running the reviewed action script
   [`browser_agent_action.mjs`](gen/src/tbsgen/browser_agent_action.mjs): the paper is booked in the ledger before
   its first call; only the paper's publisher domains are opened or clicked; nothing is typed; verification pages,
-  verification widgets and login forms are never interacted with; a bot wall cools the publisher at once. The run
+  verification widgets and login forms are never interacted with; a bot wall cools the publisher at once.
+  Known limit: URLs, links and form targets are checked before the request, but a cross-domain navigation that
+  the page itself starts (script or HTTP redirect) cannot be intercepted with the browser SDK; such a page is
+  reset to about:blank as soon as it lands and reported, and nothing from it is saved. The run
   uses an isolated Hermes home (no user memory, rules, plugins or credentials) whose `pre_tool_call` hook blocks
   every other command before it runs; repeated attempts end the run. Saved files are validated and booked by
   code; the agent's own report is not used. Papers cut by an egress change or the window's end stay queued

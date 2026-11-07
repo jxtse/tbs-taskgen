@@ -599,20 +599,23 @@ def cmd_status(workdir: str, job: str, stdout, stdin=None) -> int:
     return 0
 
 
-def _recover_results(d: Path, spec: dict) -> list[tuple[str, str, str]]:
+def _recover_results(d: Path, spec: dict) -> list[int]:
     """A worker that died between saving a text and writing its result file: rebuild that result from the cache
-    file's provenance (same identity), so a success is never lost.  Returns [(ident, doi, channel)] recovered."""
-    from .fulltext import norm_doi, paper_ident
+    file's provenance (same identity).  Returns the ledger reservation ids of ALL successes present in the cache
+    (recovered now or earlier), for an idempotent re-booking."""
+    from .fulltext import paper_ident
     cache = d / "cache"
-    done: list[tuple[str, str, str]] = []
+    rids: list[int] = []
     if not cache.exists():
-        return done
+        return rids
     provs = {}
     for pj in cache.glob("*.json"):
         with contextlib.suppress(OSError, ValueError):
             pv = json.loads(pj.read_text())
             if isinstance(pv, dict) and pv.get("ident") and (cache / (pj.stem + ".txt")).exists():
                 provs[pv["ident"]] = (pj, pv)
+                if isinstance(pv.get("reservation"), int):
+                    rids.append(pv["reservation"])
     for i, e in enumerate(spec.get("entries") or []):
         rp = d / "results" / f"{i:04d}.json"
         ident = paper_ident(e)
@@ -624,8 +627,7 @@ def _recover_results(d: Path, spec: dict) -> list[tuple[str, str, str]]:
                    url=pv.get("url"), title_match=pv.get("title_match"), provenance=dict(pv), recovered=True)
         _atomic(rp, json.dumps(dict(ident=ident, entry=e, ok=True, rec=rec, text_file=pj.stem + ".txt",
                                     raw_file=raws[0].name if raws else None, seconds=None), ensure_ascii=False))
-        done.append((ident, norm_doi(e.get("doi")), str(pv.get("channel") or "")))
-    return done
+    return rids
 
 
 def cmd_export(workdir: str, job: str, stdout) -> int:
@@ -635,15 +637,14 @@ def cmd_export(workdir: str, job: str, stdout) -> int:
     with contextlib.suppress(OSError, ValueError):
         st = json.loads((d / "status.json").read_text())
     if st.get("state") != "done":
-        for ident, doi, channel in _recover_results(d, spec):
-            # the text was saved but the worker died before booking it: book the pending reservation as the
-            # success it was (else the merge would turn it into a cancelled failure and free its quota)
+        rids = _recover_results(d, spec)
+        if rids:
+            # every text in the cache is a success: book its reservation (by id) as ok if the worker died before
+            # record(); idempotent, so an export interrupted after recovery is completed by the next one
             db = sqlite3.connect(d / "ledger.sqlite", isolation_level=None)
             db.execute("begin immediate")
-            row = db.execute("select rowid from attempts where doi=? and channel=? and status='pending' "
-                             "order by rowid desc limit 1", (doi, channel)).fetchone()
-            if row:
-                db.execute("update attempts set status='ok', note='recovered after worker crash' where rowid=?", row)
+            db.executemany("update attempts set status='ok', note='recovered after worker crash' "
+                           "where rowid=? and status='pending'", [(x,) for x in rids])
             db.execute("commit")
             db.close()
     marks = spec.get("marks") or {}

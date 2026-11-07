@@ -366,6 +366,14 @@ def wrapper_main(batch_dir: str, argv: list[str]) -> int:
         _atomic(sp, json.dumps(ps))
         _cool_publisher(led, ps, p["doi"], str(res["blocked"]), secs)
         return say(f"tbsgen: paper {n}: {res['blocked']} - publisher cooled down; report `challenge` and move on.", 2)
+    for rj in res.get("rejected") or []:              # never validated, whatever the script managed to delete
+        with contextlib.suppress(OSError):
+            Path(rj).unlink()
+    acc = [x for x in res.get("files") or [] if Path(x).resolve().parent == files]
+    if acc:
+        ps = json.loads(sp.read_text())
+        ps["accepted"] = sorted(set(ps.get("accepted") or []) | set(acc))
+        _atomic(sp, json.dumps(ps))
     if action == "look" and res.get("look_url"):
         ps = json.loads(sp.read_text())
         ps["look_url"] = res["look_url"]
@@ -502,8 +510,9 @@ def _release_space_lock(fetcher):
 
 
 def agent_space(b: dict) -> str:
-    """The agent's TaskSpace: derived from the (locked) script TaskSpace unless configured."""
-    return str((b.get("agent") or {}).get("space") or f"{b.get('space', 'tbsgen-s3-fulltext')}-agent")
+    """The agent's TaskSpace, always derived from the (locked) script TaskSpace: two batches can only share it if
+    they share the script space, and then the TaskSpace lock serializes them."""
+    return f"{b.get('space', 'tbsgen-s3-fulltext')}-agent"
 
 
 def _due(fetcher, bb: dict) -> list[dict]:
@@ -968,7 +977,8 @@ def _agent_phase(fetcher, todo: list[dict], deadline: float, bd: Path, wd: Watch
         if lost:
             why = "egress left allow_cidrs during the agent run; files discarded"
         else:
-            for f in sorted((bd / "files" / k).glob("*")) if (bd / "files" / k).exists() else []:
+            # only files the action script reported as saved (and the wrapper accepted) are considered
+            for f in [Path(x) for x in ps.get("accepted") or []]:
                 if not f.is_file():
                     continue
                 size = f.stat().st_size
