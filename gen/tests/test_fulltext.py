@@ -14,7 +14,8 @@ from tbsgen.fulltext import Fetcher, Resp
 
 @pytest.fixture(autouse=True)
 def _no_real_credentials(monkeypatch):
-    """Tests must not see credentials of the machine they run on."""
+    """Tests must not see credentials of the machine they run on, nor depend on a local pdftotext."""
+    monkeypatch.setattr(fulltext, "pdf_to_text", lambda b: TITLE + "\n" + BODY)
     for k in ("ELSEVIER_API_KEY", "ELSEVIER_INSTTOKEN", "WILEY_TDM_TOKEN", "HTTP_PROXY", "HTTPS_PROXY", "http_proxy",
               "https_proxy", "ALL_PROXY", "all_proxy"):
         monkeypatch.delenv(k, raising=False)
@@ -986,6 +987,8 @@ def test_browser_temp_file_removed_on_failure(tmp_path):
 
 
 def test_pdftotext_gets_no_credentials(monkeypatch):
+    import importlib
+    real = importlib.reload(fulltext).pdf_to_text
     seen = {}
 
     def fake_run(cmd, **kw):
@@ -996,7 +999,7 @@ def test_pdftotext_gets_no_credentials(monkeypatch):
         return P()
     monkeypatch.setenv("ELSEVIER_API_KEY", "should-not-leak")
     monkeypatch.setattr(fulltext.subprocess, "run", fake_run)
-    fulltext.pdf_to_text(b"%PDF-1.4")
+    real(b"%PDF-1.4")
     assert "ELSEVIER_API_KEY" not in seen["env"] and "PATH" in seen["env"]
 
 

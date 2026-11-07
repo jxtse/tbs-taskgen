@@ -76,8 +76,11 @@ def pdf_to_text(pdf: bytes) -> str:
         p = Path(td) / "a.pdf"
         p.write_bytes(pdf)
         env = {k: v for k, v in os.environ.items() if k in ("PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR")}
-        r = subprocess.run(["pdftotext", "-layout", "-enc", "UTF-8", str(p), "-"], capture_output=True, timeout=180,
-                           env=env)
+        try:
+            r = subprocess.run(["pdftotext", "-layout", "-enc", "UTF-8", str(p), "-"], capture_output=True,
+                               timeout=180, env=env)
+        except FileNotFoundError:
+            raise RuntimeError("pdftotext not found (install poppler)") from None
         return r.stdout.decode("utf-8", "replace")
 
 
@@ -489,7 +492,10 @@ class Fetcher:
         if kind == "pdf":
             if body[:5] != b"%PDF-":
                 return None, "not a PDF" + (" (bot-wall page)" if challenge_page(body) else ""), None
-            txt = pdf_to_text(body)
+            try:
+                txt = pdf_to_text(body)
+            except RuntimeError as e:
+                return None, str(e), None
         elif kind == "jats":
             txt = jats_text(body.decode("utf-8", "replace"))
         elif kind == "elsevier_xml":
