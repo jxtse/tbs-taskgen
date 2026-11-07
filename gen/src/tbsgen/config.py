@@ -89,13 +89,108 @@ DEFAULTS: dict[str, Any] = {
         },
     },
     "fulltext": {
-        "mode": "oa_and_cache",             # local full-text cache (read-only) then OA PDF link; else browser queue
-        "cache_dirs": [str(OLD_PIPE / "literature" / "txt")] if OLD_PIPE else [],
+        # Cascade (first success wins).  Every network channel has its own switch; only cache + oa are on by
+        # default.  See fulltext.py and README (S3).
+        "cascade": ["cache", "oa", "elsevier", "wiley", "inst", "browser"],
+        "cache_dirs": [str(OLD_PIPE / "literature" / "txt")] if OLD_PIPE else [],   # read-only caches
+        "write_cache_dir": None,            # downloaded texts + provenance json; None -> <run.root>/fulltext_cache
+        "keep_raw": True,                   # also keep the raw PDF/XML under <write_cache_dir>/raw/
+        "ledger_path": None,                # download ledger (sqlite); None -> <run.root>/fulltext_ledger.sqlite
+        "queue_path": None,                 # browser queue (jsonl); None -> <run.root>/fulltext_queue.jsonl
+        "queue_backoff_s": 21600,           # a failed queue entry waits this long (doubling, max 8x) before retry
         "min_chars": 8000,
         "title_match_min": 0.6,
         "max_pdf_mb": 40,
         "timeout": 90,
-        "allow_network": True,
+        "allow_network": True,              # False: cache only (every network channel off)
+        "use_env_proxy": False,             # False: urllib ignores HTTP(S)_PROXY (ProxyHandler({}))
+        "mailto": None,                     # contact address put in the User-Agent
+        # Refuse network downloads unless the public egress IP is inside allow_cidrs (e.g. the institution's
+        # ranges, so subscription access and IP-based TDM entitlements apply).  Checked once per ttl_s, for
+        # urllib and (separately, through the browser) for the browser channel.  When a proxy routes per domain,
+        # list a publisher-domain URL that echoes the client IP (e.g. a Cloudflare-fronted publisher's
+        # "/cdn-cgi/trace") first, so the check sees the route the downloads take.
+        "egress_check": {"enabled": False, "allow_cidrs": [], "ttl_s": 600, "timeout": 15,
+                         "urls": ["https://api.ipify.org", "https://checkip.amazonaws.com"]},
+        "oa": {"enabled": True, "europepmc": True, "unpaywall_email": None, "max_urls": 3, "skip_hosts": []},
+        "elsevier": {"enabled": False, "prefixes": ["10.1016/"], "key_env": "ELSEVIER_API_KEY",
+                     "insttoken_env": "ELSEVIER_INSTTOKEN"},
+        "wiley": {"enabled": False, "prefixes": ["10.1002/", "10.1111/"], "token_env": "WILEY_TDM_TOKEN"},
+        # Publisher PDF URLs the institution's IP range is entitled to, e.g.
+        # {prefix = "10.1007/", url = "https://link.springer.com/content/pdf/{doi}.pdf"}.  Empty by default.
+        "inst": {"enabled": False, "routes": []},
+        "browser": {
+            "enabled": False,               # needs a local ego-browser (Ego Lite) with a logged-in profile
+            "inline": False,                # False: S3 only queues; `tbsgen fetch` drains the queue
+            "binary": "ego-browser",
+            "space": "tbsgen-s3-fulltext",  # one fixed TaskSpace, reused
+            "concurrency": 2,               # parallel publishers (one Page each); never 2 of one publisher
+            "challenge_wait_s": 40,         # a challenge page must clear by itself within this, else cooldown
+            "challenge_cooldown_s": 86400,
+            "nav_timeout_s": 45, "download_timeout_s": 120, "script_timeout_s": 420, "max_navigations": 5,
+            "download_wait_s": 6,           # extra wait for a download after the navigation settled
+            "batch_only": False,            # true: the browser runs only in egress-gated batches (--browser)
+            # Batch mode (`tbsgen fetch --browser`): the reviewed script first, then (agent.enabled) one Hermes CLI
+            # agent run for the papers the script could not get.  See browser_agent.py.
+            "batch": {
+                "window_s": 600,            # egress window opened by the user (e.g. a VPN client paused for 10 min)
+                "margin_s": 60,             # stop this long before the window ends
+                "batch_max": 8,
+                "per_publisher_max": 2,
+                "require_http_first": True, # only papers the HTTP channels already tried (browser quota is small)
+                "est_script_s": 60,         # planning estimates per paper (script run, agent run)
+                "min_script_s": 20,         # no script is started with less time than this left in the window
+                "est_agent_s": 120,
+                "agent_fraction": 0.5,      # expected share of papers the script cannot get
+                "poll_s": 5,                # --wait-for-egress: egress probe interval (>= 5 s; not a download)
+                "max_wait_s": 1800,         # --wait-for-egress: give up (exit 0) after this
+                "recheck_s": 30,            # egress re-check interval during a batch
+                "probe_host_gap_s": 15,     # per echo host; rotate over several watch_urls for 5 s polling
+                "watch_urls": [],           # IP-echo pages for the probes (rotated); [] -> egress_check.urls
+                "refuse_hint": "",          # extra text printed when the browser egress is outside allow_cidrs
+            },
+            "agent": {
+                "enabled": False,
+                "hermes_bin": "hermes",
+                "provider": None,           # hermes --provider
+                "model": None,              # hermes -m
+                "provider_config": None,    # provider entry for the agent's isolated Hermes home (no api_key)
+                "skills": [],               # skills linked into the agent's isolated Hermes home
+                "max_violations": 3,        # blocked commands before the run is ended
+                "max_turns": 80,
+                "run_budget_s": 420,        # hermes --run-budget (also capped by the egress window)
+                "extra_domains": ["doi.org"],   # always allowed besides the queued papers' publisher domains
+                "gate_max_wait_s": 150,     # the per-paper gate waits at most this long for the publisher's slot
+                "prompt_template": None,    # None -> packaged browser_agent_prompt.md
+                "max_calls_per_paper": 8,   # ego-browser calls the agent may make per paper
+                "call_timeout_s": 150,      # one ego-browser call of the agent
+                "keep_batch_dir": False,    # keep prompt / wrapper state after the batch (debugging)
+            },
+        },
+        # Remote mode: run the HTTP channels (oa / elsevier / wiley / inst) on another host over ssh, e.g. a
+        # machine on the institution's network.  The local ledger stays the only persistent ledger; see remote.py.
+        "remote": {
+            "enabled": False,
+            "host": None,                   # ssh destination (alias from ~/.ssh/config)
+            "python": None,                 # remote interpreter with tbsgen installed (absolute path)
+            "workdir": None,                # remote data dir (job dirs live in <workdir>/jobs)
+            "pdftotext": None,              # remote pdftotext binary (None -> "pdftotext" on PATH)
+            "ca_file": None,                # remote CA bundle (None -> Python default, else a system bundle)
+            "ssh": ["ssh", "-o", "BatchMode=yes", "-o", "ServerAliveInterval=30", "-o", "ServerAliveCountMax=4"],
+            # a remote job starts no new paper after this; it also bounds how stale the job's copy of the ledger
+            # state (cooldowns set meanwhile by the local browser) can get
+            "max_job_s": 1800,
+            "batch_max": 50,
+            # Command printing a JSON object of secrets on stdout; it gets the wanted names (JSON list) on stdin.
+            # None -> read them from this process's environment.  Secrets go to the remote worker on ssh stdin.
+            "secrets_cmd": None,
+        },
+        "pdftotext": None,                  # pdftotext binary; None -> "pdftotext" on PATH
+        "ca_file": None,                    # CA bundle for HTTPS; None -> Python default, else a system bundle
+        # Caps / pacing (dlledger.DEFAULT_LIMITS etc.); dicts merge per channel / host.
+        "limits": {},
+        "global_limits": {},
+        "host_caps": {},
     },
     "probe": {
         "tbs_tasks_root": str(OLD_PIPE / "tasks_text") if OLD_PIPE else None,   # None -> no TBS dedup

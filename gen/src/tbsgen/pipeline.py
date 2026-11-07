@@ -53,6 +53,17 @@ class Pipeline:
         self._clients[role] = c
         return c
 
+    def fulltext_fetcher(self):
+        """The S3 Fetcher (one per pipeline: one ledger connection, one egress check).  A test-injected
+        `fetcher` (callable url -> bytes, or a fulltext.Fetcher) takes precedence."""
+        from .fulltext import Fetcher
+        if isinstance(self.fetcher, Fetcher):
+            return self.fetcher
+        if self.fetcher is not None:
+            return self.fetcher
+        self.fetcher = Fetcher(self.cfg)
+        return self.fetcher
+
     def jev_client(self) -> screen_jev.JevClient:
         if self._jev is None:
             self._jev = screen_jev.JevClient(self.ledger, self.cfg, transport=self.jev_transport)

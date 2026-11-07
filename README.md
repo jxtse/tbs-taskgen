@@ -131,9 +131,13 @@ uv run --directory gen tbsgen run    --run runs/R --config ../my.toml
 uv run --directory gen tbsgen status --run runs/R
 ```
 
-On a fresh machine both items stop at S3 as `parked: fulltext_unavailable` (listed in
-`S3_queue.json`): the pipeline needs the paper's full text, from a local cache
-(`fulltext.cache_dirs`) or an open-access PDF link. With full text, a teacher endpoint and a
+On a fresh machine both items may stop at S3 as `parked: fulltext_unavailable` (listed in
+`S3_queue.json` and in the run's full-text queue): the pipeline needs the paper's full text. S3 tries a
+configurable cascade (see [Full text (S3)](#full-text-s3)); by default only a local cache and open-access copies
+are used. `tbsgen fetch --run runs/R` retries the queue later (failed entries back off, doubling from
+`fulltext.queue_backoff_s`), hands the text to every waiting item (also items of other runs sharing the queue) and
+moves them on to S4; an entry leaves the queue only after that. Only one `tbsgen fetch` drains a queue at a time, and only one
+process at a time uses a browser TaskSpace (a second one skips the browser channel). With full text, a teacher endpoint and a
 budget in `my.toml` (see below), `tbsgen run` continues into the model stages. The other commands
 (`resume`, `reset`, `breaker`, `calib-ingest`, `harbor-local`, `ping`) are documented in
 [`gen/README.md`](gen/README.md) §3.
@@ -201,6 +205,138 @@ Jev is billed on input tokens only ($0.042 per million at the time of writing; a
 $0.001, per paper). Calls are recorded in the budget ledger like any other model call, so `budget.daily_usd_total`
 must be set.
 
+### Full text (S3)
+
+S3 tries these channels in the order given by `fulltext.cascade`; the first one that returns a usable text wins.
+Every network channel has its own switch, and only `cache` and `oa` are on by default.
+
+| Channel | Source | Needs | Default |
+|---|---|---|---|
+| `cache` | `<doi_key>.txt` in `fulltext.cache_dirs` (read-only) or in `fulltext.write_cache_dir` | nothing | on |
+| `oa` | Europe PMC full-text XML (open-access PMC articles), then the PDF links in the retrieval record, then Unpaywall OA locations if `fulltext.oa.unpaywall_email` is set | nothing | on |
+| `elsevier` | Elsevier Article Retrieval API (full-text XML), DOI prefixes `fulltext.elsevier.prefixes` (`10.1016/`) | API key in `ELSEVIER_API_KEY` (optional `ELSEVIER_INSTTOKEN`) and an institutional entitlement | off |
+| `wiley` | Wiley TDM API (PDF), prefixes `10.1002/`, `10.1111/` | token in `WILEY_TDM_TOKEN`, accepted Wiley TDM licence | off |
+| `inst` | Publisher PDF URLs your institution's IP range is entitled to, configured as `fulltext.inst.routes` (`{prefix, url}`); empty by default | network on the institution's IP range | off |
+| `browser` | A local [ego-browser](https://ego.app) (Ego Lite) session with your signed-in profile, driven by the reviewed script [`browser_fetch.mjs`](gen/src/tbsgen/browser_fetch.mjs) | `ego-browser` on `PATH` | off; when on, S3 only queues and `tbsgen fetch` runs it |
+
+Checks: a download is accepted only if it is a PDF (or full-text XML / an HTML article page with section
+headings), its text has at least `min_chars` characters, and at least `title_match_min` of the title words appear
+in its first 6,000 characters. HTML wrapper pages, abstract-only API answers and bot-wall pages are rejected.
+Accepted texts go to `fulltext.write_cache_dir` (default `<run>/fulltext_cache/`) as `<doi_key>.txt` with a
+`<doi_key>.json` provenance record (channel, URL without query string, time, bytes, SHA-256, title match).
+Read-only caches are never written.
+
+Limits: every download is booked in a SQLite ledger (`fulltext.ledger_path`, default
+`<run>/fulltext_ledger.sqlite`) before it is sent. Per channel: successes and attempts per day, successes per hour,
+a minimum gap with random jitter between two requests to the same host, and per-host daily and hourly attempt caps;
+plus a global daily success cap. Defaults are in
+[`gen/src/tbsgen/dlledger.py`](gen/src/tbsgen/dlledger.py) (`DEFAULT_LIMITS`, `DEFAULT_GLOBAL`, `DEFAULT_HOST_CAPS`)
+and are small fractions of the providers' published limits. The browser and `inst` channels, which use
+subscription access on the institution's IP range, have much lower caps than the TDM APIs (40 papers a day each;
+the browser waits 60–120 s between two papers of one publisher and runs different publishers in parallel,
+`browser.concurrency`, default 2). HTTP 429 cools the host for 6 hours; a challenge page (Cloudflare, captcha,
+Akamai "Access Denied") cools it for 24 hours and is never clicked through; a plain paywall 403 is not a block.
+By default a channel's breaker opens for the day after 3 block signals or 8 failures in a row; the `oa` channel,
+whose links point at many unrelated hosts, opens only after 10 block signals and never on failures alone (both
+configurable per channel: `breaker_blocks_per_day`, `breaker_consecutive_fail`). A cooldown also stops requests that
+were already waiting for their slot, and a longer cooldown is never shortened by a later, shorter one. All DOI
+prefixes of one publisher share the browser's pacing, caps and cooldowns, and a block on one of the publisher's web
+hosts stops both the HTTP channels and the browser for it. The TDM API hosts are kept separate: an API throttle
+does not stop the browser, and a website block does not stop the API. Redirect hops to other hosts are paced and
+counted against those hosts. Metadata lookups (Europe PMC search,
+Unpaywall) are paced at 1 request per second per host and never count as downloads. The ledger uses the
+tables `attempts`, `cooldown` and `hosts`, so another tool with the same schema can share the file and the usage
+of both adds up. `tbsgen fetch --status` prints today's usage.
+
+Network: HTTP requests ignore `HTTP(S)_PROXY` unless `fulltext.use_env_proxy = true`. Redirects are followed hop by
+hop (at most 5, never from HTTPS to HTTP, not into a host in cooldown), and API credentials are sent only to the
+original host. Logged errors, ledger notes and provenance records drop URL query strings and mask credentials. The
+browser process gets only a short allowlist of environment variables. With
+`fulltext.egress_check.enabled`, the public IP is looked up before the first download (and every `ttl_s`) and all
+network channels are refused unless it lies in `fulltext.egress_check.allow_cidrs`; the browser's egress is checked
+through the browser. Use this when subscription access depends on the IP range.
+
+#### Remote mode (HTTP channels on another host)
+
+When the machine running the pipeline is not on the institution's network but another host you can reach with
+`ssh` is, set `fulltext.remote` (`enabled`, `host`, `python`, `workdir`). `tbsgen fetch` then sends the due papers
+as one job to that host, which runs the same tbsgen code (`python -m tbsgen.remote`; both sides compare a hash of
+the package sources and the job is refused on a mismatch) through the `oa` / `elsevier` / `wiley` / `inst`
+channels, and copies the texts back into the local `write_cache_dir`. The local side makes no publisher request.
+
+- The remote host must have `egress_check` on with `allow_cidrs`; the job is refused otherwise.
+- Secrets (`ELSEVIER_API_KEY`, `WILEY_TDM_TOKEN`) are read locally (environment, or the command in
+  `fulltext.remote.secrets_cmd`, which gets the wanted names on stdin and prints a JSON object) and sent on the
+  ssh connection's stdin. The remote worker keeps them in memory; they are never in a command line, file or log.
+- One ledger: the local `ledger_path` stays the only authority, and one remote job at a time uses it. Before a job, the local ledger books one lease row
+  per paper (counts against the global daily cap, so the browser cannot use the same quota) and sends a snapshot of
+  today's usage, live cooldowns and pacing state; the remote job works on a copy seeded from it, so channel caps,
+  breakers and cooldowns include the local usage. Afterwards the remote job's new rows are merged into the local
+  ledger exactly once and the lease is dropped (a lease holds its quota until then, however long that takes).
+  Cooldowns set locally while a job runs reach the remote side with the next job (`max_job_s` bounds the delay).
+- Interruptions: the remote worker is detached, so an ssh drop does not stop it. The local job file
+  (`<queue>.remote/<job>.json`) records the stage; the next `tbsgen fetch` first collects unfinished jobs. Results
+  are written per paper (a text saved just before a crash is recovered from its provenance), so a worker that dies
+  keeps what it finished; the rest stays queued and due. `fulltext.remote.ca_file` / `fulltext.ca_file` set a CA
+  bundle when the interpreter has none.
+- `fulltext.pdftotext` points at a `pdftotext` outside `PATH` (e.g. installed in a user directory).
+
+#### Browser batches
+
+`fulltext.browser.batch_only = true` keeps the browser out of normal `tbsgen fetch` runs; it then only runs in
+`tbsgen fetch --browser`, one batch sized to an egress window that is open for a limited time (`browser.batch`):
+
+```bash
+uv run tbsgen fetch --run runs/R --config config.toml --browser --wait-for-egress   # then open the egress
+```
+
+- The browser's egress is read from an IP-echo page (`batch.watch_urls`, e.g. a publisher's `/cdn-cgi/trace`)
+  opened in the browser itself, every `poll_s` (>= 5) seconds, each echo host at most every `probe_host_gap_s`.
+  Probes are not downloads. Without `--wait-for-egress` one probe decides and an outside egress refuses the batch
+  (exit 2); with it the command waits up to `max_wait_s` and exits 0 if the egress never becomes allowed.
+- The window starts at the first allowed probe and ends `window_s - margin_s` later. The batch takes at most
+  `window / (est_script_s + agent_fraction * est_agent_s)` papers (and `batch_max`, `per_publisher_max`, the
+  ledger's remaining browser quota), publishers interleaved. During the batch the egress is checked every
+  `recheck_s` and after every download; when it leaves `allow_cidrs` the batch stops, files obtained since the
+  last good probe are discarded and the remaining papers stay queued.
+- Each paper is first tried with the reviewed script. With `browser.agent.enabled`, the papers the script could
+  not get go to one Hermes CLI run (`hermes chat --oneshot`, `agent.provider` / `model` / `max_turns` /
+  `run_budget_s`) with a prompt generated from [`browser_agent_prompt.md`](gen/src/tbsgen/browser_agent_prompt.md).
+  The agent writes no browser code. Its only tool is `tbsgen-browser N look | open URL | click I | save_pdf` (and
+  `finish`), each call running the reviewed action script
+  [`browser_agent_action.mjs`](gen/src/tbsgen/browser_agent_action.mjs): the paper is booked in the ledger before
+  its first call; only the paper's publisher domains are opened or clicked; nothing is typed; verification pages,
+  verification widgets and login forms are never interacted with; a bot wall cools the publisher at once.
+  Known limit: URLs, links and form targets are checked before the request, but a cross-domain navigation that
+  the page itself starts (script or HTTP redirect) cannot be intercepted with the browser SDK; such a page is
+  reset to about:blank as soon as it lands and reported, and nothing from it is saved. The run
+  uses an isolated Hermes home (no user memory, rules, plugins or credentials) whose `pre_tool_call` hook blocks
+  every other command before it runs; repeated attempts end the run. Saved files are validated and booked by
+  code; the agent's own report is not used. Papers cut by an egress change or the window's end stay queued
+  without backoff. Model usage per run is appended to `<queue>.browser/usage.jsonl`.
+
+Terms: use only content your own subscriptions and API licences allow. The Elsevier and Wiley TDM licences are
+for non-commercial text mining by subscribers; do not redistribute full texts. This pipeline only uses the text
+to ground generated tasks and does not copy it into task files. No channel bypasses access control.
+
+```toml
+[fulltext]
+allow_network = true
+write_cache_dir = "/data/fulltext"
+[fulltext.elsevier]
+enabled = true                 # key from env ELSEVIER_API_KEY
+[fulltext.wiley]
+enabled = true                 # token from env WILEY_TDM_TOKEN
+[fulltext.inst]
+enabled = true
+routes = [{prefix = "10.1007/", url = "https://link.springer.com/content/pdf/{doi}.pdf"}]
+[fulltext.browser]
+enabled = true
+concurrency = 2
+[fulltext.limits.elsevier]
+daily_ok = 100                 # tighten any cap per channel
+```
+
 ### Environment variables
 
 | Variable | Used by | Purpose |
@@ -208,6 +344,8 @@ must be set.
 | `TBS_OPUS_URL` | gen | Teacher endpoint URL (Anthropic-compatible `/v1/messages`). No default: set it here or with `models.opus.url`; real model stages pause with `model:config` until it is set. |
 | *your `key_env`* | gen | Teacher API key, if `models.opus.key_env` is set. |
 | `TYPESAFE_API_KEY` | gen (S2) | TypeSafe key for the Jev screen (`models.roles.screen = "jev"`). The variable name is `screen.jev.key_env`. Unset: S2 falls back to the rules screen (or parks, see `screen.jev.on_unavailable`). |
+| `ELSEVIER_API_KEY`, `ELSEVIER_INSTTOKEN` | gen (S3) | Elsevier TDM channel (`fulltext.elsevier.key_env` / `insttoken_env`). Unset: the channel is skipped. |
+| `WILEY_TDM_TOKEN` | gen (S3) | Wiley TDM channel (`fulltext.wiley.token_env`). Unset: the channel is skipped. |
 | `TBS_OLD_PIPE` | gen, retrieval | Data from an earlier pipeline: a full-text cache (`literature/txt`) and TB-Science task texts used for deduplication (`tasks_text`). Unset: no full-text cache and no deduplication. |
 | `TBS_LEAK_REFS` | retrieval | JSON file of papers that TB-Science tasks were built from; these are excluded from retrieval. Defaults to `$TBS_OLD_PIPE/literature/tbs_task_refs.json` when `TBS_OLD_PIPE` is set; otherwise no exclusion list. |
 | `TBS_HARBOR_ROOT` | gen (S9) | Directory with your Harbor job launch scripts for calibration (`calib.harbor_root`). Unset: S9 prints a plain `harbor run --config ...` command. |
@@ -236,7 +374,7 @@ and `docker` environment unless `student_agent`, `teacher_agent` or `environment
 All other keys and their defaults are in [`gen/src/tbsgen/config.py`](gen/src/tbsgen/config.py) and
 [`retrieval/src/tbsretr/config.py`](retrieval/src/tbsretr/config.py), and are explained in the two
 package READMEs. Commonly changed ones: `fulltext.cache_dirs` (directories of full texts named
-after the DOI), `fulltext.allow_network` (open-access PDF download), `calib.allow_submit`
+after the DOI), `fulltext.allow_network` (all network channels of S3) and the per-channel `fulltext.*` switches, `calib.allow_submit`
 (default `false`: only write calibration job configs), `calib.prepared_tasks_dir`,
 `sandbox.image`, and the per-source daily budgets of the retrieval layer.
 
@@ -247,8 +385,8 @@ Research code under active development.
 **Tests** (run by [GitHub Actions CI](.github/workflows/ci.yml) on every push to `main` and every pull request)
 
 - `retrieval/`: 47 offline unit tests that replay recorded API responses.
-- `gen/`: 86 tests: 70 unit tests (17 of them for the Jev screen, using recorded and scripted API responses)
-  and 16 integration tests that run task code in Docker. Locally
+- `gen/`: 156 tests: 140 unit tests (17 of them for the Jev screen and 70 for the S3 full-text channels, using
+  recorded and scripted responses; no network, no browser) and 16 integration tests that run task code in Docker. Locally
   they are skipped when Docker or the sandbox image is missing; CI builds the image and fails if
   any of them is skipped.
 - Fake-model dry run: S1 → S10 on a synthetic toy task, including the mechanical gates and
@@ -280,7 +418,8 @@ Research code under active development.
 - The L4b inversion attack, the cheap-model roles other than the S2 screen, harder-variant generation (S9b) and the
   file-format and interactive task forms are not implemented.
 - The expert-time estimate in `task.toml` is the teacher model's own estimate.
-- Full text comes only from a local cache or open-access PDF links.
+- The S3 publisher channels (TDM APIs, institution IP, browser) are off by default and need your own licences;
+  their tests use recorded or scripted responses only.
 - Automatic S9 job submission needs your own Harbor launch scripts (`calib.*_launcher`).
 
 ## Repository layout

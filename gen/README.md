@@ -11,7 +11,12 @@ src/tbsgen/
   models.py        模型调用层：OpusClient（Anthropic 兼容端点）/ FakeClient（脚本化）/ RecordingClient（录制）
   state.py         每条目一个状态目录 + state.json 状态机；events.jsonl
   pipeline.py      编排：逐条推进、断点续跑、预算/熔断暂停、resume
-  intake.py        S1 读检索层输出；S2 规则筛选（rules-v1/v2）；S3 全文；S4 可行性（规则部分 + 官方题去重）
+  intake.py        S1 读检索层输出；S2 规则筛选（rules-v1/v2）；S3 全文（调 fulltext.py）；S4 可行性（规则部分 + 官方题去重）
+  fulltext.py      S3 下载级联（cache/oa/elsevier/wiley/inst/browser）、校验、写入缓存、全文队列
+  dlledger.py      S3 下载账本：每日/每小时上限、同站点间隔、冷却、熔断
+  browser_ego.py   ego-browser 通道（运行 browser_fetch.mjs 脚本模板）
+  browser_agent.py 浏览器批次：出口门控、按出口窗口定批次规模、脚本优先、Hermes CLI agent 兜底（提示模板 browser_agent_prompt.md，agent 唯一的浏览器工具调用受审动作脚本 browser_agent_action.mjs）
+  remote.py        远程模式：HTTP 通道经 ssh 在另一台主机上运行，账本以本机为准
   screen_jev.py    S2 的 Jev 模式：问题原文、阈值、组合规则、HTTP 客户端（重试/记账/熔断）、并发预取
   prompts.py       S5/S6A/S6C/S8 提示词（版本号写进 provenance）
   spec.py          S5 规格校验（依赖图规则）；S6B 按实测定阈值
@@ -56,7 +61,7 @@ items/<item_id>/
 |---|---|---|---|---|
 | S1 | 检索层输出（`tbsretr` 的 `papers` 或 `eval/raw/*.json` 的 `selected`）或候选 JSONL | `S1_candidate.json` | 无 | — |
 | S2 | 题录 + 摘要 | `S2_screen.json`（`score`、`keep`、`form_hint`、`method`、`reason`、`deferred`；Jev 模式另有各问题概率 `probabilities`、`decision`（keep/drop/uncertain）、`uncertain`、`jev_model`、`input_tokens`）；`S2_jev.json` 为按请求键缓存的 Jev 结果 | `roles.screen`：`rules`（默认）或 `jev`（TypeSafe Jev，失败回退规则） | `dropped: low_screen_score`（规则）/ `jev_*`（Jev）；无摘要时 `deferred`，S4 用全文开头重判 |
-| S3 | DOI、OA 链接 | `fulltext.txt` + `S3_fulltext.json` | 无 | `parked: fulltext_unavailable`，并写 `S3_queue.json` |
+| S3 | DOI、OA 链接 | `fulltext.txt` + `S3_fulltext.json` | 无 | `parked: fulltext_unavailable`，写 `S3_queue.json` 并加入全文队列；`tbsgen fetch` 取到后写入 `fulltext.txt` 并推进到 S4 |
 | S4 | 全文 + 筛选记录 | `S4_probe.json`（计算核心线索、与官方 70 题去重、形态禁令） | 规则（沙箱探针待定） | `dropped: no_compute_core / tbs_duplicate / interact_form_banned_until_isolation` |
 | S5 | 全文摘录 + 探针卡 | `_spec/spec.json`、`depgraph.json`、`coverage.json`、`provenance.json` | Opus | 校验不过重试 1 次，仍不过 `dropped: spec_invalid` |
 | S6A | 规格 | `task/generator/`、`solution/`、`baselines/{mid,naive}.py`、`tests/measure.py` | Opus | 缺文件 `dropped` |
@@ -97,6 +102,11 @@ uv run tbsgen run    --run runs/R --config config.toml [--max-steps N] [--only I
 uv run tbsgen status --run runs/R ; uv run tbsgen report --run runs/R ; uv run tbsgen ledger --run runs/R
 uv run tbsgen resume --run runs/R --config config.toml              # 恢复因预算/熔断暂停的条目
 uv run tbsgen breaker --run runs/R --model claude-opus-5-5 --reset  # 人工解除熔断
+uv run tbsgen fetch --run runs/R --config config.toml [--max N] [--channels oa,browser] [--no-browser] [--dry-run]
+                                                                    # 清全文队列（含 ego-browser 通道），取到全文后交给等待的条目并推进到 S4
+uv run tbsgen fetch --run runs/R --status                          # 今日下载用量、冷却、熔断
+uv run tbsgen fetch --run runs/R --finish-browser                  # 关闭本工具的 ego TaskSpace
+uv run tbsgen fetch --run runs/R --browser --wait-for-egress         # 等出口进入 allow_cidrs 后跑一个浏览器批次
 uv run tbsgen calib-ingest --run runs/R --item ID [--job-dir DIR]   # 回填校准结果（默认取该次提交的作业目录；作业未结束则拒绝）
 uv run tbsgen harbor-local --run runs/R [--item ID]                  # 本机 Harbor oracle/nop（换本地基础镜像）
 uv run tbsgen reset  --run runs/R --item ID --stage S6B [--regen]    # 管线修复后让条目从某阶段重来（记入 history）
@@ -152,7 +162,14 @@ allow_submit = false
 | `calib.est_usd_per_run` | 20 | 每次校准作业的预留额，`calib-ingest` 用 Harbor `cost_usd` 冲销 |
 | `calib.teacher_available` | True | False：GLM 首次失败直接记 `parked:teacher_unavailable` |
 | `calib.prepared_tasks_dir` | None | 远端沙箱已注册模板的任务副本目录；设置后缺模板的条目不提交 |
-| `fulltext.mode` | 本地全文缓存（只读，`fulltext.cache_dirs`）→ OA PDF 链接 | 浏览器通道**未接入**，取不到全文的条目进 `S3_queue.json` 并暂存 |
+| `fulltext.cascade` | cache → oa → elsevier → wiley → inst → browser | 下载级联顺序；每个通道有自己的 `enabled`，默认只开 cache 和 oa（见根 README「Full text (S3)」） |
+| `fulltext.write_cache_dir / ledger_path / queue_path` | `<run>/fulltext_cache`、`<run>/fulltext_ledger.sqlite`、`<run>/fulltext_queue.jsonl` | 写入缓存（含来源 json）、下载账本、浏览器队列 |
+| `fulltext.limits / global_limits / host_caps` | `dlledger.py` 中的默认值 | 每通道每天/每小时成功与尝试上限、同站点最小间隔、全局上限；429 冷却 6 小时，验证页冷却 24 小时 |
+| `fulltext.egress_check` | 关闭 | 开启后，出口 IP 不在 `allow_cidrs` 内则拒绝所有网络通道 |
+| `fulltext.use_env_proxy` | False | 下载不读 `HTTP(S)_PROXY` |
+| `fulltext.browser.*` | 关闭；并发 2；验证页等 40 秒 | ego-browser 通道；S3 只入队，`tbsgen fetch` 执行；同一出版商间隔 60–120 秒，不点击任何验证 |
+| `fulltext.browser.batch` / `.agent` | 窗口 600 s、余量 60 s；agent 关闭 | `tbsgen fetch --browser [--wait-for-egress]`：出口门控的限时批次；agent 为 Hermes CLI |
+| `fulltext.remote` | 关闭 | HTTP 通道（oa/elsevier/wiley/inst）经 ssh 在 `host` 上运行；远端须开启 egress_check |
 | `package.dockerfile_mode` | selfcontained | Dockerfile 里用 pip 安装固定版本；`local_base` 只用于本机检查 |
 
 ## 5. S9 校准规则
@@ -181,7 +198,7 @@ hard 和 unstable 保留。reward=1 一律算通过，即使之后报了 API 错
 
 - 校准的教师（Opus agent）分支。
 - L4b 反解攻击、廉价模型各角色、S9b 变体、DOMF/CODE/MULTI 形态。
-- OA PDF 下载分支（单测只走了缓存分支）。
+- S3 出版商通道（TDM、校园 IP、浏览器）只有用伪造响应的单测；真实下载依赖使用者自己的订阅与出口网络。
 - 专家时长是教师模型的自报值；价格是占位值，美元数字不是账单。
 
 ## 6b. 真实论文端到端测试后新增的门与检查

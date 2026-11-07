@@ -6,11 +6,10 @@ S2  screen: `models.roles.screen` = "rules" (this file) or "jev" (screen_jev.py;
     Rules score abstract cues (method / data / code / computational words, negative cues for reviews / purely
     clinical / qualitative work).  rules-v2 (default) counts each cue stem once and only treats "survey" as a
     negative cue when it means a literature survey; rules-v1 is kept for comparison (screen.rules_version).
-S3  full text: (1) local full-text cache (read-only, `fulltext.cache_dirs`, one <doi_key>.txt per paper),
-    (2) OA PDF link from retrieval (`oa_url`, S2 openAccessPdf) via HTTP + pdftotext, with title identity check;
-    otherwise -> "browser_queue" (a browser route is NOT wired in MVP: it would need a logged-in browser
-    profile and its own daily caps; papers are queued to items/<id>/S3_queue.json and the run continues with
-    others).
+S3  full text: the configurable cascade in fulltext.py (cache -> OA -> Elsevier / Wiley TDM -> institution IP
+    -> browser), behind the download ledger in dlledger.py.  Papers no channel could fetch are parked
+    (`fulltext_unavailable`) and queued; `tbsgen fetch` drains the queue (incl. the ego-browser channel) and
+    re-activates the items at S3.
 S4  feasibility probe (rules part only; cheap sandbox agent 待定): full-text length, method/compute cues,
     decontamination against TBS official tasks (TF-IDF cosine + 13-gram), banned
     output forms (INTERACT/oracle-style black-box budgets until isolation exists).
@@ -22,8 +21,6 @@ import json
 import math
 import re
 import subprocess
-import tempfile
-import urllib.request
 from collections import Counter
 from pathlib import Path
 
@@ -110,72 +107,30 @@ def screen(c: dict, cfg: dict, fulltext_head: str | None = None) -> dict:
 
 
 # ------------------------------------------------------------------------------------------- S3
-def _norm(s: str) -> str:
-    return re.sub(r"[^a-z0-9]+", " ", (s or "").lower()).strip()
+# The cascade lives in fulltext.py; these names stay importable from here.
+from .fulltext import Fetcher, title_match  # noqa: E402,F401
+from .fulltext import pdf_to_text as _pdf_to_text  # noqa: E402,F401
 
 
-def title_match(title: str, text: str) -> float:
-    """share of title words (len>=4) found in the first 6000 chars of the full text"""
-    words = [w for w in _norm(title).split() if len(w) >= 4]
-    if not words:
-        return 0.0
-    head = _norm(text[:6000])
-    return sum(w in head for w in words) / len(words)
+def _legacy_transport(fn):
+    """Wrap an old-style fetcher (url -> bytes) as a fulltext transport (tests / dry runs)."""
+    from .fulltext import Resp
 
-
-def _pdf_to_text(pdf: bytes) -> str:
-    with tempfile.TemporaryDirectory() as td:
-        p = Path(td) / "a.pdf"
-        p.write_bytes(pdf)
-        r = subprocess.run(["pdftotext", "-layout", str(p), "-"], capture_output=True, timeout=120)
-        return r.stdout.decode("utf-8", "replace")
+    def transport(url, headers, timeout, max_bytes):
+        try:
+            return Resp(200, {}, fn(url), url)
+        except Exception as e:  # noqa: BLE001
+            return Resp(0, {}, b"", url, f"{type(e).__name__}: {str(e)[:120]}")
+    return transport
 
 
 def fetch_fulltext(c: dict, cfg: dict, fetcher=None) -> tuple[str | None, dict]:
-    ft = cfg["fulltext"]
-    doi = (c.get("doi") or "").lower()
-    rec: dict = dict(doi=doi, tried=[])
-    if doi:
-        for d in ft["cache_dirs"]:
-            p = Path(d) / f"{doi_key(doi)}.txt"
-            rec["tried"].append(f"cache:{p.name}")
-            if p.exists():
-                txt = p.read_text(errors="replace")
-                if len(txt) >= ft["min_chars"]:
-                    rec.update(source="cache", path=str(p))
-                    return txt, rec
-    urls = [u for u in (c.get("oa_url"), c.get("pdf_url"), (c.get("openAccessPdf") or {}).get("url")
-                        if isinstance(c.get("openAccessPdf"), dict) else None) if u]
-    if not ft.get("allow_network"):
-        urls = []
-    for u in urls:
-        rec["tried"].append(f"oa:{u}")
-        try:
-            body = fetcher(u) if fetcher else _http(u, ft)
-        except Exception as e:  # noqa: BLE001
-            rec.setdefault("errors", []).append(f"{type(e).__name__}: {str(e)[:120]}")
-            continue
-        if body[:5] == b"%PDF-":
-            txt = _pdf_to_text(body)
-        else:
-            txt = re.sub(r"<[^>]+>", " ", body.decode("utf-8", "replace"))
-        if len(txt) < ft["min_chars"]:
-            rec.setdefault("errors", []).append(f"short text {len(txt)}")
-            continue
-        tm = title_match(c.get("title", ""), txt)
-        if tm < ft["title_match_min"]:
-            rec.setdefault("errors", []).append(f"title mismatch {tm:.2f}")
-            continue
-        rec.update(source="oa", url=u, title_match=round(tm, 2))
-        return txt, rec
-    rec["source"] = None
-    return None, rec
-
-
-def _http(url: str, ft: dict) -> bytes:
-    req = urllib.request.Request(url, headers={"User-Agent": "tbsgen/0.1 (mailto:research use)"})
-    with urllib.request.urlopen(req, timeout=ft["timeout"]) as r:
-        return r.read(int(ft["max_pdf_mb"] * 1e6))
+    """S3 for one candidate.  `fetcher`: a fulltext.Fetcher, an old-style callable (url -> bytes), or None
+    (a Fetcher built from cfg)."""
+    if not isinstance(fetcher, Fetcher):
+        fetcher = Fetcher(cfg, transport=_legacy_transport(fetcher) if callable(fetcher) else None)
+    out = fetcher.fetch(c)
+    return out.text, out.rec
 
 
 # ------------------------------------------------------------------------------------------- S4
