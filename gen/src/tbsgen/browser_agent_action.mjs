@@ -151,6 +151,7 @@ try {
     const page = pages.length ? pages[0] : await task.newPage();
     if (INPUT.action === "look") {
       out.page = await look(page);
+      out.look_url = out.page.url;
       if (out.page.challenge) out.blocked = "verification page: " + out.page.title.slice(0, 60);
       out.status = "ok";
     } else if (INPUT.action === "open") {
@@ -167,28 +168,35 @@ try {
       const i0 = await info(page);
       if (isChallenge(i0)) { out.status = "refused"; out.error = "verification page: do not interact"; out.blocked = "verification page: " + i0.title.slice(0, 60); }
       else {
-        const pre = await page.evaluate(([src, k]) => {
-          const f = new Function("return (" + src + ")")();
-          const el = f()[k];
-          if (!el) return { missing: true };
-          const form = el.closest("form");
-          const login = !!(form && form.querySelector("input[type=password]"));
-          return { href: el.tagName.toLowerCase() === "a" ? el.href : "", login,
-                   text: ((el.innerText || el.value || "").trim()).slice(0, 80) };
-        }, [clickables.toString(), k]).catch(() => ({ missing: true }));
-        if (pre.missing) { out.status = "refused"; out.error = "no such item; run look first"; }
-        else if (pre.login) { out.status = "refused"; out.error = "login form: credentials are not entered by this tool (report login_required)"; }
-        else if (WIDGET.test(pre.text)) { out.status = "refused"; out.error = "verification widget: do not interact"; }
-        else if (pre.href && !pre.href.startsWith("javascript:") && !pre.href.startsWith("#") && !hostOk(pre.href)) {
-          out.status = "refused"; out.error = "link target is outside the allowed domains";
-        } else {
-          await withDownload(page, () => page.evaluate(([src, k]) => {
+        // check and click in ONE page evaluation, on the element found now, with every condition re-checked:
+        // allowed link target / form action, no verification widget or text, no login form, same page as `look`
+        await withDownload(page, async () => {
+          const r = await page.evaluate(([src, k, allow, lookUrl]) => {
+            const ok = (u) => { try { const x = new URL(u, location.href); if (!/^https?:$/.test(x.protocol)) return false;
+              const h = x.hostname.toLowerCase(); return allow.some((d) => h === d || h.endsWith("." + d)); } catch (e) { return false; } };
+            if (lookUrl && location.href !== lookUrl) return { refused: "the page changed since `look`; run look again" };
             const f = new Function("return (" + src + ")")();
             const el = f()[k];
-            if (el.tagName.toLowerCase() === "a") el.removeAttribute("target");    // stay in this Page
+            if (!el) return { refused: "no such item; run look first" };
+            const W = /captcha|turnstile|challenge|recaptcha|hcaptcha|verify|i am human|not a robot|cf-|px-|验证/i;
+            const text = ((el.innerText || el.value || el.getAttribute("aria-label") || el.title || "").trim()).slice(0, 80);
+            if (W.test(text)) return { refused: "verification widget: do not interact" };
+            const form = el.closest("form") || (el.form || null);
+            if (form && form.querySelector("input[type=password]")) return { refused: "login form: credentials are not entered by this tool (report login_required)" };
+            if (form && !ok(form.getAttribute("action") || location.href)) return { refused: "form target is outside the allowed domains" };
+            const tag = el.tagName.toLowerCase();
+            if (tag === "a") {
+              const h = el.getAttribute("href") || "";
+              if (!h.startsWith("#") && !/^javascript:/i.test(h) && !ok(el.href)) return { refused: "link target is outside the allowed domains" };
+              el.removeAttribute("target");                       // stay in this Page
+            }
+            if (el.getAttribute("formaction") && !ok(el.getAttribute("formaction"))) return { refused: "form target is outside the allowed domains" };
             el.click();
-            return true;
-          }, [clickables.toString(), k]));
+            return { clicked: text };
+          }, [clickables.toString(), k, INPUT.allow, INPUT.look_url || ""]);
+          if (r && r.refused) { out.status = "refused"; out.error = r.refused; }
+        });
+        if (out.status !== "refused") {
           await sleep(1500);
           const i = await after(page);
           out.page = { url: i.url, title: i.title, pdf: /pdf/i.test(i.ctype), login_form: i.login_form };
@@ -203,6 +211,7 @@ try {
         const f = fileName();
         const r = await page.fetch(i.url, { saveAs: f, timeout: INPUT.download_timeout_ms });
         out.http = r.status;
+        if (r.url && !hostOk(r.url)) { (await import("node:fs/promises")).unlink(f).catch(() => {}); out.status = "refused"; out.error = "PDF redirected outside the allowed domains"; console.log("TBSGEN_RESULT " + JSON.stringify(out)); process.exit(0); }
         if (r.status === 429 || await savedIsChallenge(f)) { out.blocked = r.status === 429 ? "HTTP 429" : "bot-wall page"; out.http429 = r.status === 429; }
         else if (r.ok) out.files.push(f);
         out.status = "ok";

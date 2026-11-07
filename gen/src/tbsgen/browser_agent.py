@@ -33,6 +33,7 @@ import contextlib
 import json
 import os
 import re
+import shlex
 import shutil
 import signal
 import string
@@ -77,7 +78,7 @@ class Prober:
         self.poll_s = max(5.0, float(bb.get("poll_s", 5)))
         self.host_gap = float(bb.get("probe_host_gap_s", 15))
         self.lock = threading.Lock()
-        self.cfg = dict(b, space=str(b.get("space", "tbsgen-s3-fulltext")) + "-probe")
+        self.cfg = dict(b, space=str(b.get("space", "tbsgen-s3-fulltext")) + "-probe")   # derived: same lock
 
     def _body(self, url: str) -> str:
         if self.probe_fn is not None:
@@ -332,6 +333,7 @@ def wrapper_main(batch_dir: str, argv: list[str]) -> int:
     files = (bd / "files" / n).resolve()
     files.mkdir(parents=True, exist_ok=True)
     inp = dict(space=st["space"], action=action, arg=arg, allow=p["allow"], files_dir=str(files),
+               look_url=ps.get("look_url") if action == "click" else None,
                nav_timeout_ms=45000, download_timeout_ms=120000, download_wait_ms=6000, challenge_wait_ms=20000)
     script = "const INPUT = " + json.dumps(inp) + ";\n" + ACTION.read_text()
     timeout = max(5.0, min(float(st["call_timeout_s"]), float(st["deadline"]) - time.time()))
@@ -364,6 +366,10 @@ def wrapper_main(batch_dir: str, argv: list[str]) -> int:
         _atomic(sp, json.dumps(ps))
         _cool_publisher(led, ps, p["doi"], str(res["blocked"]), secs)
         return say(f"tbsgen: paper {n}: {res['blocked']} - publisher cooled down; report `challenge` and move on.", 2)
+    if action == "look" and res.get("look_url"):
+        ps = json.loads(sp.read_text())
+        ps["look_url"] = res["look_url"]
+        _atomic(sp, json.dumps(ps))
     show = dict(status=res.get("status"), error=res.get("error"), files_saved=len(res.get("files") or []),
                 page=res.get("page"), note=res.get("note"), left_allowed=res.get("left_allowed"))
     return say(json.dumps(show, ensure_ascii=False)[:9000], 0 if res.get("status") == "ok" else 1)
@@ -461,19 +467,43 @@ def run_batch(fetcher, *, wait_for_egress: bool = False, max_wait_s: float | Non
         stats["refused"] = "browser batches need fulltext.egress_check enabled with allow_cidrs"
         return stats
     prober = prober or Prober(ft, clock=clock, sleep=sleep)
-    if not fetcher._space_held and not fetcher._try_space_lock():
-        stats["note"] = "browser TaskSpace is in use by another process"
-        return stats
+    took_lock = False
+    if not fetcher._space_held:
+        if not fetcher._try_space_lock():
+            stats["note"] = "browser TaskSpace is in use by another process"
+            return stats
+        took_lock = True
+    used: set[str] = set()                # TaskSpaces this batch actually used (all derived from the locked one)
+    stats["_used_spaces"] = used
     try:
         return _run_batch(fetcher, stats, b, bb, ag, prober, wait_for_egress, max_wait_s, on_success, log,
                           hermes_runner, clock, sleep, now_window_start)
     finally:
-        # close every TaskSpace this batch may have used (script, agent, probe), on every path
-        if prober.probe_fn is None:
-            for sp in {str(b.get("space", "tbsgen-s3-fulltext")), str(ag.get("space", "tbsgen-s3-agent")),
-                       prober.cfg["space"]}:
+        stats.pop("_used_spaces", None)
+        if prober.n and prober.probe_fn is None:
+            used.add(prober.cfg["space"])
+        if fetcher.browser_runner is None:
+            for sp in sorted(used):
                 with contextlib.suppress(Exception):
                     browser_ego.finish(dict(b, space=sp))
+        if took_lock:
+            _release_space_lock(fetcher)
+
+
+def _release_space_lock(fetcher):
+    import fcntl
+    fh = getattr(fetcher, "_space_fh", None)
+    if fh is not None:
+        with contextlib.suppress(OSError):
+            fcntl.flock(fh, fcntl.LOCK_UN)
+            fh.close()
+    fetcher._space_fh = None
+    fetcher._space_held = False
+
+
+def agent_space(b: dict) -> str:
+    """The agent's TaskSpace: derived from the (locked) script TaskSpace unless configured."""
+    return str((b.get("agent") or {}).get("space") or f"{b.get('space', 'tbsgen-s3-fulltext')}-agent")
 
 
 def _due(fetcher, bb: dict) -> list[dict]:
@@ -531,6 +561,7 @@ def _run_batch(fetcher, stats, b, bb, ag, prober, wait_for_egress, max_wait_s, o
         return stats
     results: dict[str, dict] = {}         # ident -> dict(status: ok|failed|deferred, ...)
     stop = threading.Event()              # egress lost or deadline: cancels running scripts / the agent
+    stop.used = stats.get("_used_spaces")  # type: ignore[attr-defined]
     batch_dir = _batch_dir(fetcher)
 
     def on_lost():
@@ -597,9 +628,15 @@ def _script_phase(fetcher, plan, results, stats, bb, wd, stop, deadline, clock, 
     def guarded_runner(job):
         job = dict(job, cancel=stop)
         if job.get("mode") != "egress":
-            # a script never runs past the window
-            job["cfg"] = dict(job["cfg"], script_timeout_s=max(5.0, min(float(job["cfg"].get("script_timeout_s", 420)),
-                                                                    deadline - clock())))
+            left = deadline - clock()
+            if stop.is_set() or left < float(bb.get("min_script_s", 20)):
+                # the window is (almost) over: never start a script that cannot finish inside it
+                stop.set()
+                return dict(status="cancelled", error="batch stopped (egress changed or deadline)")
+            job["cfg"] = dict(job["cfg"], script_timeout_s=min(float(job["cfg"].get("script_timeout_s", 420)), left))
+            used = getattr(stop, "used", None)
+            if used is not None:
+                used.add(str(job["cfg"].get("space", "tbsgen-s3-fulltext")))
         res = (orig_runner or browser_ego.run_one)(job)
         if job.get("mode") == "egress":
             return res
@@ -612,6 +649,14 @@ def _script_phase(fetcher, plan, results, stats, bb, wd, stop, deadline, clock, 
                         out_file=(res or {}).get("out_file"))
         return res
     fetcher.browser_runner = guarded_runner
+    led = fetcher.ledger
+    orig_sleep = led.sleep
+
+    def stop_aware_sleep(sec):            # a ledger wait never outlasts the batch (the runner then refuses)
+        end = clock() + sec
+        while not stop.is_set() and (w := end - clock()) > 0:
+            orig_sleep(min(w, 1.0))
+    led.sleep = stop_aware_sleep
     try:
         for e in plan:
             k = paper_ident(e)
@@ -645,6 +690,7 @@ def _script_phase(fetcher, plan, results, stats, bb, wd, stop, deadline, clock, 
                                 status=results[k]["status"], seconds=round(clock() - t0, 1))))
     finally:
         fetcher.browser_runner = orig_runner
+        led.sleep = orig_sleep
 
 
 def _uncount_cancelled(fetcher, e):
@@ -730,8 +776,13 @@ model:
     - matcher: ".*"
       command: {hook}
       timeout: 15
+      fail_closed: true
 hooks_auto_accept: true
 """
+
+
+PROVIDER_FIELDS = ("name", "api", "base_url", "transport", "api_mode", "default_model", "discover_models", "models",
+                   "context_length")
 
 
 def _user_provider(path: Path, name: str) -> dict | None:
@@ -798,8 +849,10 @@ def _hermes_home(bd: Path, ag: dict, hook_cmd: str) -> Path:
         entry = _user_provider(src_home / "config.yaml", pname)
     prov_block = ""
     if isinstance(entry, dict):
-        entry = {k: v for k, v in entry.items() if k not in ("api_key", "key", "token")}
-        entry.setdefault("api_key", "none")
+        # only non-sensitive fields; never api keys, headers or tokens (a provider that needs a credential cannot be
+        # used for the agent: its process gets no credentials)
+        entry = {k: v for k, v in entry.items() if k in PROVIDER_FIELDS}
+        entry["api_key"] = "none"
         prov_block = "providers: " + json.dumps({pname: entry}) + "\n"        # JSON is valid YAML
     for sk in ag.get("skills") or []:
         src = src_home / "skills" / sk
@@ -808,7 +861,7 @@ def _hermes_home(bd: Path, ag: dict, hook_cmd: str) -> Path:
                 (home / "skills" / sk).symlink_to(src.resolve())
     (home / "config.yaml").write_text(HOOK_CONFIG.format(model=json.dumps(ag.get("model") or ""),
                                                          provider=json.dumps(pname), providers=prov_block,
-                                                         hook=json.dumps(hook_cmd)))
+                                                         hook=json.dumps(shlex.quote(hook_cmd))))
     return home
 
 
@@ -826,7 +879,10 @@ def _agent_phase(fetcher, todo: list[dict], deadline: float, bd: Path, wd: Watch
     if deadline - time.time() - 10 < min(30.0, float(ag.get("run_budget_s", 420))):
         return dict(usage=dict(skipped="not enough time left in the egress window"),
                     papers={v["ident"]: dict(status="deferred") for v in papers.values()})
-    st = dict(space=str(ag.get("space", "tbsgen-s3-agent")), papers=papers, deadline=deadline,
+    stats_used = getattr(stop, "used", None)
+    if stats_used is not None:
+        stats_used.add(agent_space(b))
+    st = dict(space=agent_space(b), papers=papers, deadline=deadline,
               ledger_path=str(led.path), limits=led.limits, global_limits=led.g, host_caps=led.host_caps,
               ego_binary=browser_ego.binary(b), gate_max_wait_s=float(ag.get("gate_max_wait_s", 150)),
               max_calls_per_paper=int(ag.get("max_calls_per_paper", 8)),

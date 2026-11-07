@@ -110,7 +110,7 @@ def release_lease(ledger, job: str):
         db.execute("delete from attempts where note=? and channel='lease'", (f"lease:{job}",))
 
 
-def merge_rows(ledger, job: str, rows: dict) -> dict:
+def merge_rows(ledger, job: str, rows: dict, keep_lease: bool = False) -> dict:
     """Merge the remote job's new ledger rows into the local ledger and drop the job's lease, atomically and at
     most once per remote row (table remote_merged).  Remote rows still pending (worker died) become
     'fail' / 'cancelled: remote worker ended' (they still count as attempts, never towards a breaker)."""
@@ -136,7 +136,8 @@ def merge_rows(ledger, job: str, rows: dict) -> dict:
             db.execute("insert into hosts values(?,?) on conflict(host) do update set "
                        "next_ts = max(next_ts, excluded.next_ts)", (host, nxt))
             n["hosts"] += 1
-        db.execute("delete from attempts where note=? and channel='lease'", (f"lease:{job}",))
+        if not keep_lease:
+            db.execute("delete from attempts where note=? and channel='lease'", (f"lease:{job}",))
     return n
 
 
@@ -359,8 +360,14 @@ def collect(fetcher, job: str, run, *, log=print, poll_s: float = 15.0, sleep=ti
     limit = float(max_poll_s if max_poll_s is not None else rcfg.get("max_job_s", 7200) + 600)
     status: dict = {}
     while True:
-        rc, so, _ = run(_remote_cmd(rcfg, "status", rcfg["workdir"], job), b"", 60)
+        # every poll pushes the local live cooldowns to the worker (it merges them before each paper) and brings
+        # the worker's cooldowns back, so a block seen on one side stops the other within one poll
+        now = fetcher.ledger.clock()
+        push = fetcher.ledger.db.execute("select host, until, reason from cooldown where until>?", (now,)).fetchall()
+        rc, so, _ = run(_remote_cmd(rcfg, "status", rcfg["workdir"], job), json.dumps(push).encode(), 60)
         status = _last_json(so) if rc == 0 else {}
+        if status.get("cooldown"):
+            merge_rows(fetcher.ledger, job, dict(cooldown=status["cooldown"]), keep_lease=True)
         if status.get("state") in ("done", "dead", "missing"):
             break
         if time.monotonic() - t0 > limit:
@@ -527,6 +534,7 @@ def work(d: Path, spec: dict, secrets: dict, stop_after: int | None = None) -> i
             return 1
         if time.time() > float(spec["deadline"]):
             break
+        _merge_pushed_cooldowns(d, f.ledger)
         t0 = time.time()
         try:
             out = f.fetch(e, browser=False, channels=list(cfg["fulltext"]["cascade"]))
@@ -550,12 +558,30 @@ def work(d: Path, spec: dict, secrets: dict, stop_after: int | None = None) -> i
     return 0
 
 
-def cmd_status(workdir: str, job: str, stdout) -> int:
+def _merge_pushed_cooldowns(d: Path, ledger):
+    with contextlib.suppress(OSError, ValueError):
+        rows = json.loads((d / "cooldown_push.json").read_text())
+        with ledger._tx() as db:
+            for host, until, reason in rows:
+                db.execute("insert into cooldown values(?,?,?) on conflict(host) do update set "
+                           "reason = case when excluded.until > until then excluded.reason else reason end, "
+                           "until = max(until, excluded.until)", (host, until, reason))
+
+
+def cmd_status(workdir: str, job: str, stdout, stdin=None) -> int:
     d = _job_dir(workdir, job)
     if not (d / "status.json").exists():
         print(json.dumps(dict(state="missing")), file=stdout)
         return 0
     st = json.loads((d / "status.json").read_text())
+    push = (stdin.read() if stdin is not None else "") or ""
+    if push.strip():
+        with contextlib.suppress(ValueError):
+            _atomic(d / "cooldown_push.json", json.dumps(json.loads(push)))
+    with contextlib.suppress(sqlite3.Error):
+        db = sqlite3.connect(d / "ledger.sqlite")
+        st["cooldown"] = db.execute("select host, until, reason from cooldown where until>?", (time.time(),)).fetchall()
+        db.close()
     if st.get("state") in ("running", "starting"):
         # alive <=> someone holds worker.lock (a recycled PID cannot fake this)
         import fcntl
@@ -573,13 +599,14 @@ def cmd_status(workdir: str, job: str, stdout) -> int:
     return 0
 
 
-def _recover_results(d: Path, spec: dict):
+def _recover_results(d: Path, spec: dict) -> list[tuple[str, str, str]]:
     """A worker that died between saving a text and writing its result file: rebuild that result from the cache
-    file's provenance (same identity), so a booked success is never lost."""
-    from .fulltext import paper_ident
+    file's provenance (same identity), so a success is never lost.  Returns [(ident, doi, channel)] recovered."""
+    from .fulltext import norm_doi, paper_ident
     cache = d / "cache"
+    done: list[tuple[str, str, str]] = []
     if not cache.exists():
-        return
+        return done
     provs = {}
     for pj in cache.glob("*.json"):
         with contextlib.suppress(OSError, ValueError):
@@ -597,6 +624,8 @@ def _recover_results(d: Path, spec: dict):
                    url=pv.get("url"), title_match=pv.get("title_match"), provenance=dict(pv), recovered=True)
         _atomic(rp, json.dumps(dict(ident=ident, entry=e, ok=True, rec=rec, text_file=pj.stem + ".txt",
                                     raw_file=raws[0].name if raws else None, seconds=None), ensure_ascii=False))
+        done.append((ident, norm_doi(e.get("doi")), str(pv.get("channel") or "")))
+    return done
 
 
 def cmd_export(workdir: str, job: str, stdout) -> int:
@@ -606,7 +635,17 @@ def cmd_export(workdir: str, job: str, stdout) -> int:
     with contextlib.suppress(OSError, ValueError):
         st = json.loads((d / "status.json").read_text())
     if st.get("state") != "done":
-        _recover_results(d, spec)
+        for ident, doi, channel in _recover_results(d, spec):
+            # the text was saved but the worker died before booking it: book the pending reservation as the
+            # success it was (else the merge would turn it into a cancelled failure and free its quota)
+            db = sqlite3.connect(d / "ledger.sqlite", isolation_level=None)
+            db.execute("begin immediate")
+            row = db.execute("select rowid from attempts where doi=? and channel=? and status='pending' "
+                             "order by rowid desc limit 1", (doi, channel)).fetchone()
+            if row:
+                db.execute("update attempts set status='ok', note='recovered after worker crash' where rowid=?", row)
+            db.execute("commit")
+            db.close()
     marks = spec.get("marks") or {}
     db = sqlite3.connect(d / "ledger.sqlite")
     rows = {k: db.execute(f"select rowid, * from {k} where rowid > ?", (marks.get(k, 0),)).fetchall()
@@ -654,6 +693,8 @@ def main(argv=None, stdin=None, stdout=None, daemon: bool = True) -> int:
     cmd, wd, job = argv
     if cmd == "submit":
         return cmd_submit(wd, job, stdin, stdout, daemon)
+    if cmd == "status":
+        return cmd_status(wd, job, stdout, stdin if not getattr(stdin, "isatty", lambda: True)() else None)
     return dict(status=cmd_status, export=cmd_export, cleanup=cmd_cleanup)[cmd](wd, job, stdout)
 
 

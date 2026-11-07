@@ -69,7 +69,7 @@ class FakeSSH:
             elif sub == "export":
                 rc = remote.cmd_export(str(self.rdir), job, out)
             else:
-                rc = remote.main([sub, str(self.rdir), job], stdout=tout)
+                rc = remote.main([sub, str(self.rdir), job], stdin=io.StringIO(stdin.decode()), stdout=tout)
         finally:
             remote._TEST_TRANSPORT = old
             remote.work = orig_work
@@ -696,7 +696,7 @@ def test_agent_fallback_saves_validated_files(tmp_path, monkeypatch):
     usage = (fulltext.queue_path(f.cfg).with_name(fulltext.queue_path(f.cfg).name + ".browser") / "usage.jsonl")
     assert json.loads(usage.read_text().splitlines()[-1])["model"] == "model-y"
     ego_log = [json.loads(x) for x in (tmp_path / "ego.log").read_text().splitlines()]
-    assert {e["space"] for e in ego_log} == {"tbsgen-s3-agent"}
+    assert {e["space"] for e in ego_log} == {f.ft["browser"]["space"] + "-agent"}
 
 
 def test_agent_isolated_home_has_no_api_key(tmp_path, monkeypatch):
@@ -876,3 +876,96 @@ def test_user_provider_reader_without_yaml(tmp_path, monkeypatch):
     e = browser_agent._user_provider(cfg, "mine")
     assert e == {"name": "Local (:1)", "api": "http://127.0.0.1:1/v1", "api_key": "k", "discover_models": False,
                  "models": {"m1": {"context_length": 4000}}}
+
+
+def test_recovered_text_is_booked_as_success(tmp_path):
+    """Worker died after saving the text but before booking it: the recovered result and the ledger agree."""
+    f, net, _, led, rdir, _ = mk_remote(tmp_path, {"api.elsevier.com": ELS_XML},
+                                        limits={"elsevier": {"daily_ok": 1, "gap_s": 0.0, "jitter_s": 0.0}})
+    queue(f, ELS)
+    ssh = FakeSSH(rdir, net)
+    real = ssh.__call__
+    orig_record = DownloadLedger.record
+
+    def runner(cmd, stdin=b"", timeout=300):
+        if "submit" in cmd:
+            def crash(self, channel, host, doi, status, *a, **k):
+                if status == "ok":
+                    raise SystemExit("worker killed after saving")
+                return orig_record(self, channel, host, doi, status, *a, **k)
+            DownloadLedger.record = crash
+            try:
+                return real(cmd, stdin, timeout)
+            except SystemExit:
+                return 0, b'{"ok": true}\n', b""
+            finally:
+                DownloadLedger.record = orig_record
+                job = cmd.split()[-1]
+                sp = rdir / "jobs" / job / "status.json"
+                st = json.loads(sp.read_text())
+                st.update(state="running", ts=time.time() - 120)
+                sp.write_text(json.dumps(st))
+        return real(cmd, stdin, timeout)
+    st = drain(f, runner)
+    assert st["ok"] == 1
+    db = sqlite3.connect(led.path)
+    assert db.execute("select count(*) from attempts where channel='elsevier' and status='ok'").fetchone()[0] == 1
+    assert led.remaining("elsevier") == 0                       # the cap is not exceeded by the recovery
+
+
+def test_cooldowns_flow_both_ways_while_a_job_runs(tmp_path):
+    f, net, _, led, rdir, _ = mk_remote(tmp_path, {"api.elsevier.com": ELS_XML})
+    d = rdir / "jobs" / "j1"
+    (d / "results").mkdir(parents=True)
+    DownloadLedger(d / "ledger.sqlite").block("api.wiley.com", "remote 429", 3600)
+    (d / "status.json").write_text(json.dumps(dict(state="done", ts=time.time())))
+    (d / "spec.json").write_text(json.dumps(dict(entries=[], marks={})))
+    led.block("www.tandfonline.com", "local challenge", 3600)
+    remote.jobs_dir(f.cfg).mkdir(parents=True, exist_ok=True)
+    (remote.jobs_dir(f.cfg) / "j1.json").write_text(json.dumps(dict(job="j1", stage="submitted")))
+    remote.collect(f, "j1", FakeSSH(rdir, net), log=lambda m: None, poll_s=0, sleep=lambda s: None)
+    assert led.cooling("api.wiley.com")                          # remote -> local
+    pushed = json.loads((rdir / "jobs" / "j1" / "cooldown_push.json").read_text()) if \
+        (rdir / "jobs" / "j1").exists() else None
+    assert pushed is None or any(h == "www.tandfonline.com" for h, *_ in pushed)
+
+
+def test_hook_config_fails_closed_and_quotes_paths(tmp_path):
+    bd = tmp_path / "dir with space"
+    bd.mkdir()
+    home = browser_agent._hermes_home(bd, {"provider": "p", "model": "m",
+                                           "provider_config": {"api": "http://x/v1", "api_key": "SECRET-K",
+                                                               "extra_headers": {"Authorization": "Bearer SECRET-H"}}},
+                                      str(bd / "bin" / "tbsgen-hook"))
+    txt = (home / "config.yaml").read_text()
+    assert "fail_closed: true" in txt and "SECRET-K" not in txt and "SECRET-H" not in txt
+    import shlex
+    cmd = json.loads([ln.split("command:", 1)[1] for ln in txt.splitlines() if "command:" in ln][0])
+    assert shlex.split(cmd) == [str(bd / "bin" / "tbsgen-hook")]
+
+
+def test_refused_batch_closes_no_taskspace_and_releases_the_lock(tmp_path, monkeypatch):
+    cfg, led, clock = mk_browser(tmp_path)
+    bqueue(cfg, {"10.1080": 1})
+    closed = []
+    monkeypatch.setattr(browser_agent.browser_ego, "finish", lambda c: closed.append(c.get("space")) or {})
+    f = Fetcher(cfg, ledger=led, transport=FakeNet({}))
+    pr = browser_agent.Prober(f.ft, probe_fn=Seq(TRACE_SG), clock=clock, sleep=clock.sleep)
+    st = browser_agent.run_batch(f, prober=pr, clock=clock, sleep=clock.sleep, log=lambda m: None)
+    assert st["refused"] and closed == [] and not f._space_held
+    f2 = Fetcher(cfg, ledger=led, transport=FakeNet({}))
+    assert f2._try_space_lock()                                 # the lock was released
+
+
+def test_no_script_starts_after_stop_or_too_close_to_deadline(tmp_path):
+    clock = FakeClock(time.time())
+    cfg, led, clock = mk_browser(tmp_path, clock=clock, window_s=100, margin_s=60, est_script_s=5,
+                                 min_script_s=20)
+    bqueue(cfg, {"10.1080": 2})                                  # same publisher: the 2nd waits 60-120 s
+    run, calls = script_runner(tmp_path)
+    f = Fetcher(cfg, ledger=led, transport=FakeNet({}), browser_runner=run)
+    f.ft["limits"]["browser"].update(gap_s=60.0, jitter_s=0.0)
+    led.limits["browser"].update(gap_s=60.0, jitter_s=0.0)
+    pr = browser_agent.Prober(f.ft, probe_fn=Seq(TRACE_OK), clock=clock, sleep=clock.sleep)
+    st = browser_agent.run_batch(f, prober=pr, clock=clock, sleep=clock.sleep, log=lambda m: None)
+    assert len(calls) == 1 and st["deferred"] >= 1               # the 2nd paper's slot is past the deadline

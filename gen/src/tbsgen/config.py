@@ -139,6 +139,7 @@ DEFAULTS: dict[str, Any] = {
                 "per_publisher_max": 2,
                 "require_http_first": True, # only papers the HTTP channels already tried (browser quota is small)
                 "est_script_s": 60,         # planning estimates per paper (script run, agent run)
+                "min_script_s": 20,         # no script is started with less time than this left in the window
                 "est_agent_s": 120,
                 "agent_fraction": 0.5,      # expected share of papers the script cannot get
                 "poll_s": 5,                # --wait-for-egress: egress probe interval (>= 5 s; not a download)
@@ -158,7 +159,7 @@ DEFAULTS: dict[str, Any] = {
                 "max_violations": 3,        # blocked commands before the run is ended
                 "max_turns": 80,
                 "run_budget_s": 420,        # hermes --run-budget (also capped by the egress window)
-                "space": "tbsgen-s3-agent", # the agent's own TaskSpace (closed by code afterwards)
+                "space": None,              # agent TaskSpace; None -> "<browser.space>-agent" (closed afterwards)
                 "extra_domains": ["doi.org"],   # always allowed besides the queued papers' publisher domains
                 "gate_max_wait_s": 150,     # the per-paper gate waits at most this long for the publisher's slot
                 "prompt_template": None,    # None -> packaged browser_agent_prompt.md
