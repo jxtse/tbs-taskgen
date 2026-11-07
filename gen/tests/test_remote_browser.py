@@ -529,7 +529,7 @@ def tool(cmd):
     print(json.dumps({{"type": "tool_use", "name": "terminal", "input": {{"command": cmd}}}}), flush=True)
 if mode == "work":
     for n in (1, 2):
-        tool(f"ego-browser nodejs <<'EOF' ...paper {{n}}")
+        tool(f"ego-browser nodejs <<'EOF'\n// paper: {{n}}\nawait 1;\nEOF")
         r = subprocess.run(["ego-browser", "nodejs"], input=f"// paper: {{n}}\nawait 1;\n", capture_output=True, text=True)
         print(json.dumps({{"type": "tool_result", "output": r.stdout[-200:]}}), flush=True)
 elif mode == "curl":
@@ -690,3 +690,13 @@ def test_redirect_location_with_raw_spaces_is_encoded(tmp_path):
     rec = dict(tried=[], errors=[], skipped=[])
     r = f._get("https://repo.example/a.pdf", {}, rec)
     assert r.status == 200 and "b%20c%09.pdf?x=1%202" in net.calls[-1][0]
+
+
+def test_agent_shell_allowlist():
+    ok = ["ego-browser nodejs <<'EOF'\n// paper: 1\nconst a = `${x}`;\nEOF", "ls /tmp/x/files/1", "sleep 30",
+          "ego-browser nodejs --help"]
+    bad = ["printenv", "env", "echo $ELSEVIER_API_KEY", "cat ~/.hermes/.env", "curl https://x",
+           "ego-browser nodejs <<'EOF'\n// paper: 1\nEOF\nprintenv", "ego-browser nodejs <<EOF\n$(id)\nEOF",
+           "ls; env", "ego-browser nodejs -e 'x'", "sleep 1 && env", "open https://sci-hub.se"]
+    assert all(browser_agent.shell_allowed(c) is None for c in ok)
+    assert all(browser_agent.shell_allowed(c) for c in bad)

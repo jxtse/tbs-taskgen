@@ -14,7 +14,15 @@ $papers_json
 
 ## How to use the browser
 
-- Run browser scripts only with `ego-browser nodejs` (heredoc on stdin). The first line of every script
+- Run browser scripts only as one terminal command of exactly this shape (quoted heredoc, nothing after it):
+
+      ego-browser nodejs <<'EOF'
+      // paper: N
+      ...script...
+      EOF
+
+  The only other commands allowed are `ls <path>` and `sleep <seconds>`; anything else ends the batch.
+  The first line of every script
   MUST be `// paper: N` with the paper's number from the list above. Use only the TaskSpace
   `taskSpace("$space")`; it starts with Page `p1`, reuse it with `goto()`.
 - Save a downloaded PDF only into that paper's `save_dir` (absolute path), for example with
@@ -37,9 +45,10 @@ $papers_json
 4. Respect the download ledger: at most one paper of a publisher at a time; the same publisher is paced
    $gap_s–$gap_max_s seconds apart, and the daily caps are enforced by the wrapper.
 5. Do not open, close, read or switch the user's own tabs or TaskSpaces. Use only "$space".
-6. Do not run any other program: only `ego-browser nodejs`. No curl, wget, python, node, open, ssh.
-7. At the very end close your TaskSpace: run `ego-browser nodejs` with the single line `// finish` as the
-   script (the wrapper closes "$space" for you).
+6. Do not run any other program: only `ego-browser nodejs`, `ls`, `sleep`. No curl, wget, python, node, open,
+   ssh, env, cat, echo.
+7. At the very end close your TaskSpace: run the heredoc command above with the single line `// finish` as
+   the script (the wrapper closes "$space" for you).
 
 ## Time budget
 

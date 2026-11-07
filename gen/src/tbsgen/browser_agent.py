@@ -54,10 +54,36 @@ DENY_SCRIPT = re.compile(r"claimTaskSpace|takeOverTaskSpace|listTaskSpaces|userP
                          r"\.tabs\(|\.cdp\(|keyboard\.|mouse\.|setInputFiles|waitForFileChooser|document\.cookie|"
                          r"localStorage|sessionStorage|clearing-state|child_process|node:net|node:http|"
                          r"node:https|globalThis\.fetch|\bprocess\.env\b|GUARD\s*=")
-# Shell commands the agent must not run (checked live on the stream; the run is killed on a match).
-DENY_SHELL = re.compile(r"(^|[\s;&|(`/])(curl|wget|python3?|node|npx|deno|bun|osascript|open|ssh|scp|nc|"
-                        r"security|sqlite3|defaults|launchctl|pkill|kill|killall)(\s|$)|\.local/bin/ego-browser|"
-                        r"sci-?hub|libgen|z-lib|annas-archive", re.I)
+# The agent's shell is an allowlist (checked live on the stream; the run is killed on anything else): one
+# `ego-browser nodejs` call with the script as a quoted heredoc and nothing after it, `ego-browser nodejs
+# --help`, `ls` of a path, or `sleep N`.  Hermes may run its terminal with its own secrets in the environment,
+# so no other command (env, printenv, echo $VAR, cat, curl, ...) may run.
+_HEREDOC = re.compile(r"^ego-browser nodejs\s*<<-?\s*'([A-Za-z_]+)'\s*$")
+_SIMPLE = re.compile(r"^(ego-browser nodejs --help|ego-browser skill|ls(\s+-[al1]+)?(\s+[A-Za-z0-9_./~-]+)*|sleep\s+\d{1,3})\s*$")
+DENY_TEXT = re.compile(r"sci-?hub|libgen|z-lib|annas-archive", re.I)
+
+
+def shell_allowed(cmd: str) -> str | None:
+    """None if the agent's terminal command is allowed, else the reason."""
+    if not isinstance(cmd, str) or not cmd.strip():
+        return "empty command"
+    if DENY_TEXT.search(cmd):
+        return "unauthorized source"
+    lines = cmd.strip("\n").split("\n")
+    first = lines[0].strip()
+    if _SIMPLE.match(first):
+        return None if len(lines) == 1 else "extra lines after a simple command"
+    m = _HEREDOC.match(first)
+    if not m:
+        return f"command not allowed: {first[:60]}"
+    term = m.group(1)
+    try:
+        end = next(i for i, ln in enumerate(lines[1:], 1) if ln.strip() == term)
+    except StopIteration:
+        return "unterminated heredoc"
+    if any(ln.strip() for ln in lines[end + 1:]):
+        return "commands after the heredoc"
+    return None
 
 
 class EgressLost(RuntimeError):
@@ -667,10 +693,16 @@ def _agent_phase(fetcher, todo: list[dict], deadline: float, bd: Path, wd: Watch
     def on_event(ev):
         if ev.get("type") == "tool_use":
             events["tool_calls"] += 1
-            cmd = json.dumps(ev.get("input") or {})
-            if (m := DENY_SHELL.search(cmd)):
-                events["violations"].append(m.group(0).strip())
-                return f"denied command: {m.group(0).strip()}"
+            inp = ev.get("input") or {}
+            if ev.get("name") != "terminal":
+                why = f"tool not allowed: {ev.get('name')}"
+            elif inp.get("background") or inp.get("pty"):
+                why = "background / pty terminal not allowed"
+            else:
+                why = shell_allowed(inp.get("command"))
+            if why:
+                events["violations"].append(why[:120])
+                return f"denied command: {why[:120]}"
         if wd.lost.is_set():
             return "egress lost"
         return None
