@@ -234,11 +234,31 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
-def make_transport(use_env_proxy: bool = False) -> Transport:
+SYSTEM_CA_BUNDLES = ("/etc/ssl/cert.pem", "/etc/ssl/certs/ca-certificates.crt", "/etc/pki/tls/certs/ca-bundle.crt",
+                     "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem", "/etc/ssl/ca-bundle.pem")
+
+
+def ssl_context(ca_file: str | None = None):
+    """Default verification; `ca_file` (fulltext.ca_file) or, when the interpreter's default CA file is missing
+    (standalone Python builds on some Linux distributions), the first system bundle found."""
+    import ssl
+    if ca_file:
+        return ssl.create_default_context(cafile=ca_file)
+    dflt = ssl.get_default_verify_paths()
+    if (dflt.cafile and os.path.exists(dflt.cafile)) or os.environ.get("SSL_CERT_FILE"):
+        return ssl.create_default_context()
+    for p in SYSTEM_CA_BUNDLES:
+        if os.path.exists(p):
+            return ssl.create_default_context(cafile=p)
+    return ssl.create_default_context()
+
+
+def make_transport(use_env_proxy: bool = False, ca_file: str | None = None) -> Transport:
     """One request, no automatic redirects (Fetcher follows them hop by hop).  Environment proxies are ignored
     unless use_env_proxy.  `timeout` is a total deadline for the whole request (socket ops are bounded by it
     too), so a slowly dripping response cannot keep a reservation alive."""
-    handlers = [_NoRedirect()] + ([] if use_env_proxy else [urllib.request.ProxyHandler({})])
+    handlers = [_NoRedirect(), urllib.request.HTTPSHandler(context=ssl_context(ca_file))] + \
+        ([] if use_env_proxy else [urllib.request.ProxyHandler({})])
     opener = urllib.request.build_opener(*handlers)
 
     def transport(url: str, headers: dict, timeout: float, max_bytes: int) -> Resp:
@@ -363,7 +383,7 @@ class Fetcher:
     def __post_init__(self):
         ft = self.ft
         if self.transport is None:
-            self.transport = make_transport(bool(ft.get("use_env_proxy")))
+            self.transport = make_transport(bool(ft.get("use_env_proxy")), ft.get("ca_file"))
         if self.ledger is None:
             self.ledger = DownloadLedger(ledger_path(self.cfg), ft.get("limits"), ft.get("global_limits"),
                                          ft.get("host_caps"))

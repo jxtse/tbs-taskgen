@@ -174,6 +174,7 @@ DEFAULTS: dict[str, Any] = {
             "python": None,                 # remote interpreter with tbsgen installed (absolute path)
             "workdir": None,                # remote data dir (job dirs live in <workdir>/jobs)
             "pdftotext": None,              # remote pdftotext binary (None -> "pdftotext" on PATH)
+            "ca_file": None,                # remote CA bundle (None -> Python default, else a system bundle)
             "ssh": ["ssh", "-o", "BatchMode=yes", "-o", "ServerAliveInterval=30", "-o", "ServerAliveCountMax=4"],
             "max_job_s": 7200,              # a remote job starts no new paper after this (< ledger PENDING_TTL_S)
             "batch_max": 50,
@@ -182,6 +183,7 @@ DEFAULTS: dict[str, Any] = {
             "secrets_cmd": None,
         },
         "pdftotext": None,                  # pdftotext binary; None -> "pdftotext" on PATH
+        "ca_file": None,                    # CA bundle for HTTPS; None -> Python default, else a system bundle
         # Caps / pacing (dlledger.DEFAULT_LIMITS etc.); dicts merge per channel / host.
         "limits": {},
         "global_limits": {},

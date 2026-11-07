@@ -221,7 +221,7 @@ def remote_spec(fetcher, job: str, entries: list[dict], channels: list[str], lea
     ft.update(cache_dirs=[], write_cache_dir=f"{wd}/cache", ledger_path=f"{wd}/ledger.sqlite",
               queue_path=f"{wd}/queue.jsonl", cascade=[c for c in ft.get("cascade") or HTTP_CHANNELS
                                                         if c in channels],
-              pdftotext=rcfg.get("pdftotext"))
+              pdftotext=rcfg.get("pdftotext"), ca_file=rcfg.get("ca_file"))
     from .dlledger import DownloadLedger
     led: DownloadLedger = fetcher.ledger
     from .dlledger import PENDING_TTL_S

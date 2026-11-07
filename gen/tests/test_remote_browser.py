@@ -666,3 +666,17 @@ def test_allowed_domains_cover_publisher_and_landing():
     d = browser_agent.allowed_domains("10.1093/abc/1", "https://academic.oup.com/x/article/1", ["doi.org"])
     assert "oup.com" in d and "doi.org" in d and "silverchair.com" in d
     assert not any("sci-hub" in x for x in d)
+
+
+def test_ssl_context_falls_back_to_a_system_bundle(monkeypatch, tmp_path):
+    import ssl
+    bundle = tmp_path / "ca.pem"
+    bundle.write_text("")
+    seen = {}
+    monkeypatch.delenv("SSL_CERT_FILE", raising=False)
+    monkeypatch.setattr(ssl, "get_default_verify_paths",
+                        lambda: ssl.DefaultVerifyPaths(None, None, "SSL_CERT_FILE", "/nonexistent", "SSL_CERT_DIR", "/x"))
+    monkeypatch.setattr(fulltext, "SYSTEM_CA_BUNDLES", ("/nonexistent/a.pem", str(bundle)))
+    monkeypatch.setattr(ssl, "create_default_context", lambda cafile=None: seen.setdefault("cafile", cafile))
+    fulltext.ssl_context()
+    assert seen["cafile"] == str(bundle)
