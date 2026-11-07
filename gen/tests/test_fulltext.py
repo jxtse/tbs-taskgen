@@ -203,8 +203,11 @@ def test_challenge_detection():
     assert challenge_page(CF) and block_signal(200, CF) == 24 * 3600
     assert block_signal(429) == 6 * 3600
     assert block_signal(403, b"<html><title>Purchase this article</title></html>") is None   # paywall 403
-    page_with_recaptcha_widget = b"<html><head><title>Paper title</title></head><body>g-recaptcha</body></html>"
+    assert block_signal(403, b"<html><head><title>Access Denied</title></head></html>") == 24 * 3600
+    page_with_recaptcha_widget = (b"<html><head><title>Paper title</title></head><body><div class='g-recaptcha'>"
+                                  b"</div> please solve the captcha to comment</body></html>")
     assert not challenge_page(page_with_recaptcha_widget)
+    assert block_signal(200, page_with_recaptcha_widget) is None
 
 
 # ------------------------------------------------------------------ ledger: caps, pacing, cooldown, breaker
@@ -216,7 +219,7 @@ def test_cloudflare_cools_host_and_blocks_later_requests(tmp_path):
     assert led.cooling("pub.example.org")
     n = len(net.calls)
     out = f.fetch(dict(doi="10.5555/a2", title=TITLE))
-    assert len(net.calls) == n and any("cooling" in s for s in out.rec["skipped"])
+    assert len(net.calls) == n and any("cooldown" in s for s in out.rec["skipped"])
     clock.t += 24 * 3600 + 1
     assert led.cooling("pub.example.org") is None
 
@@ -384,7 +387,7 @@ def fake_browser(results):
 
     def run(job):
         calls.append(job)
-        r = results(job) if callable(results) else results
+        r = dict(results(job) if callable(results) else results)
         if r.get("status") == "downloaded":
             p = Path(job["out_dir"]) / f"dl-{len(calls)}.bin"
             p.write_bytes(r.pop("_body"))
@@ -417,7 +420,7 @@ def test_browser_html_instead_of_pdf_and_success(tmp_path, monkeypatch):
     f, _, led, _ = mkfetcher(tmp_path, {}, SECRETS, browser_runner=run, browser={"enabled": True},
                              elsevier={"enabled": False})
     bad = f.fetch(dict(doi="10.1016/j.x.1", title=TITLE), browser=True)
-    assert bad.text is None and "short text" in bad.rec["errors"][-1]
+    assert bad.text is None and "not a PDF or full-text article page" in bad.rec["errors"][-1]
     good = f.fetch(dict(doi="10.1021/acs.1", title=TITLE), browser=True)
     assert good.rec["source"] == "browser" and "sig=abc" not in good.rec["url"]
     assert led.usage()["browser"]["ok"] == 1
@@ -431,18 +434,80 @@ def test_queue_idempotent_and_drain(tmp_path, monkeypatch):
     f, _, _, _ = mkfetcher(tmp_path, {}, SECRETS, browser_runner=run,
                            browser={"enabled": True, "concurrency": 2})
     qp = fulltext.queue_path(f.cfg)
-    assert fulltext.enqueue(qp, dict(doi="10.1021/acs.1", title=TITLE, item_ids=["i1"]))
-    assert not fulltext.enqueue(qp, dict(doi="10.1021/ACS.1", title=TITLE, item_ids=["i2"]))
-    assert fulltext.enqueue(qp, dict(doi="10.1093/x.2", title=TITLE, item_ids=["i3"]))
+    assert fulltext.enqueue(qp, fulltext.queue_entry(dict(doi="10.1021/acs.1", title=TITLE), subscribers=[["r", "i1"]]))
+    assert not fulltext.enqueue(qp, fulltext.queue_entry(dict(doi="10.1021/ACS.1", title=TITLE),
+                                                         subscribers=[["r", "i2"]]))
+    assert fulltext.enqueue(qp, fulltext.queue_entry(dict(doi="10.1093/x.2", title=TITLE), subscribers=[["r", "i3"]]))
     q = fulltext.read_queue(qp)
-    assert len(q) == 2 and q[0]["item_ids"] == ["i1", "i2"]
+    assert len(q) == 2 and q[0]["subscribers"] == [["r", "i1"], ["r", "i2"]]
     done = []
-    st = fulltext.drain_queue(f, max_papers=10, on_success=lambda e, o: done.append(e["doi"]), log=lambda s: None)
-    assert st["ok"] == 1 and st["failed"] == 1 and st["remaining"] == 1 and done == ["10.1021/acs.1"]
+
+    def ack(e, o, sub):
+        done.append(sub[1])
+        return True
+    st = fulltext.drain_queue(f, max_papers=10, on_success=ack, log=lambda s: None, now=1000.0)
+    assert st["ok"] == 1 and st["failed"] == 1 and st["remaining"] == 1 and sorted(done) == ["i1", "i2"]
     assert {c["slot"] for c in calls} <= {0, 1}
-    # second drain: cache hit for nothing left; the failed one is tried again, the fetched one is gone
-    st = fulltext.drain_queue(f, max_papers=10, log=lambda s: None)
-    assert st["considered"] == 1
+    left = fulltext.read_queue(qp)
+    assert left[0]["doi"] == "10.1093/x.2" and left[0]["tries"] == 1 and left[0]["next_try"] > 1000.0
+    # backed off: not due right away, due after the backoff
+    assert fulltext.drain_queue(f, max_papers=10, log=lambda s: None, now=1001.0)["considered"] == 0
+    assert fulltext.drain_queue(f, max_papers=10, log=lambda s: None, now=1000.0 + 7 * 3600)["considered"] == 1
+
+
+def test_drain_keeps_entry_when_reactivation_fails(tmp_path, monkeypatch):
+    monkeypatch.setattr(fulltext, "pdf_to_text", lambda b: TITLE + "\n" + BODY)
+    run, _ = fake_browser({"status": "downloaded", "_body": FAKE_PDF})
+    f, _, _, _ = mkfetcher(tmp_path, {}, SECRETS, browser_runner=run, browser={"enabled": True})
+    qp = fulltext.queue_path(f.cfg)
+    fulltext.enqueue(qp, fulltext.queue_entry(dict(doi="10.1021/acs.1", title=TITLE), subscribers=[["r", "i1"]]))
+
+    def boom(e, o, sub):
+        raise OSError("disk full")
+    st = fulltext.drain_queue(f, on_success=boom, log=lambda s: None)
+    assert st["ok"] == 1 and any("disk full" in str(x) for x in st["errors"])
+    assert [e["doi"] for e in fulltext.read_queue(qp)] == ["10.1021/acs.1"]     # kept; text is cached now
+    st = fulltext.drain_queue(f, on_success=lambda e, o, s: True, log=lambda s: None)
+    assert st["by_channel"] == {"cache": 1} and fulltext.read_queue(qp) == []
+
+
+def test_subscriber_added_during_drain_is_kept(tmp_path, monkeypatch):
+    monkeypatch.setattr(fulltext, "pdf_to_text", lambda b: TITLE + "\n" + BODY)
+    qp_holder = {}
+
+    def run_and_enqueue(job):
+        fulltext.enqueue(qp_holder["qp"], fulltext.queue_entry(dict(doi="10.1021/acs.1", title=TITLE),
+                                                               subscribers=[["r", "late"]]))
+        p = Path(job["out_dir"]) / "x.bin"
+        p.write_bytes(FAKE_PDF)
+        return {"status": "downloaded", "path": str(p), "bytes": len(FAKE_PDF)}
+    f, _, _, _ = mkfetcher(tmp_path, {}, SECRETS, browser_runner=run_and_enqueue, browser={"enabled": True})
+    qp_holder["qp"] = qp = fulltext.queue_path(f.cfg)
+    fulltext.enqueue(qp, fulltext.queue_entry(dict(doi="10.1021/acs.1", title=TITLE), subscribers=[["r", "i1"]]))
+    fulltext.drain_queue(f, on_success=lambda e, o, s: True, log=lambda s: None)
+    q = fulltext.read_queue(qp)
+    assert len(q) == 1 and q[0]["subscribers"] == [["r", "late"]]
+
+
+def test_queue_concurrent_enqueue_is_not_lost(tmp_path):
+    import threading
+    qp = tmp_path / "q.jsonl"
+    ths = [threading.Thread(target=fulltext.enqueue, args=(qp, fulltext.queue_entry(
+        dict(doi=f"10.1/x{i}", title="t"), subscribers=[["r", f"i{i}"]]))) for i in range(20)]
+    for th in ths:
+        th.start()
+    for th in ths:
+        th.join()
+    assert len(fulltext.read_queue(qp)) == 20
+
+
+def test_queue_keeps_retrieval_fields_and_doi_less_papers(tmp_path):
+    qp = tmp_path / "q.jsonl"
+    c = dict(title="No DOI paper", openAccessPdf={"url": "https://repo.example/p.pdf"}, pmcid="PMC1", arxiv="2101.1")
+    e = fulltext.queue_entry(c, subscribers=[["r", "i"]])
+    assert fulltext.enqueue(qp, e)
+    [got] = fulltext.read_queue(qp)
+    assert got["openAccessPdf"]["url"] == "https://repo.example/p.pdf" and got["pmcid"] == "PMC1" and got["key"]
 
 
 def test_s3_parks_and_queues_then_fetch_reactivates(tmp_path, monkeypatch):
@@ -459,7 +524,7 @@ def test_s3_parks_and_queues_then_fetch_reactivates(tmp_path, monkeypatch):
     it = P.store.item(iid)
     assert it.state["status"] == "parked" and it.state["reason"] == "fulltext_unavailable"
     q = fulltext.read_queue(fulltext.queue_path(cfg))
-    assert [e["doi"] for e in q] == ["10.1021/acs.9"] and q[0]["item_ids"] == [iid]
+    assert [e["doi"] for e in q] == ["10.1021/acs.9"] and q[0]["subscribers"] == [[str(P.store.root), iid]]
     P.run(max_steps=3)                                                  # parked: not retried, not re-queued twice
     assert len(fulltext.read_queue(fulltext.queue_path(cfg))) == 1
     run, _ = fake_browser({"status": "downloaded", "_body": FAKE_PDF})
@@ -489,3 +554,161 @@ def test_browser_script_renders_input_without_env(tmp_path):
     assert browser_ego.publisher_key("10.1016/j.x") == "chrome:10.1016"
     assert browser_ego.pdf_url_hint("10.1021/acs.jcim.5b00654")[0].startswith("https://pubs.acs.org/doi/pdf/")
     assert browser_ego.binary({"binary": "/nonexistent/ego-browser"}) is None
+
+
+# ------------------------------------------------------------------ review round 1 regressions
+def test_redirect_strips_credentials_and_refuses_downgrade(tmp_path):
+    routes = {"api.elsevier.com": Resp(302, {"Location": "https://cdn.other.example/x.xml?sig=1"}, b"",
+                                       "https://api.elsevier.com/x"),
+              "cdn.other.example": ELS_XML}
+    f, net, _, _ = mkfetcher(tmp_path, routes, SECRETS)
+    out = f.fetch(dict(doi="10.1016/j.x.1", title=TITLE))
+    assert out.rec["source"] == "elsevier"
+    (u1, h1), (u2, h2) = net.calls
+    assert "X-ELS-APIKey" in h1 and "X-ELS-APIKey" not in h2 and u2.startswith("https://cdn.other.example/")
+    assert out.rec["url"] == "https://cdn.other.example/x.xml"                 # signed query dropped
+    routes = {"api.elsevier.com": Resp(302, {"Location": "http://plain.example/x"}, b"", "https://api.elsevier.com/x")}
+    f, net, _, _ = mkfetcher(tmp_path / "b", routes, SECRETS)
+    out = f.fetch(dict(doi="10.1016/j.x.1", title=TITLE))
+    assert out.text is None and len(net.calls) == 1 and "https -> http" in out.rec["errors"][-1]
+
+
+def test_redirect_target_in_cooldown_is_not_requested(tmp_path):
+    routes = {"oa.example.org": Resp(302, {"Location": "https://blocked.example/p.pdf"}, b"", "x")}
+    f, net, led, _ = mkfetcher(tmp_path, routes, SECRETS)
+    led.block("blocked.example", "cf")
+    f.fetch(dict(doi="10.9/x", title=TITLE, oa_url="https://oa.example.org/p"))
+    assert not any("blocked.example" in u for u in net.hosts())
+
+
+def test_browser_child_env_allowlist(monkeypatch):
+    monkeypatch.setenv("ELSEVIER_INSTTOKEN", "tok-should-not-leak")
+    monkeypatch.setenv("EXA_API_KEY_SECONDARY", "k2")
+    monkeypatch.setenv("MY_CUSTOM_CREDENTIAL", "c")
+    env = browser_ego.child_env()
+    assert "PATH" in env and not ({"ELSEVIER_INSTTOKEN", "EXA_API_KEY_SECONDARY", "MY_CUSTOM_CREDENTIAL"} & set(env))
+    seen = {}
+
+    def fake_run(cmd, **kw):
+        seen.update(kw)
+
+        class P:
+            stdout = 'TBSGEN_RESULT {"status": "ok"}'
+            stderr = ""
+        return P()
+    monkeypatch.setattr(browser_ego.subprocess, "run", fake_run)
+    monkeypatch.setattr(browser_ego, "binary", lambda cfg: "/bin/true")
+    assert browser_ego.finish({})["status"] == "ok"
+    assert "ELSEVIER_INSTTOKEN" not in seen["env"]
+
+
+def test_errors_and_ledger_notes_are_redacted(tmp_path):
+    run, _ = fake_browser({"status": "html", "error": "landed on https://pub.example/x?token=SECRETVALUE123 for "
+                                                      "k-els-test"})
+    f, _, _, _ = mkfetcher(tmp_path, {}, SECRETS, browser_runner=run, browser={"enabled": True})
+    out = f.fetch(dict(doi="10.1021/acs.1", title=TITLE), browser=True)
+    blob = json.dumps(out.rec)
+    assert "SECRETVALUE123" not in blob and "k-els-test" not in blob
+    notes = " ".join(r[0] for r in sqlite3.connect(tmp_path / "dl.sqlite").execute("select note from attempts"))
+    assert "SECRETVALUE123" not in notes and "k-els-test" not in notes
+    assert fulltext.safe_url("https://user:pw@h.example/p#frag") == "https://h.example/p"
+
+
+def test_cooldown_set_while_waiting_cancels_reservation(tmp_path):
+    clock = FakeClock()
+    led = DownloadLedger(tmp_path / "l.sqlite", {"browser": {"gap_s": 60, "jitter_s": 0}}, clock=clock)
+    r = led.acquire("browser", "chrome:10.1021", "a")
+    led.record("browser", "chrome:10.1021", "a", "ok", 200, 1, reservation=r)
+
+    def sleep_and_get_blocked(s):
+        clock.t += s
+        led.block("chrome:10.1021", "challenge seen by another worker")
+    led.sleep = sleep_and_get_blocked
+    with pytest.raises(LimitReached, match="cooldown"):
+        led.acquire("browser", "chrome:10.1021", "b")
+    rows = sqlite3.connect(tmp_path / "l.sqlite").execute("select status, note from attempts where doi='b'").fetchall()
+    assert rows[0][0] == "fail" and rows[0][1].startswith("cancelled")
+
+
+def test_caps_count_on_the_day_of_the_slot(tmp_path):
+    import datetime as dt
+    t = dt.datetime(2026, 11, 7, 23, 59, 30).timestamp()
+    clock = FakeClock(t)
+    led = DownloadLedger(tmp_path / "l.sqlite", {"browser": {"daily_ok": 1, "gap_s": 60, "jitter_s": 0}},
+                         clock=clock, sleep=lambda s: None)          # does not advance: slots stay in the future
+    led.acquire("browser", "chrome:10.1021", "a")                  # today
+    led.acquire("browser", "chrome:10.1021", "b")                  # slot after midnight: tomorrow's quota
+    with pytest.raises(LimitReached, match="daily success cap"):
+        led.acquire("browser", "chrome:10.1021", "c")              # tomorrow's single slot is taken
+
+
+def test_pending_reservation_holds_quota_for_long_downloads(tmp_path):
+    clock = FakeClock()
+    led = DownloadLedger(tmp_path / "l.sqlite", {"browser": {"daily_ok": 1, "gap_s": 0, "jitter_s": 0}},
+                         clock=clock, sleep=clock.sleep)
+    led.acquire("browser", "chrome:10.1021", "a")
+    clock.t += 3600 + 60                                            # a slow download, still running
+    with pytest.raises(LimitReached):
+        led.acquire("browser", "chrome:10.1093", "b")
+
+
+def test_publisher_aliases_share_cooldown_across_channels(tmp_path):
+    run, calls = fake_browser({"status": "downloaded", "_body": FAKE_PDF})
+    f, _, led, _ = mkfetcher(tmp_path, {}, SECRETS, browser_runner=run, browser={"enabled": True})
+    led.block("onlinelibrary.wiley.com", "akamai on oa")                # set by an HTTP channel
+    out = f.fetch(dict(doi="10.1111/x.1", title=TITLE), browser=True, channels=["browser"])
+    assert calls == [] and any("cooldown" in s for s in out.rec["skipped"])
+    led2_run, calls2 = fake_browser({"status": "challenge", "title": "Just a moment..."})
+    f2, _, led2, _ = mkfetcher(tmp_path / "b", {}, SECRETS, browser_runner=led2_run, browser={"enabled": True})
+    f2.fetch(dict(doi="10.1002/a.1", title=TITLE), browser=True, channels=["browser"])
+    assert led2.cooling("chrome:10.1111") and led2.cooling("onlinelibrary.wiley.com")
+    assert fulltext.publisher_of("10.1029/x")[0] == fulltext.publisher_of("10.1002/y")[0] == "wiley"
+
+
+def test_browser_429_and_downloaded_challenge_page_cool_down(tmp_path):
+    run, _ = fake_browser({"status": "html", "http": 429})
+    f, _, led, _ = mkfetcher(tmp_path, {}, SECRETS, browser_runner=run, browser={"enabled": True})
+    f.fetch(dict(doi="10.1021/a", title=TITLE), browser=True)
+    row = sqlite3.connect(tmp_path / "dl.sqlite").execute("select until from cooldown where host='chrome:10.1021'").fetchone()
+    assert row and abs(row[0] - f.ledger.clock() - 6 * 3600) < 5
+    run, _ = fake_browser({"status": "downloaded", "_body": CF})
+    f, _, led, _ = mkfetcher(tmp_path / "b", {}, SECRETS, browser_runner=run, browser={"enabled": True})
+    f.fetch(dict(doi="10.1093/a", title=TITLE), browser=True)
+    assert led.cooling("chrome:10.1093")
+
+
+def test_html_paywall_page_is_not_full_text():
+    page = ("<html><head><title>" + TITLE + "</title></head><body><h1>" + TITLE + "</h1><h2>Abstract</h2><p>"
+            + BODY + "</p><h2>Introduction</h2><h2>Methods</h2><h2>Results</h2><p>Purchase this article to read "
+            "the full text.</p></body></html>").encode()
+    assert fulltext.html_fulltext(page) is None
+    article = ("<html><head><title>" + TITLE + "</title></head><body><h1>" + TITLE + "</h1><h2>1. Introduction</h2>"
+               "<p>" + BODY + "</p><h2>2. Methods</h2><p>x</p><h2>3. Results</h2><p>y</p><h2>References</h2>"
+               "</body></html>").encode()
+    assert fulltext.html_fulltext(article)
+
+
+def test_oversize_responses_are_rejected(tmp_path):
+    big = Resp(200, {}, b"%PDF-" + b"x" * 100, "https://oa.example.org/a.pdf", truncated=True)
+    f, _, _, _ = mkfetcher(tmp_path, {"oa.example.org": big}, SECRETS, max_pdf_mb=0.00001)
+    out = f.fetch(dict(doi="10.9/x", title=TITLE, oa_url="https://oa.example.org/a.pdf"))
+    assert out.text is None and "too large" in out.rec["errors"][-1]
+
+
+def test_corrupt_provenance_does_not_break_cache(tmp_path):
+    wc = tmp_path / "wc"
+    wc.mkdir()
+    (wc / "10.9_x.txt").write_text(BODY)
+    (wc / "10.9_x.json").write_text('{"channel": "oa", "url": ')
+    f, net, _, _ = mkfetcher(tmp_path, {}, SECRETS)
+    out = f.fetch(dict(doi="10.9/x", title=TITLE))
+    assert out.rec["source"] == "cache" and net.calls == []
+
+
+def test_host_cap_on_one_oa_source_does_not_stop_others(tmp_path, monkeypatch):
+    monkeypatch.setattr(fulltext, "pdf_to_text", lambda b: TITLE + "\n" + BODY)
+    f, net, led, _ = mkfetcher(tmp_path, {"good.example.org": FAKE_PDF}, SECRETS,
+                               oa={"europepmc": True, "max_urls": 3}, host_caps={"www.ebi.ac.uk": 0})
+    led.meta["daily_calls"] = 0                                      # metadata host refused
+    out = f.fetch(dict(doi="10.9/x", title=TITLE, oa_url="https://good.example.org/a.pdf"))
+    assert out.rec["source"] == "oa" and any("metadata cap" in s for s in out.rec["skipped"])

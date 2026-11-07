@@ -97,6 +97,7 @@ DEFAULTS: dict[str, Any] = {
         "keep_raw": True,                   # also keep the raw PDF/XML under <write_cache_dir>/raw/
         "ledger_path": None,                # download ledger (sqlite); None -> <run.root>/fulltext_ledger.sqlite
         "queue_path": None,                 # browser queue (jsonl); None -> <run.root>/fulltext_queue.jsonl
+        "queue_backoff_s": 21600,           # a failed queue entry waits this long (doubling, max 8x) before retry
         "min_chars": 8000,
         "title_match_min": 0.6,
         "max_pdf_mb": 40,
@@ -124,7 +125,7 @@ DEFAULTS: dict[str, Any] = {
             "challenge_wait_s": 40,         # a challenge page must clear by itself within this, else cooldown
             "challenge_cooldown_s": 86400,
             "nav_timeout_s": 45, "download_timeout_s": 120, "script_timeout_s": 420, "max_navigations": 5,
-            "download_wait_s": 8,           # how long a navigation may take to turn into a download
+            "download_wait_s": 6,           # extra wait for a download after the navigation settled
         },
         # Caps / pacing (dlledger.DEFAULT_LIMITS etc.); dicts merge per channel / host.
         "limits": {},

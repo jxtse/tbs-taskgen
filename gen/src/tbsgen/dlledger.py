@@ -6,15 +6,20 @@ Every outbound full-text download goes through `DownloadLedger.acquire(channel, 
   2. enforces caps (successes and attempts per channel per day and per hour, a global daily success cap,
      per-host daily / hourly attempt caps),
   3. books a `pending` attempt and the next free time slot for that host (min gap + random jitter),
-then sleeps until the slot.  `record(..., reservation=id)` finalises the row.  Two processes sharing the file
-cannot both take the last slot of a cap or the same host slot.
+then sleeps until the slot and, in a second transaction, re-checks cooldowns and breakers (they may have been
+set while it slept; a refused reservation is finalised as "fail" with note "cancelled").  `record(...,
+reservation=id)` finalises the row.  Two processes sharing the file cannot both take the last slot of a cap or the
+same host slot.  Caps are counted over the day of the booked slot (a slot after midnight counts for the next day),
+and a reservation is never booked more than `max_wait_s` ahead.  A pending row keeps its quota until it is
+finalised, or until it is older than PENDING_TTL_S (a crashed run; longer than any single download may take).
 
 Schema: the three tables `attempts`, `cooldown`, `hosts` (and their meaning) are those of an earlier
 literature pipeline, so both pipelines can point at one file and their usage of a publisher adds up instead
 of each using a full cap.  Two extra tables are added (an older reader ignores them): `blocks` (block signals,
 for the breaker) and `meta_calls` (metadata lookups such as Unpaywall / Europe PMC search, which never count
 against download caps and are paced under the host key "meta:<host>").  Browser downloads are keyed
-"chrome:<DOI prefix>" (one key per publisher), as in the earlier pipeline.  The day is the local calendar day
+"chrome:<DOI prefix>" as in the earlier pipeline; callers may pass `related` keys (e.g. the publisher's web
+host, or all DOI prefixes of one publisher) whose cooldowns also apply.  The day is the local calendar day
 (same as the earlier pipeline); set TZ for the process if that matters.
 
 Block signals: 429 -> 6 h host cooldown; a challenge page (Cloudflare, captcha, Akamai "Access Denied")
@@ -33,7 +38,8 @@ from pathlib import Path
 
 COOLDOWN_S = 24 * 3600
 COOLDOWN_429_S = 6 * 3600
-PENDING_TTL_S = 3600
+PENDING_TTL_S = 3 * 3600      # > browser script timeout + max wait; older pending rows belong to crashed runs
+MAX_WAIT_S = 1800             # never book a slot further ahead than this
 
 # Defaults are deliberately small fractions of the providers' published limits (see README, S3).
 DEFAULT_LIMITS: dict[str, dict] = {
@@ -66,18 +72,18 @@ _CHALLENGE_TITLE = re.compile(
     rb"please verify|security check|human verification|captcha)", re.I)
 _CHALLENGE_MARKERS = (b"cf-chl", b"cf_chl_opt", b"_cf_chl", b"challenge-platform", b"px-captcha",
                       b"/cdn-cgi/challenge", b"perfdrive.com", b"radware")
-_BLOCK_PATTERNS = (b"captcha", b"cf-chl", b"just a moment", b"verify you are human", b"attention required",
-                   b"are you a robot")
 CHALLENGE_TITLE_TEXT = re.compile(r"just a moment|verify you are human|attention required|access denied|"
                                   r"captcha|are you a robot|security check|请稍候", re.I)
 
 
 class LimitReached(RuntimeError):
-    """A cap, cooldown or breaker refuses the request.  `kind` is cap | cooldown | breaker."""
+    """A cap, cooldown or breaker refuses the request.  `kind` is cap | cooldown | breaker; `scope` is "host"
+    (only this host / publisher is refused: try other sources) or "channel" (stop the channel)."""
 
-    def __init__(self, msg: str, kind: str = "cap"):
+    def __init__(self, msg: str, kind: str = "cap", scope: str = "channel"):
         super().__init__(msg)
         self.kind = kind
+        self.scope = scope
 
 
 def challenge_page(body: bytes) -> bool:
@@ -88,13 +94,14 @@ def challenge_page(body: bytes) -> bool:
 
 
 def block_signal(status: int | None, body: bytes = b"") -> float | None:
-    """Cooldown seconds when a response is a real block, else None (a plain paywall 403 is not a block)."""
+    """Cooldown seconds when a response is a real block, else None.  429 -> 6 h.  A challenge page (title or
+    challenge-script markers; a reCAPTCHA widget on a normal article page is not one) or an Akamai-style
+    "Access Denied" 403 -> 24 h.  A plain paywall 403 is not a block."""
     if status == 429:
         return COOLDOWN_429_S
-    low = (body or b"")[:20000].lower()
-    if challenge_page(body) or any(p in low for p in _BLOCK_PATTERNS):
+    if challenge_page(body):
         return COOLDOWN_S
-    if status == 403 and b"access denied" in low:
+    if status == 403 and re.search(rb"<title[^>]*>\s*access denied", (body or b"")[:20000], re.I):
         return COOLDOWN_S
     return None
 
@@ -153,55 +160,62 @@ class DownloadLedger:
     def _n(self, where: str, args: tuple = ()) -> int:
         return self.db.execute(f"select count(*) from attempts where {where}", args).fetchone()[0]
 
-    def _ok_or_pending(self, where: str, args: tuple, since_ts: float | None = None) -> int:
+    def _ok_or_pending(self, where: str, args: tuple, day: str | None = None, since_ts: float | None = None) -> int:
+        """Successes plus live reservations (a pending row may still succeed) on `day` or since `since_ts`."""
         now = self.clock()
-        time_cond, targs = ("day=?", (self.today(),)) if since_ts is None else ("ts>?", (since_ts,))
+        time_cond, targs = ("day=?", (day or self.today(),)) if since_ts is None else ("ts>?", (since_ts,))
         return self._n(f"{time_cond} and (status='ok' or (status='pending' and ts>?)) and {where}",
                        (*targs, now - PENDING_TTL_S, *args))
 
-    def cooling(self, host: str) -> str | None:
-        row = self.db.execute("select until, reason from cooldown where host=?", (host,)).fetchone()
-        if row and row[0] > self.clock():
-            return f"{host} in cooldown until {time.strftime('%F %T', time.localtime(row[0]))}: {row[1]}"
+    def cooling(self, host: str, *related: str) -> str | None:
+        for h in (host, *related):
+            row = self.db.execute("select until, reason from cooldown where host=?", (h,)).fetchone()
+            if row and row[0] > self.clock():
+                return f"{h} in cooldown until {time.strftime('%F %T', time.localtime(row[0]))}: {row[1]}"
         return None
 
-    def breaker(self, channel: str) -> str | None:
+    def breaker(self, channel: str, day: str | None = None) -> str | None:
         lim = self.limits.get(channel, {})
         max_blocks = lim.get("breaker_blocks_per_day", self.g["breaker_blocks_per_day"])
         n_blocks = self.db.execute("select count(*) from blocks where day=? and channel=?",
-                                   (self.today(), channel)).fetchone()[0]
+                                   (day or self.today(), channel)).fetchone()[0]
         if max_blocks and n_blocks >= max_blocks:
             return f"{channel} breaker open: {n_blocks} block signals today"
         k = int(lim.get("breaker_consecutive_fail", self.g["breaker_consecutive_fail"]) or 0)
         rows = self.db.execute("select status from attempts where day=? and channel=? and status in ('ok','fail') "
-                               "order by ts desc limit ?", (self.today(), channel, k)).fetchall()
+                               "and note not like 'cancelled%' order by ts desc limit ?",
+                               (day or self.today(), channel, k)).fetchall()
         if k and len(rows) >= k and all(r[0] == "fail" for r in rows):
             return f"{channel} breaker open: last {k} attempts failed"
         return None
 
     # ------------------------------------------------------------------ checks
-    def check(self, channel: str, host: str):
+    def check(self, channel: str, host: str, related: tuple = (), slot: float | None = None):
+        """Raise LimitReached unless one more request on (channel, host) fits, counting over the day of `slot`."""
         if channel not in self.limits:
             raise LimitReached(f"unknown channel {channel}")
         lim = self.limits[channel]
         now = self.clock()
-        if (msg := self.cooling(host)) or (msg := self.cooling(f"channel:{channel}")):
+        day = local_day(slot if slot is not None else now)
+        if (msg := self.cooling(f"channel:{channel}")):
             raise LimitReached(msg, "cooldown")
-        if (msg := self.breaker(channel)):
+        if (msg := self.cooling(host, *related)):
+            raise LimitReached(msg, "cooldown", "host")
+        if (msg := self.breaker(channel)) or (day != self.today() and (msg := self.breaker(channel, day))):
             raise LimitReached(msg, "breaker")
-        if self._ok_or_pending("1", ()) >= self.g["daily_ok"]:
+        if self._ok_or_pending("1", (), day=day) >= self.g["daily_ok"]:
             raise LimitReached(f"global daily cap {self.g['daily_ok']} reached")
-        if self._ok_or_pending("channel=?", (channel,)) >= lim["daily_ok"]:
+        if self._ok_or_pending("channel=?", (channel,), day=day) >= lim["daily_ok"]:
             raise LimitReached(f"{channel} daily success cap {lim['daily_ok']} reached")
         if self._ok_or_pending("channel=?", (channel,), since_ts=now - 3600) >= lim["hourly_ok"]:
             raise LimitReached(f"{channel} hourly success cap {lim['hourly_ok']} reached")
-        if self._n("day=? and channel=?", (self.today(), channel)) >= lim["daily_attempts"]:
+        if self._n("day=? and channel=?", (day, channel)) >= lim["daily_attempts"]:
             raise LimitReached(f"{channel} daily attempt cap {lim['daily_attempts']} reached")
         host_day = self.host_caps.get(host, lim.get("host_daily_attempts") or self.g["per_host_daily_attempts"])
-        if self._n("day=? and host=?", (self.today(), host)) >= host_day:
-            raise LimitReached(f"{host} daily attempt cap {host_day} reached")
+        if self._n("day=? and host=?", (day, host)) >= host_day:
+            raise LimitReached(f"{host} daily attempt cap {host_day} reached", "cap", "host")
         if self._n("ts>? and host=?", (now - 3600, host)) >= lim["host_hourly_attempts"]:
-            raise LimitReached(f"{host} hourly attempt cap {lim['host_hourly_attempts']} reached")
+            raise LimitReached(f"{host} hourly attempt cap {lim['host_hourly_attempts']} reached", "cap", "host")
 
     def acquire_meta(self, host: str) -> None:
         """Pace + cap a metadata lookup (not a download).  Sleeps until the host's meta slot."""
@@ -209,13 +223,14 @@ class DownloadLedger:
         with self._tx():
             if (msg := self.cooling(host)):
                 raise LimitReached(msg, "cooldown")
+
             now = self.clock()
             n_day = self.db.execute("select count(*) from meta_calls where day=? and host=?",
                                     (self.today(), host)).fetchone()[0]
             n_hour = self.db.execute("select count(*) from meta_calls where ts>? and host=?",
                                      (now - 3600, host)).fetchone()[0]
             if n_day >= self.meta["daily_calls"] or n_hour >= self.meta["hourly_calls"]:
-                raise LimitReached(f"metadata cap reached for {host}")
+                raise LimitReached(f"metadata cap reached for {host}", "cap", "host")
             nxt = self.db.execute("select next_ts from hosts where host=?", (key,)).fetchone()
             slot = max(now, nxt[0] if nxt else 0.0)
             self.db.execute("insert or replace into hosts values(?,?)",
@@ -224,22 +239,36 @@ class DownloadLedger:
         if (wait := slot - self.clock()) > 0:
             self.sleep(wait)
 
-    def acquire(self, channel: str, host: str, doi: str = "") -> int:
-        """Check caps, book a pending attempt and the next per-host slot, sleep until the slot.
-        Returns a reservation id for record()."""
+    def acquire(self, channel: str, host: str, doi: str = "", related: tuple = ()) -> int:
+        """Check caps, book a pending attempt and the next per-host slot, sleep until the slot, then re-check
+        cooldowns / breakers.  Returns a reservation id for record().  `related`: further cooldown keys that
+        must also be clear (same publisher under other names)."""
         lim = self.limits[channel]
         with self._tx():
-            self.check(channel, host)
             now = self.clock()
             nxt = self.db.execute("select next_ts from hosts where host=?", (host,)).fetchone()
             last = self.db.execute("select max(ts) from attempts where host=?", (host,)).fetchone()[0] or 0
             slot = max(now, nxt[0] if nxt else 0.0, last + lim["gap_s"])
+            if slot - now > float(lim.get("max_wait_s", MAX_WAIT_S)):
+                raise LimitReached(f"{host}: next slot in {slot - now:.0f}s exceeds max_wait_s", "cap", "host")
+            self.check(channel, host, related, slot)
             self.db.execute("insert or replace into hosts values(?,?)",
                             (host, slot + lim["gap_s"] + random.uniform(0, lim["jitter_s"])))
             rid = self.db.execute("insert into attempts values(?,?,?,?,?,?,?,?,?)",
                                   (slot, local_day(slot), channel, host, doi, "pending", None, 0, "")).lastrowid
         if (wait := slot - self.clock()) > 0:
             self.sleep(wait)
+        # whatever happened while we slept (a block on this host / publisher, an open breaker) wins
+        msg, kind, scope = self.cooling(host, *related), "cooldown", "host"
+        if not msg:
+            msg, scope = self.cooling(f"channel:{channel}"), "channel"
+        if not msg and (msg := self.breaker(channel)):
+            kind = "breaker"
+        if msg:
+            self.record(channel, host, doi, "fail", None, 0, f"cancelled: {msg}", reservation=rid)
+            raise LimitReached(msg, kind, scope)
+        with self._tx():   # the real send time (late wake-ups keep the next gap honest)
+            self.db.execute("update attempts set ts=? where rowid=?", (max(slot, self.clock()), rid))
         return rid
 
     def record(self, channel: str, host: str, doi: str, status: str, http: int | None = None, nbytes: int = 0,

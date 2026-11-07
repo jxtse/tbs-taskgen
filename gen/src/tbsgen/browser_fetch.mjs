@@ -15,7 +15,7 @@ const CHALLENGE = /just a moment|verify you are human|attention required|access 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 async function pageFor(task, slot) {
-  // slot k -> k-th managed Page (created on demand; tbsgen creates them sequentially before parallel use)
+  // slot k -> k-th managed Page (tbsgen creates them sequentially with mode "ensure_pages" before parallel use)
   let pages = await task.pages();
   while (pages.length <= slot) {
     await task.newPage();
@@ -59,20 +59,36 @@ async function grabPdfDocument(page, i, file) {
   return { ok: r.ok, status: r.status, ctype: (r.headers && (r.headers["content-type"] || r.headers["Content-Type"])) || "" };
 }
 
+async function navStatus(page) {
+  try {
+    return await page.evaluate(() => {
+      const n = performance.getEntriesByType("navigation")[0];
+      return n && n.responseStatus ? n.responseStatus : null;
+    });
+  } catch (e) { return null; }
+}
+
 async function tryUrl(page, url, file) {
   out.tried.push(url.slice(0, 200));
-  // One download wait per navigation, always settled before the next one is armed (a Page allows only one).
-  const dlP = page.waitForEvent("download", { timeout: INPUT.download_wait_ms }).catch(() => null);
-  try {
-    await page.goto(url, { timeout: INPUT.nav_timeout_ms, waitUntil: "domcontentloaded" });
-  } catch (e) {
-    /* a navigation that turns into a download aborts the document */
+  // Download waits cover the whole navigation: short waits are re-armed back to back while goto is pending,
+  // plus one more after it settles.  Each wait settles before the next is armed (a Page allows one at a time),
+  // so nothing is left pending when the next navigation starts.
+  let navDone = false;
+  const gotoP = page.goto(url, { timeout: INPUT.nav_timeout_ms, waitUntil: "domcontentloaded" })
+    .catch(() => null)                 // a navigation that turns into a download aborts the document
+    .finally(() => { navDone = true; });
+  let dl = null;
+  for (;;) {
+    dl = await page.waitForEvent("download", { timeout: INPUT.download_wait_ms }).catch(() => null);
+    if (dl || navDone) break;
   }
-  const dl = await dlP;
+  await gotoP;
   if (dl) {
     await dl.saveAs(file);
     return { kind: "download", url: dl.url() };
   }
+  out.http = await navStatus(page);
+  if (out.http === 429) return { kind: "challenge", title: "HTTP 429" };
   let i = await waitChallenge(page);
   if (isChallenge(i)) return { kind: "challenge", title: i.title || i.text.slice(0, 80) };
   if (/pdf/i.test(i.ctype)) {
@@ -134,7 +150,7 @@ try {
     await task.finish({ keep: [] });
     out.status = "ok";
   } else if (INPUT.mode === "egress") {
-    const page = await pageFor(task, INPUT.slot || 0);
+    const page = await task.newPage();               // own Page: never disturbs a download slot
     out.bodies = {};
     for (const u of INPUT.urls) {
       try {
@@ -142,6 +158,7 @@ try {
         out.bodies[u] = (await page.evaluate(() => document.body ? document.body.innerText : "")).slice(0, 2000);
       } catch (e) { out.bodies[u] = ""; }
     }
+    try { await page.close(); } catch (e) {}
     out.status = "ok";
   } else {
     const page = await pageFor(task, INPUT.slot || 0);
@@ -159,6 +176,8 @@ try {
         try {
           await page.goto(landingUrl, { timeout: INPUT.nav_timeout_ms, waitUntil: "domcontentloaded" });
         } catch (e) { last = { kind: "nav", error: String(e).slice(0, 200) }; continue; }
+        out.http = await navStatus(page);
+        if (out.http === 429) { last = { kind: "challenge", title: "HTTP 429" }; break; }
         const i = await waitChallenge(page);
         if (isChallenge(i)) { last = { kind: "challenge", title: i.title }; break; }
         out.landing = i.url;
@@ -173,7 +192,8 @@ try {
       if (last.kind === "follow") queue.unshift(...last.urls.filter((u) => !out.tried.includes(u.slice(0, 200))));
     }
     const fs = await import("node:fs/promises");
-    const st = await fs.stat(file).catch(() => null);
+    let st = await fs.stat(file).catch(() => null);
+    if (st && st.size > INPUT.max_bytes) { await fs.unlink(file).catch(() => {}); out.error = "too large"; st = null; }
     out.bytes = st ? st.size : 0;
     if (last && last.kind === "challenge") { out.status = "challenge"; out.title = last.title || ""; }
     else if (st && st.size > 0) { out.status = "downloaded"; out.path = file; out.final_url = last && last.url || ""; }
@@ -185,3 +205,4 @@ try {
   out.error = String(e && e.stack || e).slice(0, 400);
 }
 console.log("TBSGEN_RESULT " + JSON.stringify(out));
+process.exit(0);   // do not keep the script alive for timers of settled/abandoned waits

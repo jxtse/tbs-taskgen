@@ -39,7 +39,18 @@ PDF_HINTS = {
 
 
 def publisher_key(doi: str) -> str:
+    """Ledger key of a browser download (the earlier pipeline's "chrome:<DOI prefix>"); see
+    fulltext.publisher_of for the aliases that share its pacing and cooldowns."""
     return "chrome:" + (doi.split("/", 1)[0] if "/" in doi else doi)
+
+
+# The ego-browser CLI needs only these; credentials in the parent environment never reach the browser process.
+ENV_ALLOW = ("PATH", "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "LANG", "LC_ALL", "LC_CTYPE", "TERM",
+             "XDG_RUNTIME_DIR", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "NO_PROXY", "no_proxy")
+
+
+def child_env() -> dict:
+    return {k: v for k, v in os.environ.items() if k in ENV_ALLOW}
 
 
 def pdf_url_hint(doi: str, c: dict | None = None) -> list[str]:
@@ -68,7 +79,7 @@ def _exec(cfg: dict, inp: dict, timeout: float) -> dict:
         return dict(status="unavailable", error="ego-browser binary not found (fulltext.browser.binary)")
     try:
         p = subprocess.run([exe, "nodejs"], input=render(inp), capture_output=True, text=True, timeout=timeout,
-                           env={k: v for k, v in os.environ.items() if not k.endswith(("_KEY", "_TOKEN", "_SECRET"))})
+                           env=child_env())
     except subprocess.TimeoutExpired:
         return dict(status="timeout", error=f"ego-browser script exceeded {timeout:.0f}s")
     for line in reversed((p.stdout + "\n" + p.stderr).splitlines()):     # the CLI may print to either stream
@@ -77,7 +88,7 @@ def _exec(cfg: dict, inp: dict, timeout: float) -> dict:
                 return json.loads(line[len("TBSGEN_RESULT "):])
             except json.JSONDecodeError:
                 break
-    return dict(status="error", error=(p.stderr or p.stdout)[-300:])
+    return dict(status="error", error=(p.stderr or p.stdout)[-300:])   # caller redacts before logging
 
 
 def run_one(job: dict) -> dict:
@@ -87,12 +98,13 @@ def run_one(job: dict) -> dict:
                 nav_timeout_ms=int(cfg.get("nav_timeout_s", 45) * 1000),
                 download_timeout_ms=int(cfg.get("download_timeout_s", 120) * 1000),
                 challenge_wait_ms=int(cfg.get("challenge_wait_s", 40) * 1000),
-                download_wait_ms=int(cfg.get("download_wait_s", 8) * 1000),
+                download_wait_ms=int(cfg.get("download_wait_s", 6) * 1000),
                 max_navigations=int(cfg.get("max_navigations", 5)))
-    if job.get("mode") == "egress":
+    if job.get("mode") == "egress":                 # on a temporary Page of its own, closed afterwards
         return _exec(cfg, dict(base, mode="egress", urls=job["urls"]), 120)
     out_file = str(Path(job["out_dir"]).resolve() / f"dl-{uuid.uuid4().hex[:12]}.bin")
-    inp = dict(base, mode="fetch", doi=job["doi"], pdf_urls=job.get("pdf_url") or [], out_file=out_file)
+    inp = dict(base, mode="fetch", doi=job["doi"], pdf_urls=job.get("pdf_url") or [], out_file=out_file,
+               max_bytes=int(job.get("max_bytes") or 40e6))
     if cfg.get("landing_base"):                     # tests: a local stand-in for https://doi.org/
         inp["landing_base"] = cfg["landing_base"]
     return _exec(cfg, inp, float(cfg.get("script_timeout_s", 420)))

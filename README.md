@@ -134,7 +134,9 @@ uv run --directory gen tbsgen status --run runs/R
 On a fresh machine both items may stop at S3 as `parked: fulltext_unavailable` (listed in
 `S3_queue.json` and in the run's full-text queue): the pipeline needs the paper's full text. S3 tries a
 configurable cascade (see [Full text (S3)](#full-text-s3)); by default only a local cache and open-access copies
-are used. `tbsgen fetch --run runs/R` retries the queue later and puts fetched items back to S3. With full text, a teacher endpoint and a
+are used. `tbsgen fetch --run runs/R` retries the queue later (failed entries back off, doubling from
+`fulltext.queue_backoff_s`) and puts fetched items back to S3; an entry leaves the queue only after its items were
+re-activated. With full text, a teacher endpoint and a
 budget in `my.toml` (see below), `tbsgen run` continues into the model stages. The other commands
 (`resume`, `reset`, `breaker`, `calib-ingest`, `harbor-local`, `ping`) are documented in
 [`gen/README.md`](gen/README.md) §3.
@@ -233,12 +235,19 @@ subscription access on the institution's IP range, have much lower caps than the
 the browser waits 60–120 s between two papers of one publisher and runs different publishers in parallel,
 `browser.concurrency`, default 2). HTTP 429 cools the host for 6 hours; a challenge page (Cloudflare, captcha,
 Akamai "Access Denied") cools it for 24 hours and is never clicked through; a plain paywall 403 is not a block.
-A channel's breaker opens for the day after 3 block signals or 8 failures in a row. Metadata lookups (Europe PMC
-search, Unpaywall) are paced at 1 request per second per host and never count as downloads. The ledger uses the
+By default a channel's breaker opens for the day after 3 block signals or 8 failures in a row; the `oa` channel,
+whose links point at many unrelated hosts, opens only after 10 block signals and never on failures alone (both
+configurable per channel: `breaker_blocks_per_day`, `breaker_consecutive_fail`). A cooldown also stops requests that
+were already waiting for their slot. Cooldowns are shared per publisher: a block on one of its web hosts or DOI
+prefixes stops both the HTTP channels and the browser for that publisher. Metadata lookups (Europe PMC search,
+Unpaywall) are paced at 1 request per second per host and never count as downloads. The ledger uses the
 tables `attempts`, `cooldown` and `hosts`, so another tool with the same schema can share the file and the usage
 of both adds up. `tbsgen fetch --status` prints today's usage.
 
-Network: HTTP requests ignore `HTTP(S)_PROXY` unless `fulltext.use_env_proxy = true`. With
+Network: HTTP requests ignore `HTTP(S)_PROXY` unless `fulltext.use_env_proxy = true`. Redirects are followed hop by
+hop (at most 5, never from HTTPS to HTTP, not into a host in cooldown), and API credentials are sent only to the
+original host. Logged errors, ledger notes and provenance records drop URL query strings and mask credentials. The
+browser process gets only a short allowlist of environment variables. With
 `fulltext.egress_check.enabled`, the public IP is looked up before the first download (and every `ttl_s`) and all
 network channels are refused unless it lies in `fulltext.egress_check.allow_cidrs`; the browser's egress is checked
 through the browser. Use this when subscription access depends on the IP range.
@@ -313,7 +322,7 @@ Research code under active development.
 **Tests** (run by [GitHub Actions CI](.github/workflows/ci.yml) on every push to `main` and every pull request)
 
 - `retrieval/`: 47 offline unit tests that replay recorded API responses.
-- `gen/`: 115 tests: 99 unit tests (17 of them for the Jev screen and 29 for the S3 full-text channels, using
+- `gen/`: 133 tests: 117 unit tests (17 of them for the Jev screen and 47 for the S3 full-text channels, using
   recorded and scripted responses; no network, no browser) and 16 integration tests that run task code in Docker. Locally
   they are skipped when Docker or the sandbox image is missing; CI builds the image and fails if
   any of them is skipped.

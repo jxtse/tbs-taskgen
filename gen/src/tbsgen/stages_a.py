@@ -62,14 +62,16 @@ def s3(P, it):
     write_json(it.p("S3_fulltext.json"), rec)
     if txt is None:
         from . import fulltext
-        entry = dict(doi=fulltext.norm_doi(c.get("doi")), title=c.get("title"), pdf_url=c.get("pdf_url"),
-                     oa_url=c.get("oa_url"), run=str(P.store.root), item_ids=[it.item_id],
-                     failed_channels=sorted(failed_channels(rec)), queued_at=time.strftime("%Y-%m-%d %H:%M:%S"))
+        entry = fulltext.queue_entry(c, subscribers=[[str(P.store.root.resolve()), it.item_id]],
+                                     failed_channels=sorted(failed_channels(rec)),
+                                     queued_at=time.strftime("%Y-%m-%d %H:%M:%S"))
+        # park first, then queue: a queue entry always points at an item that `tbsgen fetch` can re-activate
         write_json(it.p("S3_queue.json"), dict(entry, route="tbsgen fetch", errors=rec.get("errors"),
                                                skipped=rec.get("skipped")))
-        if entry["doi"]:
+        it.finish("parked", "fulltext_unavailable")
+        if entry["key"]:
             fulltext.enqueue(fulltext.queue_path(P.cfg), entry)
-        return it.finish("parked", "fulltext_unavailable")
+        return None
     it.p("fulltext.txt").write_text(txt)
     it.advance("S3", "S4", source=rec.get("source"), chars=len(txt))
 

@@ -145,19 +145,27 @@ def _fetch(P: Pipeline, a) -> int:
         print(json.dumps(browser_ego.finish(P.cfg["fulltext"]["browser"])))
         return 0
 
-    def reactivate(entry, out):
-        for iid in entry.get("item_ids") or []:
-            run = Path(entry.get("run") or P.store.root)
-            if not (run / "items" / iid / "state.json").exists():
-                continue
-            it = Store(run).item(iid)
-            if it.state.get("stage") == "S3" and it.state.get("status") == "parked":
-                it.state.setdefault("history", []).append(dict(stage="S3", result="fulltext_fetched",
-                                                               source=out.rec.get("source"),
-                                                               ts=__import__("time").time()))
-                it.state["status"] = "active"
-                it.state.pop("reason", None)
-                it.save()
+    def reactivate(entry, out, sub) -> bool:
+        """Put one waiting item back to S3 (it re-runs S3 and finds the text in the write cache).  True when
+        the item is (now) past the parked state, so the queue entry may be dropped for it."""
+        run, iid = sub
+        run = Path(run or P.store.root)
+        if not (run / "items" / iid / "state.json").exists():
+            return True                                    # item gone: nothing to wait for
+        it = Store(run).item(iid)
+        st = it.state
+        if st.get("stage") == "S3" and st.get("status") == "parked" and st.get("reason") == "fulltext_unavailable":
+            st.setdefault("history", []).append(dict(stage="S3", result="fulltext_fetched",
+                                                     source=out.rec.get("source"), ts=__import__("time").time()))
+            st["status"] = "active"
+            st.pop("reason", None)
+            it.save()
+            return True
+        # already re-activated (another fetch) or moved on: nothing left to do for this item.  An item still
+        # active at S3 (S3 running right now) has not parked yet; S3 parks before it enqueues, so a later
+        # enqueue re-adds it if it parks again.
+        return True
+
     stats = fulltext.drain_queue(f, max_papers=a.max, channels=[x for x in a.channels.split(",") if x] or None,
                                  browser=not a.no_browser, dry_run=a.dry_run, on_success=reactivate,
                                  log=lambda s: print(s, file=sys.stderr))
