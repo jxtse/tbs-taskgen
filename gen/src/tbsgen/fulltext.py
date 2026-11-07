@@ -603,6 +603,8 @@ class Fetcher:
             loc = {k.lower(): v for k, v in r.headers.items()}.get("location")
             if not loc:
                 return r
+            # some servers send raw spaces / control characters in Location: percent-encode them
+            loc = urllib.parse.quote(loc.strip(), safe=":/?#[]@!$&'()*+,;=%~")
             nxt = urllib.parse.urljoin(url, loc)
             sp = urllib.parse.urlsplit(nxt)
             if urllib.parse.urlsplit(url).scheme == "https" and sp.scheme != "https":

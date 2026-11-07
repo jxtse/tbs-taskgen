@@ -680,3 +680,13 @@ def test_ssl_context_falls_back_to_a_system_bundle(monkeypatch, tmp_path):
     monkeypatch.setattr(ssl, "create_default_context", lambda cafile=None: seen.setdefault("cafile", cafile))
     fulltext.ssl_context()
     assert seen["cafile"] == str(bundle)
+
+
+def test_redirect_location_with_raw_spaces_is_encoded(tmp_path):
+    from test_fulltext import mkfetcher
+    f, net, led, clock = mkfetcher(tmp_path, {
+        "repo.example/a.pdf": Resp(302, {"Location": "/b c\t.pdf?x=1 2"}, b"", ""),
+        "repo.example/b%20c%09.pdf": FAKE_PDF})
+    rec = dict(tried=[], errors=[], skipped=[])
+    r = f._get("https://repo.example/a.pdf", {}, rec)
+    assert r.status == 200 and "b%20c%09.pdf?x=1%202" in net.calls[-1][0]
