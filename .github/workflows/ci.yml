@@ -23,6 +23,9 @@ env:
   TAVILY_API_KEY_SECONDARY: ""
   ANTHROPIC_API_KEY: ""
   TYPESAFE_API_KEY: ""
+  ELSEVIER_API_KEY: ""
+  ELSEVIER_INSTTOKEN: ""
+  WILEY_TDM_TOKEN: ""
   TBS_SEARCH_POOL_URL: ""
   TBS_OPUS_URL: "http://127.0.0.1:9/unused"
 
@@ -57,7 +60,7 @@ jobs:
           enable-cache: true
           cache-dependency-glob: gen/uv.lock
       - run: uv sync --locked
-      - run: uv run --locked pytest -q tests/test_unit.py tests/test_screen_jev.py
+      - run: uv run --locked pytest -q tests/test_unit.py tests/test_screen_jev.py tests/test_fulltext.py
 
   gen-integration:
     name: gen (Docker integration tests)

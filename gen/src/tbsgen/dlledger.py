@@ -1,0 +1,286 @@
+"""Download ledger for S3 full-text fetching: daily / hourly caps, per-host pacing, cooldowns, breakers.
+
+Every outbound full-text download goes through `DownloadLedger.acquire(channel, host)`, which, inside one
+`BEGIN IMMEDIATE` transaction,
+  1. refuses hosts in cooldown and channels whose breaker is open,
+  2. enforces caps (successes and attempts per channel per day and per hour, a global daily success cap,
+     per-host daily / hourly attempt caps),
+  3. books a `pending` attempt and the next free time slot for that host (min gap + random jitter),
+then sleeps until the slot.  `record(..., reservation=id)` finalises the row.  Two processes sharing the file
+cannot both take the last slot of a cap or the same host slot.
+
+Schema: the three tables `attempts`, `cooldown`, `hosts` (and their meaning) are those of an earlier
+literature pipeline, so both pipelines can point at one file and their usage of a publisher adds up instead
+of each using a full cap.  Two extra tables are added (an older reader ignores them): `blocks` (block signals,
+for the breaker) and `meta_calls` (metadata lookups such as Unpaywall / Europe PMC search, which never count
+against download caps and are paced under the host key "meta:<host>").  Browser downloads are keyed
+"chrome:<DOI prefix>" (one key per publisher), as in the earlier pipeline.  The day is the local calendar day
+(same as the earlier pipeline); set TZ for the process if that matters.
+
+Block signals: 429 -> 6 h host cooldown; a challenge page (Cloudflare, captcha, Akamai "Access Denied")
+-> 24 h.  A plain paywall 403 is not a block.  Breakers stop a whole channel: `breaker_blocks_per_day`
+block signals on one channel in a day, or `breaker_consecutive_fail` failures in a row (e.g. a revoked key).
+Nothing here reads secrets.
+"""
+from __future__ import annotations
+
+import random
+import re
+import sqlite3
+import threading
+import time
+from pathlib import Path
+
+COOLDOWN_S = 24 * 3600
+COOLDOWN_429_S = 6 * 3600
+PENDING_TTL_S = 3600
+
+# Defaults are deliberately small fractions of the providers' published limits (see README, S3).
+DEFAULT_LIMITS: dict[str, dict] = {
+    #             ok/day  attempts/day  ok/hour  gap s  jitter s  per-host attempts/day  per-host attempts/hour
+    # OA links point at many unrelated repositories: dead links and single-host blocks are normal, so the OA
+    # breaker only trips on many block signals and never on a run of failures.
+    "oa":       dict(daily_ok=300, daily_attempts=500, hourly_ok=60, gap_s=4.0, jitter_s=3.0,
+                     host_daily_attempts=60, host_hourly_attempts=30,
+                     breaker_blocks_per_day=10, breaker_consecutive_fail=0),
+    "elsevier": dict(daily_ok=200, daily_attempts=300, hourly_ok=60, gap_s=3.0, jitter_s=2.0,
+                     host_daily_attempts=300, host_hourly_attempts=80),
+    "wiley":    dict(daily_ok=150, daily_attempts=200, hourly_ok=40, gap_s=10.0, jitter_s=4.0,   # Wiley: 10 s
+                     host_daily_attempts=200, host_hourly_attempts=50),
+    # campus-IP subscription access and the logged-in browser: far below the API channels (whole-campus IP
+    # blocks are the failure mode, not a per-key quota)
+    "inst":     dict(daily_ok=40, daily_attempts=60, hourly_ok=10, gap_s=45.0, jitter_s=45.0,
+                     host_daily_attempts=30, host_hourly_attempts=8),
+    "browser":  dict(daily_ok=40, daily_attempts=60, hourly_ok=12, gap_s=60.0, jitter_s=60.0,
+                     host_daily_attempts=12, host_hourly_attempts=4),
+}
+META_LIMITS = dict(daily_calls=2000, hourly_calls=400, gap_s=1.0, jitter_s=0.5)   # per metadata host
+DEFAULT_GLOBAL = dict(daily_ok=500, per_host_daily_attempts=60, breaker_blocks_per_day=3,
+                      breaker_consecutive_fail=8)
+# hosts that serve many papers through one API / mirror get their own per-host daily attempt cap
+DEFAULT_HOST_CAPS = {"api.elsevier.com": 300, "api.wiley.com": 200, "www.ebi.ac.uk": 300, "arxiv.org": 200,
+                     "export.arxiv.org": 200}
+
+_CHALLENGE_TITLE = re.compile(
+    rb"<title[^>]*>\s*(just a moment|attention required|access denied|are you a robot|verify you are human|"
+    rb"please verify|security check|human verification|captcha)", re.I)
+_CHALLENGE_MARKERS = (b"cf-chl", b"cf_chl_opt", b"_cf_chl", b"challenge-platform", b"px-captcha",
+                      b"/cdn-cgi/challenge", b"perfdrive.com", b"radware")
+_BLOCK_PATTERNS = (b"captcha", b"cf-chl", b"just a moment", b"verify you are human", b"attention required",
+                   b"are you a robot")
+CHALLENGE_TITLE_TEXT = re.compile(r"just a moment|verify you are human|attention required|access denied|"
+                                  r"captcha|are you a robot|security check|请稍候", re.I)
+
+
+class LimitReached(RuntimeError):
+    """A cap, cooldown or breaker refuses the request.  `kind` is cap | cooldown | breaker."""
+
+    def __init__(self, msg: str, kind: str = "cap"):
+        super().__init__(msg)
+        self.kind = kind
+
+
+def challenge_page(body: bytes) -> bool:
+    """A bot-wall page (served with any status).  Title / challenge-script markers only: ordinary article
+    pages often embed a reCAPTCHA widget."""
+    head = (body or b"")[:20000]
+    return bool(_CHALLENGE_TITLE.search(head)) or any(m in head.lower() for m in _CHALLENGE_MARKERS)
+
+
+def block_signal(status: int | None, body: bytes = b"") -> float | None:
+    """Cooldown seconds when a response is a real block, else None (a plain paywall 403 is not a block)."""
+    if status == 429:
+        return COOLDOWN_429_S
+    low = (body or b"")[:20000].lower()
+    if challenge_page(body) or any(p in low for p in _BLOCK_PATTERNS):
+        return COOLDOWN_S
+    if status == 403 and b"access denied" in low:
+        return COOLDOWN_S
+    return None
+
+
+def local_day(ts: float | None = None) -> str:
+    return time.strftime("%Y-%m-%d", time.localtime(ts if ts is not None else time.time()))
+
+
+class DownloadLedger:
+    def __init__(self, path: str | Path, limits: dict | None = None, global_limits: dict | None = None,
+                 host_caps: dict | None = None, clock=time.time, sleep=time.sleep):
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.limits = {k: dict(v) for k, v in DEFAULT_LIMITS.items()}
+        for ch, v in (limits or {}).items():
+            self.limits[ch] = {**self.limits.get(ch, DEFAULT_LIMITS["oa"]), **v}
+        self.g = {**DEFAULT_GLOBAL, **(global_limits or {})}
+        self.host_caps = {**DEFAULT_HOST_CAPS, **(host_caps or {})}
+        self.meta = dict(META_LIMITS)
+        self.clock, self.sleep = clock, sleep
+        self._local = threading.local()      # one sqlite connection per thread (browser workers run in threads)
+        self.db.executescript("""
+            create table if not exists attempts(ts real, day text, channel text, host text, doi text,
+                                                status text, http int, bytes int, note text);
+            create table if not exists cooldown(host text primary key, until real, reason text);
+            create table if not exists hosts(host text primary key, next_ts real);
+            create index if not exists a_day on attempts(day, channel);
+            create table if not exists blocks(ts real, day text, channel text, host text, reason text);
+            create table if not exists meta_calls(ts real, day text, host text, status text, http int);
+        """)
+
+    @property
+    def db(self) -> sqlite3.Connection:
+        c = getattr(self._local, "db", None)
+        if c is None:
+            c = self._local.db = sqlite3.connect(self.path, timeout=120, isolation_level=None)
+        return c
+
+    # ------------------------------------------------------------------ helpers
+    def _tx(self):
+        db = self.db
+
+        class _T:
+            def __enter__(s):
+                db.execute("begin immediate")
+                return db
+
+            def __exit__(s, exc_type, *_):
+                db.execute("rollback" if exc_type else "commit")
+                return False
+        return _T()
+
+    def today(self) -> str:
+        return local_day(self.clock())
+
+    def _n(self, where: str, args: tuple = ()) -> int:
+        return self.db.execute(f"select count(*) from attempts where {where}", args).fetchone()[0]
+
+    def _ok_or_pending(self, where: str, args: tuple, since_ts: float | None = None) -> int:
+        now = self.clock()
+        time_cond, targs = ("day=?", (self.today(),)) if since_ts is None else ("ts>?", (since_ts,))
+        return self._n(f"{time_cond} and (status='ok' or (status='pending' and ts>?)) and {where}",
+                       (*targs, now - PENDING_TTL_S, *args))
+
+    def cooling(self, host: str) -> str | None:
+        row = self.db.execute("select until, reason from cooldown where host=?", (host,)).fetchone()
+        if row and row[0] > self.clock():
+            return f"{host} in cooldown until {time.strftime('%F %T', time.localtime(row[0]))}: {row[1]}"
+        return None
+
+    def breaker(self, channel: str) -> str | None:
+        lim = self.limits.get(channel, {})
+        max_blocks = lim.get("breaker_blocks_per_day", self.g["breaker_blocks_per_day"])
+        n_blocks = self.db.execute("select count(*) from blocks where day=? and channel=?",
+                                   (self.today(), channel)).fetchone()[0]
+        if max_blocks and n_blocks >= max_blocks:
+            return f"{channel} breaker open: {n_blocks} block signals today"
+        k = int(lim.get("breaker_consecutive_fail", self.g["breaker_consecutive_fail"]) or 0)
+        rows = self.db.execute("select status from attempts where day=? and channel=? and status in ('ok','fail') "
+                               "order by ts desc limit ?", (self.today(), channel, k)).fetchall()
+        if k and len(rows) >= k and all(r[0] == "fail" for r in rows):
+            return f"{channel} breaker open: last {k} attempts failed"
+        return None
+
+    # ------------------------------------------------------------------ checks
+    def check(self, channel: str, host: str):
+        if channel not in self.limits:
+            raise LimitReached(f"unknown channel {channel}")
+        lim = self.limits[channel]
+        now = self.clock()
+        if (msg := self.cooling(host)) or (msg := self.cooling(f"channel:{channel}")):
+            raise LimitReached(msg, "cooldown")
+        if (msg := self.breaker(channel)):
+            raise LimitReached(msg, "breaker")
+        if self._ok_or_pending("1", ()) >= self.g["daily_ok"]:
+            raise LimitReached(f"global daily cap {self.g['daily_ok']} reached")
+        if self._ok_or_pending("channel=?", (channel,)) >= lim["daily_ok"]:
+            raise LimitReached(f"{channel} daily success cap {lim['daily_ok']} reached")
+        if self._ok_or_pending("channel=?", (channel,), since_ts=now - 3600) >= lim["hourly_ok"]:
+            raise LimitReached(f"{channel} hourly success cap {lim['hourly_ok']} reached")
+        if self._n("day=? and channel=?", (self.today(), channel)) >= lim["daily_attempts"]:
+            raise LimitReached(f"{channel} daily attempt cap {lim['daily_attempts']} reached")
+        host_day = self.host_caps.get(host, lim.get("host_daily_attempts") or self.g["per_host_daily_attempts"])
+        if self._n("day=? and host=?", (self.today(), host)) >= host_day:
+            raise LimitReached(f"{host} daily attempt cap {host_day} reached")
+        if self._n("ts>? and host=?", (now - 3600, host)) >= lim["host_hourly_attempts"]:
+            raise LimitReached(f"{host} hourly attempt cap {lim['host_hourly_attempts']} reached")
+
+    def acquire_meta(self, host: str) -> None:
+        """Pace + cap a metadata lookup (not a download).  Sleeps until the host's meta slot."""
+        key = f"meta:{host}"
+        with self._tx():
+            if (msg := self.cooling(host)):
+                raise LimitReached(msg, "cooldown")
+            now = self.clock()
+            n_day = self.db.execute("select count(*) from meta_calls where day=? and host=?",
+                                    (self.today(), host)).fetchone()[0]
+            n_hour = self.db.execute("select count(*) from meta_calls where ts>? and host=?",
+                                     (now - 3600, host)).fetchone()[0]
+            if n_day >= self.meta["daily_calls"] or n_hour >= self.meta["hourly_calls"]:
+                raise LimitReached(f"metadata cap reached for {host}")
+            nxt = self.db.execute("select next_ts from hosts where host=?", (key,)).fetchone()
+            slot = max(now, nxt[0] if nxt else 0.0)
+            self.db.execute("insert or replace into hosts values(?,?)",
+                            (key, slot + self.meta["gap_s"] + random.uniform(0, self.meta["jitter_s"])))
+            self.db.execute("insert into meta_calls values(?,?,?,?,?)", (slot, local_day(slot), host, "sent", None))
+        if (wait := slot - self.clock()) > 0:
+            self.sleep(wait)
+
+    def acquire(self, channel: str, host: str, doi: str = "") -> int:
+        """Check caps, book a pending attempt and the next per-host slot, sleep until the slot.
+        Returns a reservation id for record()."""
+        lim = self.limits[channel]
+        with self._tx():
+            self.check(channel, host)
+            now = self.clock()
+            nxt = self.db.execute("select next_ts from hosts where host=?", (host,)).fetchone()
+            last = self.db.execute("select max(ts) from attempts where host=?", (host,)).fetchone()[0] or 0
+            slot = max(now, nxt[0] if nxt else 0.0, last + lim["gap_s"])
+            self.db.execute("insert or replace into hosts values(?,?)",
+                            (host, slot + lim["gap_s"] + random.uniform(0, lim["jitter_s"])))
+            rid = self.db.execute("insert into attempts values(?,?,?,?,?,?,?,?,?)",
+                                  (slot, local_day(slot), channel, host, doi, "pending", None, 0, "")).lastrowid
+        if (wait := slot - self.clock()) > 0:
+            self.sleep(wait)
+        return rid
+
+    def record(self, channel: str, host: str, doi: str, status: str, http: int | None = None, nbytes: int = 0,
+               note: str = "", reservation: int | None = None):
+        with self._tx():
+            if reservation is not None:
+                self.db.execute("update attempts set doi=?, status=?, http=?, bytes=?, note=? where rowid=?",
+                                (doi, status, http, nbytes, note[:300], reservation))
+            else:
+                self.db.execute("insert into attempts values(?,?,?,?,?,?,?,?,?)",
+                                (self.clock(), self.today(), channel, host, doi, status, http, nbytes, note[:300]))
+
+    def finalize_pending(self, reservation: int, channel: str, host: str, doi: str, note: str):
+        row = self.db.execute("select status from attempts where rowid=?", (reservation,)).fetchone()
+        if row and row[0] == "pending":
+            self.record(channel, host, doi, "fail", None, 0, note, reservation=reservation)
+
+    def block(self, host: str, reason: str, seconds: float = COOLDOWN_S, channel: str | None = None):
+        with self._tx():
+            self.db.execute("insert or replace into cooldown values(?,?,?)",
+                            (host, self.clock() + seconds, reason[:200]))
+            if channel:
+                self.db.execute("insert into blocks values(?,?,?,?,?)",
+                                (self.clock(), self.today(), channel, host, reason[:200]))
+
+    def usage(self) -> dict:
+        out = {}
+        for ch, lim in self.limits.items():
+            ok = self._n("day=? and channel=? and status='ok'", (self.today(), ch))
+            att = self._n("day=? and channel=?", (self.today(), ch))
+            out[ch] = dict(ok=ok, attempts=att, cap_ok=lim.get("daily_ok"), cap_attempts=lim.get("daily_attempts"),
+                           breaker=self.breaker(ch))
+        out["_meta_calls"] = self.db.execute("select count(*) from meta_calls where day=?", (self.today(),)).fetchone()[0]
+        out["_global_ok"] = self._n("day=? and status='ok'", (self.today(),))
+        out["_global_cap"] = self.g["daily_ok"]
+        out["_cooldown"] = [dict(host=h, until=time.strftime("%F %T", time.localtime(u)), reason=r)
+                            for h, u, r in self.db.execute("select host, until, reason from cooldown where until>?",
+                                                           (self.clock(),))]
+        return out
+
+    def remaining(self, channel: str) -> int | None:
+        lim = self.limits[channel]
+        return max(0, min(lim["daily_ok"] - self._ok_or_pending("channel=?", (channel,)),
+                          self.g["daily_ok"] - self._ok_or_pending("1", ())))

@@ -12,6 +12,9 @@
   tbsgen harbor-local --run DIR [--item ID]                       local Harbor oracle+nop on packaged items
   tbsgen reset   --run DIR --item ID --stage S5 [--regen]        re-activate an item at a stage (after a pipeline fix);
                                                                  --regen also forces S6A/S6C to regenerate files
+  tbsgen fetch   --run DIR [--max N] [--channels a,b] [--no-browser] [--dry-run] [--status] [--finish-browser]
+                                                                 drain the S3 full-text queue (incl. the ego-browser
+                                                                 channel); fetched items go back to S3
 Real model calls need budget.daily_usd_total in the config (or --budget-usd on ping).
 """
 from __future__ import annotations
@@ -41,7 +44,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser(prog="tbsgen")
     sub = ap.add_subparsers(dest="cmd", required=True)
     for name in ("ingest", "run", "resume", "status", "report", "ledger", "breaker", "calib-ingest", "ping", "reset",
-                 "harbor-local"):
+                 "harbor-local", "fetch"):
         s = sub.add_parser(name)
         s.add_argument("--run", required=True)
         s.add_argument("--config", default=None)
@@ -65,6 +68,13 @@ def main(argv=None):
             s.add_argument("--item", required=True)
             s.add_argument("--stage", required=True)
             s.add_argument("--regen", action="store_true")
+        if name == "fetch":
+            s.add_argument("--max", type=int, default=10)
+            s.add_argument("--channels", default="")
+            s.add_argument("--no-browser", action="store_true")
+            s.add_argument("--dry-run", action="store_true")
+            s.add_argument("--status", action="store_true")
+            s.add_argument("--finish-browser", action="store_true")
         if name == "ping":
             s.add_argument("--calls", type=int, default=1)
             s.add_argument("--budget-usd", type=float, required=True)
@@ -73,6 +83,8 @@ def main(argv=None):
     if a.cmd == "ping":
         return _ping(a)
     P = _pipeline(a)
+    if a.cmd == "fetch":
+        return _fetch(P, a)
     if a.cmd == "ingest":
         from .intake import load_candidates
         cs = load_candidates(__import__("pathlib").Path(a.candidates))
@@ -118,6 +130,38 @@ def main(argv=None):
         except ValueError as e:
             sys.exit(str(e))
         print(json.dumps(t, ensure_ascii=False))
+    return 0
+
+
+def _fetch(P: Pipeline, a) -> int:
+    from . import browser_ego, fulltext
+    from .state import Store
+    f = P.fulltext_fetcher()
+    if a.status:
+        print(json.dumps(dict(ledger=str(fulltext.ledger_path(P.cfg)), usage=f.ledger.usage(),
+                              queue=len(fulltext.read_queue(fulltext.queue_path(P.cfg)))), indent=1))
+        return 0
+    if a.finish_browser:
+        print(json.dumps(browser_ego.finish(P.cfg["fulltext"]["browser"])))
+        return 0
+
+    def reactivate(entry, out):
+        for iid in entry.get("item_ids") or []:
+            run = Path(entry.get("run") or P.store.root)
+            if not (run / "items" / iid / "state.json").exists():
+                continue
+            it = Store(run).item(iid)
+            if it.state.get("stage") == "S3" and it.state.get("status") == "parked":
+                it.state.setdefault("history", []).append(dict(stage="S3", result="fulltext_fetched",
+                                                               source=out.rec.get("source"),
+                                                               ts=__import__("time").time()))
+                it.state["status"] = "active"
+                it.state.pop("reason", None)
+                it.save()
+    stats = fulltext.drain_queue(f, max_papers=a.max, channels=[x for x in a.channels.split(",") if x] or None,
+                                 browser=not a.no_browser, dry_run=a.dry_run, on_success=reactivate,
+                                 log=lambda s: print(s, file=sys.stderr))
+    print(json.dumps(stats, indent=1, ensure_ascii=False))
     return 0
 
 

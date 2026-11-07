@@ -3,6 +3,7 @@ P is the Pipeline (cfg, store, ledger, clients).  Handlers write outputs before 
 from __future__ import annotations
 
 import hashlib
+import time
 import json
 import shutil
 import re
@@ -57,13 +58,25 @@ def s2(P, it):
 
 def s3(P, it):
     c = read_json(it.p("S1_candidate.json"))
-    txt, rec = intake.fetch_fulltext(c, P.cfg, P.fetcher)
+    txt, rec = intake.fetch_fulltext(c, P.cfg, P.fulltext_fetcher())
     write_json(it.p("S3_fulltext.json"), rec)
     if txt is None:
-        write_json(it.p("S3_queue.json"), dict(doi=c.get("doi"), route="browser_fetch (manual, not wired in MVP)"))
+        from . import fulltext
+        entry = dict(doi=fulltext.norm_doi(c.get("doi")), title=c.get("title"), pdf_url=c.get("pdf_url"),
+                     oa_url=c.get("oa_url"), run=str(P.store.root), item_ids=[it.item_id],
+                     failed_channels=sorted(failed_channels(rec)), queued_at=time.strftime("%Y-%m-%d %H:%M:%S"))
+        write_json(it.p("S3_queue.json"), dict(entry, route="tbsgen fetch", errors=rec.get("errors"),
+                                               skipped=rec.get("skipped")))
+        if entry["doi"]:
+            fulltext.enqueue(fulltext.queue_path(P.cfg), entry)
         return it.finish("parked", "fulltext_unavailable")
     it.p("fulltext.txt").write_text(txt)
     it.advance("S3", "S4", source=rec.get("source"), chars=len(txt))
+
+
+def failed_channels(rec: dict) -> set[str]:
+    """Channels that made a request and got a definitive non-text answer (not skipped / capped)."""
+    return {t.split(":", 1)[0] for t in rec.get("tried") or [] if not t.startswith("cache:")}
 
 
 def s4(P, it):

@@ -89,13 +89,47 @@ DEFAULTS: dict[str, Any] = {
         },
     },
     "fulltext": {
-        "mode": "oa_and_cache",             # local full-text cache (read-only) then OA PDF link; else browser queue
-        "cache_dirs": [str(OLD_PIPE / "literature" / "txt")] if OLD_PIPE else [],
+        # Cascade (first success wins).  Every network channel has its own switch; only cache + oa are on by
+        # default.  See fulltext.py and README (S3).
+        "cascade": ["cache", "oa", "elsevier", "wiley", "inst", "browser"],
+        "cache_dirs": [str(OLD_PIPE / "literature" / "txt")] if OLD_PIPE else [],   # read-only caches
+        "write_cache_dir": None,            # downloaded texts + provenance json; None -> <run.root>/fulltext_cache
+        "keep_raw": True,                   # also keep the raw PDF/XML under <write_cache_dir>/raw/
+        "ledger_path": None,                # download ledger (sqlite); None -> <run.root>/fulltext_ledger.sqlite
+        "queue_path": None,                 # browser queue (jsonl); None -> <run.root>/fulltext_queue.jsonl
         "min_chars": 8000,
         "title_match_min": 0.6,
         "max_pdf_mb": 40,
         "timeout": 90,
-        "allow_network": True,
+        "allow_network": True,              # False: cache only (every network channel off)
+        "use_env_proxy": False,             # False: urllib ignores HTTP(S)_PROXY (ProxyHandler({}))
+        "mailto": None,                     # contact address put in the User-Agent
+        # Refuse network downloads unless the public egress IP is inside allow_cidrs (e.g. the institution's
+        # ranges, so subscription access and IP-based TDM entitlements apply).  Checked once per ttl_s.
+        "egress_check": {"enabled": False, "allow_cidrs": [], "ttl_s": 600, "timeout": 15,
+                         "urls": ["https://api.ipify.org", "https://checkip.amazonaws.com"]},
+        "oa": {"enabled": True, "europepmc": True, "unpaywall_email": None, "max_urls": 3, "skip_hosts": []},
+        "elsevier": {"enabled": False, "prefixes": ["10.1016/"], "key_env": "ELSEVIER_API_KEY",
+                     "insttoken_env": "ELSEVIER_INSTTOKEN"},
+        "wiley": {"enabled": False, "prefixes": ["10.1002/", "10.1111/"], "token_env": "WILEY_TDM_TOKEN"},
+        # Publisher PDF URLs the institution's IP range is entitled to, e.g.
+        # {prefix = "10.1007/", url = "https://link.springer.com/content/pdf/{doi}.pdf"}.  Empty by default.
+        "inst": {"enabled": False, "routes": []},
+        "browser": {
+            "enabled": False,               # needs a local ego-browser (Ego Lite) with a logged-in profile
+            "inline": False,                # False: S3 only queues; `tbsgen fetch` drains the queue
+            "binary": "ego-browser",
+            "space": "tbsgen-s3-fulltext",  # one fixed TaskSpace, reused
+            "concurrency": 2,               # parallel publishers (one Page each); never 2 of one publisher
+            "challenge_wait_s": 40,         # a challenge page must clear by itself within this, else cooldown
+            "challenge_cooldown_s": 86400,
+            "nav_timeout_s": 45, "download_timeout_s": 120, "script_timeout_s": 420, "max_navigations": 5,
+            "download_wait_s": 8,           # how long a navigation may take to turn into a download
+        },
+        # Caps / pacing (dlledger.DEFAULT_LIMITS etc.); dicts merge per channel / host.
+        "limits": {},
+        "global_limits": {},
+        "host_caps": {},
     },
     "probe": {
         "tbs_tasks_root": str(OLD_PIPE / "tasks_text") if OLD_PIPE else None,   # None -> no TBS dedup
