@@ -2,8 +2,10 @@
 
 S1  intake: candidates come from the retrieval layer (tbsretr) output JSON (`out["papers"]`) or from a
     hand-written candidates JSONL.  The generation side never calls search APIs.
-S2  screen: rules (cheap model role 待定 -> rules fallback).  Score from abstract cues (method / data / code /
-    computational words, negative cues for reviews / purely clinical / qualitative work).
+S2  screen: `models.roles.screen` = "rules" (this file) or "jev" (screen_jev.py; rules are its fallback).
+    Rules score abstract cues (method / data / code / computational words, negative cues for reviews / purely
+    clinical / qualitative work).  rules-v2 (default) counts each cue stem once and only treats "survey" as a
+    negative cue when it means a literature survey; rules-v1 is kept for comparison (screen.rules_version).
 S3  full text: (1) local full-text cache (read-only, `fulltext.cache_dirs`, one <doi_key>.txt per paper),
     (2) OA PDF link from retrieval (`oa_url`, S2 openAccessPdf) via HTTP + pdftotext, with title identity check;
     otherwise -> "browser_queue" (a browser route is NOT wired in MVP: it would need a logged-in browser
@@ -33,6 +35,13 @@ POS = re.compile(r"\b(algorithm|estimat|simulat|inversion|solver|numerical|optim
                  re.I)
 NEG = re.compile(r"\b(review|survey|perspective|editorial|commentary|qualitative|interview|questionnaire|"
                  r"case report|randomi[sz]ed controlled|patients were recruited)\b", re.I)
+# rules-v2: "survey" alone is often a sample survey (household / living-conditions survey data); count it only in
+# literature-survey phrasings.
+NEG2 = re.compile(r"\b(review|perspective|editorial|commentary|qualitative|interview|questionnaire|"
+                  r"case report|randomi[sz]ed controlled|patients were recruited|"
+                  r"(?:this|our|a|the) survey (?:of|on) (?:the )?(?:literature|recent|existing|state|methods|"
+                  r"approaches|techniques|advances|developments|research)|literature survey|"
+                  r"we survey|this survey|survey paper)\b", re.I)
 BLACKBOX = re.compile(r"\b(black[- ]box|derivative[- ]free|query budget|oracle calls?|bandit|active learning "
                       r"loop|interactive)\b", re.I)
 
@@ -64,23 +73,40 @@ def load_candidates(path: Path) -> list[dict]:
 
 
 # ------------------------------------------------------------------------------------------- S2
+def _stem(w: str) -> str:
+    """POS alternative -> one key per cue (modelling/modeling/model, optimise/optimize, finite-element ...)."""
+    w = re.sub(r"[- ]", " ", w.lower())
+    w = re.sub(r"^model(?:ling|ing)$", "model", w)
+    return w.replace("optimiz", "optimis")
+
+
 def screen(c: dict, cfg: dict, fulltext_head: str | None = None) -> dict:
     """Rule screen on title + abstract.  No abstract: S2 defers (keep, deferred=True) and S4 re-screens on the
     first chars of the full text (e2e-iter1: a nanoindentation drift-correction method paper with no abstract
-    in the retrieval record scored -1 and was dropped)."""
+    in the retrieval record scored -1 and was dropped).
+
+    rules-v1: distinct matched words (estimating / estimation / estimator count 3 times), "survey" negative.
+    rules-v2: distinct cue stems (each POS alternative once), "survey" negative only as literature survey."""
+    ver = str(cfg["screen"].get("rules_version", "v2"))
+    method = f"rules-{ver}"
     if not c.get("abstract") and fulltext_head is None:
-        return dict(score=None, pos=[], neg=[], keep=True, deferred=True, form_hint=None, method="rules-v1",
+        return dict(score=None, pos=[], neg=[], keep=True, deferred=True, form_hint=None, method=method,
                     reason=None)
     abstract = c.get("abstract") or (fulltext_head or "")[:4000]
     text = f"{c.get('title', '')}\n{abstract}"
-    pos = sorted({m.group(0).lower() for m in POS.finditer(text)})
-    neg = sorted({m.group(0).lower() for m in NEG.finditer(text)})
+    if ver == "v1":
+        pos = sorted({m.group(0).lower() for m in POS.finditer(text)})
+        neg = sorted({m.group(0).lower() for m in NEG.finditer(text)})
+    else:
+        pos = sorted({_stem(m.group(1)) for m in POS.finditer(text)})
+        neg = sorted({m.group(1).lower() for m in NEG2.finditer(text)})
     score = len(pos) - 2 * len(neg) + (1 if c.get("code_links") or c.get("code_urls") else 0) + \
         (1 if c.get("data_links") or c.get("data_urls") else 0)
     form_hint = "INTERACT" if BLACKBOX.search(text) else None
-    keep = score >= cfg["screen"]["min_score"]
-    return dict(score=score, pos=pos, neg=neg, keep=keep, form_hint=form_hint, method="rules-v1",
-                reason=None if keep else "low_screen_score")
+    min_score = cfg["screen"].get("min_score_v1", 2) if ver == "v1" else cfg["screen"]["min_score"]
+    keep = score >= min_score
+    return dict(score=score, pos=pos, neg=neg, keep=keep, form_hint=form_hint, method=method,
+                reason=None if keep else "low_screen_score", deferred=False)
 
 
 # ------------------------------------------------------------------------------------------- S3

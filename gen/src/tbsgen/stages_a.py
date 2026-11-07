@@ -8,8 +8,10 @@ import shutil
 import re
 from pathlib import Path
 
-from . import intake, runner
-from .models import extract_json, parse_files  # noqa: F401
+from . import intake, runner, screen_jev
+from .budget import BudgetStop
+from .config import resolve_role
+from .models import ModelError, extract_json, parse_files  # noqa: F401
 from .prompts import METRICS_API, PROMPT_VERSION, S5_SPEC, S6A_GEN, S6M_MID, SYSTEM
 from .spec import set_thresholds, validate_spec
 from .state import read_json, write_json
@@ -22,13 +24,35 @@ def s1(P, it):
     it.advance("S1", "S2")
 
 
+def screen_paper(P, it, c: dict, stage: str, fulltext_head: str | None = None) -> dict | None:
+    """S2 decision for one paper with the configured screen (rules or Jev).  Returns the S2_screen.json record,
+    or None when Jev is unavailable and screen.jev.on_unavailable="park" (the item is then paused with a
+    model:jev_unavailable reason, which `tbsgen resume` reactivates)."""
+    if resolve_role(P.cfg, "screen") != "jev":
+        return intake.screen(c, P.cfg, fulltext_head=fulltext_head)
+    if not c.get("abstract") and fulltext_head is None:
+        return dict(intake.screen(c, P.cfg), method="jev")          # deferred: S4 asks Jev on the full text
+    try:
+        return screen_jev.cached_call(P.jev_client(), it, c, P.cfg, stage=stage, fulltext_head=fulltext_head)
+    except (ModelError, BudgetStop) as e:
+        why = f"{getattr(e, 'cls', None) or 'budget'}:{getattr(e, 'reason', '') or ''}".rstrip(":")
+        P.store.event("screen_jev_unavailable", item=it.item_id, stage=stage, why=why, err=str(e)[:200])
+        if P.cfg["screen"]["jev"].get("on_unavailable", "rules") == "park":
+            it.finish("paused", f"model:jev_unavailable:{why}", paused_stage=stage)
+            return None
+        rec = intake.screen(c, P.cfg, fulltext_head=fulltext_head)
+        return dict(rec, method=rec["method"] + "-fallback", fallback_reason=why)
+
+
 def s2(P, it):
     c = read_json(it.p("S1_candidate.json"))
-    rec = intake.screen(c, P.cfg)
+    rec = screen_paper(P, it, c, "S2")
+    if rec is None:
+        return
     write_json(it.p("S2_screen.json"), rec)
     if not rec["keep"]:
         return it.finish("dropped", rec["reason"])
-    it.advance("S2", "S3", score=rec["score"])
+    it.advance("S2", "S3", score=rec["score"], screen=rec["method"], uncertain=bool(rec.get("uncertain")))
 
 
 def s3(P, it):
@@ -45,7 +69,9 @@ def s3(P, it):
 def s4(P, it):
     c = read_json(it.p("S1_candidate.json"))
     if read_json(it.p("S2_screen.json"), {}).get("deferred"):
-        rec = intake.screen(c, P.cfg, fulltext_head=it.p("fulltext.txt").read_text()[:4000])
+        rec = screen_paper(P, it, c, "S4", fulltext_head=it.p("fulltext.txt").read_text()[:4000])
+        if rec is None:
+            return
         write_json(it.p("S2_screen.json"), dict(rec, rescreened_at="S4"))
         if not rec["keep"]:
             return it.finish("dropped", rec["reason"])

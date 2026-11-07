@@ -11,7 +11,8 @@ src/tbsgen/
   models.py        模型调用层：OpusClient（Anthropic 兼容端点）/ FakeClient（脚本化）/ RecordingClient（录制）
   state.py         每条目一个状态目录 + state.json 状态机；events.jsonl
   pipeline.py      编排：逐条推进、断点续跑、预算/熔断暂停、resume
-  intake.py        S1 读检索层输出；S2 规则筛选；S3 全文；S4 可行性（规则部分 + 官方题去重）
+  intake.py        S1 读检索层输出；S2 规则筛选（rules-v1/v2）；S3 全文；S4 可行性（规则部分 + 官方题去重）
+  screen_jev.py    S2 的 Jev 模式：问题原文、阈值、组合规则、HTTP 客户端（重试/记账/熔断）、并发预取
   prompts.py       S5/S6A/S6C/S8 提示词（版本号写进 provenance）
   spec.py          S5 规格校验（依赖图规则）；S6B 按实测定阈值
   runner.py        Docker 沙箱里跑 生成器/参考解/基线/measure/verifier
@@ -38,7 +39,7 @@ eval/                        泄漏门回测结果
 ledger.sqlite  events.jsonl  reports/daily-<日期>.md  release/manifest.jsonl
 items/<item_id>/
   state.json                 当前阶段、状态、历史、各阶段尝试次数
-  S1_candidate.json S2_screen.json S3_fulltext.json fulltext.txt S4_probe.json
+  S1_candidate.json S2_screen.json S2_jev.json S3_fulltext.json fulltext.txt S4_probe.json
   _spec/{spec,depgraph,coverage,provenance}.json      出题侧，不进 Harbor
   task/                      工作树：generator/ solution/ baselines/ tests/ instruction.md
   runs/                      沙箱运行产物
@@ -54,7 +55,7 @@ items/<item_id>/
 | 阶段 | 输入 | 输出 | 模型 | 失败去向 |
 |---|---|---|---|---|
 | S1 | 检索层输出（`tbsretr` 的 `papers` 或 `eval/raw/*.json` 的 `selected`）或候选 JSONL | `S1_candidate.json` | 无 | — |
-| S2 | 题录 + 摘要 | `S2_screen.json`（分数、正负线索、是否黑盒形态） | 规则（廉价模型待定） | `dropped: low_screen_score` |
+| S2 | 题录 + 摘要 | `S2_screen.json`（`score`、`keep`、`form_hint`、`method`、`reason`、`deferred`；Jev 模式另有各问题概率 `probabilities`、`decision`（keep/drop/uncertain）、`uncertain`、`jev_model`、`input_tokens`）；`S2_jev.json` 为按请求键缓存的 Jev 结果 | `roles.screen`：`rules`（默认）或 `jev`（TypeSafe Jev，失败回退规则） | `dropped: low_screen_score`（规则）/ `jev_*`（Jev）；无摘要时 `deferred`，S4 用全文开头重判 |
 | S3 | DOI、OA 链接 | `fulltext.txt` + `S3_fulltext.json` | 无 | `parked: fulltext_unavailable`，并写 `S3_queue.json` |
 | S4 | 全文 + 筛选记录 | `S4_probe.json`（计算核心线索、与官方 70 题去重、形态禁令） | 规则（沙箱探针待定） | `dropped: no_compute_core / tbs_duplicate / interact_form_banned_until_isolation` |
 | S5 | 全文摘录 + 探针卡 | `_spec/spec.json`、`depgraph.json`、`coverage.json`、`provenance.json` | Opus | 校验不过重试 1 次，仍不过 `dropped: spec_invalid` |
@@ -125,7 +126,15 @@ allow_submit = false
 | `budget.breaker_open_on` | quota, auth | 出现即熔断；另有连续 4 次错误也熔断 |
 | `budget.est_usd_per_call` | 1.5 | 调用前按此金额预占，用于判断是否会超预算 |
 | `models.prices` | Opus $5/$25 每百万 token | **占位**，需按实际价格替换 |
-| `models.cheap` / `roles.screen/probe/review/invert` | None / rules | 廉价模型角色**待定**；S2/S4/S8 审查先用规则，L4b 跳过 |
+| `models.cheap` / `roles.screen/probe/review/invert` | None / rules | `roles.screen = "jev"` 启用 Jev 筛选；其余廉价模型角色**待定**，S4/S8 审查用规则，L4b 跳过 |
+| `screen.rules_version / min_score` | v2 / 1 | 规则筛选：v2 每个词干只计一次、“survey”只在文献综述语境扣分；v1（`min_score_v1`=2）保留作对照 |
+| `screen.jev.model` | jev-1.14.0 | 固定版本；响应里的 `model` 不一致时报错并熔断（`jev-latest` 不检查） |
+| `screen.jev.key_env` | TYPESAFE_API_KEY | 存放密钥的环境变量名 |
+| `screen.jev.uncertain` | keep | 不确定时放行并标记 `uncertain=true`；`drop` 则丢弃 |
+| `screen.jev.on_unavailable` | rules | 无密钥/熔断/API 不可用：回退规则（`method=rules-v2-fallback`）；`park` 则暂停条目 |
+| `screen.jev.concurrency / timeout / max_retries` | 4 / 30 s / 4 | 并发预取数；单次超时；429/529/5xx 指数退避（遵守 `retry-after`）的重试上限，其他 4xx 不重试 |
+| `screen.jev.thresholds` | 空 | 覆盖 `screen_jev.THRESHOLDS` |
+| `models.prices["jev-1.14.0"]` | in $0.042 / 百万 | 只按输入计费 |
 | `spec.allowed_forms` | ANS, PROG | DOMF 需要逐格式读写库；INTERACT 在隔离方案落地前禁止 |
 | `spec.prog_quota_frac` | 0.5 | PROG 占比上限（**待定**；当前只记录，未在调度中强制） |
 | `thresholds.frac / min_ref_margin / loose_margin` | 0.5 / 0.10 / 0.50 | 阈值位置（**待定**）；非区分指标若 naive 明显更差，阈值收到参考与 naive 的对数中点（不紧于参考×(1±margin)） |
