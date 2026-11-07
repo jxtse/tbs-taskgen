@@ -268,14 +268,17 @@ channels, and copies the texts back into the local `write_cache_dir`. The local 
 - Secrets (`ELSEVIER_API_KEY`, `WILEY_TDM_TOKEN`) are read locally (environment, or the command in
   `fulltext.remote.secrets_cmd`, which gets the wanted names on stdin and prints a JSON object) and sent on the
   ssh connection's stdin. The remote worker keeps them in memory; they are never in a command line, file or log.
-- One ledger: the local `ledger_path` stays the only authority. Before a job, the local ledger books one lease row
+- One ledger: the local `ledger_path` stays the only authority, and one remote job at a time uses it. Before a job, the local ledger books one lease row
   per paper (counts against the global daily cap, so the browser cannot use the same quota) and sends a snapshot of
   today's usage, live cooldowns and pacing state; the remote job works on a copy seeded from it, so channel caps,
   breakers and cooldowns include the local usage. Afterwards the remote job's new rows are merged into the local
-  ledger exactly once and the lease is dropped. One remote job runs at a time per queue.
+  ledger exactly once and the lease is dropped (a lease holds its quota until then, however long that takes).
+  Cooldowns set locally while a job runs reach the remote side with the next job (`max_job_s` bounds the delay).
 - Interruptions: the remote worker is detached, so an ssh drop does not stop it. The local job file
   (`<queue>.remote/<job>.json`) records the stage; the next `tbsgen fetch` first collects unfinished jobs. Results
-  are written per paper, so a worker that dies keeps what it finished; the rest stays queued and due.
+  are written per paper (a text saved just before a crash is recovered from its provenance), so a worker that dies
+  keeps what it finished; the rest stays queued and due. `fulltext.remote.ca_file` / `fulltext.ca_file` set a CA
+  bundle when the interpreter has none.
 - `fulltext.pdftotext` points at a `pdftotext` outside `PATH` (e.g. installed in a user directory).
 
 #### Browser batches
@@ -297,15 +300,17 @@ uv run tbsgen fetch --run runs/R --config config.toml --browser --wait-for-egres
   `recheck_s` and after every download; when it leaves `allow_cidrs` the batch stops, files obtained since the
   last good probe are discarded and the remaining papers stay queued.
 - Each paper is first tried with the reviewed script. With `browser.agent.enabled`, the papers the script could
-  not get go to one Hermes CLI run (`hermes chat --oneshot`, `agent.provider` / `model` / `skills` /
-  `max_turns` / `run_budget_s`) with a prompt generated from
-  [`browser_agent_prompt.md`](gen/src/tbsgen/browser_agent_prompt.md). The agent reaches the browser only
-  through a per-batch `ego-browser` wrapper that books the paper in the ledger before its first call, refuses
-  scripts that use other TaskSpaces, user tabs, keyboard / mouse input, cookies or storage, and prepends
-  [`browser_agent_guard.mjs`](gen/src/tbsgen/browser_agent_guard.mjs) (publisher domains only, no typing, no
-  interaction with verification pages, files only in the paper's directory). Shell commands other than
-  `ego-browser` end the run. Saved files are validated and booked by code; the agent's own report is not used.
-  Model usage per run is appended to `<queue>.browser/usage.jsonl`.
+  not get go to one Hermes CLI run (`hermes chat --oneshot`, `agent.provider` / `model` / `max_turns` /
+  `run_budget_s`) with a prompt generated from [`browser_agent_prompt.md`](gen/src/tbsgen/browser_agent_prompt.md).
+  The agent writes no browser code. Its only tool is `tbsgen-browser N look | open URL | click I | save_pdf` (and
+  `finish`), each call running the reviewed action script
+  [`browser_agent_action.mjs`](gen/src/tbsgen/browser_agent_action.mjs): the paper is booked in the ledger before
+  its first call; only the paper's publisher domains are opened or clicked; nothing is typed; verification pages,
+  verification widgets and login forms are never interacted with; a bot wall cools the publisher at once. The run
+  uses an isolated Hermes home (no user memory, rules, plugins or credentials) whose `pre_tool_call` hook blocks
+  every other command before it runs; repeated attempts end the run. Saved files are validated and booked by
+  code; the agent's own report is not used. Papers cut by an egress change or the window's end stay queued
+  without backoff. Model usage per run is appended to `<queue>.browser/usage.jsonl`.
 
 Terms: use only content your own subscriptions and API licences allow. The Elsevier and Wiley TDM licences are
 for non-commercial text mining by subscribers; do not redistribute full texts. This pipeline only uses the text

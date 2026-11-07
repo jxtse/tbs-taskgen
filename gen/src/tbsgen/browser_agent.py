@@ -15,13 +15,14 @@ secure-access VPN client is paused for 10 minutes), a batch is sized to fit the 
      Fetcher / ledger path (pacing, caps, cooldowns, validation, cache).  A paper is only started when its
      publisher slot is free before the deadline.
   4. agent phase (`browser.agent.enabled`): one Hermes CLI run (`hermes chat --oneshot`, the configured
-     provider / model / skills) for the papers the script could not get, with a prompt generated from the
-     reviewed template browser_agent_prompt.md.  The agent reaches the browser only through a per-batch
-     `ego-browser` wrapper (first on PATH) that books the ledger slot of a paper before its first browser
-     call, refuses scripts using denied APIs and prepends browser_agent_guard.mjs (domain allow-list, no
-     typing, no verification widgets, files only under the batch directory).  The agent's claims are not
-     trusted: after the run, code validates every saved file (PDF / text length / title match) and books the
-     outcome in the ledger.
+     provider / model) for the papers the script could not get, with a prompt generated from the reviewed
+     template browser_agent_prompt.md.  The agent writes no browser code: its only tool is `tbsgen-browser`
+     (look / open URL / click I / save_pdf / finish), each call running the reviewed action script
+     browser_agent_action.mjs, which books the paper in the ledger before its first call, only navigates to
+     the paper's publisher domains, never types, never interacts with verification pages or widgets, and
+     cools the publisher at once on a bot wall.  The Hermes run uses an isolated Hermes home whose
+     pre_tool_call hook blocks every other command before it runs.  The agent's claims are not trusted:
+     after the run, code validates every saved file (PDF / text length / title match) and books it.
   5. a watchdog re-probes the egress every `batch.recheck_s` during the batch; when it leaves allow_cidrs the
      batch stops at once (the running script / agent process is killed, a result obtained meanwhile is
      discarded) and every paper not finished stays in the queue, still due.
@@ -47,43 +48,7 @@ from . import browser_ego
 from .dlledger import LimitReached
 
 PROMPT = Path(__file__).with_name("browser_agent_prompt.md")
-GUARD = Path(__file__).with_name("browser_agent_guard.mjs")
 REFUSE = "browser egress is outside fulltext.egress_check.allow_cidrs; open the allowed egress first"
-# Scripts the agent may not run at all (the guard also blocks these at run time).
-DENY_SCRIPT = re.compile(r"claimTaskSpace|takeOverTaskSpace|listTaskSpaces|userPage|handOff|\.adopt\(|\.release\(|"
-                         r"\.tabs\(|\.cdp\(|keyboard\.|mouse\.|setInputFiles|waitForFileChooser|document\.cookie|"
-                         r"localStorage|sessionStorage|clearing-state|child_process|node:net|node:http|"
-                         r"node:https|globalThis\.fetch|\bprocess\.env\b|GUARD\s*=")
-# The agent's shell is an allowlist (checked live on the stream; the run is killed on anything else): one
-# `ego-browser nodejs` call with the script as a quoted heredoc and nothing after it, `ego-browser nodejs
-# --help`, `ls` of a path, or `sleep N`.  Hermes may run its terminal with its own secrets in the environment,
-# so no other command (env, printenv, echo $VAR, cat, curl, ...) may run.
-_HEREDOC = re.compile(r"^ego-browser nodejs\s*<<-?\s*'([A-Za-z_]+)'\s*$")
-_SIMPLE = re.compile(r"^(ego-browser nodejs --help|ego-browser skill|ls(\s+-[al1]+)?(\s+[A-Za-z0-9_./~-]+)*|sleep\s+\d{1,3})\s*$")
-DENY_TEXT = re.compile(r"sci-?hub|libgen|z-lib|annas-archive", re.I)
-
-
-def shell_allowed(cmd: str) -> str | None:
-    """None if the agent's terminal command is allowed, else the reason."""
-    if not isinstance(cmd, str) or not cmd.strip():
-        return "empty command"
-    if DENY_TEXT.search(cmd):
-        return "unauthorized source"
-    lines = cmd.strip("\n").split("\n")
-    first = lines[0].strip()
-    if _SIMPLE.match(first):
-        return None if len(lines) == 1 else "extra lines after a simple command"
-    m = _HEREDOC.match(first)
-    if not m:
-        return f"command not allowed: {first[:60]}"
-    term = m.group(1)
-    try:
-        end = next(i for i, ln in enumerate(lines[1:], 1) if ln.strip() == term)
-    except StopIteration:
-        return "unterminated heredoc"
-    if any(ln.strip() for ln in lines[end + 1:]):
-        return "commands after the heredoc"
-    return None
 
 
 class EgressLost(RuntimeError):
@@ -102,6 +67,7 @@ class Prober:
     last_host: dict = field(default_factory=dict)
     i: int = 0
     n: int = 0
+    last_ok: dict | None = None
 
     def __post_init__(self):
         b = self.ft.get("browser") or {}
@@ -144,7 +110,8 @@ class Prober:
             return Resp(200 if body else 0, {}, body.encode(), url)
         try:
             r = check_egress(dict(self.ft.get("egress_check") or {}, urls=[u]), tr)
-            return dict(ok=True, ip=r["ip"], via=r["via"])
+            self.last_ok = dict(ok=True, ip=r["ip"], via=r["via"])
+            return self.last_ok
         except EgressRefused as e:
             m = re.search(r"egress IP (\S+)", str(e))
             return dict(ok=False, ip=m.group(1) if m else None, why=str(e))
@@ -161,15 +128,18 @@ class Watchdog:
         self.why = ""
         self.th = threading.Thread(target=self._run, daemon=True)
 
+    def _lose(self, r: dict):
+        self.why = r.get("why") or "egress lost"
+        self.lost.set()
+        if self.on_lost:
+            with contextlib.suppress(Exception):
+                self.on_lost()
+
     def _run(self):
         while not self.stop_ev.wait(self.recheck_s):
             r = self.prober.probe()
             if not r["ok"]:
-                self.why = r.get("why") or "egress lost"
-                self.lost.set()
-                if self.on_lost:
-                    with contextlib.suppress(Exception):
-                        self.on_lost()
+                self._lose(r)
                 return
 
     def check_now(self) -> bool:
@@ -177,8 +147,7 @@ class Watchdog:
             return False
         r = self.prober.probe()
         if not r["ok"]:
-            self.why = r.get("why") or "egress lost"
-            self.lost.set()
+            self._lose(r)
             return False
         return True
 
@@ -248,97 +217,156 @@ def allowed_domains(doi: str, landing: str | None, extra: list[str]) -> list[str
     return sorted(x for x in d if x)
 
 
-# ------------------------------------------------------------------------------------------- agent wrapper
-WRAPPER = r'''#!{python}
-# tbsgen browser batch: ego-browser wrapper for the agent (generated; removed with the batch directory)
+# ------------------------------------------------------------------------------------------- agent tools
+# The agent never runs browser code of its own.  Its only browser tool is `tbsgen-browser` (a generated
+# executable first on PATH): `tbsgen-browser N look|open URL|click I|save_pdf` and `tbsgen-browser finish`.  Each
+# call runs the reviewed action script browser_agent_action.mjs with one injected INPUT line.  The Hermes run
+# itself uses an isolated Hermes home whose pre_tool_call hook (hook_main) allows only `tbsgen-browser ...` and
+# `sleep N` terminal commands *before* they run; anything else is blocked (and the stream watcher kills the run).
+ACTION = Path(__file__).with_name("browser_agent_action.mjs")
+TOOL = r"""#!{python}
+# tbsgen browser batch tool (generated; removed with the batch directory)
 import sys
 sys.path.insert(0, {pkg_parent!r})
-from tbsgen.browser_agent import wrapper_main
-sys.exit(wrapper_main({batch_dir!r}, sys.argv[1:]))
-'''
+from tbsgen.browser_agent import {fn}
+sys.exit({fn}({batch_dir!r}, sys.argv[1:]))
+"""
+_TOOL_CMD = re.compile(r"^tbsgen-browser (finish|[1-9]\d? (look|save_pdf|click \d{1,3}|open https?://[^\s'\"`$;&|<>\\]+))$")
+_SLEEP_CMD = re.compile(r"^sleep ([1-9]\d?|[12]\d\d|300)$")
+DENY_TEXT = re.compile(r"sci-?hub|libgen|z-lib|annas-archive", re.I)
+
+
+def shell_allowed(cmd) -> str | None:
+    """None if the agent's terminal command is allowed, else the reason (used by the pre-execution hook and,
+    as a second line, by the stream watcher)."""
+    if not isinstance(cmd, str) or not cmd.strip():
+        return "empty command"
+    c = cmd.strip()
+    if DENY_TEXT.search(c):
+        return "unauthorized source"
+    if "\n" in c or not (_TOOL_CMD.match(c) or _SLEEP_CMD.match(c)):
+        return f"command not allowed (only `tbsgen-browser ...` and `sleep N`): {c[:60]}"
+    return None
+
+
+def hook_main(batch_dir: str, argv: list[str]) -> int:
+    """Hermes pre_tool_call hook: stdin {tool_name, tool_input}; prints a block decision unless allowed."""
+    try:
+        d = json.loads(sys.stdin.read() or "{}")
+    except ValueError:
+        d = {}
+    name, inp = d.get("tool_name"), d.get("tool_input") or {}
+    if name != "terminal":
+        why = f"tool {name} is not available in this batch"
+    elif inp.get("background") or inp.get("pty"):
+        why = "background / pty terminals are not available"
+    else:
+        why = shell_allowed(inp.get("command"))
+    if why:
+        with contextlib.suppress(OSError):
+            with open(Path(batch_dir) / "violations.jsonl", "a") as fh:
+                fh.write(json.dumps(dict(ts=time.time(), tool=name, why=why[:200])) + "\n")
+        print(json.dumps({"action": "block", "message": f"tbsgen: {why}"}))
+    return 0
+
+
+def _cool_publisher(led, ps: dict, doi: str, why: str, secs: float):
+    from .fulltext import publisher_of
+    _, keys, web_hosts = publisher_of(doi)
+    for h in {ps["lkey"], *keys, *web_hosts}:
+        led.block(h, f"browser agent: {why}"[:200], seconds=secs, channel="browser" if h == ps["lkey"] else None)
 
 
 def wrapper_main(batch_dir: str, argv: list[str]) -> int:
-    """The agent's `ego-browser`: `ego-browser nodejs [-e CODE]` (stdin) with a leading `// paper: N` line."""
-    from .dlledger import DownloadLedger
+    """`tbsgen-browser N <action> [arg]` / `tbsgen-browser finish`."""
+    from .dlledger import COOLDOWN_429_S, DownloadLedger
     from .fulltext import publisher_of
     bd = Path(batch_dir)
     st = json.loads((bd / "batch.json").read_text())
+
+    def say(msg, rc):
+        print(msg)
+        return rc
     if (bd / "STOP").exists():
-        print("tbsgen: STOP — the batch was stopped (egress changed or deadline). Do not retry; end now.")
-        return 3
-    if argv[:1] == ["skill"]:
-        print("tbsgen: the ego-browser guide is already loaded; use `ego-browser nodejs` only.")
-        return 0
-    if argv[:1] != ["nodejs"]:
-        print("tbsgen: only `ego-browser nodejs` is available in this batch")
-        return 2
-    code = argv[2] if len(argv) >= 3 and argv[1] == "-e" else sys.stdin.read()
-    if re.match(r"\s*//\s*finish\s*$", code.strip().splitlines()[0] if code.strip() else ""):
+        return say("tbsgen: STOP - the batch was stopped (egress changed or deadline). End now.", 3)
+    if argv[:1] == ["finish"]:
         r = browser_ego.finish(dict(binary=st["ego_binary"], space=st["space"]))
-        print(f"tbsgen: TaskSpace closed ({r.get('status')})")
-        return 0
-    m = re.match(r"\s*//\s*paper:\s*(\d+)\s*\n", code)
-    if not m or m.group(1) not in st["papers"]:
-        print("tbsgen: the script must start with a line `// paper: N` naming one paper of the batch")
-        return 2
-    n = m.group(1)
+        return say(f"tbsgen: TaskSpace closed ({r.get('status')})", 0)
+    if len(argv) < 2 or argv[0] not in st["papers"] or argv[1] not in ("look", "open", "click", "save_pdf"):
+        return say("usage: tbsgen-browser N look|open URL|click I|save_pdf  |  tbsgen-browser finish", 2)
+    n, action, arg = argv[0], argv[1], (argv[2] if len(argv) > 2 else "")
     p = st["papers"][n]
-    if (bad := DENY_SCRIPT.search(code)):
-        print(f"tbsgen: refused: `{bad.group(0)}` is not allowed in this batch")
-        return 2
     sp = bd / "papers" / f"{n}.json"
     ps = json.loads(sp.read_text()) if sp.exists() else dict(calls=0)
     if ps.get("closed"):
-        print(f"tbsgen: paper {n} is closed ({ps['closed']}); move on")
-        return 2
+        return say(f"tbsgen: paper {n} is closed ({ps['closed']}); move on", 2)
     if ps["calls"] >= int(st["max_calls_per_paper"]):
-        print(f"tbsgen: paper {n}: browser call limit reached; give up on this paper")
-        return 2
+        return say(f"tbsgen: paper {n}: call limit reached; give up on this paper", 2)
+    if time.time() >= float(st["deadline"]):
+        return say("tbsgen: the batch deadline has passed; end now.", 3)
     led = DownloadLedger(st["ledger_path"], st["limits"], st["global_limits"], st["host_caps"])
+    _, keys, web_hosts = publisher_of(p["doi"])
+    lkey = "chrome:" + p["doi"].split("/", 1)[0]
+    aliases = tuple(k for k in keys if k != lkey)
     if "rid" not in ps:
-        # first browser call for this paper: book its slot (pacing / caps / cooldowns of the publisher)
-        name, keys, web_hosts = publisher_of(p["doi"])
-        lkey = "chrome:" + p["doi"].split("/", 1)[0]
-        aliases = tuple(k for k in keys if k != lkey)
+        # first call for this paper: book its slot (pacing / caps / cooldowns of the publisher)
         try:
             slot = led_next_slot(led, "browser", (lkey, *aliases))
             if slot - time.time() > float(st["gate_max_wait_s"]):
-                print(f"tbsgen: publisher of paper {n} is paced; its slot opens in {slot - time.time():.0f}s. "
-                      "Work on another paper and retry later.")
-                return 4
+                return say(f"tbsgen: the publisher of paper {n} is paced; its slot opens in "
+                           f"{slot - time.time():.0f}s. Work on another paper, or `sleep` and retry.", 4)
             if slot > float(st["deadline"]):
-                print("tbsgen: the batch deadline comes first; end now.")
-                return 3
+                return say("tbsgen: the batch deadline comes before this publisher's next slot; skip it.", 4)
             rid = led.acquire("browser", lkey, p["doi"], related=tuple(web_hosts), group=aliases)
         except LimitReached as e:
             ps["closed"] = f"ledger: {e}"
             _atomic(sp, json.dumps(ps))
-            print(f"tbsgen: paper {n} refused by the download ledger ({e}); move on")
-            return 2
+            return say(f"tbsgen: paper {n} refused by the download ledger ({e}); move on", 2)
         ps.update(rid=rid, lkey=lkey, t0=time.time())
+    elif (msg := led.cooling(lkey, *aliases, *web_hosts)):
+        ps["closed"] = "publisher in cooldown"
+        _atomic(sp, json.dumps(ps))
+        return say(f"tbsgen: paper {n}: {msg[:120]}; move on", 2)
     ps["calls"] += 1
     _atomic(sp, json.dumps(ps))
-    if (bd / "STOP").exists():
-        print("tbsgen: STOP — the batch was stopped. End now.")
-        return 3
-    files = bd / "files" / n
+    files = (bd / "files" / n).resolve()
     files.mkdir(parents=True, exist_ok=True)
-    guard = dict(space=st["space"], allow=p["allow"], files_dir=str(files.resolve()), inputs=[])
-    script = "const GUARD = " + json.dumps(guard) + ";\n" + GUARD.read_text() + "\n" + code
-    env = browser_ego.child_env()
-    try:
-        r = subprocess.run([st["ego_binary"], "nodejs"], input=script, capture_output=True, text=True,
-                           timeout=float(st["call_timeout_s"]), env=env)
-        outp = (r.stdout or "") + (("\n" + r.stderr) if r.stderr else "")
-    except subprocess.TimeoutExpired:
-        outp, r = "tbsgen: browser call timed out", None
-    if re.search(r"tbsgen guard: (this is a verification page|never interact with a verification)", outp):
+    inp = dict(space=st["space"], action=action, arg=arg, allow=p["allow"], files_dir=str(files),
+               nav_timeout_ms=45000, download_timeout_ms=120000, download_wait_ms=6000, challenge_wait_ms=20000)
+    script = "const INPUT = " + json.dumps(inp) + ";\n" + ACTION.read_text()
+    timeout = max(5.0, min(float(st["call_timeout_s"]), float(st["deadline"]) - time.time()))
+    proc = subprocess.Popen([st["ego_binary"], "nodejs"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, text=True, env=browser_ego.child_env())
+    t_end = time.time() + timeout
+    so = se = ""
+    first = True
+    while True:
+        try:
+            so, se = proc.communicate(script if first else None, timeout=0.5)
+            break
+        except subprocess.TimeoutExpired:
+            first = False
+            if (bd / "STOP").exists() or time.time() > t_end:
+                proc.kill()
+                proc.communicate()
+                return say("tbsgen: stopped (egress changed, deadline or call timeout). End now.", 3)
+    res: dict = {}
+    for line in reversed((so + "\n" + se).splitlines()):
+        if line.startswith("TBSGEN_RESULT "):
+            with contextlib.suppress(ValueError):
+                res = json.loads(line[len("TBSGEN_RESULT "):])
+            break
+    if res.get("blocked"):
+        # a verification page / bot wall / 429: cool the publisher now, close the paper (never interact)
+        secs = COOLDOWN_429_S if res.get("http429") else float(st.get("challenge_cooldown_s", 24 * 3600))
         ps = json.loads(sp.read_text())
-        ps["challenge"] = True
+        ps.update(closed="challenge", challenge=str(res["blocked"])[:80])
         _atomic(sp, json.dumps(ps))
-    sys.stdout.write(outp[-12000:])
-    return 0 if r is not None and r.returncode == 0 else 1
+        _cool_publisher(led, ps, p["doi"], str(res["blocked"]), secs)
+        return say(f"tbsgen: paper {n}: {res['blocked']} - publisher cooled down; report `challenge` and move on.", 2)
+    show = dict(status=res.get("status"), error=res.get("error"), files_saved=len(res.get("files") or []),
+                page=res.get("page"), note=res.get("note"), left_allowed=res.get("left_allowed"))
+    return say(json.dumps(show, ensure_ascii=False)[:9000], 0 if res.get("status") == "ok" else 1)
 
 
 def led_next_slot(led, channel: str, keys: tuple) -> float:
@@ -406,9 +434,9 @@ def default_hermes_runner(argv: list[str], env: dict, timeout: float, on_event, 
 
 def run_batch(fetcher, *, wait_for_egress: bool = False, max_wait_s: float | None = None, on_success=None,
               log=print, prober: Prober | None = None, hermes_runner=None, clock=time.time,
-              sleep=time.sleep, now_window_start: float | None = None) -> dict:
+              sleep=time.sleep, now_window_start: float | None = None, dry_run: bool = False) -> dict:
     """One egress-gated browser batch.  Returns stats; stats['refused'] when the egress was outside the
-    allowed ranges (without --wait-for-egress)."""
+    allowed ranges (without --wait-for-egress).  dry_run: plan only (no probe, no browser, no ledger)."""
     from .fulltext import paper_ident
     ft = fetcher.ft
     b = ft.get("browser") or {}
@@ -416,6 +444,12 @@ def run_batch(fetcher, *, wait_for_egress: bool = False, max_wait_s: float | Non
     ag = b.get("agent") or {}
     stats: dict = dict(mode="browser-batch", ok=0, failed=0, script_ok=0, agent_ok=0, probes=0, deferred=0,
                        papers=[], errors=[])
+    if dry_run:
+        due = _due(fetcher, bb)
+        plan = plan_batch(due, float(bb.get("window_s", 600)) - float(bb.get("margin_s", 60)), bb,
+                          bool(ag.get("enabled")), fetcher.ledger.remaining("browser"))
+        stats.update(dry_run=True, due=len(due), planned=[paper_ident(e) for e in plan])
+        return stats
     if not b.get("enabled"):
         stats["note"] = "fulltext.browser.enabled is false"
         return stats
@@ -430,11 +464,41 @@ def run_batch(fetcher, *, wait_for_egress: bool = False, max_wait_s: float | Non
     if not fetcher._space_held and not fetcher._try_space_lock():
         stats["note"] = "browser TaskSpace is in use by another process"
         return stats
+    try:
+        return _run_batch(fetcher, stats, b, bb, ag, prober, wait_for_egress, max_wait_s, on_success, log,
+                          hermes_runner, clock, sleep, now_window_start)
+    finally:
+        # close every TaskSpace this batch may have used (script, agent, probe), on every path
+        if prober.probe_fn is None:
+            for sp in {str(b.get("space", "tbsgen-s3-fulltext")), str(ag.get("space", "tbsgen-s3-agent")),
+                       prober.cfg["space"]}:
+                with contextlib.suppress(Exception):
+                    browser_ego.finish(dict(b, space=sp))
+
+
+def _due(fetcher, bb: dict) -> list[dict]:
+    from .fulltext import queue_lock, queue_path, read_queue
+    qp = queue_path(fetcher.cfg)
+    with queue_lock(qp):
+        queue = read_queue(qp)
+    t_now = time.time()
+    # the browser has its own backoff (browser_next_try): a failed HTTP attempt must not hide a paper from the
+    # browser, and by default only papers the HTTP cascade already tried are taken (the browser quota is small)
+    http_first = bool(bb.get("require_http_first", True))
+    due = [e for e in queue if float(e.get("browser_next_try") or 0) <= t_now and e.get("doi")
+           and fetcher.channel_applies("browser", e["doi"])
+           and (not http_first or e.get("failed_channels") or e.get("tries") or e.get("last_try"))]
+    due.sort(key=lambda e: float(e.get("browser_last_try") or 0))
+    return [e for e in due if not fetcher.cached(e)]          # cached papers are delivered by a normal drain
+
+
+def _run_batch(fetcher, stats, b, bb, ag, prober, wait_for_egress, max_wait_s, on_success, log, hermes_runner,
+               clock, sleep, now_window_start) -> dict:
+    from .fulltext import paper_ident
     hint = (" " + bb["refuse_hint"]) if bb.get("refuse_hint") else ""
     # ---- 1. egress
     t_wait0 = clock()
     limit = float(max_wait_s if max_wait_s is not None else bb.get("max_wait_s", 1800))
-    first = None
     while True:
         r = prober.probe()
         stats["probes"] = prober.n
@@ -455,21 +519,8 @@ def run_batch(fetcher, *, wait_for_egress: bool = False, max_wait_s: float | Non
     stats.update(egress=first, window_start=start, deadline=deadline, waited_s=round(start - t_wait0, 1))
     log(json.dumps(dict(event="egress_ok", ip=first["ip"], via=first.get("via"),
                         seconds_left=round(deadline - clock()))))
-    fetcher._egress_browser = dict(ok=True, ip=first["ip"], via=first.get("via"), ts=time.time())
     # ---- 2. plan
-    from .fulltext import queue_lock, queue_path, read_queue
-    qp = queue_path(fetcher.cfg)
-    with queue_lock(qp):
-        queue = read_queue(qp)
-    t_now = time.time()
-    # the browser has its own backoff (browser_next_try): a failed HTTP attempt must not hide a paper from the
-    # browser, and by default only papers the HTTP cascade already tried are taken (the browser quota is small)
-    http_first = bool(bb.get("require_http_first", True))
-    due = [e for e in queue if float(e.get("browser_next_try") or 0) <= t_now and e.get("doi")
-           and fetcher.channel_applies("browser", e["doi"])
-           and (not http_first or e.get("failed_channels") or e.get("tries") or e.get("last_try"))]
-    due.sort(key=lambda e: float(e.get("browser_last_try") or 0))
-    due = [e for e in due if not fetcher.cached(e)]          # cached papers are delivered by a normal drain
+    due = _due(fetcher, bb)
     remaining = fetcher.ledger.remaining("browser")
     use_agent = bool(ag.get("enabled"))
     plan = plan_batch(due, deadline - clock(), bb, use_agent, remaining)
@@ -479,102 +530,133 @@ def run_batch(fetcher, *, wait_for_egress: bool = False, max_wait_s: float | Non
     if not plan:
         return stats
     results: dict[str, dict] = {}         # ident -> dict(status: ok|failed|deferred, ...)
-    state = dict(proc_stop=threading.Event())
+    stop = threading.Event()              # egress lost or deadline: cancels running scripts / the agent
     batch_dir = _batch_dir(fetcher)
 
     def on_lost():
-        state["proc_stop"].set()
+        stop.set()
         with contextlib.suppress(OSError):
             (batch_dir / "STOP").write_text("egress lost")
     wd = Watchdog(prober, float(bb.get("recheck_s", 30)), on_lost=on_lost)
-    with wd:
-        # ---- 3. script phase
-        script_failed: list[dict] = []
-        orig_runner = fetcher.browser_runner
 
-        def guarded_runner(job):
-            job = dict(job, cancel=state["proc_stop"])
-            res = (orig_runner or browser_ego.run_one)(job)
-            # accept a download only if the egress is still allowed right after it (probe now)
-            if not wd.check_now():         # the egress changed while this paper was running: discard
-                for k in ("path", "out_file"):
-                    if res and res.get(k):
-                        Path(res[k]).unlink(missing_ok=True)
-                return dict(status="egress_lost", error="egress left allow_cidrs during the run",
-                            out_file=(res or {}).get("out_file"))
-            return res
-        fetcher.browser_runner = guarded_runner
-        try:
-            for e in plan:
-                k = paper_ident(e)
-                if wd.lost.is_set() or clock() >= deadline:
-                    break
-                slot = led_next_slot(fetcher.ledger, "browser", _browser_keys(e["doi"]))
-                if slot + float(bb.get("est_script_s", 60)) > deadline:
-                    continue                                    # publisher not free in time: stays queued
-                while (w := slot - clock()) > 0 and not wd.lost.is_set():
-                    sleep(min(w, 5.0))
-                if wd.lost.is_set():
-                    break
-                fetcher._egress_browser = dict(ok=True, ip=first["ip"], ts=time.time())
-                t0 = clock()
-                out = fetcher.fetch(e, browser=True, channels=["cache", "browser"])
-                if wd.lost.is_set():
-                    results[k] = dict(status="deferred", phase="script", errors=["egress lost"])
-                    break
-                if out.text is not None:
-                    results[k] = _deliver(fetcher, e, out, on_success, stats, "script")
-                    stats["script_ok"] += 1
-                else:
-                    blocked = any("challenge" in x or "HTTP 429" in x for x in out.rec.get("errors") or [])
-                    tried = bool(out.rec.get("tried"))
-                    results[k] = dict(status="failed" if tried else "deferred", phase="script",
-                                      errors=out.rec.get("errors", [])[-2:], skipped=out.rec.get("skipped", [])[-2:],
-                                      seconds=round(clock() - t0, 1))
-                    if tried and not blocked:
-                        script_failed.append(dict(e, _landing=out.rec.get("landing")))
-                log(json.dumps(dict(event="script", key=k, ok=out.text is not None,
-                                    status=results[k]["status"], seconds=round(clock() - t0, 1))))
-        finally:
-            fetcher.browser_runner = orig_runner
-        # ---- 4. agent phase
-        if use_agent and script_failed and not wd.lost.is_set():
-            left = deadline - clock()
-            n_ag = int(max(0.0, left - 20) // max(1.0, float(bb.get("est_agent_s", 120))))
-            todo = script_failed[:max(0, n_ag)]
-            if todo:
-                ar = _agent_phase(fetcher, todo, deadline, batch_dir, wd, state, hermes_runner, log)
-                stats["agent"] = {k: v for k, v in ar.items() if k != "papers"}
-                for k, v in ar["papers"].items():
-                    if v["status"] == "ok":
-                        e = next(x for x in todo if paper_ident(x) == k)
-                        results[k] = _deliver(fetcher, e, v["outcome"], on_success, stats, "agent")
-                        stats["agent_ok"] += 1
-                    elif v["status"] == "deferred":
-                        results[k] = dict(results.get(k) or {}, status="deferred", phase="agent")
-                    else:
-                        results[k] = dict(status="failed", phase="agent", errors=v.get("errors", []))
-    # close the TaskSpaces this batch used (script, agent, probe)
-    if prober.probe_fn is None:
-        for sp in {str(b.get("space", "tbsgen-s3-fulltext")), str(ag.get("space", "tbsgen-s3-agent")),
-                   prober.cfg["space"]}:
-            with contextlib.suppress(Exception):
-                browser_ego.finish(dict(b, space=sp))
-    stats["egress_lost"] = wd.why if wd.lost.is_set() else None
-    stats["probes"] = prober.n
-    for e in plan:
-        k = paper_ident(e)
-        r = results.get(k) or dict(status="deferred", phase="not started")
-        stats["papers"].append(dict(key=k, doi=e.get("doi"), **{x: y for x, y in r.items() if x != "outcome"}))
-        if r["status"] == "failed":
-            stats["failed"] += 1
-        elif r["status"] == "deferred":
-            stats["deferred"] += 1
-    _update_queue(fetcher, plan, results)
-    with contextlib.suppress(OSError):
-        if not (ft.get("browser") or {}).get("agent", {}).get("keep_batch_dir"):
+    def deadline_guard():                 # the window ends: stop whatever runs
+        while not stop.wait(1.0):
+            if clock() >= deadline:
+                stop.set()
+                with contextlib.suppress(OSError):
+                    (batch_dir / "STOP").write_text("deadline")
+                return
+    dg = threading.Thread(target=deadline_guard, daemon=True)
+    try:
+        with wd:
+            dg.start()
+            _script_phase(fetcher, plan, results, stats, bb, wd, stop, deadline, clock, sleep, on_success, log)
+            script_failed = [dict(e, _landing=results[paper_ident(e)].get("landing")) for e in plan
+                             if results.get(paper_ident(e), {}).get("retry_with_agent")]
+            if use_agent and script_failed and not stop.is_set():
+                n_ag = int(max(0.0, deadline - clock() - 20) // max(1.0, float(bb.get("est_agent_s", 120))))
+                todo = script_failed[:max(0, n_ag)]
+                if todo:
+                    ar = _agent_phase(fetcher, todo, deadline, batch_dir, wd, stop, hermes_runner, log)
+                    stats["agent"] = {k: v for k, v in ar.items() if k != "papers"}
+                    for k, v in ar["papers"].items():
+                        if v["status"] == "ok":
+                            e = next(x for x in todo if paper_ident(x) == k)
+                            results[k] = _deliver(fetcher, e, v["outcome"], on_success, stats, "agent")
+                            stats["agent_ok"] += 1
+                        else:
+                            results[k] = dict(status=v["status"], phase="agent", errors=v.get("errors", []))
+    finally:
+        stop.set()
+        wd.stop_ev.set()
+        if wd.th.is_alive():
+            wd.th.join(timeout=60)
+        if dg.is_alive():
+            dg.join(timeout=5)
+        stats["egress_lost"] = wd.why if wd.lost.is_set() else None
+        stats["probes"] = prober.n
+        for e in plan:
+            k = paper_ident(e)
+            r = results.get(k) or dict(status="deferred", phase="not started")
+            stats["papers"].append(dict(key=k, doi=e.get("doi"),
+                                        **{x: y for x, y in r.items() if x not in ("outcome", "retry_with_agent")}))
+            if r["status"] == "failed":
+                stats["failed"] += 1
+            elif r["status"] == "deferred":
+                stats["deferred"] += 1
+        _update_queue(fetcher, plan, results)
+        if not ag.get("keep_batch_dir"):
             shutil.rmtree(batch_dir, ignore_errors=True)
     return stats
+
+
+def _script_phase(fetcher, plan, results, stats, bb, wd, stop, deadline, clock, sleep, on_success, log):
+    from .fulltext import paper_ident
+    orig_runner = fetcher.browser_runner
+
+    def guarded_runner(job):
+        job = dict(job, cancel=stop)
+        if job.get("mode") != "egress":
+            # a script never runs past the window
+            job["cfg"] = dict(job["cfg"], script_timeout_s=max(5.0, min(float(job["cfg"].get("script_timeout_s", 420)),
+                                                                    deadline - clock())))
+        res = (orig_runner or browser_ego.run_one)(job)
+        if job.get("mode") == "egress":
+            return res
+        # accept a download only if the egress is still allowed right after it (probe now)
+        if stop.is_set() or not wd.check_now():
+            for k in ("path", "out_file"):
+                if res and res.get(k):
+                    Path(res[k]).unlink(missing_ok=True)
+            return dict(status="cancelled", error="batch stopped (egress changed or deadline)",
+                        out_file=(res or {}).get("out_file"))
+        return res
+    fetcher.browser_runner = guarded_runner
+    try:
+        for e in plan:
+            k = paper_ident(e)
+            if stop.is_set() or clock() >= deadline:
+                break
+            slot = led_next_slot(fetcher.ledger, "browser", _browser_keys(e["doi"]))
+            if slot + float(bb.get("est_script_s", 60)) > deadline:
+                continue                                    # publisher not free in time: stays queued
+            while (w := slot - clock()) > 0 and not stop.is_set():
+                sleep(min(w, 2.0))
+            if stop.is_set():
+                break
+            fetcher._egress_browser = dict(ok=True, ip=(wd.prober.last_ok or {}).get("ip"), ts=time.time())
+            t0 = clock()
+            out = fetcher.fetch(e, browser=True, channels=["cache", "browser"])
+            if stop.is_set() and out.text is None:
+                results[k] = dict(status="deferred", phase="script", errors=["batch stopped"])
+                _uncount_cancelled(fetcher, e)
+                break
+            if out.text is not None:
+                results[k] = _deliver(fetcher, e, out, on_success, stats, "script")
+                stats["script_ok"] += 1
+            else:
+                blocked = any("challenge" in x or "HTTP 429" in x for x in out.rec.get("errors") or [])
+                tried = bool(out.rec.get("tried"))
+                results[k] = dict(status="failed" if tried else "deferred", phase="script",
+                                  errors=out.rec.get("errors", [])[-2:], skipped=out.rec.get("skipped", [])[-2:],
+                                  seconds=round(clock() - t0, 1), landing=out.rec.get("landing"),
+                                  retry_with_agent=tried and not blocked)
+            log(json.dumps(dict(event="script", key=k, ok=out.text is not None,
+                                status=results[k]["status"], seconds=round(clock() - t0, 1))))
+    finally:
+        fetcher.browser_runner = orig_runner
+
+
+def _uncount_cancelled(fetcher, e):
+    """A paper cut by the batch stop is not a real failure: mark its last browser row as cancelled, so it does not
+    feed the channel's consecutive-failure breaker (it still counts as an attempt)."""
+    from .fulltext import norm_doi
+    led = fetcher.ledger
+    with led._tx() as db:
+        row = db.execute("select rowid from attempts where channel='browser' and doi=? order by rowid desc limit 1",
+                         (norm_doi(e.get("doi")),)).fetchone()
+        if row:
+            db.execute("update attempts set note='cancelled: batch stopped' where rowid=? and status='fail'", row)
 
 
 def _browser_keys(doi: str) -> tuple:
@@ -639,9 +721,100 @@ def _update_queue(fetcher, plan, results):
         write_queue(qp, keep)
 
 
-def _agent_phase(fetcher, todo: list[dict], deadline: float, bd: Path, wd: Watchdog, state: dict, hermes_runner,
-                 log) -> dict:
-    from .fulltext import Outcome, paper_ident, publisher_of
+HOOK_CONFIG = """# tbsgen browser batch: isolated Hermes home (generated; removed with the batch directory)
+model:
+  default: {model}
+  provider: {provider}
+{providers}hooks:
+  pre_tool_call:
+    - matcher: ".*"
+      command: {hook}
+      timeout: 15
+hooks_auto_accept: true
+"""
+
+
+def _user_provider(path: Path, name: str) -> dict | None:
+    """The `providers.<name>` mapping of a Hermes config.yaml (PyYAML when available, else a small reader for
+    the simple `key: scalar` / nested-mapping layout Hermes writes)."""
+    try:
+        text = path.read_text()
+    except OSError:
+        return None
+    with contextlib.suppress(Exception):
+        import yaml
+        return ((yaml.safe_load(text) or {}).get("providers") or {}).get(name)
+    lines = text.splitlines()
+    try:
+        i = lines.index("providers:")
+    except ValueError:
+        return None
+    out: dict = {}
+    stack: list[tuple[int, dict]] = []
+    inside = False
+    for ln in lines[i + 1:]:
+        if not ln.strip() or ln.lstrip().startswith("#"):
+            continue
+        ind = len(ln) - len(ln.lstrip())
+        if ind == 0:
+            break
+        key, _, val = ln.strip().partition(":")
+        if ind == 2:
+            if inside:
+                break
+            inside = key == name
+            stack = [(2, out)]
+            continue
+        if not inside:
+            continue
+        while stack and ind <= stack[-1][0]:
+            stack.pop()
+        cur = stack[-1][1] if stack else out
+        val = val.strip()
+        if val == "":
+            cur[key] = {}
+            stack.append((ind, cur[key]))
+        else:
+            v: object = val.strip("'\"")
+            if val in ("true", "false"):
+                v = val == "true"
+            elif re.fullmatch(r"-?\d+", val):
+                v = int(val)
+            cur[key] = v
+    return out or None
+
+
+def _hermes_home(bd: Path, ag: dict, hook_cmd: str) -> Path:
+    """An isolated Hermes home for the agent: only the configured provider, the requested skills and the
+    pre_tool_call hook.  No user memory, rules, plugins or other skills.  The provider entry comes from
+    `agent.provider_config` or, for a user-defined provider, from the user's Hermes config; its `api_key` is never
+    copied (use a provider that needs no key, e.g. a local proxy, or `key_env`)."""
+    home = bd / "hermes-home"
+    (home / "skills").mkdir(parents=True, exist_ok=True)
+    src_home = Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
+    pname = ag.get("provider") or ""
+    entry = ag.get("provider_config")
+    if entry is None and pname:
+        entry = _user_provider(src_home / "config.yaml", pname)
+    prov_block = ""
+    if isinstance(entry, dict):
+        entry = {k: v for k, v in entry.items() if k not in ("api_key", "key", "token")}
+        entry.setdefault("api_key", "none")
+        prov_block = "providers: " + json.dumps({pname: entry}) + "\n"        # JSON is valid YAML
+    for sk in ag.get("skills") or []:
+        src = src_home / "skills" / sk
+        if src.exists():
+            with contextlib.suppress(OSError):
+                (home / "skills" / sk).symlink_to(src.resolve())
+    (home / "config.yaml").write_text(HOOK_CONFIG.format(model=json.dumps(ag.get("model") or ""),
+                                                         provider=json.dumps(pname), providers=prov_block,
+                                                         hook=json.dumps(hook_cmd)))
+    return home
+
+
+def _agent_phase(fetcher, todo: list[dict], deadline: float, bd: Path, wd: Watchdog, stop: threading.Event,
+                 hermes_runner, log) -> dict:
+    from .fulltext import Outcome, paper_ident
     ft = fetcher.ft
     b = ft["browser"]
     ag = b.get("agent") or {}
@@ -650,67 +823,67 @@ def _agent_phase(fetcher, todo: list[dict], deadline: float, bd: Path, wd: Watch
     for i, e in enumerate(todo, 1):
         papers[str(i)] = dict(doi=e["doi"], title=e.get("title") or "", ident=paper_ident(e),
                               allow=allowed_domains(e["doi"], e.get("_landing"), ag.get("extra_domains") or []))
-    ego = browser_ego.binary(b)
-    st = dict(space=str(ag.get("space", "tbsgen-s3-agent")), papers=papers, deadline=deadline,
-              ledger_path=str(led.path), limits=led.limits, global_limits=led.g, host_caps=led.host_caps,
-              ego_binary=ego, gate_max_wait_s=float(ag.get("gate_max_wait_s", 150)),
-              max_calls_per_paper=int(ag.get("max_calls_per_paper", 8)),
-              call_timeout_s=float(ag.get("call_timeout_s", 150)))
     if deadline - time.time() - 10 < min(30.0, float(ag.get("run_budget_s", 420))):
         return dict(usage=dict(skipped="not enough time left in the egress window"),
                     papers={v["ident"]: dict(status="deferred") for v in papers.values()})
+    st = dict(space=str(ag.get("space", "tbsgen-s3-agent")), papers=papers, deadline=deadline,
+              ledger_path=str(led.path), limits=led.limits, global_limits=led.g, host_caps=led.host_caps,
+              ego_binary=browser_ego.binary(b), gate_max_wait_s=float(ag.get("gate_max_wait_s", 150)),
+              max_calls_per_paper=int(ag.get("max_calls_per_paper", 8)),
+              call_timeout_s=float(ag.get("call_timeout_s", 150)),
+              challenge_cooldown_s=float(b.get("challenge_cooldown_s", 24 * 3600)))
     (bd / "papers").mkdir(exist_ok=True)
     (bd / "files").mkdir(exist_ok=True)
     _atomic(bd / "batch.json", json.dumps(st))
     bin_dir = bd / "bin"
     bin_dir.mkdir(exist_ok=True)
-    w = bin_dir / "ego-browser"
-    w.write_text(WRAPPER.format(python=sys.executable, pkg_parent=str(Path(__file__).resolve().parent.parent),
-                                batch_dir=str(bd)))
-    w.chmod(0o700)
+    pkg_parent = str(Path(__file__).resolve().parent.parent)
+    for name, fn in (("tbsgen-browser", "wrapper_main"), ("tbsgen-hook", "hook_main")):
+        w = bin_dir / name
+        w.write_text(TOOL.format(python=sys.executable, pkg_parent=pkg_parent, batch_dir=str(bd), fn=fn))
+        w.chmod(0o700)
+    home = _hermes_home(bd, ag, str(bin_dir / "tbsgen-hook"))
     tmpl = Path(ag["prompt_template"]).read_text() if ag.get("prompt_template") else PROMPT.read_text()
     budget = min(float(ag.get("run_budget_s", 420)), deadline - time.time() - 10)
-    lines = [dict(n=int(k), doi=v["doi"], title=v["title"], allowed_domains=v["allow"],
-                  save_dir=str((bd / "files" / k).resolve())) for k, v in papers.items()]
-    prompt = render_prompt(tmpl, papers_json=json.dumps(lines, indent=1, ensure_ascii=False), space=st["space"],
-                           minutes=f"{budget / 60:.0f}", gap_s=f"{float(led.limits['browser']['gap_s']):.0f}",
-                           gap_max_s=f"{float(led.limits['browser']['gap_s']) + float(led.limits['browser']['jitter_s']):.0f}")
+    lines = [dict(n=int(k), doi=v["doi"], title=v["title"], allowed_domains=v["allow"]) for k, v in papers.items()]
+    lim = led.limits["browser"]
+    prompt = render_prompt(tmpl, papers_json=json.dumps(lines, indent=1, ensure_ascii=False),
+                           minutes=f"{budget / 60:.0f}", gap_s=f"{float(lim['gap_s']):.0f}",
+                           gap_max_s=f"{float(lim['gap_s']) + float(lim['jitter_s']):.0f}")
     (bd / "prompt.md").write_text(prompt)
     hermes = ag.get("hermes_bin") or "hermes"
     argv = [hermes, "chat", "--query-file", str(bd / "prompt.md"), "--oneshot", "--format", "stream-json",
-            "--source", "tool", "--max-turns", str(int(ag.get("max_turns", 80))), "--run-budget", str(int(budget)),
-            "-t", ",".join(ag.get("toolsets") or ["terminal"])]
+            "--source", "tool", "--accept-hooks", "--ignore-rules", "--max-turns", str(int(ag.get("max_turns", 80))),
+            "--run-budget", str(int(budget)), "-t", "terminal"]
     if ag.get("provider"):
         argv += ["--provider", str(ag["provider"])]
     if ag.get("model"):
         argv += ["-m", str(ag["model"])]
-    for s in ag.get("skills") or []:
-        argv += ["-s", str(s)]
     env = dict(browser_ego.child_env())
     env["PATH"] = str(bin_dir) + os.pathsep + env.get("PATH", "")
+    env["HERMES_HOME"] = str(home)
     events = dict(tool_calls=0, violations=[])
 
     def on_event(ev):
-        if ev.get("type") == "tool_use":
+        if ev.get("type") == "tool_use":          # second line of defence (the hook already blocked it)
             events["tool_calls"] += 1
             inp = ev.get("input") or {}
-            if ev.get("name") != "terminal":
-                why = f"tool not allowed: {ev.get('name')}"
-            elif inp.get("background") or inp.get("pty"):
-                why = "background / pty terminal not allowed"
-            else:
-                why = shell_allowed(inp.get("command"))
+            why = (f"tool not allowed: {ev.get('name')}" if ev.get("name") != "terminal" else
+                   "background / pty terminal not allowed" if inp.get("background") or inp.get("pty") else
+                   shell_allowed(inp.get("command")))
             if why:
                 events["violations"].append(why[:120])
-                return f"denied command: {why[:120]}"
-        if wd.lost.is_set():
-            return "egress lost"
+                if len(events["violations"]) >= int(ag.get("max_violations", 3)):
+                    return f"too many denied commands: {why[:120]}"
+        if stop.is_set():
+            return "batch stopped (egress changed or deadline)"
         return None
     t0 = time.time()
     log(json.dumps(dict(event="agent_start", papers=len(papers), budget_s=int(budget),
                         model=ag.get("model"), provider=ag.get("provider"))))
     runner = hermes_runner or default_hermes_runner
-    rr = runner(argv, env, budget + float(ag.get("kill_grace_s", 20)), on_event, state["proc_stop"])
+    rr = runner(argv, env, budget + float(ag.get("kill_grace_s", 20)), on_event, stop)
+    (bd / "STOP").write_text("agent run ended")       # a late tool call cannot book anything any more
     res = rr.get("result") or {}
     usage = dict(tokens=res.get("tokens"), duration_ms=res.get("duration_ms"), session_id=res.get("session_id"),
                  exit=rr.get("exit"), killed=rr.get("killed"), tool_calls=events["tool_calls"],
@@ -720,22 +893,22 @@ def _agent_phase(fetcher, todo: list[dict], deadline: float, bd: Path, wd: Watch
         with open(bd.parent / "usage.jsonl", "a") as fh:
             fh.write(json.dumps(dict(usage, ts=time.strftime("%F %T"), papers=len(papers))) + "\n")
     log(json.dumps(dict(event="agent_end", **{k: v for k, v in usage.items() if k != "session_id"})))
-    (bd / "STOP").write_text("agent run ended")       # a late wrapper call cannot book anything any more
     # ---- validate and book every paper (the agent's own report is not used)
     out: dict = dict(usage=usage, papers={})
-    lost = not wd.check_now()                         # files saved while the egress was not allowed are dropped
+    cut = stop.is_set() and not rr.get("result")     # killed by egress loss / deadline
+    lost = wd.lost.is_set() or not wd.check_now()    # files saved while the egress was not allowed are dropped
     for k, p in papers.items():
         sp = bd / "papers" / f"{k}.json"
         ps = json.loads(sp.read_text()) if sp.exists() else {}
         c = next(e for e in todo if paper_ident(e) == p["ident"])
         rid = ps.get("rid")
         if rid is None:
-            out["papers"][p["ident"]] = dict(status="deferred" if (lost or rr.get("killed")) else "failed",
+            out["papers"][p["ident"]] = dict(status="deferred" if (lost or cut or rr.get("killed")) else "failed",
                                              errors=[ps.get("closed") or "agent did not open this paper"])
             continue
+        txt, size, why = None, 0, "no valid file saved"
         rec = dict(doi=p["doi"], key=p["ident"], tried=[f"browser:agent:{ps['lkey']}"], errors=[], skipped=[],
                    source=None)
-        txt, size, why = None, 0, "no file saved"
         if lost:
             why = "egress left allow_cidrs during the agent run; files discarded"
         else:
@@ -759,18 +932,16 @@ def _agent_phase(fetcher, todo: list[dict], deadline: float, bd: Path, wd: Watch
                            provenance=prov)
                 txt = t
                 break
-        _, keys, web_hosts = publisher_of(p["doi"])
         if ps.get("challenge"):
-            secs = float(b.get("challenge_cooldown_s", 24 * 3600))
-            for h in {ps["lkey"], *keys, *web_hosts}:
-                led.block(h, "browser agent: challenge page", seconds=secs,
-                          channel="browser" if h == ps["lkey"] else None)
-            why = "challenge page (publisher cooled down)"
+            why = f"challenge: {ps['challenge']} (publisher cooled down)"
         ok = txt is not None
-        led.record("browser", ps["lkey"], p["doi"], "ok" if ok else "fail", None, size,
-                   "" if ok else fetcher._r(f"agent: {why}")[:300], reservation=rid)
+        interrupted = not ok and (lost or cut) and not ps.get("challenge")
+        note = "" if ok else ("cancelled: batch stopped" if interrupted else fetcher._r(f"agent: {why}")[:300])
+        led.record("browser", ps["lkey"], p["doi"], "ok" if ok else "fail", None, size, note, reservation=rid)
         if ok:
             out["papers"][p["ident"]] = dict(status="ok", outcome=Outcome(txt, rec))
+        elif interrupted:
+            out["papers"][p["ident"]] = dict(status="deferred", errors=[why])
         else:
             out["papers"][p["ident"]] = dict(status="failed", errors=[fetcher._r(f"agent: {why}")])
     return out

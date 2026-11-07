@@ -153,8 +153,9 @@ DEFAULTS: dict[str, Any] = {
                 "hermes_bin": "hermes",
                 "provider": None,           # hermes --provider
                 "model": None,              # hermes -m
-                "skills": ["ego-browser"],
-                "toolsets": ["terminal"],
+                "provider_config": None,    # provider entry for the agent's isolated Hermes home (no api_key)
+                "skills": [],               # skills linked into the agent's isolated Hermes home
+                "max_violations": 3,        # blocked commands before the run is ended
                 "max_turns": 80,
                 "run_budget_s": 420,        # hermes --run-budget (also capped by the egress window)
                 "space": "tbsgen-s3-agent", # the agent's own TaskSpace (closed by code afterwards)
@@ -176,7 +177,9 @@ DEFAULTS: dict[str, Any] = {
             "pdftotext": None,              # remote pdftotext binary (None -> "pdftotext" on PATH)
             "ca_file": None,                # remote CA bundle (None -> Python default, else a system bundle)
             "ssh": ["ssh", "-o", "BatchMode=yes", "-o", "ServerAliveInterval=30", "-o", "ServerAliveCountMax=4"],
-            "max_job_s": 7200,              # a remote job starts no new paper after this (< ledger PENDING_TTL_S)
+            # a remote job starts no new paper after this; it also bounds how stale the job's copy of the ledger
+            # state (cooldowns set meanwhile by the local browser) can get
+            "max_job_s": 1800,
             "batch_max": 50,
             # Command printing a JSON object of secrets on stdout; it gets the wanted names (JSON list) on stdin.
             # None -> read them from this process's environment.  Secrets go to the remote worker on ssh stdin.

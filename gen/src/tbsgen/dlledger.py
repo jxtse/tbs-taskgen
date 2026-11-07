@@ -174,7 +174,8 @@ class DownloadLedger:
         """Successes plus live reservations (a pending row may still succeed) on `day` or since `since_ts`."""
         now = self.clock()
         time_cond, targs = ("day=?", (day or self.today(),)) if since_ts is None else ("ts>?", (since_ts,))
-        return self._n(f"{time_cond} and (status='ok' or (status='pending' and ts>?)) and {where}",
+        # remote-job leases (channel 'lease') hold quota until the job is collected, however long that takes
+        return self._n(f"{time_cond} and (status='ok' or (status='pending' and (ts>? or channel='lease'))) and {where}",
                        (*targs, now - PENDING_TTL_S, *args))
 
     def cooling(self, host: str, *related: str) -> str | None:

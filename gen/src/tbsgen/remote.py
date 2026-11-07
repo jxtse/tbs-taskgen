@@ -141,12 +141,22 @@ def merge_rows(ledger, job: str, rows: dict) -> dict:
 
 
 # ------------------------------------------------------------------------------------------- local: transport
+SSH_ENV_ALLOW = ("PATH", "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "LANG", "LC_ALL", "LC_CTYPE", "TERM",
+                 "SSH_AUTH_SOCK", "SSH_AGENT_PID", "DISPLAY", "SSH_ASKPASS")
+
+
+def ssh_env() -> dict:
+    """The ssh client gets only what it needs: secrets in this process's environment never reach it (or `ps e`)."""
+    return {k: v for k, v in os.environ.items() if k in SSH_ENV_ALLOW}
+
+
 def default_ssh_runner(rcfg: dict):
     base = list(rcfg.get("ssh") or ["ssh"]) + [rcfg["host"]]
 
     def run(remote_cmd: str, stdin: bytes = b"", timeout: float = 300) -> tuple[int, bytes, bytes]:
         try:
-            p = subprocess.run(base + [remote_cmd], input=stdin, capture_output=True, timeout=timeout)
+            p = subprocess.run(base + [remote_cmd], input=stdin, capture_output=True, timeout=timeout,
+                               env=ssh_env())
         except subprocess.TimeoutExpired:
             return 255, b"", b"ssh timeout"
         return p.returncode, p.stdout, p.stderr
@@ -165,7 +175,7 @@ def load_secrets(fetcher, names: list[str]) -> dict:
     out: dict = {}
     if rcfg.get("secrets_cmd"):
         p = subprocess.run(list(rcfg["secrets_cmd"]), input=json.dumps(names).encode(), capture_output=True,
-                           timeout=120)
+                           timeout=120, env=ssh_env())
         if p.returncode != 0:
             raise RuntimeError(f"remote.secrets_cmd failed (exit {p.returncode})")
         try:
@@ -217,9 +227,7 @@ def remote_spec(fetcher, job: str, entries: list[dict], channels: list[str], lea
     ft = copy.deepcopy(fetcher.ft)
     rcfg = ft.pop("remote")
     ft.pop("browser", None)
-    wd = rcfg["workdir"].rstrip("/") + f"/jobs/{job}"
-    ft.update(cache_dirs=[], write_cache_dir=f"{wd}/cache", ledger_path=f"{wd}/ledger.sqlite",
-              queue_path=f"{wd}/queue.jsonl", cascade=[c for c in ft.get("cascade") or HTTP_CHANNELS
+    ft.update(cache_dirs=[], write_cache_dir=None, ledger_path=None, queue_path=None, cascade=[c for c in ft.get("cascade") or HTTP_CHANNELS
                                                         if c in channels],
               pdftotext=rcfg.get("pdftotext"), ca_file=rcfg.get("ca_file"))
     from .dlledger import DownloadLedger
@@ -245,7 +253,8 @@ def run_job(fetcher, entries: list[dict], channels: list[str] | None = None, *, 
     run = ssh_runner or default_ssh_runner(rcfg)
     import fcntl
     jobs_dir(fetcher.cfg).mkdir(parents=True, exist_ok=True)
-    with open(jobs_dir(fetcher.cfg) / ".lock", "a+") as fh:
+    lock = Path(str(fetcher.ledger.path) + ".remote.lock")         # per ledger: queues sharing it serialize
+    with open(lock, "a+") as fh:
         try:
             fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
@@ -277,6 +286,11 @@ def _run_job_locked(fetcher, entries, channels, run, log, poll_s, sleep, max_pol
         out["note"] = "allow_network=false: remote job not started"
         return out
     led = fetcher.ledger
+    # one remote job per LEDGER (not per queue): its seeded copy is only valid while no other job uses the quota
+    live = led.db.execute("select distinct host from attempts where channel='lease'").fetchall()
+    if live:
+        out["note"] = f"another remote job holds a lease on this ledger ({live[0][0]}); not starting a new one"
+        return out
     gl_left = max(0, int(led.g["daily_ok"]) - led._ok_or_pending("1", ()))
     lease_n = min(len(entries), gl_left)
     if lease_n <= 0:
@@ -488,9 +502,14 @@ def work(d: Path, spec: dict, secrets: dict, stop_after: int | None = None) -> i
         os.environ["TZ"] = spec["tz"]          # count days in the orchestrator's zone
         with contextlib.suppress(AttributeError):
             time.tzset()
-    ft = spec["fulltext"]
+    ft = dict(spec["fulltext"])
+    # every working path is rebuilt from the (expanded) job directory: seed, worker and export use the same files
+    ft.update(write_cache_dir=str(d / "cache"), ledger_path=str(d / "ledger.sqlite"), queue_path=str(d / "queue.jsonl"))
     if ft.get("pdftotext"):
         fulltext.PDFTOTEXT = ft["pdftotext"]
+    import fcntl
+    lock_fh = open(d / "worker.lock", "a+")
+    fcntl.flock(lock_fh, fcntl.LOCK_EX)           # held for the worker's lifetime; status tests it
     cfg = load_config(None, {"run": {"root": str(d)}, "fulltext": ft})
     cfg["fulltext"]["remote"]["enabled"] = False
     cfg["fulltext"]["browser"]["enabled"] = False
@@ -538,22 +557,56 @@ def cmd_status(workdir: str, job: str, stdout) -> int:
         return 0
     st = json.loads((d / "status.json").read_text())
     if st.get("state") in ("running", "starting"):
+        # alive <=> someone holds worker.lock (a recycled PID cannot fake this)
+        import fcntl
         alive = False
-        if st.get("pid"):
-            try:
-                os.kill(int(st["pid"]), 0)
-                alive = True
-            except (OSError, ValueError):
-                alive = False
+        if (d / "worker.lock").exists():
+            with open(d / "worker.lock", "a+") as fh:
+                try:
+                    fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    fcntl.flock(fh, fcntl.LOCK_UN)
+                except BlockingIOError:
+                    alive = True
         if not alive and time.time() - float(st.get("ts") or 0) > 30:
             st["state"] = "dead"
     print(json.dumps(st, default=str), file=stdout)
     return 0
 
 
+def _recover_results(d: Path, spec: dict):
+    """A worker that died between saving a text and writing its result file: rebuild that result from the cache
+    file's provenance (same identity), so a booked success is never lost."""
+    from .fulltext import paper_ident
+    cache = d / "cache"
+    if not cache.exists():
+        return
+    provs = {}
+    for pj in cache.glob("*.json"):
+        with contextlib.suppress(OSError, ValueError):
+            pv = json.loads(pj.read_text())
+            if isinstance(pv, dict) and pv.get("ident") and (cache / (pj.stem + ".txt")).exists():
+                provs[pv["ident"]] = (pj, pv)
+    for i, e in enumerate(spec.get("entries") or []):
+        rp = d / "results" / f"{i:04d}.json"
+        ident = paper_ident(e)
+        if rp.exists() or ident not in provs:
+            continue
+        pj, pv = provs[ident]
+        raws = sorted((cache / "raw").glob(pj.stem + ".*")) if (cache / "raw").exists() else []
+        rec = dict(doi=e.get("doi"), key=ident, tried=[], errors=[], skipped=[], source=pv.get("channel"),
+                   url=pv.get("url"), title_match=pv.get("title_match"), provenance=dict(pv), recovered=True)
+        _atomic(rp, json.dumps(dict(ident=ident, entry=e, ok=True, rec=rec, text_file=pj.stem + ".txt",
+                                    raw_file=raws[0].name if raws else None, seconds=None), ensure_ascii=False))
+
+
 def cmd_export(workdir: str, job: str, stdout) -> int:
     d = _job_dir(workdir, job)
     spec = json.loads((d / "spec.json").read_text())
+    st = {}
+    with contextlib.suppress(OSError, ValueError):
+        st = json.loads((d / "status.json").read_text())
+    if st.get("state") != "done":
+        _recover_results(d, spec)
     marks = spec.get("marks") or {}
     db = sqlite3.connect(d / "ledger.sqlite")
     rows = {k: db.execute(f"select rowid, * from {k} where rowid > ?", (marks.get(k, 0),)).fetchall()

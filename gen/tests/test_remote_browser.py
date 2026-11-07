@@ -325,11 +325,92 @@ def test_remote_one_job_at_a_time(tmp_path):
     import fcntl
     f, net, _, led, rdir, _ = mk_remote(tmp_path, {"api.elsevier.com": ELS_XML})
     queue(f, ELS)
-    remote.jobs_dir(f.cfg).mkdir(parents=True, exist_ok=True)
-    with open(remote.jobs_dir(f.cfg) / ".lock", "a+") as fh:
+    with open(str(led.path) + ".remote.lock", "a+") as fh:          # per ledger
         fcntl.flock(fh, fcntl.LOCK_EX)
         r = remote.run_job(f, [fulltext.queue_entry(ELS)], ssh_runner=FakeSSH(rdir, net))
     assert r.get("busy") and net.calls == []
+
+
+def test_lease_holds_quota_past_pending_ttl(tmp_path):
+    from tbsgen.dlledger import PENDING_TTL_S, LimitReached
+    clock = FakeClock(time.time())
+    led = DownloadLedger(tmp_path / "l.sqlite", global_limits={"daily_ok": 1}, clock=clock, sleep=clock.sleep)
+    remote.lease_and_snapshot(led, "j", 1)
+    clock.t += PENDING_TTL_S + 60
+    with pytest.raises(LimitReached):
+        led.check("browser", "chrome:10.1080")
+
+
+def test_second_remote_job_waits_for_the_first_lease(tmp_path):
+    f, net, _, led, rdir, _ = mk_remote(tmp_path, {"api.elsevier.com": ELS_XML})
+    remote.lease_and_snapshot(led, "other-queue-job", 1)
+    r = remote.run_job(f, [fulltext.queue_entry(ELS)], ssh_runner=FakeSSH(rdir, net))
+    assert "holds a lease" in r["note"] and net.calls == []
+
+
+def test_worker_crash_after_save_before_result_is_recovered(tmp_path):
+    f, net, _, led, rdir, _ = mk_remote(tmp_path, {"api.elsevier.com": ELS_XML})
+    queue(f, ELS)
+    ssh = FakeSSH(rdir, net)
+    real = ssh.__call__
+    orig_atomic = remote._atomic
+
+    def runner(cmd, stdin=b"", timeout=300):
+        if "submit" in cmd:
+            def crashy(path, data):                         # the result file of paper 0 is never written
+                if path.name == "0000.json":
+                    raise SystemExit("worker killed")
+                return orig_atomic(path, data)
+            remote._atomic = crashy
+            try:
+                return real(cmd, stdin, timeout)
+            except SystemExit:
+                return 0, b'{"ok": true}\n', b""
+            finally:
+                remote._atomic = orig_atomic
+                job = cmd.split()[-1]
+                sp = rdir / "jobs" / job / "status.json"
+                st = json.loads(sp.read_text())
+                st.update(state="running", ts=time.time() - 120)
+                sp.write_text(json.dumps(st))
+        return real(cmd, stdin, timeout)
+    st = drain(f, runner)
+    assert st["ok"] == 1 and fulltext.read_queue(fulltext.queue_path(f.cfg)) == []
+    assert len(list(Path(f.ft["write_cache_dir"]).glob("*.txt"))) == 1
+    db = sqlite3.connect(led.path)
+    assert db.execute("select count(*) from attempts where status='ok'").fetchone()[0] == 1
+
+
+def test_tilde_workdir_uses_one_job_directory(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    (tmp_path / "home").mkdir()
+    f, net, _, led, rdir, _ = mk_remote(tmp_path, {"api.elsevier.com": ELS_XML})
+    f.ft["remote"]["workdir"] = "~/tbs-remote"
+    queue(f, ELS)
+    st = drain(f, FakeSSH(Path("~/tbs-remote"), net))
+    assert st["ok"] == 1
+    assert not (tmp_path / "home" / "tbs-remote" / "jobs").exists() or \
+        not any((tmp_path / "home" / "tbs-remote" / "jobs").iterdir())
+
+
+def test_ssh_and_secrets_cmd_get_no_credentials(tmp_path, monkeypatch):
+    monkeypatch.setenv("ELSEVIER_API_KEY", "k-env")
+    monkeypatch.setenv("SOME_TOKEN", "t")
+    seen = {}
+
+    def fake_run(argv, **kw):
+        seen.setdefault("envs", []).append(kw.get("env"))
+
+        class P:
+            returncode, stdout, stderr = 0, b"{}", b""
+        return P()
+    monkeypatch.setattr(remote.subprocess, "run", fake_run)
+    remote.default_ssh_runner({"host": "h"})("true")
+    f, *_ = mk_remote(tmp_path, {})
+    f.ft["remote"]["secrets_cmd"] = ["x"]
+    remote.load_secrets(f, ["A"])
+    for env in seen["envs"]:
+        assert env is not None and "ELSEVIER_API_KEY" not in env and "SOME_TOKEN" not in env
 
 
 def test_posix_tz_matches_local_offset():
@@ -504,66 +585,86 @@ def test_validation_failure_is_not_success(tmp_path, monkeypatch):
 
 
 # ---- agent phase with a fake `hermes` executable and a fake `ego-browser`
-FAKE_EGO = r'''#!{py}
-import json, re, sys, os
+FAKE_EGO = r"""#!{py}
+import json, os, re, sys, time
 code = sys.stdin.read()
-m = re.search(r"const GUARD = (\{.*?\});\n", code)
-g = json.loads(m.group(1))
+m = re.match(r"const INPUT = (\{.*?\});\n", code)
+inp = json.loads(m.group(1)) if m else {}
 mode = "{ego_mode}"
-if "TBSGEN_RESULT" in code or "INPUT" in code[:200]:
-    print('TBSGEN_RESULT {"status": "ok", "bodies": {}}'); sys.exit(0)
-if mode == "pdf":
-    open(os.path.join(g["files_dir"], "paper.pdf"), "wb").write(b"%PDF-1.7 fake")
-elif mode == "html":
-    open(os.path.join(g["files_dir"], "paper.pdf"), "wb").write(b"<html>login</html>")
-print("saved")
-'''
+log = "{ego_log}"
+if log:
+    open(log, "a").write(json.dumps({"action": inp.get("action"), "arg": inp.get("arg"), "space": inp.get("space")}) + "\n")
+out = {"status": "ok", "files": []}
+if inp.get("action") == "open":
+    if mode == "challenge":
+        out["blocked"] = "verification page: Just a moment"
+    elif mode == "slow":
+        time.sleep(30)
+    else:
+        f = os.path.join(inp["files_dir"], "dl.bin")
+        open(f, "wb").write(b"%PDF-1.7 fake" if mode == "pdf" else b"<html>login</html>")
+        out["files"] = [f]
+print("TBSGEN_RESULT " + json.dumps(out))
+"""
 
-FAKE_HERMES = r'''#!{py}
+FAKE_HERMES = r"""#!{py}
 import json, os, subprocess, sys, time
 argv = sys.argv[1:]
-open(os.environ["FAKE_HERMES_ARGS"], "w").write(json.dumps(argv))
+open(os.environ["FAKE_HERMES_ARGS"], "w").write(json.dumps({"argv": argv, "home": os.environ.get("HERMES_HOME"),
+                                                           "env": sorted(os.environ)}))
 mode = os.environ.get("FAKE_HERMES_MODE", "work")
-print(json.dumps({{"type": "system", "subtype": "init", "model": "fake"}}), flush=True)
+print(json.dumps({"type": "system", "subtype": "init", "model": "fake"}), flush=True)
 def tool(cmd):
-    print(json.dumps({{"type": "tool_use", "name": "terminal", "input": {{"command": cmd}}}}), flush=True)
+    print(json.dumps({"type": "tool_use", "name": "terminal", "input": {"command": cmd}}), flush=True)
+    # like Hermes: run the pre_tool_call hook first, execute only if it does not block
+    home = os.environ["HERMES_HOME"]
+    hook = [l.split("command:", 1)[1].strip() for l in open(os.path.join(home, "config.yaml")) if "command:" in l][0]
+    r = subprocess.run([json.loads(hook)], input=json.dumps({"tool_name": "terminal", "tool_input": {"command": cmd}}),
+                       capture_output=True, text=True)
+    if r.stdout.strip():
+        print(json.dumps({"type": "tool_result", "output": r.stdout.strip()}), flush=True)
+        return
+    r = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    print(json.dumps({"type": "tool_result", "output": r.stdout[-300:]}), flush=True)
 if mode == "work":
     for n in (1, 2):
-        tool(f"ego-browser nodejs <<'EOF'\n// paper: {{n}}\nawait 1;\nEOF")
-        r = subprocess.run(["ego-browser", "nodejs"], input=f"// paper: {{n}}\nawait 1;\n", capture_output=True, text=True)
-        print(json.dumps({{"type": "tool_result", "output": r.stdout[-200:]}}), flush=True)
+        tool(f"tbsgen-browser {n} open https://doi.org/10.1080/x")
+    tool("tbsgen-browser finish")
 elif mode == "curl":
+    tool("touch " + os.environ["FAKE_MARKER"])
     tool("curl -s https://sci-hub.example/10.1/x")
+    tool("env")
     time.sleep(5)
 elif mode == "hang":
     time.sleep(60)
-print(json.dumps({{"type": "result", "exit_code": 0, "text": "1: saved\n2: saved", "tokens": {{"input": 10, "output": 5, "total": 15}}, "duration_ms": 1234, "session_id": "s"}}), flush=True)
-'''
+print(json.dumps({"type": "result", "exit_code": 0, "text": "1: saved\n2: saved", "tokens": {"input": 10, "output": 5, "total": 15}, "duration_ms": 1234, "session_id": "s"}), flush=True)
+"""
 
 
 def mk_agent(tmp_path, monkeypatch, hermes_mode="work", ego_mode="pdf", **bb):
     bin_dir = tmp_path / "fakebin"
     bin_dir.mkdir()
     ego = bin_dir / "ego-real"
-    ego.write_text(FAKE_EGO.replace("{py}", sys.executable).replace("{ego_mode}", ego_mode))
+    ego.write_text(FAKE_EGO.replace("{py}", sys.executable).replace("{ego_mode}", ego_mode)
+                   .replace("{ego_log}", str(tmp_path / "ego.log")))
     ego.chmod(0o755)
     herm = bin_dir / "hermes"
-    herm.write_text(FAKE_HERMES.replace("{py}", sys.executable).replace("{{", "{").replace("}}", "}"))
+    herm.write_text(FAKE_HERMES.replace("{py}", sys.executable))
     herm.chmod(0o755)
     monkeypatch.setenv("FAKE_HERMES_MODE", hermes_mode)
-    monkeypatch.setenv("FAKE_EGO_MODE", ego_mode)
     monkeypatch.setenv("FAKE_HERMES_ARGS", str(tmp_path / "hermes-args.json"))
-    monkeypatch.setattr(browser_agent.browser_ego, "ENV_ALLOW",
-                        browser_agent.browser_ego.ENV_ALLOW + ("FAKE_HERMES_MODE", "FAKE_EGO_MODE", "FAKE_HERMES_ARGS"))
-    clock = FakeClock(time.time())
-    clock.sleep = lambda s: None                               # real time for the agent run; no pacing waits
+    monkeypatch.setenv("FAKE_MARKER", str(tmp_path / "marker"))
+    monkeypatch.setenv("FAKE_EGO_LOG", str(tmp_path / "ego.log"))
+    monkeypatch.setenv("ELSEVIER_API_KEY", "k-should-not-leak")
+    monkeypatch.setattr(browser_agent.browser_ego, "ENV_ALLOW", browser_agent.browser_ego.ENV_ALLOW + (
+        "FAKE_HERMES_MODE", "FAKE_HERMES_ARGS", "FAKE_MARKER", "FAKE_EGO_LOG"))
     cfg = mkcfg(tmp_path, egress_check=dict(EC),
                 browser={"enabled": True, "batch_only": True, "binary": str(ego),
                          "batch": dict({"window_s": 600, "margin_s": 60, "poll_s": 5, "recheck_s": 3600,
                                         "probe_host_gap_s": 0, "require_http_first": False}, **bb),
                          "agent": {"enabled": True, "hermes_bin": str(herm), "provider": "prov-x", "model": "model-y",
-                                   "skills": ["ego-browser"], "max_turns": 7, "run_budget_s": 30,
-                                   "call_timeout_s": 20}})
+                                   "provider_config": {"api": "http://127.0.0.1:9/v1", "api_key": "SECRET-K"},
+                                   "max_turns": 7, "run_budget_s": 30, "call_timeout_s": 20}})
     led = DownloadLedger(cfg["fulltext"]["ledger_path"], cfg["fulltext"]["limits"], cfg["fulltext"]["global_limits"],
                          cfg["fulltext"]["host_caps"])
     bqueue(cfg, {"10.1080": 1, "10.1093": 1})
@@ -578,11 +679,14 @@ def test_agent_fallback_saves_validated_files(tmp_path, monkeypatch):
     st = browser_agent.run_batch(f, prober=pr, sleep=lambda s: None, log=lambda m: None)
     assert len(calls) == 2                                     # the script went first
     assert st["agent_ok"] == 2 and st["ok"] == 2, st
-    args = json.loads((tmp_path / "hermes-args.json").read_text())
-    assert args[:2] == ["chat", "--query-file"] and "--oneshot" in args
+    got = json.loads((tmp_path / "hermes-args.json").read_text())
+    args = got["argv"]
+    assert args[:2] == ["chat", "--query-file"] and "--oneshot" in args and "--accept-hooks" in args
     assert args[args.index("--provider") + 1] == "prov-x" and args[args.index("-m") + 1] == "model-y"
-    assert args[args.index("--max-turns") + 1] == "7" and "-s" in args
+    assert args[args.index("--max-turns") + 1] == "7" and args[args.index("-t") + 1] == "terminal"
     assert int(args[args.index("--run-budget") + 1]) <= 30
+    assert "ELSEVIER_API_KEY" not in got["env"]                # the agent's process gets no credentials
+    assert got["home"] and "hermes-home" in got["home"]       # isolated Hermes home with the hook
     assert st["agent"]["usage"]["tokens"]["total"] == 15
     rows = sqlite3.connect(led.path).execute("select channel, status, note from attempts order by rowid").fetchall()
     assert [r[1] for r in rows if r[0] == "browser"] == ["fail", "fail", "ok", "ok"]
@@ -591,6 +695,17 @@ def test_agent_fallback_saves_validated_files(tmp_path, monkeypatch):
     assert fulltext.read_queue(fulltext.queue_path(f.cfg)) == []
     usage = (fulltext.queue_path(f.cfg).with_name(fulltext.queue_path(f.cfg).name + ".browser") / "usage.jsonl")
     assert json.loads(usage.read_text().splitlines()[-1])["model"] == "model-y"
+    ego_log = [json.loads(x) for x in (tmp_path / "ego.log").read_text().splitlines()]
+    assert {e["space"] for e in ego_log} == {"tbsgen-s3-agent"}
+
+
+def test_agent_isolated_home_has_no_api_key(tmp_path, monkeypatch):
+    bd = tmp_path / "bd"
+    bd.mkdir()
+    home = browser_agent._hermes_home(bd, {"provider": "p", "model": "m",
+                                           "provider_config": {"api": "http://x/v1", "api_key": "SECRET-K"}}, "/h")
+    txt = (home / "config.yaml").read_text()
+    assert "SECRET-K" not in txt and "pre_tool_call" in txt and '"/h"' in txt
 
 
 def test_agent_claims_do_not_count_without_a_valid_file(tmp_path, monkeypatch):
@@ -600,12 +715,20 @@ def test_agent_claims_do_not_count_without_a_valid_file(tmp_path, monkeypatch):
     assert len(fulltext.read_queue(fulltext.queue_path(f.cfg))) == 2
 
 
-def test_agent_denied_command_kills_the_run(tmp_path, monkeypatch):
+def test_agent_challenge_cools_publisher_at_once(tmp_path, monkeypatch):
+    f, led, pr, calls = mk_agent(tmp_path, monkeypatch, ego_mode="challenge")
+    st = browser_agent.run_batch(f, prober=pr, sleep=lambda s: None, log=lambda m: None)
+    assert st["ok"] == 0 and led.cooling("chrome:10.1080") and led.cooling("www.tandfonline.com")
+    assert "challenge" in json.dumps(st["papers"])
+
+
+def test_agent_commands_are_blocked_before_they_run(tmp_path, monkeypatch):
     f, led, pr, calls = mk_agent(tmp_path, monkeypatch, hermes_mode="curl")
     t0 = time.time()
     st = browser_agent.run_batch(f, prober=pr, sleep=lambda s: None, log=lambda m: None)
-    assert time.time() - t0 < 5 and "denied command" in st["agent"]["usage"]["killed"]
-    assert st["ok"] == 0
+    assert not (tmp_path / "marker").exists()                 # blocked by the hook, never executed
+    assert time.time() - t0 < 8 and "too many denied commands" in st["agent"]["usage"]["killed"]
+    assert st["ok"] == 0 and len(st["agent"]["usage"]["violations"]) == 3
 
 
 def test_agent_timeout_is_enforced(tmp_path, monkeypatch):
@@ -616,20 +739,25 @@ def test_agent_timeout_is_enforced(tmp_path, monkeypatch):
     assert time.time() - t0 < 20 and st["agent"]["usage"]["killed"] == "timeout"
     assert st["ok"] == 0 and st["deferred"] == 2               # never opened: stays due
     q = fulltext.read_queue(fulltext.queue_path(f.cfg))
-    assert len(q) == 2
+    assert len(q) == 2 and not any(e.get("browser_next_try") for e in q)
 
 
-def test_agent_egress_lost_discards_files(tmp_path, monkeypatch):
+def test_agent_egress_lost_discards_files_and_requeues(tmp_path, monkeypatch):
     f, led, pr, calls = mk_agent(tmp_path, monkeypatch)
     # start ok, ok after each of the 2 script papers, then lost at the post-agent check
     pr.probe_fn = Seq(TRACE_OK, TRACE_OK, TRACE_OK, TRACE_SG)
     st = browser_agent.run_batch(f, prober=pr, sleep=lambda s: None, log=lambda m: None)
-    assert st["ok"] == 0 and st["egress_lost"]
+    assert st["ok"] == 0 and st["egress_lost"] and st["deferred"] == 2
     assert not list(Path(f.ft["write_cache_dir"]).glob("*.txt"))
+    q = fulltext.read_queue(fulltext.queue_path(f.cfg))
+    assert len(q) == 2 and not any(e.get("browser_next_try") for e in q)      # no backoff
+    notes = [r[0] for r in sqlite3.connect(led.path).execute(
+        "select note from attempts where channel='browser' and note like 'cancelled%'")]
+    assert len(notes) == 2                                     # not counted towards the failure breaker
 
 
-def test_wrapper_requires_paper_line_and_refuses_denied_apis(tmp_path, monkeypatch, capsys):
-    f, led, pr, calls = mk_agent(tmp_path, monkeypatch)
+def test_wrapper_refuses_unknown_actions_and_honours_stop(tmp_path, monkeypatch, capsys):
+    led = DownloadLedger(tmp_path / "l.sqlite")
     bd = tmp_path / "bd"
     (bd / "papers").mkdir(parents=True)
     st = dict(space="sp", papers={"1": dict(doi="10.1080/p", title=TITLE, ident="doi:10.1080/p",
@@ -638,27 +766,71 @@ def test_wrapper_requires_paper_line_and_refuses_denied_apis(tmp_path, monkeypat
               host_caps=led.host_caps, ego_binary="/bin/false", gate_max_wait_s=100, max_calls_per_paper=2,
               call_timeout_s=10)
     (bd / "batch.json").write_text(json.dumps(st))
-    monkeypatch.setattr(sys, "stdin", io.StringIO("await page.goto('x')"))
-    assert browser_agent.wrapper_main(str(bd), ["nodejs"]) == 2
-    monkeypatch.setattr(sys, "stdin", io.StringIO("// paper: 1\nawait (await userPage()).goto('x')"))
-    assert browser_agent.wrapper_main(str(bd), ["nodejs"]) == 2
-    monkeypatch.setattr(sys, "stdin", io.StringIO("// paper: 1\nconst c = document.cookie"))
-    assert browser_agent.wrapper_main(str(bd), ["nodejs"]) == 2
+    assert browser_agent.wrapper_main(str(bd), ["1", "type", "secret"]) == 2
+    assert browser_agent.wrapper_main(str(bd), ["9", "look"]) == 2
     assert sqlite3.connect(led.path).execute("select count(*) from attempts").fetchone()[0] == 0
     (bd / "STOP").write_text("x")
-    monkeypatch.setattr(sys, "stdin", io.StringIO("// paper: 1\nawait 1"))
-    assert browser_agent.wrapper_main(str(bd), ["nodejs"]) == 3
-    out = capsys.readouterr().out
-    assert "paper: N" in out and "userPage" in out and "STOP" in out
+    assert browser_agent.wrapper_main(str(bd), ["1", "look"]) == 3
+    assert "STOP" in capsys.readouterr().out
+
+
+def test_hook_allowlist():
+    ok = ["tbsgen-browser 1 look", "tbsgen-browser 2 open https://doi.org/10.1/x", "tbsgen-browser 3 click 12",
+          "tbsgen-browser 1 save_pdf", "tbsgen-browser finish", "sleep 90"]
+    bad = ["printenv", "env", "echo $ELSEVIER_API_KEY", "cat ~/.hermes/.env", "curl https://x",
+           "tbsgen-browser 1 look; env", "tbsgen-browser 1 open https://x/$(id)", "tbsgen-browser 1 look\nenv",
+           "ego-browser nodejs", "sleep 1 && env", "tbsgen-browser 1 open https://sci-hub.se/x", "sleep 9999"]
+    assert all(browser_agent.shell_allowed(c) is None for c in ok)
+    assert all(browser_agent.shell_allowed(c) for c in bad)
+
+
+def test_hook_main_blocks_other_tools(tmp_path, monkeypatch, capsys):
+    for payload, blocked in (({"tool_name": "terminal", "tool_input": {"command": "tbsgen-browser 1 look"}}, False),
+                             ({"tool_name": "terminal", "tool_input": {"command": "env"}}, True),
+                             ({"tool_name": "write_file", "tool_input": {"path": "/x"}}, True),
+                             ({"tool_name": "terminal", "tool_input": {"command": "sleep 5", "background": True}}, True)):
+        monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
+        browser_agent.hook_main(str(tmp_path), [])
+        out = capsys.readouterr().out
+        assert ('"block"' in out) == blocked
+
+
+def test_dry_run_plans_without_side_effects(tmp_path):
+    cfg, led, clock = mk_browser(tmp_path)
+    bqueue(cfg, {"10.1080": 2, "10.1093": 2})
+    run, calls = script_runner(tmp_path)
+    f = Fetcher(cfg, ledger=led, transport=FakeNet({}), browser_runner=run)
+    probe = Seq(TRACE_OK)
+    pr = browser_agent.Prober(f.ft, probe_fn=probe, clock=clock, sleep=clock.sleep)
+    st = browser_agent.run_batch(f, prober=pr, clock=clock, sleep=clock.sleep, dry_run=True)
+    assert st["dry_run"] and len(st["planned"]) == 4 and calls == [] and probe.urls == []
+    assert sqlite3.connect(led.path).execute("select count(*) from attempts").fetchone()[0] == 0
+
+
+def test_running_script_is_cut_at_the_deadline(tmp_path):
+    clock = FakeClock(time.time())
+    cfg, led, clock = mk_browser(tmp_path, clock=clock, window_s=120, margin_s=60, est_script_s=10)
+    bqueue(cfg, {"10.1080": 1})
+    seen = {}
+
+    def run(job):
+        if job.get("mode") in ("egress", "probe", "finish"):
+            return {"status": "ok"}
+        seen["timeout"] = job["cfg"]["script_timeout_s"]
+        return {"status": "timeout"}
+    f = Fetcher(cfg, ledger=led, transport=FakeNet({}), browser_runner=run)
+    pr = browser_agent.Prober(f.ft, probe_fn=Seq(TRACE_OK), clock=clock, sleep=clock.sleep)
+    browser_agent.run_batch(f, prober=pr, clock=clock, sleep=clock.sleep, log=lambda m: None)
+    assert seen["timeout"] <= 60                              # never past the window's deadline
 
 
 def test_prompt_template_carries_the_hard_rules():
     t = browser_agent.PROMPT.read_text()
-    for s in ("CAPTCHA", "credentials", "allowed_domains", "Sci-Hub", "user's own tabs", "$papers_json", "// finish",
-              "$gap_s"):
+    for s in ("CAPTCHA", "credentials", "allowed_domains", "Sci-Hub", "user's own tabs", "$papers_json",
+              "tbsgen-browser finish", "$gap_s"):
         assert s in t
-    g = browser_agent.GUARD.read_text()
-    for s in ("claimTaskSpace", "userPage", "fill", "verification", "files_dir", "allow"):
+    g = browser_agent.ACTION.read_text()
+    for s in ("hostOk", "isChallenge", "login form", "verification widget", "files_dir", "finish"):
         assert s in g
 
 
@@ -692,11 +864,15 @@ def test_redirect_location_with_raw_spaces_is_encoded(tmp_path):
     assert r.status == 200 and "b%20c%09.pdf?x=1%202" in net.calls[-1][0]
 
 
-def test_agent_shell_allowlist():
-    ok = ["ego-browser nodejs <<'EOF'\n// paper: 1\nconst a = `${x}`;\nEOF", "ls /tmp/x/files/1", "sleep 30",
-          "ego-browser nodejs --help"]
-    bad = ["printenv", "env", "echo $ELSEVIER_API_KEY", "cat ~/.hermes/.env", "curl https://x",
-           "ego-browser nodejs <<'EOF'\n// paper: 1\nEOF\nprintenv", "ego-browser nodejs <<EOF\n$(id)\nEOF",
-           "ls; env", "ego-browser nodejs -e 'x'", "sleep 1 && env", "open https://sci-hub.se"]
-    assert all(browser_agent.shell_allowed(c) is None for c in ok)
-    assert all(browser_agent.shell_allowed(c) for c in bad)
+def test_user_provider_reader_without_yaml(tmp_path, monkeypatch):
+    import builtins
+    real_import = builtins.__import__
+    monkeypatch.setattr(builtins, "__import__",
+                        lambda n, *a, **k: (_ for _ in ()).throw(ImportError()) if n == "yaml" else real_import(n, *a, **k))
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text("model:\n  default: x\nproviders:\n  other:\n    api: http://o\n  mine:\n    name: Local (:1)\n"
+                   "    api: http://127.0.0.1:1/v1\n    api_key: k\n    discover_models: false\n    models:\n"
+                   "      m1:\n        context_length: 4000\n  third:\n    api: http://t\nother_top: 1\n")
+    e = browser_agent._user_provider(cfg, "mine")
+    assert e == {"name": "Local (:1)", "api": "http://127.0.0.1:1/v1", "api_key": "k", "discover_models": False,
+                 "models": {"m1": {"context_length": 4000}}}

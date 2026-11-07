@@ -15,7 +15,7 @@ src/tbsgen/
   fulltext.py      S3 下载级联（cache/oa/elsevier/wiley/inst/browser）、校验、写入缓存、全文队列
   dlledger.py      S3 下载账本：每日/每小时上限、同站点间隔、冷却、熔断
   browser_ego.py   ego-browser 通道（运行 browser_fetch.mjs 脚本模板）
-  browser_agent.py 浏览器批次：出口门控、按出口窗口定批次规模、脚本优先、Hermes CLI agent 兜底（提示模板 browser_agent_prompt.md，guard 脚本 browser_agent_guard.mjs）
+  browser_agent.py 浏览器批次：出口门控、按出口窗口定批次规模、脚本优先、Hermes CLI agent 兜底（提示模板 browser_agent_prompt.md，agent 唯一的浏览器工具调用受审动作脚本 browser_agent_action.mjs）
   remote.py        远程模式：HTTP 通道经 ssh 在另一台主机上运行，账本以本机为准
   screen_jev.py    S2 的 Jev 模式：问题原文、阈值、组合规则、HTTP 客户端（重试/记账/熔断）、并发预取
   prompts.py       S5/S6A/S6C/S8 提示词（版本号写进 provenance）

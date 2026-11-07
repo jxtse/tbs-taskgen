@@ -171,7 +171,7 @@ def _fetch(P: Pipeline, a) -> int:
     readded = fulltext.reconcile(P.store, fulltext.queue_path(P.cfg)) if not a.dry_run else 0
     if getattr(a, "browser", False):
         from . import browser_agent
-        stats = browser_agent.run_batch(f, wait_for_egress=a.wait_for_egress, max_wait_s=a.max_wait,
+        stats = browser_agent.run_batch(f, wait_for_egress=a.wait_for_egress, max_wait_s=a.max_wait, dry_run=a.dry_run,
                                         on_success=reactivate, log=lambda s: print(s, file=sys.stderr, flush=True))
         stats["requeued_from_items"] = readded
         print(json.dumps(stats, indent=1, ensure_ascii=False, default=str))
