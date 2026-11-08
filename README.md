@@ -339,7 +339,7 @@ uv run tbsgen fetch --run runs/R --config config.toml --browser --wait-for-egres
   |---|---|
   | `look [full] [@REF] [OFFSET]` | page summary: URL (no query), title, PDF? verification page? login form?, text excerpt, numbered links / buttons / fields of the page, same-origin iframes and (via the ego page snapshot) cross-origin iframes; `full` whole page, `@REF` one subtree |
   | `open URL` | navigate (allowed domains only) |
-  | `click I` | click item I (also inside iframes; `_blank` links by a native click, new tabs tracked) |
+  | `click I` | click item I (also inside same-origin iframes and links inside cross-origin iframes; a button inside a cross-origin iframe after opening the frame item; `_blank` links by a native click, new tabs tracked) |
   | `click_xy X Y` | native click at viewport coordinates (the element there is checked first) |
   | `hover I` | native pointer onto item I (dropdown menus) |
   | `scroll up\|down [PX]` | scroll (wheel fallback) |

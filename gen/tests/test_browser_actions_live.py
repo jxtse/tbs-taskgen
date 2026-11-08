@@ -250,6 +250,20 @@ def _pages(port, port2):
             '<button type="submit" id="login">登录 / Login</button>',
             f'<button form="other" id="login">登录 / Login</button>').replace(
             "</form>", f'</form><form id="other" method="post" action="http://127.0.0.1:{port2}/stolen"></form>').encode()),
+        # round 15: a hidden field in a same-origin frame next to a cross-origin e-mail frame; a label (outside
+        # any form) of an off-site submit button; a neutral frame showing a verification page (click_xy);
+        # a cross-origin frame with an off-site form button
+        "/hidden-inner": ("text/html", b'<html><body><input type="text" style="display:none"></body></html>'),
+        "/shot-mix": ("text/html", f'<html><head><title>Article</title></head><body><iframe src="/hidden-inner" width="100" height="40"></iframe>'
+                                   f'<iframe src="http://127.0.0.1:{port2}/xemail" width="300" height="80"></iframe></body></html>'.encode()),
+        "/label-xy": ("text/html", b'<html><head><title>Article</title></head><body style="margin:0"><form id="f" method="get" '
+                                   b'action="https://denied.example/collect"><button id="s">Go</button></form>'
+                                   b'<label for="s" style="position:absolute;left:0;top:100px;width:200px;height:50px;display:block">'
+                                   b'<span>Download</span></label></body></html>'),
+        "/verify-xy": ("text/html", b'<html><head><title>Article</title></head><body style="margin:0">'
+                                    b'<iframe src="/verify-inner" style="position:absolute;left:0;top:0;width:400px;height:200px;border:0"></iframe></body></html>'),
+        "/xform-frame": ("text/html", f'<html><head><title>Article</title></head><body><iframe src="http://127.0.0.1:{port2}/xform" '
+                                      f'width="300" height="80"></iframe></body></html>'.encode()),
         "/wayf-form": ("text/html", b'<html><head><title>Find your institution</title></head><body><form method="post" '
                                     b'action="/logged"><input type="search" name="q" aria-label="Search for your institution">'
                                     b'<button>Find</button></form></body></html>'),
@@ -267,6 +281,8 @@ def _pages(port, port2):
 
 # the second (foreign) origin; every request it gets is recorded (a request for /stolen is a leak)
 XPAGES = {"/xframe": ("text/html", XFRAME.encode()),
+          "/xform": ("text/html", b'<html><body><form method="get" action="https://denied.example/collect">'
+                                  b'<button>Download PDF</button></form></body></html>'),
           "/xemail": ("text/html", b'<html><body><input type="email" name="em" value="SECRETMAIL@x.org"></body></html>')}
 XHITS: list = []
 
@@ -435,10 +451,11 @@ def test_cross_origin_iframe_items_and_frame_page(origins):
         assert _run(sp, "open", origins[0] + "/landing")["status"] == "ok"
         r = _run(sp, "look")
         it = _item(r, "Cross Frame Button")
-        r2 = _run(sp, "click", str(it["i"]), look_key=r["look_key"])        # inside the cross-origin frame
+        r2 = _run(sp, "hover", str(it["i"]), look_key=r["look_key"])        # inside the cross-origin frame
         assert r2["status"] == "ok", r2
+        r2 = _run(sp, "click", str(it["i"]), look_key=r["look_key"])        # a button there: open the frame first
+        assert r2["status"] == "refused" and "frame item" in r2["error"], r2
         r = _run(sp, "look")
-        assert r["page"]["title"] == "X Clicked", r["page"]                   # the frame's button ran
         fr = next(x for x in r["page"]["items"] if x["kind"] == "frame" and x["href"].endswith("/xframe"))
         r2 = _run(sp, "click", str(fr["i"]), look_key=r["look_key"])
         assert r2["status"] == "ok" and r2["page"]["url"].endswith("/xframe"), r2
@@ -1110,5 +1127,31 @@ def test_round14_screenshot_coverage_and_sso_other_form(origins):
         assert r["status"] == "refused" and r["sso_submitted"] is False and r["sso_stage"] == "pre", r
         time.sleep(1)
         assert "/stolen" not in XHITS, XHITS
+    finally:
+        _finish(sp)
+
+
+def test_round15_screenshot_label_xy_verify_xy_and_frame_form(origins):
+    sp = "tbsgen-test-r15"
+    try:
+        assert _run(sp, "open", origins[0] + "/shot-mix", handoff=False)["status"] == "ok"
+        r = _run(sp, "screenshot", handoff=False)
+        assert r["status"] == "refused" and not r.get("shot"), r
+        XHITS.clear()
+        assert _run(sp, "open", origins[0] + "/label-xy", handoff=False)["status"] == "ok"
+        r = _run(sp, "click_xy", "50 120", handoff=False)
+        assert r["status"] == "refused" and "outside the allowed" in r["error"], r
+        assert _run(sp, "open", origins[0] + "/verify-xy", handoff=False)["status"] == "ok"
+        r = _run(sp, "click_xy", "20 15", handoff=False)
+        assert r["status"] == "refused" and "verification" in r["error"], r
+        assert not _run(sp, "look", handoff=False)["page"]["url"].endswith("/logged")
+        assert _run(sp, "open", origins[0] + "/xform-frame", handoff=False)["status"] == "ok"
+        r = _run(sp, "look", handoff=False)
+        it = _item(r, "Download PDF")
+        assert it and it.get("in_frame"), r["page"]["items"]
+        r2 = _run(sp, "click", str(it["i"]), look_key=r["look_key"], handoff=False)
+        assert r2["status"] == "refused" and "frame item" in r2["error"], r2
+        time.sleep(1)
+        assert "/collect" not in XHITS
     finally:
         _finish(sp)

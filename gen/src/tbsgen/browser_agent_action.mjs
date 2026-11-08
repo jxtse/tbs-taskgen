@@ -710,6 +710,12 @@ async function snapAct(task, page, kind, it, value) {
   if ((kind === "type" || kind === "select") && (it.kind !== "field" || CRED.test(it.meta || ""))) {
     out.status = "refused"; out.error = it.kind !== "field" ? "item is not a field" : "this field can hold credentials; typing is not allowed"; return;
   }
+  if (kind === "click" && !it.href) {
+    // a button inside a cross-origin frame may submit a form whose target cannot be checked from here: open
+    // the frame as the page (click its frame item) - there the button is a checked DOM item
+    out.status = "refused"; out.error = "a button inside a cross-origin frame: click the frame item first (opens the frame as the page), then click the button"; return;
+  }
+  if (kind === "click" && it.href && !hostOk(it.href)) { out.status = "refused"; out.error = "link target is outside the allowed domains"; return; }
   const sel = "@" + it.ref;
   await withDownload(task, page, async () => {
     if (kind === "click") await page.click(sel, { timeout: 8000 });
@@ -811,8 +817,11 @@ function ssoSubmit(args) {
   // method or target, the submission (a navigation not yet started) is cancelled here, before any request.
   // (A script of the SSO page that reads the autofilled values itself is outside what any tool can prevent:
   // the configured SSO domain is trusted, as when the user logs in by hand.)
-  const t2 = (b.hasAttribute("formaction") ? b.formAction : "") || form.action || location.href;
-  const m2 = ((b.hasAttribute("formmethod") ? b.formMethod : "") || form.method || "get").toLowerCase();
+  let t2 = "", m2 = "";
+  try {
+    t2 = (b.hasAttribute("formaction") ? b.formAction : "") || fAction(form) || location.href;
+    m2 = String((b.hasAttribute("formmethod") ? b.formMethod : "") || fMethod(form) || "get").toLowerCase();
+  } catch (e) { m2 = ""; }
   if (m2 !== "post" || !inDom(t2) || !inDom(location.href)) {
     window.stop();
     return { submitted: true, aborted: "the login form changed while it was submitted; stopped" };
@@ -963,16 +972,31 @@ try {
       else if (!(parts[0] >= 0) || !(parts[1] >= 0)) { out.status = "refused"; out.error = "usage: click_xy X Y"; }
       else {
         // the element at the point is checked (same rules as `click`) right before the native click
-        const pre = await page.evaluate(([x, y, allow]) => {
+        const pre = await page.evaluate(([x, y, allow, chSrc]) => {
           const ok = (u) => { try { const v = new URL(u, location.href); if (!/^https?:$/.test(v.protocol)) return false;
             const h = v.hostname.toLowerCase(); return allow.some((d) => h === d || h.endsWith("." + d)); } catch (e) { return false; } };
-          let el = document.elementFromPoint(x, y);
-          if (!el) return { refused: "nothing at that point" };
-          // descend into open shadow roots and same-origin frames to the real target
+          const C = new RegExp(chSrc, "i");
+          const isVerify = (d) => { const body = (d.body && d.body.innerText || "").slice(0, 300);
+            return C.test(d.title || "") || (/^\s*$/.test(d.title || "") && C.test(body))
+              || !!d.querySelector(".cf-turnstile, .g-recaptcha, .h-captcha, #challenge-form, #px-captcha, iframe[src*='captcha'], iframe[src*='challenges.cloudflare.com']"); };
+          // the real target: through open shadow roots and SAME-ORIGIN frames (each level checked for a
+          // verification page); a cross-origin frame stays the target element
+          let doc = document, px = x, py = y, el = null;
           for (let n = 0; n < 8; n++) {
-            if (el.shadowRoot) { const r = el.shadowRoot.elementFromPoint(x, y); if (r && r !== el) { el = r; continue; } }
+            if (isVerify(doc)) return { refused: "verification page: do not interact" };
+            el = doc.elementFromPoint(px, py);
+            if (!el) return { refused: "nothing at that point" };
+            for (let m = 0; m < 8 && el.shadowRoot; m++) { const r = el.shadowRoot.elementFromPoint(px, py); if (!r || r === el) break; el = r; }
+            if (el.tagName === "IFRAME" || el.tagName === "FRAME") {
+              let inner = null; try { inner = el.contentDocument; } catch (e) { inner = null; }
+              if (inner) { const fr = el.getBoundingClientRect(); px -= fr.left; py -= fr.top; doc = inner; continue; }
+            }
             break;
           }
+          // a label forwards the click to its control: check the control instead
+          const lb = el.closest && el.closest("label");
+          if (lb && lb.control) el = lb.control;
+          if (el.tagName === "INPUT" && (el.getAttribute("type") || "").toLowerCase() === "password") return { refused: "password field: do not interact" };
           const W = /captcha|turnstile|challenge|recaptcha|hcaptcha|verify|i am human|not a robot|cf-|px-|验证/i;
           if (el.tagName === "IFRAME" || el.tagName === "FRAME") {
             const src = el.src || "";
@@ -987,14 +1011,15 @@ try {
           const fAction = (f) => Object.getOwnPropertyDescriptor(FP, "action").get.call(f);
           const fElems = (f) => [...Object.getOwnPropertyDescriptor(FP, "elements").get.call(f)];
           const fa = el.closest("button, input");
-          const form = (fa && fa.form) || el.form || el.closest("form");
+          const own = (v) => { try { return Object.getOwnPropertyDescriptor(Object.getPrototypeOf(v), "form").get.call(v); } catch (e) { return v.form; } };
+          const form = (fa && own(fa)) || (el.form !== undefined ? own(el) : null) || el.closest("form");
           if (form && (fElems(form).some((v) => (v.getAttribute("type") || "").toLowerCase() === "password") || Element.prototype.querySelector.call(form, "input[type=password]"))) return { refused: "login form: credentials are not entered by this tool" };
           const a = el.closest("a[href]");
           if (a) { const h = a.getAttribute("href") || ""; if (!/^\s*javascript:/i.test(h) && !ok(a.href)) return { refused: "link target is outside the allowed domains" }; }
           if (form && !ok((fa && fa.hasAttribute("formaction") ? fa.formAction : "") || fAction(form) || location.href)) return { refused: "form target is outside the allowed domains" };
           if (W.test(((el.innerText || "") + " " + (el.getAttribute("aria-label") || "")).slice(0, 200))) return { refused: "verification widget: do not interact" };
           return { ok: true };
-        }, [parts[0], parts[1], INPUT.allow]).catch(() => null);
+        }, [parts[0], parts[1], INPUT.allow, CHALLENGE.source]).catch(() => null);
         if (!pre) { out.status = "refused"; out.error = "the point could not be checked; use click on a look item"; }
         else if (pre.refused) { out.status = "refused"; out.error = pre.refused; }
         else {
@@ -1060,7 +1085,7 @@ try {
           const add = (root, inFrame) => {
             const st = document.createElement("style"); st.className = "__tbsgen_mask"; st.textContent = css;
             (root.documentElement || root).appendChild(st);
-            const n = root.querySelectorAll(TXT).length;
+            const n = [...root.querySelectorAll(TXT)].filter((x) => x.getClientRects().length > 0).length;   // rendered only
             if (inFrame) res.frames += n; else res.top += n;
             for (const h of root.querySelectorAll("*")) if (h.shadowRoot) add(h.shadowRoot, inFrame);
             for (const fr of root.querySelectorAll("iframe, frame")) {
@@ -1073,7 +1098,9 @@ try {
         }, MASK).catch(() => null);
         // refused unless every field the browser shows is in a masked document: no snapshot, a field in an
         // unreachable (cross-origin) frame, or more fields than the masked documents hold (closed shadow roots)
-        const uncovered = !snap || !cov || (cov.unreachable > 0 && frameFields > cov.frames)
+        // (a field in a cross-origin frame can never be masked: any frame field while such a frame exists refuses
+        // - other frames' fields are never counted against it)
+        const uncovered = !snap || !cov || (cov.unreachable > 0 && frameFields > 0)
           || topFields > cov.top || frameFields > cov.frames;
         const masked = uncovered ? -1 : 1, snapFields = 0;
         if (masked < 0 || snapFields > masked) {

@@ -700,6 +700,16 @@ def _paced_run(bd, st, n, p, ps, action, arg, say, led, pkey, space, handoff_fre
 _VALID_STATUS = ("ok", "refused", "error", "handoff", "paused")
 
 
+def _sso_available(bd: Path, st: dict) -> bool:
+    """An automatic SSO login is still possible in this batch (enabled, budget left, none failed, none signed in
+    yet).  Otherwise an SSO login page is handed to the user like any other login page."""
+    if not st.get("sso_login_enabled"):
+        return False
+    s = _read_state(bd).get("sso") or {}
+    return (int(s.get("submissions") or 0) < int(st.get("sso_max_submissions", 2)) and not s.get("failed")
+            and not s.get("logged_in"))
+
+
 def _sso_finalize(bd: Path, slock: Path, n: str, res: dict) -> str | None:
     """Book a reserved SSO submission.  Only an explicit `sso_submitted: false` with `sso_stage: "pre"` (the
     script ended before the login button was touched) returns the reservation; anything else - a result, no
@@ -733,7 +743,7 @@ def _paper_run(bd, st, n, p, ps, action, arg, say, led, pkey, space, handoff_fre
                nav_timeout_ms=45000, download_timeout_ms=120000, download_wait_ms=6000,
                challenge_wait_ms=int(st.get("challenge_wait_ms", 40000)),
                handoff={"enabled": handoff_free},
-               sso={"login": sso_ok, "enabled": bool(st.get("sso_login_enabled")), "domains": st.get("sso_domains") or []},
+               sso={"login": sso_ok, "enabled": _sso_available(bd, st), "domains": st.get("sso_domains") or []},
                handoff_state={"active": bool(ps.get("handoff")),
                               "deadline_ms": int(float(ps.get("handoff_deadline") or 0) * 1000),
                               "title": ps.get("handoff_title") or "", "page_label": ps.get("handoff_page") or ""})

@@ -25,6 +25,7 @@ Use your terminal tool to run exactly one of these commands per call (nothing el
   `doi.org`, the institution SSO / WAYF domains and known PDF CDNs); start with `https://doi.org/<DOI>`.
 - `tbsgen-browser N click I` — click item I of the last `look` list (run `look` first; the numbering changes when
   the page changes). Links to allowed hosts only. Cookie / consent banners may be clicked ("Accept" / "Reject").
+  A button inside a cross-origin frame (`in_frame`) is clicked after opening the frame: click its `frame` item.
 - `tbsgen-browser N click_xy X Y` — click viewport coordinates X Y (use after `screenshot`).
 - `tbsgen-browser N hover I` — move the mouse onto item I (opens "Download" dropdown menus; run `look` again).
 - `tbsgen-browser N scroll up|down [PX]` — scroll the page.

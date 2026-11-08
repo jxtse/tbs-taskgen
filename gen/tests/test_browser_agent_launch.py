@@ -781,3 +781,13 @@ def test_type_text_is_percent_decoded_and_sso_flag_is_passed(tmp_path, monkeypat
     out, _ = _call(bd, "1", "type", "4 King%27s College").communicate(timeout=60)
     inp = json.loads((tmp_path / "inp.json").read_text())
     assert inp["arg"] == "4 King's College" and inp["sso"]["enabled"] is True and inp["sso"]["login"] is False, (out, inp)
+
+
+def test_sso_page_goes_to_the_user_once_automatic_logins_are_over(tmp_path, monkeypatch):
+    """Round 15: after a failed sso_login the other papers' SSO pages are handed to the user (sso.enabled false)"""
+    bd, led = _batch(tmp_path, monkeypatch, ["10.1080/a.1", "10.1080/b.2"])
+    _call(bd, "1", "sso_login").communicate(timeout=60)              # FAKE_EGO default: a failed login
+    (tmp_path / "ego").write_text(CAPTURE_EGO.replace("{py}", sys.executable).replace("{out}", str(tmp_path / "inp.json")))
+    _call(bd, "2", "open", "https://sso.example/login").communicate(timeout=60)
+    inp = json.loads((tmp_path / "inp.json").read_text())
+    assert inp["sso"]["enabled"] is False and inp["sso"]["login"] is False, inp
