@@ -329,6 +329,8 @@ def deploy(fetcher, *, dry_run: bool = False, force: bool = False, ssh_runner=No
     for k in ("host", "code_dir", "python", "workdir"):
         if not rcfg.get(k):
             return dict(ok=False, error=f"fulltext.remote.{k} is not set")
+    if not str(rcfg["code_dir"]).startswith(("/", "~/")):
+        return dict(ok=False, error="fulltext.remote.code_dir must be absolute (/...) or start with ~/")
     st = local_code_state() if repo is None else dict(
         repo=str(repo), head=_git("rev-parse", "HEAD", cwd=repo), fingerprint=code_fingerprint(),
         dirty=[ln[3:] for ln in (_git("status", "--porcelain", "--", SRC_REL, cwd=repo) or "").splitlines()

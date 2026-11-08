@@ -1275,15 +1275,17 @@ def classify(out: Outcome, now: float | None = None) -> tuple[str, float | None,
 
 
 def _requeue(e: dict, now: float, backoff: float, was_limited: bool, until: float | None, failed_ch: set[str],
-             same_version: bool, backoff_only: bool = False, untried_due: bool = False) -> None:
+             same_version: bool, backoff_only: bool = False, partial: bool = False) -> None:
     """Update a queue entry after an attempt without text (see drain_queue).
 
     One rule: the entry is due again at the earliest time any of its channels could do something new -- a channel
     that failed retries after its own backoff (`chan_backoff`, doubling per channel from `queue_backoff_s`); a
     channel that was refused retries when the refusal lifts (`until`; unknown -> LIMIT_RECHECK_S).  Only when no
     channel holds any such state (no channel applies at all) does the paper itself back off.  `tries` counts the
-    rounds in which a request was really sent and failed (informational).  `untried_due`: a channel whose backoff
-    has run out was not part of this round (`--channels`): it may try now."""
+    rounds in which a request was really sent and failed (informational).
+
+    `partial`: the round tried only some channels (`tbsgen fetch --channels`).  It records the backoff of the
+    channels it tried but never reschedules the entry: only a full round knows every channel's state."""
     if not same_version:
         # updated meanwhile (a new link / subscriber; enqueue reset the channel backoff): stay due, and do not
         # bring an old link's backoff back
@@ -1298,9 +1300,11 @@ def _requeue(e: dict, now: float, backoff: float, was_limited: bool, until: floa
     if failed_ch:
         e["failed_channels"] = sorted(set(e.get("failed_channels") or []) | failed_ch)
         e.update(tries=int(e.get("tries") or 0) + 1, last_try=now)
+    if partial:
+        if failed_ch:
+            e["last_try"] = now
+        return
     cands = [float(v["next_try"]) for v in cb.values() if float(v.get("next_try") or 0) > now]
-    if untried_due:
-        cands.append(now)
     if was_limited and not backoff_only:
         cands.append(until if until is not None else now + LIMIT_RECHECK_S)
         e.update(limited_until=min(cands), last_limited=now)
@@ -1390,6 +1394,8 @@ def _drain_locked(fetcher, qp, now, max_papers, channels, browser, dry_run, on_s
     limited: dict[str, float | None] = {}          # refused by the ledger / egress: due again at `until`
     chan_failed: dict[str, set[str]] = {}          # channels that made a request and got nothing
     backoff_only: set[str] = set()                 # nothing refused, every applicable channel still backing off
+    full = [ch for ch in (fetcher.ft.get("cascade") or CHANNELS) if ch in CHANNELS and ch != "browser"]
+    partial = bool(channels) and not set(full) <= set(channels)    # --channels left out a channel of the cascade
     if fetcher.remote_mode():
         # the HTTP channels of every due paper run as one job on the remote host; results feed the cascade
         from . import remote
@@ -1500,14 +1506,9 @@ def _drain_locked(fetcher, qp, now, max_papers, channels, browser, dry_run, on_s
                     e["next_try"] = 0
                     e.pop("chan_backoff", None)
                 else:
-                    round_ch = set(channels or fetcher.ft.get("cascade") or CHANNELS)
-                    untried = any(ch not in round_ch and ch not in (chan_failed.get(k) or set())
-                                  and float(v.get("next_try") or 0) <= now
-                                  and fetcher.channel_applies(ch, e.get("doi") or "")
-                                  for ch, v in (e.get("chan_backoff") or {}).items())
                     _requeue(e, now, backoff, k in limited, limited.get(k), chan_failed.get(k) or set(),
                              same_version=int(e.get("ver") or 0) == vers.get(k, 0), backoff_only=k in backoff_only,
-                             untried_due=untried)
+                             partial=partial)
             keep.append(e)
         write_queue(qp, keep)
         stats["remaining"] = len(keep)

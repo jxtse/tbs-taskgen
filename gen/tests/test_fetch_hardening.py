@@ -158,8 +158,24 @@ def test_channel_not_in_this_round_keeps_entry_due(tmp_path):
     fulltext.write_queue(qp, [e])
     drain(f, clock, channels=["cache", "oa"])
     e = entry(qp, "10.1016/j.k.1")
-    assert e["chan_backoff"]["oa"]["tries"] == 2 and e["next_try"] == pytest.approx(clock.t)
+    assert e["chan_backoff"]["oa"]["tries"] == 2 and float(e.get("next_try") or 0) <= clock.t   # still due
     assert drain(f, clock)["ok"] == 1                                  # elsevier is tried at once
+
+
+def test_partial_round_never_reschedules_a_refused_channel_away(tmp_path):
+    """oa refused by a 30 min cooldown, elsevier backing off 6 h; after the cooldown `--channels elsevier` sends
+    nothing: the entry must stay due for oa (Codex r6)."""
+    f, net, led, clock = mkfetcher(tmp_path, {"api.elsevier.com": Resp(500, {}, b"", "u"), "repo.example": FAKE_PDF},
+                                   SECRETS)
+    led.block("repo.example", "test", seconds=1800)
+    qp = q(f, dict(doi="10.1016/j.h.1", title=TITLE, oa_url="https://repo.example/h.pdf"))
+    drain(f, clock)
+    e = entry(qp, "10.1016/j.h.1")
+    assert e["chan_backoff"]["elsevier"]["tries"] == 1 and e["next_try"] == pytest.approx(clock.t + 1800, abs=2)
+    clock.t += 1801
+    drain(f, clock, channels=["cache", "elsevier"])                      # elsevier still backing off: no request
+    assert float(entry(qp, "10.1016/j.h.1")["next_try"]) <= clock.t
+    assert drain(f, clock)["ok"] == 1                                  # oa is tried at once
 
 
 def test_real_failure_still_backs_off(tmp_path):
@@ -385,6 +401,12 @@ def test_deploy_dry_run_plans_and_touches_nothing(tmp_path):
     assert run.cmds == [] and copied == []
     assert any(f"checkout -q --detach {out['sha']}" in c for c in out["plan"])
     assert any("uv sync" in c for c in out["plan"]) and "~/code" in out["plan"][1]
+
+
+def test_deploy_refuses_relative_code_dir(tmp_path):
+    f, r = _rf(tmp_path, code_dir="tbsgen/code"), _repo(tmp_path)
+    out = remote.deploy(f, dry_run=True, repo=r)
+    assert not out["ok"] and "absolute" in out["error"]
 
 
 def test_deploy_refuses_dirty_tree(tmp_path):
