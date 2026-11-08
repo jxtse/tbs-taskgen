@@ -170,7 +170,7 @@ def _read_sse(r):
         raise ModelError("network", f"{type(e).__name__} mid-stream: {e}", usage=dict(usage)) from None
     if stop is None:
         raise ModelError("stream", "stream ended without message_delta/stop_reason", usage=dict(usage))
-    return "".join(text), model, usage, stop
+    return "".join(text), model, usage, stop      # every element is a str (checked per event)
 
 
 def _sse_line(raw, text, usage, stop, model):
@@ -178,10 +178,12 @@ def _sse_line(raw, text, usage, stop, model):
     line = raw.decode("utf-8", "replace").strip()
     if not line.startswith("data:"):
         return stop, model
-    try:
-        ev = json.loads(line[5:].strip())
-    except json.JSONDecodeError:
+    payload = line[5:].strip()
+    if payload in ("", "[DONE]"):
         return stop, model
+    ev = json.loads(payload)            # malformed JSON -> ValueError -> ModelError("stream") in _read_sse
+    if not isinstance(ev, dict):
+        raise ValueError(f"SSE event is not an object: {payload[:80]}")
     t = ev.get("type")
     if t == "message_start":
         msg = ev.get("message", {})
@@ -190,7 +192,10 @@ def _sse_line(raw, text, usage, stop, model):
     elif t == "content_block_delta":
         d = ev.get("delta", {})
         if d.get("type") == "text_delta":
-            text.append(d.get("text", ""))
+            t_ = d.get("text", "")
+            if not isinstance(t_, str):
+                raise TypeError(f"text_delta.text is {type(t_).__name__}")
+            text.append(t_)
     elif t == "message_delta":
         stop = (ev.get("delta") or {}).get("stop_reason") or stop
         usage.update(ev.get("usage") or {})

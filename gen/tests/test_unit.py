@@ -691,3 +691,17 @@ def test_teacher_malformed_sse_event_bills_reported_usage(tmp_path, monkeypatch)
     with pytest.raises(ModelError) as e:
         c.chat("sys", "user", stage="S5", item="i1", max_tokens=9000)
     assert e.value.cls == "stream" and _calls(led)[0][2] > 0
+
+
+@pytest.mark.parametrize("bad", ['data: {"type": "content_block_delta", "delta": {"type": "text_delta", "text": nul',
+                                 'data: {"type": "content_block_delta", "delta": {"type": "text_delta", "text": null}}',
+                                 'data: {"type": "content_block_delta", "delta": {"type": "text_delta", "text": 7}}',
+                                 'data: [1, 2]'])
+def test_teacher_corrupt_sse_is_a_billed_stream_error_not_a_retry(tmp_path, monkeypatch, bad):
+    start = {"type": "message_start", "message": {"model": "claude-opus-5-5", "usage": {"input_tokens": 1000}}}
+    end = {"type": "message_delta", "delta": {"stop_reason": "max_tokens"}, "usage": {"output_tokens": 4000}}
+    resp = _SSEResp(["data: " + json.dumps(start), bad, "data: " + json.dumps(end)])
+    c, led, sent = _teacher(tmp_path, monkeypatch, [resp, _sse("ok", "end_turn", 5)])
+    with pytest.raises(ModelError) as e:
+        c.chat("sys", "user", stage="S6A", item="i1", max_tokens=64000)
+    assert e.value.cls == "stream" and len(sent) == 1 and _calls(led)[0][2] > 0
