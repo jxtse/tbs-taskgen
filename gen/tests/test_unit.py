@@ -665,3 +665,29 @@ def test_teacher_stream_failure_bills_usage_already_reported(tmp_path, monkeypat
             c.chat("sys", "user", stage="S6A", item="i1", max_tokens=64000)
         assert e.value.cls == cls
         assert _calls(led)[0][2] > 0                     # input (and any reported output) tokens are billed
+
+
+def test_teacher_fallback_never_raises_effort_and_fake_matches(tmp_path, monkeypatch):
+    c, led, sent = _teacher(tmp_path, monkeypatch, [_sse("", "max_tokens", 64000), _sse("ok", "end_turn", 5)],
+                            effort_by_stage={"S6A": "low"}, effort_on_thinking_exhausted="high")
+    with pytest.raises(ModelError):
+        c.chat("sys", "user", stage="S6A", item="i1", max_tokens=64000)
+    assert [s["output_config"]["effort"] for s in sent] == ["low"]
+    # the fake client resolves the same effective effort (stage override) and makes the same decision
+    cfg = load_config(None, {"run": {"root": str(tmp_path)}, "budget": {"daily_usd_total": 50.0},
+                             "models": {"teacher": {"url": "http://x/v1/messages", "effort_by_stage": {"S6A": "low"}}}})
+    f = FakeClient(Ledger(tmp_path / "f.sqlite", cfg), cfg,
+                   [{"stage": "S6A", "error": "empty", "stop": "max_tokens", "usage": {"output_tokens": 9}},
+                    {"stage": "S6A", "text": "ok"}])
+    with pytest.raises(ModelError):
+        f.chat("sys", "user", stage="S6A", item="i1")
+    assert [x["effort"] for x in f.log] == ["low"]
+
+
+def test_teacher_malformed_sse_event_bills_reported_usage(tmp_path, monkeypatch):
+    start = {"type": "message_start", "message": {"model": "claude-opus-5-5", "usage": {"input_tokens": 1000}}}
+    bad = {"type": "content_block_delta", "delta": None}
+    c, led, sent = _teacher(tmp_path, monkeypatch, [_SSEResp(["data: " + json.dumps(e) for e in (start, bad)])])
+    with pytest.raises(ModelError) as e:
+        c.chat("sys", "user", stage="S5", item="i1", max_tokens=9000)
+    assert e.value.cls == "stream" and _calls(led)[0][2] > 0

@@ -63,6 +63,8 @@ class ModelError(RuntimeError):
         return self.cls == "empty" and self.stop_reason == "max_tokens"
 
 
+EFFORT_RANK = {"low": 0, "medium": 1, "high": 2, "xhigh": 3, "max": 4}
+
 QUOTA_PAT = re.compile(r"额度|quota|insufficient|balance|credit|billing|exceeded your", re.I)
 
 
@@ -132,9 +134,22 @@ class _Base:
         usd = self.ledger.finish(cid, usage, latency=time.time() - t0, resp_model=resp_model)
         return ModelResult(text, resp_model or self.name, usage, usd, stop, round(time.time() - t0, 2), cid)
 
+    def _teacher_cfg(self) -> dict:
+        return self.cfg["models"].get("teacher") or {}
+
+    def effort_for(self, stage: str, effort: str | None = None) -> str:
+        m = self._teacher_cfg()
+        return effort or (m.get("effort_by_stage") or {}).get(stage) or m.get("effort", "medium")
+
     def _fallback_effort(self, stage: str, effort: str | None) -> str | None:
-        """Effort for one retry after an empty max_tokens answer, or None (no retry)."""
-        return None
+        """Effort for one retry after an empty max_tokens answer, or None (no retry).  The retry only LOWERS the
+        effort: a call already at (or below) the fallback effort is not repeated -- the same request would most
+        likely exhaust the same budget again and cost another full max_tokens.  Unknown effort names: no retry."""
+        low = self._teacher_cfg().get("effort_on_thinking_exhausted")
+        cur = self.effort_for(stage, effort)
+        if not low or low not in EFFORT_RANK or cur not in EFFORT_RANK:
+            return None
+        return low if EFFORT_RANK[low] < EFFORT_RANK[cur] else None
 
     def _call(self, system, user, *, stage, max_tokens, effort=None):  # pragma: no cover
         raise NotImplementedError
@@ -149,6 +164,8 @@ def _read_sse(r):
     except ModelError as e:
         e.usage = e.usage or dict(usage)      # tokens already reported by the stream are billed (lower bound)
         raise
+    except (AttributeError, TypeError, ValueError) as e:     # malformed event (e.g. "delta": null)
+        raise ModelError("stream", f"malformed SSE event: {type(e).__name__}: {e}", usage=dict(usage)) from None
     except (TimeoutError, ConnectionError, OSError, http.client.HTTPException) as e:
         raise ModelError("network", f"{type(e).__name__} mid-stream: {e}", usage=dict(usage)) from None
     if stop is None:
@@ -192,14 +209,8 @@ class TeacherClient(_Base):
         if not self.m.get("url"):
             raise ModelError("config", f"models.{alias}.url is not set (set models.{alias}.url or TBS_TEACHER_URL)")
 
-    def effort_for(self, stage: str, effort: str | None = None) -> str:
-        return effort or (self.m.get("effort_by_stage") or {}).get(stage) or self.m.get("effort", "medium")
-
-    def _fallback_effort(self, stage: str, effort: str | None) -> str | None:
-        """The retry only LOWERS the effort: a call that already ran at the fallback effort is not repeated (the
-        same request would most likely exhaust the same budget again and cost another full max_tokens)."""
-        low = self.m.get("effort_on_thinking_exhausted")
-        return low if low and low != self.effort_for(stage, effort) else None
+    def _teacher_cfg(self) -> dict:
+        return self.m
 
     def _call(self, system, user, *, stage, max_tokens, effort=None):
         m = self.m
@@ -250,12 +261,8 @@ class FakeClient(_Base):
         self.used: list[int] = []
         self.log: list[dict] = []
 
-    def _fallback_effort(self, stage: str, effort: str | None) -> str | None:
-        low = self.cfg["models"].get("teacher", {}).get("effort_on_thinking_exhausted")
-        return low if low and low != effort else None
-
     def _call(self, system, user, *, stage, max_tokens, effort=None):
-        self.log.append(dict(stage=stage, sha=_sha(system, user), effort=effort))
+        self.log.append(dict(stage=stage, sha=_sha(system, user), effort=self.effort_for(stage, effort)))
         if callable(self.script):
             out = self.script(stage, system, user)
             if isinstance(out, dict):
