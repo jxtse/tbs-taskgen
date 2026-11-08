@@ -23,6 +23,7 @@ server (5xx), stream (SSE error / incomplete read), network, empty, other.
 from __future__ import annotations
 
 import hashlib
+import http.client
 import json
 import os
 import re
@@ -142,31 +143,43 @@ class _Base:
 # ---------------------------------------------------------------------------------------------- teacher
 def _read_sse(r):
     text, model, usage, stop = [], None, {}, None
-    for raw in r:
-        line = raw.decode("utf-8", "replace").strip()
-        if not line.startswith("data:"):
-            continue
-        try:
-            ev = json.loads(line[5:].strip())
-        except json.JSONDecodeError:
-            continue
-        t = ev.get("type")
-        if t == "message_start":
-            msg = ev.get("message", {})
-            model = msg.get("model")
-            usage.update(msg.get("usage") or {})
-        elif t == "content_block_delta":
-            d = ev.get("delta", {})
-            if d.get("type") == "text_delta":
-                text.append(d.get("text", ""))
-        elif t == "message_delta":
-            stop = (ev.get("delta") or {}).get("stop_reason") or stop
-            usage.update(ev.get("usage") or {})
-        elif t == "error":
-            raise ModelError("stream", json.dumps(ev.get("error"))[:300])
+    try:
+        for raw in r:
+            stop, model = _sse_line(raw, text, usage, stop, model)
+    except ModelError as e:
+        e.usage = e.usage or dict(usage)      # tokens already reported by the stream are billed (lower bound)
+        raise
+    except (TimeoutError, ConnectionError, OSError, http.client.HTTPException) as e:
+        raise ModelError("network", f"{type(e).__name__} mid-stream: {e}", usage=dict(usage)) from None
     if stop is None:
-        raise ModelError("stream", "stream ended without message_delta/stop_reason")
+        raise ModelError("stream", "stream ended without message_delta/stop_reason", usage=dict(usage))
     return "".join(text), model, usage, stop
+
+
+def _sse_line(raw, text, usage, stop, model):
+    """One SSE line: appends text, updates usage in place; returns (stop, model)."""
+    line = raw.decode("utf-8", "replace").strip()
+    if not line.startswith("data:"):
+        return stop, model
+    try:
+        ev = json.loads(line[5:].strip())
+    except json.JSONDecodeError:
+        return stop, model
+    t = ev.get("type")
+    if t == "message_start":
+        msg = ev.get("message", {})
+        model = msg.get("model")
+        usage.update(msg.get("usage") or {})
+    elif t == "content_block_delta":
+        d = ev.get("delta", {})
+        if d.get("type") == "text_delta":
+            text.append(d.get("text", ""))
+    elif t == "message_delta":
+        stop = (ev.get("delta") or {}).get("stop_reason") or stop
+        usage.update(ev.get("usage") or {})
+    elif t == "error":
+        raise ModelError("stream", json.dumps(ev.get("error"))[:300])
+    return stop, model
 
 
 class TeacherClient(_Base):
@@ -183,6 +196,8 @@ class TeacherClient(_Base):
         return effort or (self.m.get("effort_by_stage") or {}).get(stage) or self.m.get("effort", "medium")
 
     def _fallback_effort(self, stage: str, effort: str | None) -> str | None:
+        """The retry only LOWERS the effort: a call that already ran at the fallback effort is not repeated (the
+        same request would most likely exhaust the same budget again and cost another full max_tokens)."""
         low = self.m.get("effort_on_thinking_exhausted")
         return low if low and low != self.effort_for(stage, effort) else None
 

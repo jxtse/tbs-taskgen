@@ -636,3 +636,32 @@ def test_teacher_other_empty_answers_are_not_retried(tmp_path, monkeypatch):
     with pytest.raises(ModelError) as e:
         c.chat("sys", "user", stage="S5", item="i1", max_tokens=9000)
     assert not e.value.thinking_exhausted and len(sent) == 1
+
+
+def test_teacher_no_retry_when_already_at_fallback_effort(tmp_path, monkeypatch):
+    # the retry only lowers the effort: a call already at the fallback effort is not repeated
+    c, led, sent = _teacher(tmp_path, monkeypatch, [_sse("", "max_tokens", 64000), _sse("ok", "end_turn", 5)],
+                            effort_by_stage={"S6A": "low"})
+    with pytest.raises(ModelError) as e:
+        c.chat("sys", "user", stage="S6A", item="i1", max_tokens=64000)
+    assert e.value.thinking_exhausted and len(sent) == 1 and _calls(led)[0][2] > 0
+
+
+def test_teacher_stream_failure_bills_usage_already_reported(tmp_path, monkeypatch):
+    start = {"type": "message_start", "message": {"model": "claude-opus-5-5", "usage": {"input_tokens": 1000}}}
+    delta = {"type": "message_delta", "delta": {}, "usage": {"output_tokens": 4000}}
+    err = {"type": "error", "error": {"type": "overloaded_error", "message": "overloaded"}}
+
+    class Broken(_SSEResp):
+        def __iter__(self):
+            yield from self.lines
+            raise TimeoutError("read timeout")
+
+    for resp, cls in [(_SSEResp(["data: " + json.dumps(e) for e in (start, delta, err)]), "stream"),
+                      (_SSEResp(["data: " + json.dumps(start)]), "stream"),
+                      (Broken(["data: " + json.dumps(e) for e in (start, delta)]), "network")]:
+        c, led, sent = _teacher(tmp_path / cls / str(id(resp)), monkeypatch, [resp])
+        with pytest.raises(ModelError) as e:
+            c.chat("sys", "user", stage="S6A", item="i1", max_tokens=64000)
+        assert e.value.cls == cls
+        assert _calls(led)[0][2] > 0                     # input (and any reported output) tokens are billed

@@ -59,7 +59,7 @@ DEFAULTS: dict[str, Any] = {
                  # per-stage effort override, e.g. {"S6A": "low"}; empty -> "effort" for every stage
                  "effort_by_stage": {},
                  # empty answer with stop_reason=max_tokens (adaptive thinking used the whole output budget, seen on
-                 # S6A at 64k with effort medium): one retry at this effort; None -> no retry
+                 # S6A at 64k with effort medium): one retry at this effort if it is lower than the call's; None -> no retry
                  "effort_on_thinking_exhausted": "low"},
         # USD per million tokens.  PLACEHOLDERS: set real prices for your model.
         "prices": {"claude-opus-5-5": {"in": 5.0, "out": 25.0, "cache_read": 0.5},
