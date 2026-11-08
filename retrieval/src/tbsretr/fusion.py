@@ -23,6 +23,9 @@ def source_of(list_name: str) -> str:
     return list_name.split(".", 1)[0]
 
 
+WEB_ORIGINS = ("exa", "tavily")
+
+
 # ------------------------------------------------------------------ merge
 def _merge_into(a: Paper, b: Paper):
     for f in ("doi", "arxiv", "openalex", "s2", "pmid", "venue", "type", "language", "url", "year"):
@@ -30,7 +33,9 @@ def _merge_into(a: Paper, b: Paper):
             setattr(a, f, getattr(b, f))
     if len(b.abstract or "") > len(a.abstract or ""):
         a.abstract = b.abstract
-    if len(b.title or "") > 0 and (not a.title or (a.origin == "exa" and b.origin != "exa")):
+    # titles from web-search hits are page titles: a bibliographic source's title wins.  "tavily" stays in the set
+    # only so the recorded 2026-11-05 evaluation lists (eval/raw) re-fuse exactly as they did
+    if len(b.title or "") > 0 and (not a.title or (a.origin in WEB_ORIGINS and b.origin not in WEB_ORIGINS)):
         a.title = b.title
     if b.oa_url and (not a.oa_url or (a.oa_url and not a.oa_url.lower().endswith(".pdf") and b.oa_url.lower().endswith(".pdf"))):
         a.oa_url = b.oa_url

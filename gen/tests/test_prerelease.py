@@ -41,7 +41,9 @@ def test_clean_task_passes_and_records_companion_code(tmp_path):
 
 
 @pytest.mark.parametrize("req", ["decayfit==1.2\n", "DecayFit\n", "decay-fit>=1\n", "git+https://github.com/someone/DecayFit\n",
-                                 "pydecayfit\n"])
+                                 "pydecayfit\n", "decayfit~=1.2\n", "decayfit[extra]>=1 ; python_version>'3'\n",
+                                 "-e git+https://github.com/lab/DecayFit.git#egg=decayfit\n",
+                                 "-e ./vendor/DecayFit\n", "mypkg @ https://github.com/lab/DecayFit/archive/v1.zip\n"])
 def test_dependency_on_the_papers_package_is_blocking(tmp_path, req):
     r = prerelease.readymade_check(mk_task(tmp_path, req=req), CAND, SPEC)
     assert not r["ok"] and r["findings"][0]["kind"] == "dependency" and "DecayFit" in r["findings"][0]["matches"]
@@ -51,8 +53,12 @@ def test_dependency_on_the_papers_package_is_blocking(tmp_path, req):
     "FROM python:3.11-slim\nRUN pip install --no-cache-dir numpy==2.1.3 \\\n    decayfit==0.3\n",   # continuation
     "FROM python:3.11-slim\nRUN apt-get update && python -m pip install -q decayfit && rm -rf /root/.cache\n",
     "FROM python:3.11-slim\nRUN uv pip install --system git+https://github.com/someone/DecayFit.git@v1\n",
+    'FROM python:3.11-slim\nRUN pip install "decayfit==1.2"\n',
+    "FROM python:3.11-slim\nRUN pip install -i https://mirror.example/simple decayfit~=1.2\n",
+    "FROM python:3.11-slim\nRUN pip install -e git+https://github.com/lab/DecayFit.git#egg=decayfit\n",
 ])
 def test_pip_line_in_a_dockerfile_is_blocking(tmp_path, df):
+    """(see the parameters; quoted and ~= specifiers are covered below)"""
     r = prerelease.readymade_check(mk_task(tmp_path, dockerfile=df), CAND, SPEC)
     assert [f["kind"] for f in r["findings"]] == ["dependency"], r
 
@@ -96,6 +102,13 @@ def test_candidate_software_names_are_signals(tmp_path):
 def test_s5_prompt_asks_for_method_names():
     from tbsgen import prompts
     assert '"method_names"' in prompts.S5_SPEC
+
+
+def test_pyproject_dependencies_are_checked(tmp_path):
+    t = mk_task(tmp_path, extra={"environment/pyproject.toml":
+                                 '[project]\nname = "task"\ndependencies = ["numpy>=2", "decayfit==1.2"]\n'})
+    r = prerelease.readymade_check(t, CAND, SPEC)
+    assert [f["name"] for f in r["findings"]] == ["decayfit"]
 
 
 def test_unrelated_dependencies_and_generic_repo_names_pass(tmp_path):
@@ -217,3 +230,22 @@ def test_an_intent_saved_with_submit_off_is_rechecked_and_rewritten_at_launch(tm
     conf = json.loads(Path(rec["config"]).read_text())
     assert conf["agents"][0]["extra_allowed_hosts"] == ["models.example.com"]
     assert out["state"] == "launch_failed" and "not launched" not in out["error"]   # got past the check (no tmux)
+
+
+def test_resumed_intent_keeps_its_identity(tmp_path):
+    """Only the allowed hosts of a saved intent's job config change on resume: model, job dir and task stay those
+    of the record (ingest() checks a result against them)."""
+    item = tmp_path / "items" / "i1"
+    _pkg_task(item)
+    base = {"harbor_root": str(tmp_path), "student_launcher": "x.sh", "jobs_dir": str(tmp_path / "jobs"),
+            "tmux_bin": "/nonexistent-tmux", "agent_allowed_hosts": ["old.example.com"]}
+    rec = calib.prepare(load_config(overrides={"calib": base}), item, "glm", 1)
+    before = json.loads(Path(rec["config"]).read_text())
+    cfg = load_config(overrides={"calib": dict(base, allow_submit=True, student_model="other-model",
+                                               jobs_dir=str(tmp_path / "jobs2"),
+                                               agent_allowed_hosts=["new.example.com"])})
+    calib.launch(cfg, dict(rec), None, lambda r: None)
+    after = json.loads(Path(rec["config"]).read_text())
+    assert after["agents"][0]["extra_allowed_hosts"] == ["new.example.com"]
+    after["agents"][0]["extra_allowed_hosts"] = before["agents"][0]["extra_allowed_hosts"]
+    assert after == before

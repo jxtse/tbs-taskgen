@@ -38,6 +38,7 @@ baseline that matches one of those signals.  Known companion repositories are wr
 from __future__ import annotations
 
 import ast
+import contextlib
 import re
 from pathlib import Path
 
@@ -115,17 +116,44 @@ def signals(candidate: dict, spec: dict | None) -> dict:
     return dict(repos=repos, names=names)
 
 
+_REQ_NAME = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?")
+
+
+def _spec_name(tok: str) -> list[str]:
+    """Distribution name(s) of one requirement token: `name[extra]>=1`, `"name==1"`, `name @ url`, a VCS / archive
+    URL (`git+https://github.com/o/repo.git@v1#egg=name`), or a local path (its last component)."""
+    tok = tok.strip().strip("'\"")
+    if not tok or tok.startswith("-"):
+        return []
+    out = []
+    if (m := re.search(r"[#&]egg=([A-Za-z0-9._-]+)", tok)):
+        out.append(m.group(1))
+    url = re.sub(r"^[a-z]+\+", "", tok)
+    if re.match(r"(https?|ssh|file)://", url) or re.match(r"[\w.-]+\.[a-z]{2,}/", url):
+        out += [r["name"] for r in repo_names([url])]
+        if not out:
+            out.append(re.split(r"[/#?]", url.rstrip("/"))[-1].split("-")[0])
+        return out
+    if tok.startswith((".", "/", "~")):
+        return [Path(tok.rstrip("/")).name]
+    if (m := _REQ_NAME.match(tok)):
+        out.append(m.group(0))
+    return out
+
+
 def _req_names(text: str) -> list[str]:
+    """Distribution names in a requirements file (incl. `-e <url or path>` lines)."""
     out = []
     for line in text.splitlines():
-        line = line.split("#", 1)[0].strip()
-        if not line or line.startswith(("-", "--")):
+        line = re.sub(r"\s+#.*$", "", line).strip()
+        if not line or line.startswith("#"):
             continue
-        m = re.match(r"([A-Za-z0-9][A-Za-z0-9._-]*)", line)
-        if m:
-            out.append(m.group(1))
-        if "git+" in line or "github.com" in line:
-            out += [r["name"] for r in repo_names(re.findall(r"https?://\S+", line.replace("git+", "")))]
+        if (m := re.match(r"(-e|--editable)\s+(.+)", line)):
+            out += _spec_name(m.group(2))
+        elif not line.startswith("-"):
+            out += _spec_name(line.split(";")[0].split(" @ ")[-1] if " @ " in line else line.split(";")[0])
+            if " @ " in line:
+                out += _spec_name(line.split(" @ ")[0])
     return out
 
 
@@ -153,14 +181,36 @@ def environment_packages(task: Path) -> list[dict]:
                 m = PIP_LINE.search(cmd)
                 if not m:
                     continue
-                for w in m.group(1).split():
-                    if w.startswith("-") or "=" in w and not re.match(r"[\w.-]+==", w):
+                words = m.group(1).split()
+                skip_next = False
+                for w in words:
+                    if skip_next:
+                        skip_next = False
                         continue
-                    if w.startswith(("git+", "http")):
-                        out += [dict(name=r["name"], file=rel) for r in repo_names([w.replace("git+", "")])]
-                    elif (m2 := re.match(r"([A-Za-z0-9][\w.-]*)", w)):
-                        out.append(dict(name=m2.group(1), file=rel))
-    return [x for x in out if _norm(x["name"]) not in BASE_STACK]
+                    if w in ("-r", "--requirement", "-c", "--constraint", "-i", "--index-url", "--extra-index-url",
+                             "-f", "--find-links", "-t", "--target", "--prefix", "--root"):
+                        skip_next = True
+                        continue
+                    if w in ("-e", "--editable"):
+                        continue
+                    out += [dict(name=n, file=rel) for n in _spec_name(w)]
+        elif name == "pyproject.toml":
+            import tomllib
+            with contextlib.suppress(ValueError):
+                t = tomllib.loads(txt)
+                deps = list((t.get("project") or {}).get("dependencies") or [])
+                for v in ((t.get("project") or {}).get("optional-dependencies") or {}).values():
+                    deps += list(v)
+                for v in (t.get("dependency-groups") or {}).values():
+                    deps += [d for d in v if isinstance(d, str)]
+                out += [dict(name=n, file=rel) for d in deps for n in _req_names(str(d))]
+    seen, uniq = set(), []
+    for x in out:
+        k = (_norm(x["name"]), x["file"])
+        if k not in seen and k[0] not in BASE_STACK:
+            seen.add(k)
+            uniq.append(x)
+    return uniq
 
 
 def imports(py: Path) -> set[str]:

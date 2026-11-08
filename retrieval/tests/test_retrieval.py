@@ -425,3 +425,13 @@ def test_no_machine_specific_defaults(monkeypatch):
     assert rc.load_config(overrides={"leak_refs": "/x/refs.json"})["leak_refs"] == "/x/refs.json"
     monkeypatch.undo()
     importlib.reload(rc)
+
+
+def test_recorded_web_search_titles_still_yield_to_bibliographic_titles():
+    """eval/raw holds lists from the removed Tavily source; re-fusing them must keep the old title rule."""
+    from tbsretr.fusion import _merge_into
+    from tbsretr.model import Paper
+    for web in ("exa", "tavily"):
+        a = Paper(title="Page title - a review site", origin=web, doi="10.1/x")
+        _merge_into(a, Paper(title="Estimating X", origin="openalex", doi="10.1/x"))
+        assert a.title == "Estimating X"

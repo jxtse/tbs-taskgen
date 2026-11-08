@@ -173,9 +173,19 @@ def launch(cfg: dict, rec: dict, ledger, save) -> dict:
     import subprocess
     c = cfg["calib"]
     if rec["state"] == "intent":
-        # an intent has no side effect outside item_dir: rewrite its job config from the current settings (it may
-        # have been written while submit was off, before calib.agent_allowed_hosts was set) and re-check it
-        conf = job_config(cfg, Path(rec["task"]), rec["who"], rec["job_name"])
+        # an intent has no side effect outside item_dir.  It may have been written while submit was off, before
+        # calib.agent_allowed_hosts was set: update only that field of its job config (model, job dir and task stay
+        # those of the record, which ingest() checks the result against) and re-check it
+        try:
+            conf = json.loads(Path(rec["config"]).read_text())
+        except (OSError, ValueError):
+            conf = job_config(cfg, Path(rec["task"]), rec["who"], rec["job_name"])
+        hosts = [str(h) for h in c.get("agent_allowed_hosts") or []]
+        for a in conf.get("agents") or []:
+            if hosts:
+                a["extra_allowed_hosts"] = hosts
+            else:
+                a.pop("extra_allowed_hosts", None)
         Path(rec["config"]).write_text(json.dumps(conf, indent=1))
         why = network_problem(cfg, Path(rec["task"]), conf)
         if why:
