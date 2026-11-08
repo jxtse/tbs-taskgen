@@ -601,8 +601,13 @@ class Fetcher:
             other = json.loads((w / f"{key}.json").read_text())
             if isinstance(other, dict) and other.get("ident", "doi:" + norm_doi(other.get("doi"))) != ident:
                 stem = _alt_key(key, ident)          # another paper owns this file name
+        ext = {"pdf": "pdf", "jats": "xml", "elsevier_xml": "xml", "html": "html"}.get(kind, "bin")
+        # a text replaced by another download: its raw file(s) go too, so raw/ always matches the provenance
+        # (a TDM XML must not survive under a later OA provenance, where `purge --channel` would miss it)
+        for old in (w / "raw").glob(stem + ".*") if (w / "raw").exists() else []:
+            if old.stem == stem and (old.suffix != f".{ext}" or not (self.ft.get("keep_raw", True) and body)):
+                old.unlink(missing_ok=True)
         if self.ft.get("keep_raw", True) and body:
-            ext = {"pdf": "pdf", "jats": "xml", "elsevier_xml": "xml", "html": "html"}.get(kind, "bin")
             (w / "raw").mkdir(exist_ok=True)
             _atomic_write(w / "raw" / f"{stem}.{ext}", body)
         # provenance first, text last: a text file always has its (complete) provenance next to it
@@ -708,13 +713,14 @@ class Fetcher:
                                note[:300], reservation=rid)
         return txt
 
-    def _meta(self, url: str) -> dict | None:
-        """Metadata lookup (Unpaywall / Europe PMC search): paced and capped, never counted as a download."""
+    def _meta(self, url: str, rec: dict | None = None) -> dict | None:
+        """Metadata lookup (Unpaywall / Europe PMC search): paced and capped, never counted as a download.  A
+        redirect into a host in cooldown is booked in rec["limited"] (the paper waits for it, not a failure)."""
         host = urllib.parse.urlsplit(url).hostname or ""
         if self.ledger is not None:
             self.ledger.acquire_meta(host)
         self._tl.hop = None
-        r = self._get(url, {"User-Agent": self._ua(), "Accept": "application/json"}, {})
+        r = self._get(url, {"User-Agent": self._ua(), "Accept": "application/json"}, rec if rec is not None else {})
         if self.ledger is not None and (cool := block_signal(r.status, r.body)):
             self.ledger.block(host, f"block signal HTTP {r.status} on metadata", seconds=cool)
         if r.status != 200:
@@ -758,7 +764,7 @@ class Fetcher:
             try:
                 if not pmcid:
                     d = self._meta("https://www.ebi.ac.uk/europepmc/webservices/rest/search?" + urllib.parse.urlencode(
-                        {"query": f'DOI:"{doi}"', "format": "json", "resultType": "lite"}))
+                        {"query": f'DOI:"{doi}"', "format": "json", "resultType": "lite"}), rec)
                     hits = ((d or {}).get("resultList") or {}).get("result") or []
                     if hits and hits[0].get("pmcid") and hits[0].get("inEPMC") == "Y" and \
                             hits[0].get("isOpenAccess") == "Y":
@@ -775,7 +781,7 @@ class Fetcher:
         if oa.get("unpaywall_email") and doi:
             try:
                 u = self._meta(f"https://api.unpaywall.org/v2/{urllib.parse.quote(doi)}?"
-                               + urllib.parse.urlencode({"email": oa["unpaywall_email"]}))
+                               + urllib.parse.urlencode({"email": oa["unpaywall_email"]}), rec)
                 urls += [loc["url_for_pdf"] for loc in (u or {}).get("oa_locations") or [] if loc.get("url_for_pdf")]
             except LimitReached as e:
                 self._host_scoped(e, rec, "oa")
@@ -1265,38 +1271,37 @@ def classify(out: Outcome, now: float | None = None) -> tuple[str, float | None,
 
 def _requeue(e: dict, now: float, backoff: float, was_limited: bool, until: float | None, failed_ch: set[str],
              same_version: bool, backoff_only: bool = False) -> None:
-    """Update a queue entry after an attempt without text (see drain_queue)."""
-    if failed_ch and same_version:
-        # (an entry updated meanwhile -- a new link, a new subscriber -- had its channel backoff reset by enqueue;
-        # a failure of the old link must not bring it back)
-        # every channel that really failed backs off on its own (doubling per channel)
-        cb = dict(e.get("chan_backoff") or {})
-        for ch in sorted(failed_ch):
-            n_ch = int((cb.get(ch) or {}).get("tries") or 0) + 1
-            cb[ch] = dict(tries=n_ch, next_try=now + backoff * min(8, 2 ** (n_ch - 1)))
-        e["chan_backoff"] = cb
-        e["failed_channels"] = sorted(set(e.get("failed_channels") or []) | failed_ch)
-    if not same_version:                               # updated meanwhile (new link / subscriber): stay due
+    """Update a queue entry after an attempt without text (see drain_queue).
+
+    One rule: the entry is due again at the earliest time any of its channels could do something new -- a channel
+    that failed retries after its own backoff (`chan_backoff`, doubling per channel from `queue_backoff_s`); a
+    channel that was refused retries when the refusal lifts (`until`; unknown -> LIMIT_RECHECK_S).  Only when no
+    channel holds any such state (no channel applies at all) does the paper itself back off.  `tries` counts the
+    rounds in which a request was really sent and failed (informational)."""
+    if not same_version:
+        # updated meanwhile (a new link / subscriber; enqueue reset the channel backoff): stay due, and do not
+        # bring an old link's backoff back
         e.update(last_try=now, next_try=0)
-    elif was_limited:                                  # refused without a request: not a try, no backoff
-        ends = [float(v["next_try"]) for v in (e.get("chan_backoff") or {}).values()
-                if float(v.get("next_try") or 0) > now]
-        if until is not None:
-            nxt = until
-        elif backoff_only and ends:                    # nothing refused: only waiting for backed-off channels
-            nxt = min(ends)
-        else:
-            nxt = now + LIMIT_RECHECK_S
-        # due again when the refusal lifts or a backed-off channel may retry, whichever comes first
-        nxt = min([nxt, *ends])
-        e.update(next_try=max(now, nxt), limited_until=nxt, last_limited=now)
-    else:                                              # a real failure: back off
-        n_try = int(e.get("tries") or 0) + 1
-        nxt = now + backoff * min(8, 2 ** (n_try - 1))
-        # a channel backing off from an earlier failure may retry sooner: due then (the others stay skipped)
-        ends = [float(v["next_try"]) for ch, v in (e.get("chan_backoff") or {}).items()
-                if ch not in failed_ch and float(v.get("next_try") or 0) > now]
-        e.update(tries=n_try, last_try=now, next_try=min([nxt, *ends]))
+        return
+    cb = dict(e.get("chan_backoff") or {})
+    for ch in sorted(failed_ch):
+        n_ch = int((cb.get(ch) or {}).get("tries") or 0) + 1
+        cb[ch] = dict(tries=n_ch, next_try=now + backoff * min(8, 2 ** (n_ch - 1)))
+    if cb:
+        e["chan_backoff"] = cb
+    if failed_ch:
+        e["failed_channels"] = sorted(set(e.get("failed_channels") or []) | failed_ch)
+        e.update(tries=int(e.get("tries") or 0) + 1, last_try=now)
+    cands = [float(v["next_try"]) for v in cb.values() if float(v.get("next_try") or 0) > now]
+    if was_limited and not backoff_only:
+        cands.append(until if until is not None else now + LIMIT_RECHECK_S)
+        e.update(limited_until=min(cands), last_limited=now)
+    if cands:
+        e["next_try"] = max(now, min(cands))
+        return
+    # nothing to wait for on any channel (none applies): back off the paper itself
+    n_try = int(e.get("paper_tries") or 0) + 1
+    e.update(paper_tries=n_try, last_try=now, next_try=now + backoff * min(8, 2 ** (n_try - 1)))
 
 
 def _chan_skip(e: dict, now: float) -> list[str]:
@@ -1386,6 +1391,10 @@ def _drain_locked(fetcher, qp, now, max_papers, channels, browser, dry_run, on_s
         round_results = rjob.get("results") or {}
         fetcher.remote_results.clear()             # a reused Fetcher must not consume an earlier round's results
         fetcher.remote_results.update(round_results)
+        for ident, r in round_results.items():
+            # a result of an older job (collected now) was fetched for the entry version of that time
+            if "entry_ver" in r and ident in vers:
+                vers[ident] = int(r["entry_ver"])
         stats["remote"] = {k: v for k, v in rjob.items() if k != "results"}
         for j in stats["remote"].get("jobs") or []:
             j.pop("results", None)

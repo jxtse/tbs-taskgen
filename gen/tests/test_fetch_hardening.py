@@ -109,6 +109,31 @@ def test_failure_keeps_earlier_retry_of_another_backed_off_channel(tmp_path):
     assert e["chan_backoff"]["oa"]["tries"] == 1 and e["next_try"] == pytest.approx(t_els)
 
 
+def test_failure_uses_the_failed_channels_own_backoff(tmp_path):
+    """An entry with tries=1 whose channel backoff was reset by a new link: the next failure waits the channel's
+    first backoff (6 h), not the paper's second (12 h) (Codex r4)."""
+    f, net, led, clock = mkfetcher(tmp_path, {"api.elsevier.com": Resp(500, {}, b"", "u")}, SECRETS,
+                                   oa={"enabled": False})
+    qp = q(f, dict(doi="10.1016/j.w.1", title=TITLE))
+    e = entry(qp, "10.1016/j.w.1")
+    e["tries"] = 1
+    fulltext.write_queue(qp, [e])
+    drain(f, clock)
+    assert entry(qp, "10.1016/j.w.1")["next_try"] == pytest.approx(clock.t + 21600)
+
+
+def test_oa_metadata_redirect_into_cooldown_is_a_refusal(tmp_path):
+    """Europe PMC search redirected to a host in cooldown: limited (due when it lifts), not a failure (Codex r4)."""
+    f, net, led, clock = mkfetcher(tmp_path, {"rest/search": Resp(302, {"Location": "https://cool.example/s"}, b"", "u")},
+                                   SECRETS, oa={"enabled": True, "europepmc": True})
+    led.block("cool.example", "test", seconds=3000)
+    qp = q(f, dict(doi="10.9999/r.1", title=TITLE))
+    st = drain(f, clock)
+    assert st["limited"] == 1 and st["failed"] == 0
+    e = entry(qp, "10.9999/r.1")
+    assert not e.get("tries") and e["next_try"] == pytest.approx(clock.t + 3000, abs=2)
+
+
 def test_real_failure_still_backs_off(tmp_path):
     f, net, led, clock = mkfetcher(tmp_path, {"api.elsevier.com": Resp(500, {}, b"err", "u")}, SECRETS,
                                    oa={"enabled": False})
@@ -128,7 +153,9 @@ def test_limited_channel_does_not_reset_backoff_of_a_failed_one(tmp_path):
     qp = q(f, dict(doi="10.1016/j.d.1", title=TITLE, oa_url="https://repo.example/d.pdf"))
     drain(f, clock)
     e = entry(qp, "10.1016/j.d.1")
-    assert not e.get("tries") and e["chan_backoff"]["elsevier"]["tries"] == 1
+    # elsevier really failed (that round counts as a try), but the entry is due when oa's cooldown lifts, not
+    # after the 6 h backoff
+    assert e["chan_backoff"]["elsevier"]["tries"] == 1 and "oa" not in e["chan_backoff"]
     assert e["next_try"] == pytest.approx(clock.t + 1800, abs=2)
     n = len(net.calls)
     clock.t += 1801
@@ -426,6 +453,23 @@ def test_remote_not_entitled_survives_worker_crash(tmp_path):
     assert res["merged"]["not_entitled"] == 1 and led.not_entitled("wiley", "10.1002/zz")
 
 
+def test_stale_remote_result_uses_its_own_entry_version(tmp_path, monkeypatch):
+    """An old remote job (fetched for version 0 of the entry) is collected after a new link was enqueued
+    (version 1): its failure must not back the new link off (Codex r4)."""
+    f, net, led, clock = mkfetcher(tmp_path, {}, SECRETS, remote=dict(enabled=True, host="h", python="/p",
+                                                                         workdir="/w"))
+    qp = q(f, dict(doi="10.1016/j.t.1", title=TITLE))
+    fulltext.enqueue(qp, fulltext.queue_entry(dict(doi="10.1016/j.t.1", title=TITLE, oa_url="https://x.example/n.pdf"),
+                                              subscribers=[]))
+    assert entry(qp, "10.1016/j.t.1")["ver"] == 1
+    ident = "doi:10.1016/j.t.1"
+    monkeypatch.setattr(remote, "run_job", lambda *a, **k: dict(jobs=[], results={ident: dict(
+        ok=False, text=None, entry_ver=0, rec=dict(tried=["elsevier:u"], errors=["HTTP 500"]))}))
+    drain(f, clock)
+    e = entry(qp, "10.1016/j.t.1")
+    assert not e.get("chan_backoff") and e["next_try"] == 0 and not e.get("tries")
+
+
 def test_lease_rows_never_count_as_attempts_or_breaker(tmp_path):
     f, net, led, clock = mkfetcher(tmp_path, {}, SECRETS)
     remote.lease_and_snapshot(led, "j", 3)
@@ -537,6 +581,18 @@ def test_purge_before_uses_original_download_day_for_item_copies(tmp_path):
     (d / "state.json").write_text(json.dumps(dict(stage="S10", status="done")))
     out = fulltext.purge(f.cfg, ["elsevier"], before="2026-02-01", runs=[run])
     assert out["texts"] == 1 and out["items"] == 1 and not (d / "fulltext.txt").exists()
+
+
+def test_replaced_download_removes_old_raw_so_purge_cannot_miss_it(tmp_path):
+    """Elsevier XML first, then an OA PDF for the same DOI: the TDM XML must not survive under the OA provenance
+    (Codex r4)."""
+    f, net, led, clock = mkfetcher(tmp_path, {"api.elsevier.com": ELS_XML, "repo.example": FAKE_PDF}, SECRETS)
+    c = dict(doi="10.1016/j.y.1", title=TITLE, oa_url="https://repo.example/y.pdf")
+    assert f.fetch(c, channels=["elsevier"]).rec["source"] == "elsevier"
+    w = Path(f.cfg["fulltext"]["write_cache_dir"])
+    assert [p.suffix for p in (w / "raw").iterdir()] == [".xml"]
+    assert f.fetch(c, channels=["oa"]).rec["source"] == "oa"
+    assert [p.suffix for p in (w / "raw").iterdir()] == [".bin"]           # the OA download only; no TDM XML
 
 
 def test_purge_before_date_and_bad_args(tmp_path):

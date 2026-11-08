@@ -610,7 +610,8 @@ def import_export(fetcher, job: str, blob: bytes) -> dict:
         for ch in rec.get("not_entitled") or []:     # metadata-only answers seen remotely: never ask again
             from .fulltext import norm_doi
             fetcher.ledger.mark_not_entitled(ch, norm_doi(doi), f"remote:{job}")
-        results[r["ident"]] = dict(ok=text is not None, text=text, rec=rec)
+        results[r["ident"]] = dict(ok=text is not None, text=text, rec=rec,
+                                   entry_ver=int((r.get("entry") or {}).get("ver") or 0))
     rows = json.loads(files.get("ledger.json", b"{}"))
     merged = merge_rows(fetcher.ledger, job, rows)
     return dict(results=results, merged=merged)
