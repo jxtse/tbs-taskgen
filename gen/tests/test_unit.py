@@ -802,7 +802,7 @@ def test_metrics_at_the_floating_point_noise_floor():
     meas["mid"]["0"]["hidden_sigma_relerr"] = 1e-12
     meas["naive"]["0"]["hidden_sigma_relerr"] = 5e-9
     t3 = set_thresholds(spec, meas, cfg)["thresholds"]["hidden_sigma_relerr"]
-    assert t3["threshold"] == pytest.approx(1.5e-12)                            # plain loose rule, no floor
+    assert t3["threshold"] == pytest.approx(1.5e-12, rel=1e-6, abs=0)          # plain loose rule, no floor
     meas["mid"]["0"]["hidden_sigma_relerr"] = 2e-9                              # mid above the floor: separating
     assert set_thresholds(spec, meas, cfg)["thresholds"]["hidden_sigma_relerr"]["separating"]
     cfg0 = load_config(None, {"thresholds": {"noise_floor_abs": 0}})             # disabled: old behaviour
@@ -825,3 +825,11 @@ def test_noise_floor_separation_branch_and_nonfinite_values():
             "mid": {"0": {"hidden_a": 2e-10, "hidden_b": 0.9}, "1": {"hidden_a": float("inf"), "hidden_b": 0.9}},
             "naive": {"0": {"hidden_a": 1e-10, "hidden_b": 0.9}, "1": {"hidden_a": 1e-10, "hidden_b": 0.9}}}
     assert set_thresholds(spec, meas, load_config())["thresholds"]["hidden_a"]["threshold"] < 1e-9
+
+
+def test_noise_floor_threshold_is_exact_for_non_default_floor():
+    cfg = load_config(None, {"thresholds": {"noise_floor_abs": 1e-10}})
+    spec = {"metrics": [{"name": "hidden_a", "direction": "<="}, {"name": "hidden_b", "direction": "<="}]}
+    meas = {"ref": {"0": {"hidden_a": 1e-11, "hidden_b": 0.1}}, "mid": {"0": {"hidden_a": 1e-11, "hidden_b": 0.9}},
+            "naive": {"0": {"hidden_a": 1e-11, "hidden_b": 0.9}}}
+    assert set_thresholds(spec, meas, cfg)["thresholds"]["hidden_a"]["threshold"] == 1e-10

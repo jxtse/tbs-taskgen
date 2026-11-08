@@ -170,8 +170,11 @@ def set_thresholds(spec: dict, measure: dict, cfg: dict) -> dict:
             # (e2e-prod-20261109: ref 4.3e-11, mid 2.7e-11, naive 4.3e-11): the metric separates nothing, and ref x1.5
             # would fail a correct implementation that merely rounds differently
             thr, naive_capped = floor_abs, False
+            at_floor = True
+        else:
+            at_floor = False
         exact = thr
-        thr = _round_sig(exact, tc["sig_digits"], d, toward_loose=True)
+        thr = exact if at_floor else _round_sig(exact, tc["sig_digits"], d, toward_loose=True)   # floor: kept exact
         if separating and not _worse(d, m_best, thr):   # rounding must not let the mid baseline pass
             thr = _round_sig(exact, tc["sig_digits"] + 2, d, toward_loose=False)
         if naive_capped and not _worse(d, n_best, thr):  # nor the naive baseline (review #9)
