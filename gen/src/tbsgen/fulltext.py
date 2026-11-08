@@ -1313,6 +1313,11 @@ def _requeue(e: dict, now: float, backoff: float, was_limited: bool, until: floa
     if cands:
         e["next_try"] = max(now, min(cands))
         return
+    if backoff_only:
+        # every channel was skipped for a backoff that has run out by now (e.g. a remote job submitted earlier,
+        # collected now): nothing failed in this round, so the entry is due again at once
+        e["next_try"] = now
+        return
     # nothing to wait for on any channel (none applies): back off the paper itself
     n_try = int(e.get("paper_tries") or 0) + 1
     e.update(paper_tries=n_try, last_try=now, next_try=now + backoff * min(8, 2 ** (n_try - 1)))

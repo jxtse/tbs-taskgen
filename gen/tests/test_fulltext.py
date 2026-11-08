@@ -961,6 +961,21 @@ def test_hops_do_not_use_channel_attempts(tmp_path):
     assert led.usage()["oa"]["attempts"] == 1
 
 
+def test_hop_cap_refusals_carry_when_they_lift(tmp_path):
+    """A redirect target over its hourly cap: the refusal says when the cap lifts, so the queue does not wait the
+    unknown-end recheck interval instead (Codex PR-A r8)."""
+    from tbsgen.dlledger import LimitReached
+    clock = FakeClock()
+    led = DownloadLedger(tmp_path / "l.sqlite", {"oa": {"gap_s": 0, "jitter_s": 0, "host_hourly_attempts": 1}},
+                         clock=clock, sleep=clock.sleep)
+    t0 = clock.t
+    led.acquire_hop("oa", "b.example", "x")
+    clock.t += 3540
+    with pytest.raises(LimitReached) as ex:
+        led.acquire_hop("oa", "b.example", "y")
+    assert ex.value.until == pytest.approx(t0 + 3600, abs=1)
+
+
 def test_cooldown_on_any_publisher_prefix_blocks_the_others(tmp_path):
     run, calls = fake_browser({"status": "downloaded", "_body": FAKE_PDF})
     f, _, led, _ = mkfetcher(tmp_path, {}, SECRETS, browser_runner=run, browser={"enabled": True})

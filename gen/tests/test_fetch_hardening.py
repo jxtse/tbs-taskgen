@@ -192,6 +192,15 @@ def test_explicit_channels_listing_every_http_channel_is_still_partial(tmp_path)
     assert e["chan_backoff"]["elsevier"]["tries"] == 1 and float(e["next_try"]) > clock.t
 
 
+def test_skipped_only_for_a_backoff_that_has_run_out_stays_due():
+    """A result collected now from an older job in which every channel was skipped for its backoff: that backoff
+    has run out meanwhile, nothing failed -- the entry is due at once, not backed off as a paper (Codex PR-A r8)."""
+    now = 1_000_000.0
+    e = dict(ver=1, chan_backoff={"elsevier": dict(tries=1, next_try=now - 5)})
+    fulltext._requeue(e, now, 21600, True, None, set(), same_version=True, backoff_only=True)
+    assert e["next_try"] == now and not e.get("paper_tries") and e["chan_backoff"]["elsevier"]["tries"] == 1
+
+
 def test_real_failure_still_backs_off(tmp_path):
     f, net, led, clock = mkfetcher(tmp_path, {"api.elsevier.com": Resp(500, {}, b"err", "u")}, SECRETS,
                                    oa={"enabled": False})

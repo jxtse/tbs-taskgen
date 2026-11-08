@@ -377,7 +377,8 @@ def test_remote_one_job_at_a_time(tmp_path):
 
 def test_lease_holds_quota_past_pending_ttl(tmp_path):
     from tbsgen.dlledger import PENDING_TTL_S, LimitReached
-    clock = FakeClock(time.time())
+    noon = time.mktime(time.localtime()[:3] + (12, 0, 0, 0, 0, -1))   # TTL must not cross local midnight
+    clock = FakeClock(noon)
     led = DownloadLedger(tmp_path / "l.sqlite", global_limits={"daily_ok": 1}, clock=clock, sleep=clock.sleep)
     remote.lease_and_snapshot(led, "j", 1)
     clock.t += PENDING_TTL_S + 60
