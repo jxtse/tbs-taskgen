@@ -945,8 +945,9 @@ def test_hop_rechecks_cooldown_and_gap_after_waiting(tmp_path):
         clock.t += s
         led.block("cdn.example", "429 seen elsewhere", seconds=6 * 3600)
     led.sleep = sleep_then_block
-    with pytest.raises(LimitReached, match="cooldown"):
+    with pytest.raises(LimitReached, match="cooldown") as ex:
         led.acquire_hop("oa", "cdn.example", "b")
+    assert ex.value.until == pytest.approx(clock.t + 6 * 3600, abs=2)    # carries the lift time (Codex PR-A r10)
     assert not sqlite3.connect(tmp_path / "l.sqlite").execute(
         "select count(*) from attempts where status='hop'").fetchone()[0]
 

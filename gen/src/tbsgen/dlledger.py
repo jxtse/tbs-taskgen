@@ -416,6 +416,7 @@ class DownloadLedger:
             with self._tx():
                 now = self.clock()
                 msg = self.cooling(host, *related)
+                kind, until = "cooldown", (self.cooling_until(host, *related) if msg else None)
                 if not msg:
                     last = self._last_sent((host,), exclude=rid)
                     if last and now < last + gap:
@@ -423,6 +424,7 @@ class DownloadLedger:
                         if slot - now <= max_wait:
                             continue
                         msg = f"{host}: redirect target busy"
+                        kind, until = "cap", slot - max_wait
                 if msg:
                     self.db.execute("update attempts set status='fail', note=? where rowid=?",
                                     (f"{NOT_SENT}{msg}"[:300], rid))
@@ -430,7 +432,7 @@ class DownloadLedger:
                     self.db.execute("update attempts set ts=?, day=?, status='hop', note='redirect' where rowid=?",
                                     (now, local_day(now), rid))
             if msg:
-                raise LimitReached(msg, "cooldown", "host")
+                raise LimitReached(msg, kind, "host", until=until)
             return
         self.record(channel, host, doi, "fail", None, 0, f"{NOT_SENT}could not pace redirect", reservation=rid)
         raise LimitReached(f"{host}: could not pace redirect", "cap", "host")
