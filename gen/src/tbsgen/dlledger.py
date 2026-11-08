@@ -396,12 +396,16 @@ class DownloadLedger:
             now = self.clock()
             slot = self._next_slot((host,), gap)
             if slot - now > max_wait:
-                raise LimitReached(f"{host}: redirect target busy for {slot - now:.0f}s", "cap", "host")
+                raise LimitReached(f"{host}: redirect target busy for {slot - now:.0f}s", "cap", "host",
+                                   until=slot - max_wait)
             day = local_day(slot)
             cap = self.host_caps.get(host, lim.get("host_daily_attempts") or self.g["per_host_daily_attempts"])
-            if self._n(f"day=? and host=? and {_SENT}", (day, host)) >= cap or \
-                    self._n(f"ts>? and host=? and {_SENT}", (now - 3600, host)) >= lim["host_hourly_attempts"]:
-                raise LimitReached(f"{host}: attempt cap reached (redirect target)", "cap", "host")
+            if self._n(f"day=? and host=? and {_SENT}", (day, host)) >= cap:
+                raise LimitReached(f"{host}: daily attempt cap reached (redirect target)", "cap", "host",
+                                   until=next_midnight(slot))
+            if self._n(f"ts>? and host=? and {_SENT}", (now - 3600, host)) >= lim["host_hourly_attempts"]:
+                raise LimitReached(f"{host}: hourly attempt cap reached (redirect target)", "cap", "host",
+                                   until=self._hour_reset(f"host=? and {_SENT}", (host,)))
             self.db.execute("insert or replace into hosts values(?,?)",
                             (host, slot + gap + random.uniform(0, lim["jitter_s"])))
             rid = self.db.execute("insert into attempts values(?,?,?,?,?,?,?,?,?)",
@@ -412,6 +416,7 @@ class DownloadLedger:
             with self._tx():
                 now = self.clock()
                 msg = self.cooling(host, *related)
+                kind, until = "cooldown", (self.cooling_until(host, *related) if msg else None)
                 if not msg:
                     last = self._last_sent((host,), exclude=rid)
                     if last and now < last + gap:
@@ -419,6 +424,7 @@ class DownloadLedger:
                         if slot - now <= max_wait:
                             continue
                         msg = f"{host}: redirect target busy"
+                        kind, until = "cap", slot - max_wait
                 if msg:
                     self.db.execute("update attempts set status='fail', note=? where rowid=?",
                                     (f"{NOT_SENT}{msg}"[:300], rid))
@@ -426,7 +432,7 @@ class DownloadLedger:
                     self.db.execute("update attempts set ts=?, day=?, status='hop', note='redirect' where rowid=?",
                                     (now, local_day(now), rid))
             if msg:
-                raise LimitReached(msg, "cooldown", "host")
+                raise LimitReached(msg, kind, "host", until=until)
             return
         self.record(channel, host, doi, "fail", None, 0, f"{NOT_SENT}could not pace redirect", reservation=rid)
         raise LimitReached(f"{host}: could not pace redirect", "cap", "host")

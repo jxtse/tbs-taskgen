@@ -178,6 +178,39 @@ def test_partial_round_never_reschedules_a_refused_channel_away(tmp_path):
     assert drain(f, clock)["ok"] == 1                                  # oa is tried at once
 
 
+def test_explicit_channels_listing_every_http_channel_is_still_partial(tmp_path):
+    """`--channels cache,oa,elsevier,wiley,inst` leaves out browser: still a partial round, so elsevier's failure
+    records its backoff but does not push the entry back (a due browser channel keeps it due) (Codex r7)."""
+    f, net, led, clock = mkfetcher(tmp_path, {"api.elsevier.com": Resp(500, {}, b"", "u")}, SECRETS,
+                                   oa={"enabled": False})
+    qp = q(f, dict(doi="10.1016/j.p.1", title=TITLE))
+    drain(f, clock, channels=["cache", "oa", "elsevier", "wiley", "inst"])
+    e = entry(qp, "10.1016/j.p.1")
+    assert e["chan_backoff"]["elsevier"]["tries"] == 1 and float(e.get("next_try") or 0) <= clock.t
+    drain(f, clock)                                                    # a full round does reschedule
+    e = entry(qp, "10.1016/j.p.1")
+    assert e["chan_backoff"]["elsevier"]["tries"] == 1 and float(e["next_try"]) > clock.t
+
+
+def test_skipped_only_for_a_backoff_that_has_run_out_stays_due():
+    """A result collected now from an older job in which every channel was skipped for its backoff: that backoff
+    has run out meanwhile, nothing failed -- the entry is due at once, not backed off as a paper (Codex PR-A r8)."""
+    now = 1_000_000.0
+    e = dict(ver=1, chan_backoff={"elsevier": dict(tries=1, next_try=now - 5)})
+    fulltext._requeue(e, now, 21600, True, None, set(), same_version=True, backoff_only=True)
+    assert e["next_try"] == now and not e.get("paper_tries") and e["chan_backoff"]["elsevier"]["tries"] == 1
+
+
+def test_round_skipping_a_since_expired_backoff_is_due_at_the_earliest_channel():
+    """Old remote result: elsevier (expired by now) and wiley (still backing off) were both skipped for their
+    backoff: the entry is due now for elsevier, not at wiley's retry (Codex PR-A r9)."""
+    now = 1000.0
+    e = dict(ver=1, chan_backoff={"elsevier": dict(tries=1, next_try=995.0), "wiley": dict(tries=1, next_try=5000.0)})
+    fulltext._requeue(e, now, 21600, True, None, set(), same_version=True, backoff_only=True,
+                      skipped_backoff={"elsevier", "wiley"})
+    assert e["next_try"] == now and not e.get("paper_tries")
+
+
 def test_real_failure_still_backs_off(tmp_path):
     f, net, led, clock = mkfetcher(tmp_path, {"api.elsevier.com": Resp(500, {}, b"err", "u")}, SECRETS,
                                    oa={"enabled": False})

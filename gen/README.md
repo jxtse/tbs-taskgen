@@ -107,6 +107,8 @@ uv run tbsgen breaker --run runs/R --model claude-opus-5-5 --reset  # 人工解�
 uv run tbsgen fetch --run runs/R --config config.toml [--max N] [--channels oa,browser] [--no-browser] [--dry-run]
                                                                     # 清全文队列（含 ego-browser 通道），取到全文后交给等待的条目并推进到 S4
                                                                     # 只有真正发出请求并失败才退避；被限额/冷却/熔断跳过的不计次数，到最早恢复时间再到期
+                                                                    # 部分轮次（任何显式 --channels，或本轮收回的旧远程作业范围窄于该条目适用的全部通道）
+                                                                    # 只记录真正尝试过的通道的退避，不重新安排条目、不推迟未尝试的通道
 uv run tbsgen fetch --run runs/R --only 10.1016/j.x.1,arxiv:2101.00001  # 只处理指定条目（不论是否到期）
 uv run tbsgen remote deploy --run runs/R --config config.toml [--dry-run]  # 把本地 HEAD 部署到 fulltext.remote.code_dir 并核对两端指纹
 uv run tbsgen remote status --run runs/R --config config.toml       # 两端 HEAD、指纹、远端作业
