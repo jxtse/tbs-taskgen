@@ -541,19 +541,12 @@ def _paper_call(bd: Path, st: dict, n: str, action: str, arg: str, say) -> int:
             return say(f"tbsgen: paper {n}: only the configured institution names may be typed", 2)
     # budgets shared by the batch's concurrent calls are reserved under one lock: navigation pacing per
     # publisher, the publisher's single hand-off and the SSO submission budget
-    nav_at = 0.0
     with _locked(slock):
         state = _read_state(bd)
         if action in NAV_ACTIONS:
             if ps.get("navs", 0) >= int(st["max_navigations_per_paper"]):
                 _atomic(sp, json.dumps(ps))
                 return say(f"tbsgen: paper {n}: navigation limit reached; give up on this paper", 2)
-            nav = state.setdefault("nav", {})
-            nav_at = max(time.time(), float(nav.get(pkey) or 0) + float(st["nav_gap_s"]))
-            if nav_at > float(st["deadline"]):
-                _atomic(sp, json.dumps(ps))
-                return say("tbsgen: the batch deadline comes before the next navigation; end now.", 3)
-            nav[pkey] = nav_at
             ps["navs"] = ps.get("navs", 0) + 1
         handoff_free = (bool(st.get("handoff_enabled")) and not ps.get("handoff")
                         and not (state.get("handoff") or {}).get(pkey)
@@ -571,19 +564,48 @@ def _paper_call(bd: Path, st: dict, n: str, action: str, arg: str, say) -> int:
                 s["pending"] = n
         _write_state(bd, state)
     _atomic(sp, json.dumps(ps))
+    # page loads of one publisher run one at a time (a lock held over the wait AND the action), at least
+    # nav_gap_s after the previous one FINISHED
+    nav_lock = (_locked(bd / f".nav-{re.sub(r'[^A-Za-z0-9_.-]', '_', pkey)}.lock") if action in NAV_ACTIONS
+                else contextlib.nullcontext())
     try:
-        # wait for the reserved navigation slot (cancellable), then re-check everything that may have changed
-        while (wait := nav_at - time.time()) > 0:
-            if (bd / "STOP").exists():
-                return say("tbsgen: STOP - the batch was stopped (egress changed or deadline). End now.", 3)
-            time.sleep(min(0.5, wait))
+        with nav_lock:
+            return _paced_run(bd, st, n, p, ps, action, arg, say, led, pkey, space, handoff_free, sso_ok, slock,
+                              COOLDOWN_429_S, aliases, web_hosts, sp)
+    finally:
+        with _locked(slock):
+            state = _read_state(bd)
+            if (state.get("handoff_inflight") or {}).get(pkey) == n:
+                state["handoff_inflight"].pop(pkey, None)
+                _write_state(bd, state)
+
+
+def _paced_run(bd, st, n, p, ps, action, arg, say, led, pkey, space, handoff_free, sso_ok, slock, COOLDOWN_429_S,
+               aliases, web_hosts, sp) -> int:
+    def refund_sso():
+        if sso_ok:
+            _sso_finalize(bd, slock, n, {"sso_submitted": False, "sso_stage": "pre"})
+    try:
+        if action in NAV_ACTIONS:
+            last = float((_read_state(bd).get("nav") or {}).get(pkey) or 0)
+            nav_at = last + float(st["nav_gap_s"])
+            if nav_at > float(st["deadline"]):
+                refund_sso()
+                return say("tbsgen: the batch deadline comes before the next navigation; end now.", 3)
+            # cancellable wait, then re-check everything that may have changed meanwhile
+            while (wait := nav_at - time.time()) > 0:
+                if (bd / "STOP").exists():
+                    refund_sso()
+                    return say("tbsgen: STOP - the batch was stopped (egress changed or deadline). End now.", 3)
+                time.sleep(min(0.5, wait))
         if (bd / "STOP").exists():
+            refund_sso()
             return say("tbsgen: STOP - the batch was stopped (egress changed or deadline). End now.", 3)
         if time.time() >= float(st["deadline"]):
+            refund_sso()
             return say("tbsgen: the batch deadline has passed; end now.", 3)
         if (msg := led.cooling(ps["lkey"], *aliases, *web_hosts)):
-            if sso_ok:
-                _sso_finalize(bd, slock, n, {"sso_submitted": False, "sso_stage": "pre"})
+            refund_sso()
             ps = json.loads(sp.read_text())
             ps["closed"] = "publisher in cooldown"
             _atomic(sp, json.dumps(ps))
@@ -591,10 +613,10 @@ def _paper_call(bd: Path, st: dict, n: str, action: str, arg: str, say) -> int:
         return _paper_run(bd, st, n, p, ps, action, arg, say, led, pkey, space, handoff_free, sso_ok, slock,
                           COOLDOWN_429_S)
     finally:
-        with _locked(slock):
-            state = _read_state(bd)
-            if (state.get("handoff_inflight") or {}).get(pkey) == n:
-                state["handoff_inflight"].pop(pkey, None)
+        if action in NAV_ACTIONS:
+            with _locked(slock):
+                state = _read_state(bd)
+                state.setdefault("nav", {})[pkey] = time.time()       # when this page load finished
                 _write_state(bd, state)
 
 
@@ -695,6 +717,8 @@ def _paper_run(bd, st, n, p, ps, action, arg, say, led, pkey, space, handoff_fre
         _atomic(sp, json.dumps(ps))
     if action == "handoff_status":
         chk = res.get("handoff_check")
+        if chk == "cleared" and time.time() > float(ps.get("handoff_deadline") or 0):
+            chk = "expired"                   # the deadline passed while the poll ran: not a clear
         if chk == "cleared":
             ps = save_ps()
             for k in ("handoff", "handoff_title", "handoff_page"):
@@ -728,7 +752,7 @@ def _paper_run(bd, st, n, p, ps, action, arg, say, led, pkey, space, handoff_fre
         ps["look_url"] = res["look_url"]
         _atomic(sp, json.dumps(ps))
     show = dict(status=res.get("status"), error=res.get("error"), files_saved=len(res.get("files") or []),
-                page=res.get("page"), note=res.get("note"), left_allowed=res.get("left_allowed"),
+                page=res.get("page"), note=res.get("note"), left_allowed=res.get("left_allowed") or res.get("reset_foreign"),
                 login_required=res.get("login_required"),
                 shot=res.get("shot"), tabs=res.get("tabs"), acted=res.get("acted"), sso=res.get("sso"),
                 waited=res.get("waited"), scroll=res.get("scroll"), page_label=res.get("page_label"),
@@ -758,13 +782,12 @@ STDERR_LOG_TAIL = 1500            # characters of it repeated in the agent_end l
 # credential-like text in the agent's stderr: whole auth headers, key=value / key: value pairs (also with spaces
 # inside a quoted value), URL userinfo and well-known token shapes
 _SECRET_PATTERNS = (
-    # auth / cookie headers, also inside JSON ("Authorization": "Basic ...") - the whole rest of the value
-    re.compile(r"(?i)([\"']?(?:proxy-)?(?:authorization|cookie|set-cookie|x-api-key|api-key)[\"']?\s*[:=]\s*)"
-               r"(\"[^\"\r\n]*\"?|'[^'\r\n]*'?|[^\r\n]*)"),
-    re.compile(r"(?i)\b((?:bearer|basic)\s+)[A-Za-z0-9._~+/=\-]+"),
-    re.compile(r"(?i)([\"']?(?:api[_-]?key|access[_-]?token|refresh[_-]?token|id[_-]?token|token|secret|"
-               r"client[_-]?secret|password|passwd|pwd|session(?:id)?|sid|credentials?)[\"']?\s*[:=]\s*)"
-               r"(\"[^\"\r\n]*\"?|'[^'\r\n]*'?|[^\s,;&]+)"),
+    # a sensitive key (also as a JSON key) and EVERYTHING after it on the line: no quote / escape parsing
+    # that a crafted value could get around
+    re.compile(r"(?im)([\"']?(?:proxy-)?(?:authorization|cookie|set-cookie|x-api-key|api-key|api[_-]?key|"
+               r"access[_-]?token|refresh[_-]?token|id[_-]?token|token|secret|client[_-]?secret|password|passwd|"
+               r"pwd|session(?:id)?|sid|credentials?)[\"']?\s*[:=]\s*).*$"),
+    re.compile(r"(?i)\b((?:bearer|basic)\s+).*$", re.M),
     re.compile(r"(?i)(\w+://)[^/\s:@]+:[^/\s@]+@"),
     re.compile(r"()\b(?:sk|pk|rk|ghp|gho|ghu|ghs|github_pat|xox[abprs]|glpat|hf)[-_][A-Za-z0-9_\-]{8,}"),
     re.compile(r"()\beyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{4,}"),     # JWT
@@ -802,16 +825,22 @@ class _StderrTail:
 
     def _read(self, pipe):
         buf = b""
+        skipping = False                  # inside an over-long line: drop everything up to its newline
         with contextlib.suppress(Exception):
             for chunk in iter(lambda: pipe.read(8192), b""):
                 buf += chunk
                 while b"\n" in buf:
                     line, buf = buf.split(b"\n", 1)
+                    if skipping:
+                        skipping = False          # the rest of the long line ends here; never shown
+                        continue
                     self._add(line + b"\n")
                 if len(buf) > self.MAX_LINE:
-                    self._add(buf)
+                    if not skipping:
+                        self._add(b"x" * (self.MAX_LINE + 1))      # the "[long line dropped]" marker
+                    skipping = True
                     buf = b""
-        if buf:
+        if buf and not skipping:
             self._add(buf)
 
     def text(self) -> str:

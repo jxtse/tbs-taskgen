@@ -318,11 +318,14 @@ uv run tbsgen fetch --run runs/R --config config.toml --browser --wait-for-egres
     `agent.max_navigations_per_paper` page loads (12) per paper, page loads of one publisher at least
     `agent.nav_gap_s` (2.5 s) apart;
   - only the paper's `allowed_domains` (its publisher, `doi.org`, known PDF CDNs and `browser.sso.domains`, the
-    institution / WAYF domains) are opened or clicked; `type` only types the strings in
+    institution / WAYF domains) are opened or clicked (link and browser-resolved form targets are checked
+    before the click; inside cross-origin frames only links are clicked; a page found outside the domains is
+    reset before the next action); `type` only types the strings in
     `agent.institution_names`, never into a field that can hold credentials;
   - field values are never read: `look` lists field types and labels only, and `screenshot` is refused on pages
-    with credential fields (also in frames, or when a cross-origin frame has form fields or the page cannot be
-    checked); field contents are masked in screenshots. The agent may view its own screenshots
+    with credential fields (also in frames and open shadow roots, or when fields exist that the page cannot
+    inspect); field contents are masked in screenshots; field texts are removed from page snapshots, and URLs
+    of SSO hosts or with token-like parameters are reported without query and fragment. The agent may view its own screenshots
     (`vision_analyze`, batch directory only);
   - verification pages (Cloudflare / Turnstile, captchas, sliders) are never solved. With `browser.handoff.enabled`
     the page is handed to you instead (macOS notification, optional local `handoff.bark_cmd`); the agent works on
@@ -438,10 +441,10 @@ Research code under active development.
 **Tests** (run by [GitHub Actions CI](.github/workflows/ci.yml) on every push to `main` and every pull request)
 
 - `retrieval/`: 47 offline unit tests that replay recorded API responses.
-- `gen/`: 264 tests: 234 offline unit tests (18 for the Jev screen, 6 for the S2 publisher blocklist and 157 for
+- `gen/`: 269 tests: 238 offline unit tests (18 for the Jev screen, 6 for the S2 publisher blocklist and 161 for
   the S3 full-text channels and browser batches, using recorded and scripted responses and fake `ego-browser` /
   `hermes` executables; no network, no real browser or model), 16 integration tests that run task code in
-  Docker, and 14 live tests of the browser agent's action script against local pages in a real ego-browser
+  Docker, and 15 live tests of the browser agent's action script against local pages in a real ego-browser
   (no website is contacted; skipped where ego-browser is not installed, as in CI). Locally the integration
   tests are skipped when Docker or the sandbox image is missing; CI builds the image and fails if any of them
   is skipped.

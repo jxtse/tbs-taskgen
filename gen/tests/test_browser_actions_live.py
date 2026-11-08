@@ -113,6 +113,20 @@ def _pages(port, port2):
         "/verify-btn": ("text/html", b'<html><head><title>Article</title></head><body><button id="b1">Verify you are human</button></body></html>'),
         "/frame-blank": ("text/html", b'<html><head><title>Frame Blank</title></head><body><iframe src="/blank-inner" width="400" height="200"></iframe></body></html>'),
         "/blank-inner": ("text/html", b'<html><body><a href="/other" target="_blank" id="nb">Open Other</a></body></html>'),
+        # round 3: a form posting off-site through a plain button; a login form in a shadow root; a page
+        # that redirects off-site later; a second login step (verification code) after the password
+        "/offsite-form": ("text/html", b'<html><head><title>Offsite Form</title></head><body><form method="post" '
+                                       b'action="https://denied.example/x"><button id="dl">Download</button></form></body></html>'),
+        "/shadow-login": ("text/html", b'<html><head><title>Shadow</title></head><body><div id="h"></div><script>'
+                                       b'const r=document.getElementById("h").attachShadow({mode:"open"});'
+                                       b'r.innerHTML=\'<form><input id="u" autocomplete="username"><input type="password"></form>\';'
+                                       b'</script></body></html>'),
+        "/late-redirect": ("text/html", b'<html><head><title>Late</title></head><body>wait<script>'
+                                        b'setTimeout(()=>{location.href="https://denied.example/late"},1500)</script></body></html>'),
+        "/sso-2fa": ("text/html", SSO.format(action="/code-step", user="u", pw="p", extra="").encode()),
+        "/code-step": ("text/html", b'<html><head><title>Verify</title></head><body><form method="post" action="/logged">'
+                                    b'<input name="otp_code" autocomplete="one-time-code"> Enter the verification code'
+                                    b'<button>OK</button></form></body></html>'),
         # a login form inside a same-origin iframe
         "/frame-login": ("text/html", b'<html><head><title>Frame Login</title></head><body><h1>x</h1>'
                                       b'<iframe src="/sso" width="400" height="300"></iframe></body></html>'),
@@ -147,7 +161,9 @@ def _serve(pages):
             n = int(self.headers.get("content-length", 0))
             self.rfile.read(n)
             p = self.path.split("?")[0]
-            if p in pages and p.startswith("/sso"):        # a failed login shows the login form again
+            if p == "/code-step":
+                self._x(pages[p][1], "text/html")
+            elif p in pages and p.startswith("/sso"):        # a failed login shows the login form again
                 self._x(pages[p][1], "text/html")
             else:
                 self._x(b"<html><head><title>Logged In</title></head><body>ok</body></html>", "text/html")
@@ -271,10 +287,13 @@ def test_cross_origin_iframe_click_by_snapshot_ref(origins):
     try:
         assert _run(sp, "open", origins[0] + "/landing")["status"] == "ok"
         r = _run(sp, "look")
-        assert _run(sp, "click", str(_item(r, "Cross Frame Button")["i"]),
-                    look_url=r["page"]["url"])["status"] == "ok"
+        # items of the cross-origin frame are listed (from the snapshot) ...
+        assert _item(r, "Cross Frame Button"), r["page"]["items"]
+        # ... but a button there is not clicked: what it submits cannot be read from the page
+        r2 = _run(sp, "click", str(_item(r, "Cross Frame Button")["i"]), look_url=r["page"]["url"])
+        assert r2["status"] == "refused" and "cross-origin frames" in r2["error"], r2
         r = _run(sp, "look")
-        assert r["page"]["title"] == "X Clicked", r                        # the iframe button really ran
+        assert r["page"]["title"] != "X Clicked", r
     finally:
         _finish(sp)
 
@@ -550,3 +569,33 @@ def test_round2_click_and_sso_guards(origins):
             assert r["sso_stage"] == "pre", r
         finally:
             _finish(sp)
+
+
+def test_round3_guards(origins):
+    sp = "tbsgen-test-r3"
+    try:
+        # a plain button of a form that posts off-site is never clicked
+        assert _run(sp, "open", origins[0] + "/offsite-form", handoff=False)["status"] == "ok"
+        r = _run(sp, "look", handoff=False)
+        r = _run(sp, "click", str(_item(r, "Download")["i"]), look_url=r["page"]["url"], handoff=False)
+        assert r["status"] == "refused" and "outside the allowed" in r["error"], r
+        # a login form in a shadow root: no screenshot
+        assert _run(sp, "open", origins[0] + "/shadow-login", handoff=False)["status"] == "ok"
+        r = _run(sp, "screenshot", handoff=False)
+        assert r["status"] == "refused" and "credential" in r["error"], r
+        # a late redirect off-site is reset before the next action reads anything
+        assert _run(sp, "open", origins[0] + "/late-redirect", handoff=False)["status"] == "ok"
+        time.sleep(3)
+        r = _run(sp, "look", handoff=False)
+        # (denied.example does not resolve: the browser shows its own error page, never content of that host)
+        assert not r["page"]["url"].startswith(("http://denied", "https://denied")), r
+    finally:
+        _finish(sp)
+    # a verification-code step after the password is handed to the user, not reported as logged in
+    sp = "tbsgen-test-r3-2fa"
+    try:
+        assert _run(sp, "open", origins[2] + "/sso-2fa")["status"] == "ok"
+        r = _run(sp, "sso_login", sso_login=True)
+        assert r["status"] == "handoff" and r.get("sso") == "handoff" and r["sso_submitted"] is True, r
+    finally:
+        _finish(sp)

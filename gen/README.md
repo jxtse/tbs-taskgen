@@ -190,7 +190,7 @@ hard 和 unstable 保留。reward=1 一律算通过，即使之后报了 API 错
 
 **已验证（实际跑过）**
 
-- 测试：gen 共 264 个（234 个离线单测，含 S3 全文通道与浏览器批次的 157 个；16 个在 Docker 里执行任务代码的集成测试；14 个用本机真实 ego-browser 打本地测试页的动作脚本 live 测试，CI 上无 ego-browser 时跳过），每次推送由 GitHub Actions CI 运行。
+- 测试：gen 共 269 个（238 个离线单测，含 S3 全文通道与浏览器批次的 161 个；16 个在 Docker 里执行任务代码的集成测试；15 个用本机真实 ego-browser 打本地测试页的动作脚本 live 测试，CI 上无 ego-browser 时跳过），每次推送由 GitHub Actions CI 运行。
 - 集成测试覆盖的情况：断点续跑（中途停止，换新进程继续，已完成阶段不重复调用模型）；预算上限触发暂停，`resume` 后继续；quota 错误触发熔断并暂停；参考解崩溃 → S8 修复 → 恢复；注入泄漏 → L2 阻塞 → 修复后通过；修不好 → 2 轮后丢弃；S6A 截断续写；mid 不可区分时 S6M 只重写 mid；真值隔离探针；筛选丢弃；取不到全文 → 暂存。
 - fake 模型端到端干跑：人造条目走完 S1→S9，再用模拟的校准结果走到 S10。
 - 打包出的 Harbor 任务：用本机 Docker 实际跑 Harbor，oracle reward=1，nop reward=0（`tbsgen harbor-local`，Dockerfile 换成本地基础镜像）。

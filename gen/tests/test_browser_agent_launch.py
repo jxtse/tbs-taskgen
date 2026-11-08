@@ -307,11 +307,11 @@ def test_finish_is_not_cancelled_by_the_stop_file(tmp_path):
 
 def test_redaction_masks_whole_auth_headers_and_quoted_values():
     txt = ("Authorization: Bearer abc.def-123 TOKENTAIL\npassword = \"two words\"\n"
-           "url=https://user:pw123@host/x api_key: k-1234567890 ok-text\n")
+           "url=https://user:pw123@host/x\napi_key: k-1234567890 rest-of-line\nok-text\n")
     r = browser_agent.redact(txt)
-    for secret in ("abc.def-123", "TOKENTAIL", "two words", "pw123", "k-1234567890"):
+    for secret in ("abc.def-123", "TOKENTAIL", "two words", "pw123", "k-1234567890", "rest-of-line"):
         assert secret not in r, (secret, r)
-    assert "ok-text" in r
+    assert "ok-text" in r                              # other lines are kept
 
 
 def test_allowed_commands_reach_the_wrapper_unchanged_through_a_real_shell(tmp_path):
@@ -423,3 +423,45 @@ def test_wrapper_never_enables_the_local_sso_test_mode(tmp_path, monkeypatch):
     _call(bd, "1", "sso_login").communicate(timeout=60)
     inp = json.loads((tmp_path / "inp.json").read_text())
     assert inp["sso"]["login"] is True and "local_test" not in inp["sso"]
+
+
+def test_long_stderr_line_never_leaks_its_tail():
+    import io
+    body = b"x" * (browser_agent._StderrTail.MAX_LINE + 100) + b"password=" + b"\n"
+    data = body[:-1] + b"LEAKEDSECRET\nnext line\n"
+    tail = browser_agent._StderrTail(io.BytesIO(data), keep=4096).text()
+    assert "LEAKEDSECRET" not in tail and "next line" in tail and "long line dropped" in tail
+
+
+def test_redaction_ignores_quote_tricks():
+    for txt in ('{"password":"prefix\\"SECRET"}', 'Cookie: a="x\\"y"; sid=SECRET', 'token = "a" SECRET'):
+        assert "SECRET" not in browser_agent.redact(txt), txt
+
+
+def test_navigations_of_one_publisher_never_overlap(tmp_path, monkeypatch):
+    bd, _ = _batch(tmp_path, monkeypatch, ["10.1080/a.1", "10.1080/b.2", "10.1080/c.3"], nav_gap_s=0.3,
+                   sso_login_enabled=False)
+    slow = tmp_path / "ego"
+    slow.write_text(f"#!{sys.executable}\nimport json, time\nt0 = time.time()\ntime.sleep(0.8)\n"
+                    f"open({str(tmp_path / 'spans.log')!r}, 'a').write(json.dumps([t0, time.time()]) + chr(10))\n"
+                    "print('TBSGEN_RESULT ' + json.dumps({'status': 'ok', 'files': []}))\n")
+    procs = [_call(bd, k, "open", f"https://pub.example/{k}") for k in ("1", "2", "3")]
+    for pr in procs:
+        pr.communicate(timeout=60)
+    spans = sorted(json.loads(x) for x in (tmp_path / "spans.log").read_text().splitlines())
+    assert len(spans) == 3
+    for (a0, a1), (b0, b1) in zip(spans, spans[1:]):
+        assert b0 >= a1 + 0.25, spans                  # one at a time, the gap counted from the end
+
+
+def test_poll_that_ends_after_the_deadline_is_not_a_clear(tmp_path, monkeypatch):
+    bd, led = _batch(tmp_path, monkeypatch, ["10.1080/a.1"], handoff_enabled=True, sso_login_enabled=False,
+                     handoff_wait_s=1.5)
+    _call(bd, "1", "open", "https://pub.example/a", env={"FAKE_EGO_MODE": "handoff"}).communicate(timeout=60)
+    late = tmp_path / "ego"
+    late.write_text(f"#!{sys.executable}\nimport json, time\ntime.sleep(2.5)\n"
+                    "print('TBSGEN_RESULT ' + json.dumps({'status': 'ok', 'handoff_check': 'cleared'}))\n")
+    out, _ = _call(bd, "1", "handoff_status").communicate(timeout=60)
+    assert "timed out" in out
+    assert json.loads((bd / "papers" / "1.json").read_text())["closed"].startswith("challenge")
+    assert led.cooling("chrome:10.1080")
