@@ -51,6 +51,12 @@ def item_id_for(c: dict) -> str:
 
 
 # ------------------------------------------------------------------------------------------- S1
+def _target_id(d: dict) -> str | None:
+    """`target` is the target id (str) in `tbsretr run` per-target files, a target dict in eval records."""
+    t = d.get("target")
+    return t.get("id") if isinstance(t, dict) else t
+
+
 def load_candidates(path: Path) -> list[dict]:
     txt = Path(path).read_text()
     if path.suffix == ".jsonl":
@@ -58,12 +64,12 @@ def load_candidates(path: Path) -> list[dict]:
     d = json.loads(txt)
     if isinstance(d, list):
         if d and "papers" in d[0]:          # tbsretr run output: list of per-target results
-            return [dict(p, _target=t.get("target", {}).get("id")) for t in d for p in t["papers"]]
+            return [dict(p, _target=_target_id(t)) for t in d for p in t["papers"]]
         return d
     if "papers" in d:
-        return [dict(p, _target=(d.get("target") or {}).get("id")) for p in d["papers"]]
+        return [dict(p, _target=_target_id(d)) for p in d["papers"]]
     if "selected" in d:                     # recorded retrieval eval output (retrieval/eval/raw/*.json)
-        return [dict(p, _target=(d.get("target") or {}).get("id")) for p in d["selected"]]
+        return [dict(p, _target=_target_id(d)) for p in d["selected"]]
     raise ValueError("unrecognised candidates file")
 
 
