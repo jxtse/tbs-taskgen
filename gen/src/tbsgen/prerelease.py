@@ -71,11 +71,14 @@ def _norm(name: str) -> str:
 
 def _tokens(name: str) -> set[str]:
     n = _norm(name)
-    out = {n, n.replace("-", ""), n.replace("-", "_")}
+    stems = {n}
     if n.startswith(("py", "python-")) and len(n) > 4:
-        out.add(n.removeprefix("python-").removeprefix("py"))
+        stems.add(n.removeprefix("python-").removeprefix("py").strip("-"))
     if n.endswith(("-py", "py")) and len(n) > 4:
-        out.add(n.removesuffix("-py").removesuffix("py"))
+        stems.add(n.removesuffix("-py").removesuffix("py").strip("-"))
+    out = set()
+    for s in stems:                       # every variant in every separator form: py_decay_fit -> decayfit
+        out |= {s, s.replace("-", ""), s.replace("-", "_")}
     return {t.strip("-_") for t in out if len(t.strip("-_")) >= 3 and t.strip("-_") not in GENERIC}
 
 
@@ -97,7 +100,7 @@ def repo_names(links: list[str]) -> list[dict]:
             continue
         if host.endswith("cran.r-project.org"):
             # /package=<name>, /web/packages/<name>/..., /src/contrib/<name>_<ver>.tar.gz
-            q = re.search(r"/package=([A-Za-z0-9.]+)", u)
+            q = re.search(r"[/?&]package=([A-Za-z0-9.]+)", u)
             name = q.group(1) if q else None
             if not name and len(parts) >= 3 and parts[:2] == ["web", "packages"]:
                 name = parts[2]
@@ -127,7 +130,7 @@ def _archive_dist(fname: str) -> str:
     """Distribution name of a source / wheel archive file name: `decay-fit-1.2.0.tar.gz` -> `decay-fit`,
     `decay_fit-1.2-py3-none-any.whl` -> `decay_fit`, `DecayFit-main.zip` -> `DecayFit`."""
     stem = _ARCHIVE.sub("", fname)
-    return re.split(r"-v?\d|-(?:main|master)$", stem, maxsplit=1)[0] or stem
+    return re.split(r"[-_]v?\d|-(?:main|master)$", stem, maxsplit=1)[0] or stem
 
 
 def signals(candidate: dict, spec: dict | None) -> dict:
@@ -170,7 +173,7 @@ def _spec_name(tok: str) -> list[str]:
             path = re.split(r"[#?]", url, maxsplit=1)[0].rstrip("/")
             out.append(_archive_dist(path.rsplit("/", 1)[-1]))
         return out
-    if tok.startswith((".", "/", "~")):
+    if tok.startswith((".", "/", "~")) or "/" in tok:      # a local path (a distribution name has no "/")
         return [_archive_dist(Path(re.split(r"[#?]", tok)[0].rstrip("/")).name)]
     if _ARCHIVE.search(re.split(r"[#?]", tok)[0]):
         return [_archive_dist(re.split(r"[#?]", tok)[0])]

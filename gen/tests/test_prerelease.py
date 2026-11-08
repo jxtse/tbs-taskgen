@@ -98,6 +98,10 @@ def test_shipped_compiled_modules_are_blocking(tmp_path, name):
     "https://files.example.org/w/decayfit-1.2-py3-none-any.whl#sha256=" + "a" * 64 + "\n",
     "decayfit @ https://files.example.org/w/decayfit-1.2-py3-none-any.whl#sha256=" + "b" * 64 + "\n",
     "./wheels/decayfit-1.2-py3-none-any.whl\n",
+    "wheels/decayfit-1.2-py3-none-any.whl\n",
+    "-e vendor/DecayFit\n",
+    "https://files.example.org/dist/DecayFit_1.2.tar.gz\n",
+    "py_decay_fit==1.2\n",
 ])
 def test_direct_archive_urls_resolve_to_the_distribution_name(tmp_path, req):
     r = prerelease.readymade_check(mk_task(tmp_path, req=req), CAND, SPEC)
@@ -108,6 +112,7 @@ def test_direct_archive_urls_resolve_to_the_distribution_name(tmp_path, req):
                                   "https://gitlab.com/group/sub/DecayFit/-/tree/main",
                                   "https://cran.r-project.org/web/packages/DecayFit/index.html",
                                   "https://cran.r-project.org/package=DecayFit",
+                                  "https://cran.r-project.org/?package=DecayFit",
                                   "https://CRAN.R-project.org/package=DecayFit"])
 def test_gitlab_subgroups_and_cran_links_give_the_package_name(tmp_path, link):
     cand = dict(CAND, code_links=[link])
