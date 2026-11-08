@@ -14,11 +14,11 @@ import time
 import traceback
 from pathlib import Path
 
-from . import intake, screen_jev, stages_a as A, stages_b as B
+from . import blocklist, intake, screen_jev, stages_a as A, stages_b as B
 from .budget import BudgetStop, Ledger, today
 from .config import resolve_role
 from .models import ModelError, get_client
-from .state import Store, write_json
+from .state import Store, read_json, write_json
 
 HANDLERS = {"S1": A.s1, "S2": A.s2, "S3": A.s3, "S4": A.s4, "S5": A.s5, "S6A": A.s6a, "S6A_run": A.s6a_run, "S6M": A.s6m,
             "S6B": A.s6b, "S6C": B.s6c, "S7": B.s7, "S8": B.s8, "PKG": B.pkg, "S9": B.s9, "S10": B.s10}
@@ -76,6 +76,9 @@ class Pipeline:
             return 0
         its = [i for i in self.store.items() if i.state["status"] == "active" and i.state["stage"] == "S2"
                and (not only or i.item_id in only)]
+        rules = self.cfg["screen"].get("blocklist")
+        if rules:                           # blocked papers are dropped by S2 without a screen call
+            its = [i for i in its if blocklist.match(read_json(i.p("S1_candidate.json")) or {}, rules) is None]
         if not its:
             return 0
         try:

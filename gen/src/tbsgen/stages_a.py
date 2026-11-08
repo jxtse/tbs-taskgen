@@ -9,7 +9,7 @@ import shutil
 import re
 from pathlib import Path
 
-from . import intake, runner, screen_jev
+from . import blocklist, intake, runner, screen_jev
 from .budget import BudgetStop
 from .config import resolve_role
 from .models import ModelError, extract_json, parse_files  # noqa: F401
@@ -47,6 +47,11 @@ def screen_paper(P, it, c: dict, stage: str, fulltext_head: str | None = None) -
 
 def s2(P, it):
     c = read_json(it.p("S1_candidate.json"))
+    rule = blocklist.match(c, P.cfg["screen"].get("blocklist"))
+    if rule is not None:                    # full text unobtainable: drop before spending a screen call
+        rec = blocklist.screen_record(c, rule)
+        write_json(it.p("S2_screen.json"), rec)
+        return it.finish("dropped", rec["reason"])
     rec = screen_paper(P, it, c, "S2")
     if rec is None:
         return

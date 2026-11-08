@@ -12,6 +12,7 @@ src/tbsgen/
   state.py         每条目一个状态目录 + state.json 状态机；events.jsonl
   pipeline.py      编排：逐条推进、断点续跑、预算/熔断暂停、resume
   intake.py        S1 读检索层输出；S2 规则筛选（rules-v1/v2）；S3 全文（调 fulltext.py）；S4 可行性（规则部分 + 官方题去重）
+  blocklist.py     S2 前置黑名单：按 DOI 前缀（可加发表年份）直接丢弃拿不到全文的论文，配置 screen.blocklist
   fulltext.py      S3 下载级联（cache/oa/elsevier/wiley/inst/browser）、校验、写入缓存、全文队列
   dlledger.py      S3 下载账本：每日/每小时上限、同站点间隔、冷却、熔断
   browser_ego.py   ego-browser 通道（运行 browser_fetch.mjs 脚本模板）
