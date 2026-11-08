@@ -770,3 +770,12 @@ def test_resource_metric_threshold_tolerates_timing_noise():
     m2 = {w: {"0": {"hidden_mae": v["0"]["hidden_mae"], "hidden_err2": 0.58 if w == "ref" else 0.6 if w == "mid" else 0.4}}
           for w, v in meas.items()}
     assert set_thresholds(spec2, m2, cfg)["thresholds"]["hidden_err2"]["threshold"] == pytest.approx(0.87)
+
+
+def test_resource_loose_margin_is_configurable():
+    cfg = load_config(None, {"thresholds": {"resource_loose_margin": 0.8}})
+    spec = {"metrics": [{"name": "hidden_mae", "direction": "<="}, {"name": "hidden_runtime_sec", "direction": "<="}]}
+    meas = {"ref": {"0": {"hidden_mae": 0.2, "hidden_runtime_sec": 0.58}},
+            "mid": {"0": {"hidden_mae": 1.3, "hidden_runtime_sec": 0.60}},
+            "naive": {"0": {"hidden_mae": 1.9, "hidden_runtime_sec": 2.0}}}
+    assert set_thresholds(spec, meas, cfg)["thresholds"]["hidden_runtime_sec"]["threshold"] == pytest.approx(1.1)
