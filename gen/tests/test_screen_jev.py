@@ -220,7 +220,10 @@ def test_pipeline_blocklisted_paper_gets_no_jev_call(tmp_path, key):
     blocked = dict(FAY, doi="10.1177/14759217251415195")
     P = mkp(tmp_path, [(200, {}, resp(answers()))], concurrency=1)
     a, b = P.ingest([FAY, blocked])
-    P.run(only=[a, b], max_steps=4)
+    P.run(only=[a, b], max_steps=2)                 # S1 only: both items now wait at S2
+    assert [P.store.item(i).state["stage"] for i in (a, b)] == ["S2", "S2"]
+    assert P.jev_transport.calls == []
+    P.run(only=[a, b], max_steps=2)                 # run start prefetches S2 items: must skip the blocked one
     assert len(P.jev_transport.calls) == 1             # only FAY; the SAGE paper never reaches Jev
     rb = read_json(P.store.item(b).p("S2_screen.json"))
     assert rb["method"] == "blocklist" and P.store.item(b).state["status"] == "dropped"

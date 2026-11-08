@@ -11,7 +11,7 @@ import re
 import urllib.parse
 
 _PII_YEAR = re.compile(r"\((\d{2})\)")
-_YEAR = re.compile(r"^\s*(\d{4})\b")
+_YEAR = re.compile(r"^\s*(\d{4})(?:[-/]\d{1,2}(?:[-/]\d{1,2})?)?\s*$")   # 1997, 1997-03, 1997-03-01
 
 
 def _norm_doi(doi: str | None) -> str:

@@ -35,6 +35,10 @@ def test_invalid_year_falls_back_and_doi_variants_normalise():
     assert blocklist.match({"doi": "10.1016/s0022-5096(97)00086-0", "year": "n.d."}, RULES)["name"] == \
         "elsevier-pre2000"
     assert blocklist.paper_year({"year": "1997-03-01"}) == 1997
+    assert blocklist.paper_year({"year": 1997}) == 1997
+    # a malformed year falls back to the PII year (here 2002 -> not blocked)
+    assert blocklist.paper_year({"year": "1997.5", "doi": "10.1016/s0022-5096(02)00086-0"}) == 2002
+    assert blocklist.match({"doi": "10.1016/s0022-5096(02)00086-0", "year": "1997.5"}, RULES) is None
     # "doi: " with a space, URL forms and percent-encoding
     assert blocklist.match({"doi": "doi: 10.1177/x"}, RULES)["name"] == "sage"
     assert blocklist.match({"doi": "https://doi.org/10.1016/S0022-5096%2897%2900086-0"}, RULES)["name"] == \
