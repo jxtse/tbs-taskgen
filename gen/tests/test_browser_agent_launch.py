@@ -325,7 +325,7 @@ def test_allowed_commands_reach_the_wrapper_unchanged_through_a_real_shell(tmp_p
     (tmp_path / "pdf").mkdir()                          # a glob would expand to this
     cmds = ["tbsgen-browser 1 wait_for sel div#pdf 20", "tbsgen-browser 1 wait_for url /pdf",
             "tbsgen-browser 1 select 2 Nanjing University", "tbsgen-browser 1 type 4 南京大学",
-            "tbsgen-browser 1 open https://doi.org/10.1080/x?a=1", "tbsgen-browser 1 look @12 40"]
+            "tbsgen-browser 1 open https://doi.org/10.1080/x?a=1", "tbsgen-browser 1 look 40"]
     for c in cmds:
         assert browser_agent.shell_allowed(c) is None, c
         r = subprocess.run(c, shell=True, capture_output=True, text=True, cwd=tmp_path,
@@ -464,4 +464,54 @@ def test_poll_that_ends_after_the_deadline_is_not_a_clear(tmp_path, monkeypatch)
     out, _ = _call(bd, "1", "handoff_status").communicate(timeout=60)
     assert "timed out" in out
     assert json.loads((bd / "papers" / "1.json").read_text())["closed"].startswith("challenge")
+    assert led.cooling("chrome:10.1080")
+
+
+def test_redaction_of_nested_and_encoded_json_keys():
+    for txt in ('{"body":"{\\"password\\":\\"SECRET\\"}"}', '{"a":"{\\\\\\"token\\\\\\":\\\\\\"SECRET\\\\\\"}"}',
+                'q=password%22%3A%22SECRET', 'password%3DSECRET', "{'access_token': 'SECRET'}"):
+        assert "SECRET" not in browser_agent.redact(txt), txt
+    import io
+    line = ('{"body":"{\\"password\\":\\"SECRET\\"}"}\nnext\n').encode()
+    assert "SECRET" not in browser_agent._StderrTail(io.BytesIO(line), keep=4096).text()
+
+
+def _pub(doi):
+    from tbsgen.fulltext import publisher_of
+    return publisher_of(doi)[0]
+
+
+HANG_AFTER_HANDOFF_EGO = r"""#!{py}
+import json, sys, time
+print("TBSGEN_RESULT " + json.dumps({"status": "handoff", "handoff": {"reason": "challenge: x", "host": "pub.example",
+                                     "kind": "challenge"}}), flush=True)
+time.sleep(60)                                     # task.handOff() hangs: the call times out
+"""
+
+SILENT_HANG_EGO = r"""#!{py}
+import time
+time.sleep(60)
+"""
+
+
+def test_handoff_result_printed_before_a_timeout_is_still_booked(tmp_path, monkeypatch):
+    bd, led = _batch(tmp_path, monkeypatch, ["10.1080/a.1", "10.1080/b.2"], handoff_enabled=True,
+                     sso_login_enabled=False, call_timeout_s=3)
+    (tmp_path / "ego").write_text(HANG_AFTER_HANDOFF_EGO.replace("{py}", sys.executable))
+    out, _ = _call(bd, "1", "open", "https://pub.example/a").communicate(timeout=60)
+    assert "handed the page to the user" in out, out
+    ps = json.loads((bd / "papers" / "1.json").read_text())
+    assert ps.get("handoff") and ps.get("handoff_kind") == "challenge"
+    assert json.loads((bd / "state.json").read_text())["handoff"]["pub:" + _pub("10.1080/a.1")]
+
+
+def test_silent_timeout_with_a_handoff_budget_closes_the_paper_and_cools(tmp_path, monkeypatch):
+    bd, led = _batch(tmp_path, monkeypatch, ["10.1080/a.1", "10.1080/b.2"], handoff_enabled=True,
+                     sso_login_enabled=False, call_timeout_s=3)
+    (tmp_path / "ego").write_text(SILENT_HANG_EGO.replace("{py}", sys.executable))
+    out, _ = _call(bd, "1", "open", "https://pub.example/a").communicate(timeout=60)
+    assert "timed out" in out, out
+    ps = json.loads((bd / "papers" / "1.json").read_text())
+    assert ps.get("closed") and not ps.get("handoff")
+    assert json.loads((bd / "state.json").read_text())["handoff"]["pub:" + _pub("10.1080/a.1")]   # not re-opened
     assert led.cooling("chrome:10.1080")

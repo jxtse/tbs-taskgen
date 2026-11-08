@@ -225,8 +225,8 @@ def allowed_domains(doi: str, landing: str | None, extra: list[str]) -> list[str
 # executable first on PATH): `tbsgen-browser N <action> [arg]` and `tbsgen-browser finish`.  Each call runs
 # the reviewed action script browser_agent_action.mjs with one injected INPUT line.  The Hermes run itself
 # uses an isolated Hermes home whose pre_tool_call hook (hook_main) allows only `tbsgen-browser ...` and
-# `sleep N` terminal commands (and vision_analyze for screenshots inside the batch's files dir) *before*
-# they run; anything else is blocked (and the stream watcher kills the run).
+# `sleep N` terminal commands *before* they run; anything else (every other tool too) is blocked (and the
+# stream watcher kills the run).
 ACTION = Path(__file__).with_name("browser_agent_action.mjs")
 TOOL = r"""#!{python}
 # tbsgen browser batch tool (generated; removed with the batch directory)
@@ -241,15 +241,14 @@ sys.exit({fn}({batch_dir!r}, sys.argv[1:]))
 _SAFE_TOK = r"[^\s'\"`$;&|<>\\*\[\]{}!()]{1,200}"
 _SAFE_TXT = r"[A-Za-z0-9 ,.\-_\u4e00-\u9fff]{1,60}"     # no quotes / parentheses: the shell must pass it as is
 _PAPER_ACTIONS = "|".join((
-    r"look( full)?( @\d{1,5})?( \d{1,4})?",
+    r"look( \d{1,4})?",
     r"open https?://" + _SAFE_TOK,
     r"click \d{1,3}",
-    r"click_xy \d{1,4} \d{1,4}",
     r"hover \d{1,3}",
     r"scroll (up|down)( \d{1,4})?",
     r"select \d{1,3} " + _SAFE_TXT,
     r"type \d{1,3} " + _SAFE_TXT,
-    "screenshot", "tabs",
+    "tabs",
     r"switch [A-Za-z0-9_.-]{1,24}",
     "back",
     # the pattern never starts with '#' (a shell comment) and has no glob / quote characters
@@ -262,8 +261,7 @@ _SLEEP_CMD = re.compile(r"^sleep ([1-9]\d?|[12]\d\d|300)$")
 DENY_TEXT = re.compile(r"sci-?hub|libgen|z-lib|annas-archive", re.I)
 # actions that can load a page of the publisher (paced per publisher and capped per paper)
 # (select / type / hover / scroll can trigger a navigation from the page's handlers: reserved and paced like one)
-NAV_ACTIONS = frozenset({"open", "click", "click_xy", "back", "sso_login", "select", "type", "hover", "scroll"})
-VISION_TOOL = "vision_analyze"
+NAV_ACTIONS = frozenset({"open", "click", "back", "sso_login", "select", "type", "hover", "scroll"})
 
 
 def shell_allowed(cmd) -> str | None:
@@ -279,20 +277,6 @@ def shell_allowed(cmd) -> str | None:
     return None
 
 
-def _vision_allowed(batch_dir: str, inp: dict) -> str | None:
-    """None if a vision_analyze call may run: only images the batch itself saved (screenshots)."""
-    url = inp.get("image_url")
-    if not isinstance(url, str) or not url:
-        return "vision: image_url is required"
-    try:
-        root = (Path(batch_dir) / "files").resolve()
-        p = Path(url).resolve()
-        p.relative_to(root)
-    except (OSError, ValueError):
-        return "vision: only screenshots inside this batch's files directory may be viewed"
-    return None
-
-
 def hook_main(batch_dir: str, argv: list[str]) -> int:
     """Hermes pre_tool_call hook: stdin {tool_name, tool_input}; prints a block decision unless allowed."""
     try:
@@ -300,9 +284,7 @@ def hook_main(batch_dir: str, argv: list[str]) -> int:
     except ValueError:
         d = {}
     name, inp = d.get("tool_name"), d.get("tool_input") or {}
-    if name == VISION_TOOL:
-        why = _vision_allowed(batch_dir, inp)
-    elif name != "terminal":
+    if name != "terminal":
         why = f"tool {name} is not available in this batch"
     elif inp.get("background") or inp.get("pty"):
         why = "background / pty terminals are not available"
@@ -364,21 +346,27 @@ def _run_script(st: dict, inp: dict, timeout: float, bd: Path, honor_stop: bool 
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=browser_ego.child_env())
     t_end = time.time() + max(5.0, timeout)
     so = se = ""
+    why = ""
     while True:
         try:
             so, se = proc.communicate(timeout=0.5)
             break
         except subprocess.TimeoutExpired:
             if (honor_stop and (bd / "STOP").exists()) or time.time() > t_end:
+                why = "timeout" if time.time() > t_end else "stopped"
                 proc.kill()
-                proc.communicate()
-                return {}, "stopped"
+                # what the script printed before it was killed still counts: a hand-off result is printed
+                # BEFORE the space is handed to the user, and must be booked even if the call then times out
+                so, se = proc.communicate()
+                break
     res: dict = {}
     for line in reversed((so + "\n" + se).splitlines()):
         if line.startswith("TBSGEN_RESULT "):
             with contextlib.suppress(ValueError):
                 res = json.loads(line[len("TBSGEN_RESULT "):])
             break
+    if why:
+        return res, why
     return res, (se or so)[-200:]
 
 
@@ -468,8 +456,8 @@ def wrapper_main(batch_dir: str, argv: list[str]) -> int:
         spaces = sorted(set(state.get("spaces") or []) | {st["space"]})
         done = _finish_spaces(bd, st, spaces)
         return say(f"tbsgen: TaskSpaces closed ({', '.join(done)})", 0)
-    usage = ("usage: tbsgen-browser N look [full] [@REF] [OFFSET]|open URL|click I|click_xy X Y|hover I|"
-             "scroll up|down [PX]|select I VALUE|type I TEXT|screenshot|tabs|switch LABEL|back|"
+    usage = ("usage: tbsgen-browser N look [OFFSET]|open URL|click I|hover I|"
+             "scroll up|down [PX]|select I VALUE|type I TEXT|tabs|switch LABEL|back|"
              "wait_for url SUB|sel CSS [S]|save_pdf|sso_login|handoff_status  |  tbsgen-browser finish")
     if len(argv) < 2 or argv[0] not in st["papers"] or not _TOOL_CMD.match("tbsgen-browser " + " ".join(argv)):
         return say(usage, 2)
@@ -648,8 +636,8 @@ def _paper_run(bd, st, n, p, ps, action, arg, say, led, pkey, space, handoff_fre
     files = (bd / "files" / n).resolve()
     files.mkdir(parents=True, exist_ok=True)
     inp = dict(space=space, action=action, arg=arg, allow=p["allow"], files_dir=str(files),
-               look_url=ps.get("look_url") if action in ("click", "hover", "select", "type") else None,
-               look_scope=ps.get("look_scope") or "", page_label=ps.get("page_label") or "",
+               look_key=ps.get("look_key") if action in ("click", "hover", "select", "type") else None,
+               page_label=ps.get("page_label") or "",
                nav_timeout_ms=45000, download_timeout_ms=120000, download_wait_ms=6000,
                challenge_wait_ms=int(st.get("challenge_wait_ms", 40000)),
                handoff={"enabled": handoff_free}, sso={"login": sso_ok, "domains": st.get("sso_domains") or []},
@@ -658,8 +646,22 @@ def _paper_run(bd, st, n, p, ps, action, arg, say, led, pkey, space, handoff_fre
                               "deadline_ms": int(float(ps.get("handoff_deadline") or 0) * 1000),
                               "title": ps.get("handoff_title") or "", "page_label": ps.get("handoff_page") or ""})
     timeout = max(5.0, min(float(st["call_timeout_s"]), float(st["deadline"]) - time.time()))
-    res, _err = _run_script(st, inp, timeout, bd)
+    res, err = _run_script(st, inp, timeout, bd)
     sso_result = _sso_finalize(bd, slock, n, res) if sso_ok else None
+    if not res and err == "timeout" and handoff_free:
+        # the call may have handed the space to the user and then hung (its result line lost): the hand-off
+        # state is unknown.  Never re-open the publisher's hand-off and never act on the paper again: book it
+        # as a hand-off that was not cleared (paper closed, publisher cooled)
+        with _locked(slock):
+            state = _read_state(bd)
+            state.setdefault("handoff", {})[pkey] = True
+            _write_state(bd, state)
+        cur = json.loads(sp.read_text())
+        cur.update(handoff=True, handoff_used=True, handoff_kind="challenge", handoff_deadline=0,
+                   handoff_note=f"call timed out at={time.strftime('%H:%M:%S')} (hand-off state unknown)")
+        why = _expire_handoff(st, led, n, cur, force=True)
+        _atomic(sp, json.dumps(cur))
+        return say(f"tbsgen: paper {n}: the browser call timed out - paper closed ({why}); move on.", 2)
 
     def save_ps(**kw):
         cur = json.loads(sp.read_text())
@@ -735,26 +737,18 @@ def _paper_run(bd, st, n, p, ps, action, arg, say, led, pkey, space, handoff_fre
             _atomic(sp, json.dumps(ps))
             return say(f"tbsgen: paper {n}: hand-off timed out - paper closed ({why}).", 2)
         return say("tbsgen: no hand-off in progress for this paper.", 0)
-    if res.get("shot"):
-        ps = save_ps()
-        ps["shots"] = sorted(set(ps.get("shots") or []) | {res["shot"]})   # viewable, never the paper's text
-        _atomic(sp, json.dumps(ps))
     if res.get("page_label"):
         ps = save_ps()
         ps["page_label"] = res["page_label"]
         _atomic(sp, json.dumps(ps))
-    if res.get("look_scope") is not None:
+    if action == "look" and res.get("look_key"):
         ps = save_ps()
-        ps["look_scope"] = res["look_scope"]
-        _atomic(sp, json.dumps(ps))
-    if action == "look" and res.get("look_url"):
-        ps = save_ps()
-        ps["look_url"] = res["look_url"]
+        ps["look_key"] = res["look_key"]
         _atomic(sp, json.dumps(ps))
     show = dict(status=res.get("status"), error=res.get("error"), files_saved=len(res.get("files") or []),
                 page=res.get("page"), note=res.get("note"), left_allowed=res.get("left_allowed") or res.get("reset_foreign"),
                 login_required=res.get("login_required"),
-                shot=res.get("shot"), tabs=res.get("tabs"), acted=res.get("acted"), sso=res.get("sso"),
+                tabs=res.get("tabs"), acted=res.get("acted"), sso=res.get("sso"),
                 waited=res.get("waited"), scroll=res.get("scroll"), page_label=res.get("page_label"),
                 handoff_check=res.get("handoff_check"), handoff_left_s=res.get("handoff_left_s"))
     return say(json.dumps({k: v for k, v in show.items() if v is not None}, ensure_ascii=False)[:9000],
@@ -784,9 +778,10 @@ STDERR_LOG_TAIL = 1500            # characters of it repeated in the agent_end l
 _SECRET_PATTERNS = (
     # a sensitive key (also as a JSON key) and EVERYTHING after it on the line: no quote / escape parsing
     # that a crafted value could get around
-    re.compile(r"(?im)([\"']?(?:proxy-)?(?:authorization|cookie|set-cookie|x-api-key|api-key|api[_-]?key|"
-               r"access[_-]?token|refresh[_-]?token|id[_-]?token|token|secret|client[_-]?secret|password|passwd|"
-               r"pwd|session(?:id)?|sid|credentials?)[\"']?\s*[:=]\s*).*$"),
+    # (the key may be quoted and escaped any number of times - JSON inside JSON - or URL-encoded)
+    re.compile(r"(?im)((?:[\\\"']|%2[27]|%5c)*(?:proxy-)?(?:authorization|cookie|set-cookie|x-api-key|api-key|"
+               r"api[_-]?key|access[_-]?token|refresh[_-]?token|id[_-]?token|token|secret|client[_-]?secret|"
+               r"password|passwd|pwd|session(?:id)?|sid|credentials?)(?:[\\\"'\s]|%2[27]|%5c|%20)*(?:[:=]|%3a|%3d)).*$"),
     re.compile(r"(?i)\b((?:bearer|basic)\s+).*$", re.M),
     re.compile(r"(?i)(\w+://)[^/\s:@]+:[^/\s@]+@"),
     re.compile(r"()\b(?:sk|pk|rk|ghp|gho|ghu|ghs|github_pat|xox[abprs]|glpat|hf)[-_][A-Za-z0-9_\-]{8,}"),
@@ -1436,7 +1431,7 @@ def _agent_phase(fetcher, todo: list[dict], deadline: float, bd: Path, wd: Watch
                            type_names=" / ".join(f"'{x}'" for x in st["type_allow"]) or "(none: typing is off)")
     (bd / "prompt.md").write_text(prompt)
     hermes = ag.get("hermes_bin") or "hermes"
-    toolsets = "terminal,vision" if ag.get("vision", True) else "terminal"
+    toolsets = "terminal"                         # the wrapper is the only tool (no screenshots / vision)
     argv = [hermes, "chat", "--query-file", str(bd / "prompt.md"), "--oneshot", "--format", "stream-json",
             "--source", "tool", "--accept-hooks", "--ignore-rules", "--max-turns", str(int(ag.get("max_turns", 80))),
             "--run-budget", str(int(budget)), "-t", toolsets]
@@ -1453,9 +1448,7 @@ def _agent_phase(fetcher, todo: list[dict], deadline: float, bd: Path, wd: Watch
         if ev.get("type") == "tool_use":          # second line of defence (the hook already blocked it)
             events["tool_calls"] += 1
             inp = ev.get("input") or {}
-            if ev.get("name") == VISION_TOOL:
-                why = _vision_allowed(str(bd), inp)
-            elif ev.get("name") != "terminal":
+            if ev.get("name") != "terminal":
                 why = f"tool not allowed: {ev.get('name')}"
             elif inp.get("background") or inp.get("pty"):
                 why = "background / pty terminal not allowed"

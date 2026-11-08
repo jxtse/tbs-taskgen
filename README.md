@@ -310,10 +310,12 @@ uv run tbsgen fetch --run runs/R --config config.toml --browser --wait-for-egres
   `run_budget_s`) with a prompt generated from [`browser_agent_prompt.md`](gen/src/tbsgen/browser_agent_prompt.md).
   The agent writes no browser code. Its only tool is `tbsgen-browser N <action>`, each call running the reviewed
   action script [`browser_agent_action.mjs`](gen/src/tbsgen/browser_agent_action.mjs) in a TaskSpace of its own
-  per paper. Actions: `look` (page summary with a numbered list of links, buttons and fields, including hidden
-  dropdown items and iframes; `full`, `@REF` and an offset for long pages), `open URL`, `click I`, `click_xy X Y`,
-  `hover I`, `scroll`, `select I VALUE`, `type I TEXT`, `screenshot`, `tabs` / `switch`, `back`, `wait_for`,
-  `save_pdf`, `sso_login`, `handoff_status` and `finish`. Code enforces the limits, not the prompt:
+  per paper. Actions: `look` (page summary with a numbered list of links, buttons and fields of the page's own
+  DOM, including hidden dropdown items and same-origin iframes; a cross-origin iframe is one item whose `click`
+  opens its checked URL; an offset for long pages), `open URL`, `click I`, `hover I`, `scroll`,
+  `select I VALUE`, `type I TEXT`, `tabs` / `switch`, `back`, `wait_for`, `save_pdf`, `sso_login`,
+  `handoff_status` and `finish`. There are deliberately no coordinate clicks, no screenshots and no actions
+  inside cross-origin iframes (each was a recurring source of credential / domain-check gaps in review). Code enforces the limits, not the prompt:
   - the paper is booked in the ledger before its first call; at most `agent.max_calls_per_paper` calls (25) and
     `agent.max_navigations_per_paper` page loads (12) per paper, page loads of one publisher at least
     `agent.nav_gap_s` (2.5 s) apart;
@@ -322,11 +324,11 @@ uv run tbsgen fetch --run runs/R --config config.toml --browser --wait-for-egres
     before the click; inside cross-origin frames only links are clicked; a page found outside the domains is
     reset before the next action); `type` only types the strings in
     `agent.institution_names`, never into a field that can hold credentials;
-  - field values are never read: `look` lists field types and labels only, and `screenshot` is refused on pages
-    with credential fields (also in frames and open shadow roots, or when fields exist that the page cannot
-    inspect); field contents are masked in screenshots; field texts are removed from page snapshots, and URLs
-    of SSO hosts or with token-like parameters are reported without query and fragment. The agent may view its own screenshots
-    (`vision_analyze`, batch directory only);
+  - field values are never read: `look` lists field types and labels only, the browser's page snapshot (which
+    carries field values) is never taken, and on a page with credential or verification-code fields
+    (top document, same-origin frames, open shadow roots, or a rendered identity-provider frame) `click`,
+    `hover`, `select` and `type` are refused - only `sso_login` acts there. Every URL in the tool's output
+    loses its query and fragment;
   - verification pages (Cloudflare / Turnstile, captchas, sliders) are never solved. With `browser.handoff.enabled`
     the page is handed to you instead (macOS notification, optional local `handoff.bark_cmd`); the agent works on
     other papers and polls `handoff_status` for up to `handoff.wait_s` (120 s). One hand-off per paper and per

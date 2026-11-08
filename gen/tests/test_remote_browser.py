@@ -765,7 +765,7 @@ def test_agent_fallback_saves_validated_files(tmp_path, monkeypatch):
     args = got["argv"]
     assert args[:2] == ["chat", "--query-file"] and "--oneshot" in args and "--accept-hooks" in args
     assert args[args.index("--provider") + 1] == "prov-x" and args[args.index("-m") + 1] == "model-y"
-    assert args[args.index("--max-turns") + 1] == "7" and args[args.index("-t") + 1] == "terminal,vision"
+    assert args[args.index("--max-turns") + 1] == "7" and args[args.index("-t") + 1] == "terminal"
     assert int(args[args.index("--run-budget") + 1]) <= 30
     assert "ELSEVIER_API_KEY" not in got["env"]                # the agent's process gets no credentials
     assert got["home"] and "hermes-home" in got["home"]       # isolated Hermes home with the hook

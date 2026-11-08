@@ -200,7 +200,6 @@ DEFAULTS: dict[str, Any] = {
                 "max_calls_per_paper": 25,  # ego-browser calls the agent may make per paper
                 "max_navigations_per_paper": 12,   # page loads per paper (open / click / back / sso_login)
                 "nav_gap_s": 2.5,           # min seconds between two page loads of the same publisher
-                "vision": True,             # the agent may view the screenshots it saved (batch dir only)
                 "institution_names": [],    # the ONLY strings `type` may type, e.g. ["Nanjing University", "南京大学"]
                 "call_timeout_s": 150,      # one ego-browser call of the agent
                 "keep_batch_dir": False,    # keep prompt / wrapper state after the batch (debugging)

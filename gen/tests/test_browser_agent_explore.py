@@ -65,15 +65,14 @@ def _bd(f):
 
 def test_shell_allowed_new_actions():
     ok = [
-        "tbsgen-browser 1 look", "tbsgen-browser 2 look full", "tbsgen-browser 1 look @12",
-        "tbsgen-browser 1 look full 40", "tbsgen-browser 3 look @4 8",
+        "tbsgen-browser 1 look", "tbsgen-browser 1 look 40",
         "tbsgen-browser 1 open https://doi.org/10.1080/x",
-        "tbsgen-browser 1 click 12", "tbsgen-browser 1 click_xy 320 240", "tbsgen-browser 1 hover 3",
+        "tbsgen-browser 1 click 12", "tbsgen-browser 1 hover 3",
         "tbsgen-browser 1 scroll down", "tbsgen-browser 1 scroll up 800",
         "tbsgen-browser 1 select 2 Nanjing University", "tbsgen-browser 1 type 4 Nanjing University",
         "tbsgen-browser 1 type 4 南京大学", "tbsgen-browser 1 type 4 hunter2",   # shape ok; the wrapper's
         # whitelist (institution names only) refuses it before the action script runs
-        "tbsgen-browser 1 screenshot", "tbsgen-browser 1 tabs", "tbsgen-browser 1 switch p2",
+        "tbsgen-browser 1 tabs", "tbsgen-browser 1 switch p2",
         "tbsgen-browser 1 back", "tbsgen-browser 1 wait_for url /pdf 20",
         "tbsgen-browser 1 wait_for sel a.pdf-link", "tbsgen-browser 1 wait_for sel div#pdf", "tbsgen-browser 1 save_pdf",
         "tbsgen-browser 1 sso_login", "tbsgen-browser 1 handoff_status", "tbsgen-browser finish",
@@ -88,7 +87,8 @@ def test_shell_allowed_new_actions():
         "tbsgen-browser 1 type 4 'x';env",
         "tbsgen-browser 1 select 1 a|b",
         "tbsgen-browser 1 click 1234",                              # 4-digit item index: out of range
-        "tbsgen-browser 1 look full full",
+        "tbsgen-browser 1 look full", "tbsgen-browser 1 look @12",          # removed: snapshot scopes
+        "tbsgen-browser 1 click_xy 320 240", "tbsgen-browser 1 screenshot",  # removed: coordinate clicks / shots
         "tbsgen-browser 1 wait_for url $(cat /etc/passwd)",
         "tbsgen-browser 1 wait_for exec x",
         "tbsgen-browser 1 look\n touch x",
@@ -113,15 +113,13 @@ def _hook(batch_dir, tool, inp):
     return r.stdout.strip()
 
 
-def test_hook_allows_vision_only_for_batch_screenshots(tmp_path):
+def test_hook_blocks_every_tool_but_the_wrapper(tmp_path):
     (tmp_path / "files" / "1").mkdir(parents=True)
     shot = str(tmp_path / "files" / "1" / "shot-1.png")
     Path(shot).write_bytes(b"png")
-    assert _hook(tmp_path, "vision_analyze", {"image_url": shot, "question": "?"}) == ""
-    assert "block" in _hook(tmp_path, "vision_analyze", {"image_url": "/etc/passwd", "question": "?"})
-    assert "block" in _hook(tmp_path, "vision_analyze", {"image_url": "shot-1.png", "question": "?"})
-    assert "block" in _hook(tmp_path, "vision_analyze", {"image_url": None, "question": "?"})
+    assert "block" in _hook(tmp_path, "vision_analyze", {"image_url": shot, "question": "?"})   # no vision tool
     assert "block" in _hook(tmp_path, "web_search", {"query": "x"})
+    assert _hook(tmp_path, "terminal", {"command": "tbsgen-browser 1 look"}) == ""
     assert "block" in _hook(tmp_path, "terminal", {"command": "env"})
 
 
@@ -240,14 +238,13 @@ def test_sso_login_success_marks_batch_logged_in(tmp_path, monkeypatch):
 
 # --------------------------------------------------------------------------- screenshots / domains
 
-def test_screenshot_is_viewable_but_never_a_deliverable(tmp_path, monkeypatch):
+def test_screenshot_is_not_an_action_any_more(tmp_path, monkeypatch):
     f, led, pr, _ = mk_agent(tmp_path, monkeypatch, hermes_mode="shot", ego_mode="shot",
                              queue={"10.1080": 1}, agent={"keep_batch_dir": True})
     st = _run(f, pr)
-    assert st["papers"][0]["status"] == "failed"    # no validated file: a screenshot is not the paper's text
-    ps = json.loads((_bd(f) / "papers" / "1.json").read_text())
-    assert ps.get("shots") and Path(ps["shots"][0]).is_file()
-    assert not ps.get("accepted")
+    assert st["papers"][0]["status"] == "failed"
+    assert not list((_bd(f) / "files").rglob("shot-*.png"))     # the hook blocked it before it ran
+    assert any("screenshot" in v for v in st["agent"]["usage"]["violations"])
 
 
 def test_allowed_domains_cover_sso_and_prompt_lists_actions(tmp_path, monkeypatch):
@@ -260,6 +257,8 @@ def test_allowed_domains_cover_sso_and_prompt_lists_actions(tmp_path, monkeypatc
         assert any(d in p["allow"] for p in st["papers"].values())
     assert st["handoff_enabled"] and st["sso_login_enabled"] and st["sso_domains"] == ["authserver.nju.edu.cn"]
     prompt = (_bd(f) / "prompt.md").read_text()
-    for s in ("click_xy", "hover", "screenshot", "tabs", "switch LABEL", "wait_for", "sso_login",
+    for s in ("hover", "tabs", "switch LABEL", "wait_for", "sso_login",
               "handoff_status", "25 tool calls", "12 page loads"):
         assert s in prompt, s
+    for s in ("click_xy", "screenshot", "vision", "look [full]", "@REF"):
+        assert s not in prompt, s
