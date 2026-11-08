@@ -146,6 +146,17 @@ def _pages(port, port2):
         "/form-span": ("text/html", b'<html><head><title>Form Span</title></head><body><form id="f" method="post" '
                                     b'action="https://denied.example/x"></form><button form="f"><span role="button">'
                                     b'Get PDF</span></button></body></html>'),
+        # round 5: identifier-first (e-mail) login; a span inside an off-site link; a link with a long URL
+        "/email-login": ("text/html", b'<html><head><title>Sign in</title></head><body><a href="/other">Other</a>'
+                                      b'<form method="post" action="/logged"><input type="email" name="email" autocomplete="email">'
+                                      b'<button>Sign in</button></form></body></html>'),
+        "/newsletter": ("text/html", b'<html><head><title>Article</title></head><body><a href="/other">Other</a>'
+                                     b'<form method="post" action="/logged"><input type="email" name="email">'
+                                     b'<button>Subscribe to our newsletter</button></form></body></html>'),
+        "/span-link": ("text/html", b'<html><head><title>Span Link</title></head><body><a href="https://denied.example/x">'
+                                    b'<span role="button">Get PDF</span></a></body></html>'),
+        "/long-link": ("text/html", ('<html><head><title>Long</title></head><body><a href="https://alice:' + "S" * 300
+                                     + '@127.0.0.1/x">Long link</a></body></html>').encode()),
         "/code-only": ("text/html", b'<html><head><title>Check</title></head><body><a href="/other">Other</a>'
                                     b'<form method="post" action="/logged"><input name="code"><button>OK</button></form>'
                                     b'</body></html>'),
@@ -660,5 +671,39 @@ def test_round4_guards(origins):
         assert _take_over(sp, origins[0] + "/code-only")
         r = _run(sp, "handoff_status", handoff_state={"active": True, "deadline_ms": int(time.time() * 1000) + 60000})
         assert r["status"] == "ok" and r["handoff_check"] == "waiting", r
+    finally:
+        _finish(sp)
+
+
+
+def test_round5_guards(origins):
+    sp = "tbsgen-test-r5"
+    try:
+        # identifier-first e-mail login: a login page (no interaction); a newsletter e-mail field is not
+        assert _run(sp, "open", origins[0] + "/email-login", handoff=False)["status"] == "ok"
+        r = _run(sp, "look", handoff=False)
+        r = _run(sp, "click", str(_item(r, "Other")["i"]), look_key=r["look_key"], handoff=False)
+        assert r["status"] == "refused" and "login" in r["error"], r
+        assert _run(sp, "open", origins[0] + "/newsletter", handoff=False)["status"] == "ok"
+        r = _run(sp, "look", handoff=False)
+        r = _run(sp, "click", str(_item(r, "Other")["i"]), look_key=r["look_key"], handoff=False)
+        assert r["status"] == "ok" and r["page"]["url"].endswith("/other"), r
+        # a span inside an off-site link: the link's target is checked
+        assert _run(sp, "open", origins[0] + "/span-link", handoff=False)["status"] == "ok"
+        r = _run(sp, "look", handoff=False)
+        span = next(it for it in r["page"]["items"] if it["text"] == "Get PDF" and it["kind"] == "button")
+        r = _run(sp, "click", str(span["i"]), look_key=r["look_key"], handoff=False)
+        assert r["status"] == "refused" and "outside the allowed" in r["error"], r
+        # userinfo in a long URL never comes back, cut or not
+        assert _run(sp, "open", origins[0] + "/long-link", handoff=False)["status"] == "ok"
+        r = _run(sp, "look", handoff=False)
+        assert "SSSSSSSS" not in json.dumps(r), r
+    finally:
+        _finish(sp)
+    # a verification-code page outside the SSO domains is handed to the user at once
+    sp = "tbsgen-test-r5-code"
+    try:
+        r = _run(sp, "open", origins[0] + "/code-only")
+        assert r["status"] == "handoff" and r["handoff"]["kind"] == "mfa", r
     finally:
         _finish(sp)

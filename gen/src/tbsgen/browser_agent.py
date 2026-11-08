@@ -261,7 +261,8 @@ _SLEEP_CMD = re.compile(r"^sleep ([1-9]\d?|[12]\d\d|300)$")
 DENY_TEXT = re.compile(r"sci-?hub|libgen|z-lib|annas-archive", re.I)
 # actions that can load a page of the publisher (paced per publisher and capped per paper)
 # (select / type / hover / scroll can trigger a navigation from the page's handlers: reserved and paced like one)
-NAV_ACTIONS = frozenset({"open", "click", "back", "sso_login", "select", "type", "hover", "scroll"})
+# actions that may load a page or request a file: navigation budget, per-publisher lock and pacing
+NAV_ACTIONS = frozenset({"open", "click", "back", "sso_login", "select", "type", "hover", "scroll", "save_pdf"})
 
 
 def shell_allowed(cmd) -> str | None:
@@ -341,7 +342,7 @@ def _run_script(st: dict, inp: dict, timeout: float, bd: Path, honor_stop: bool 
     script whose TaskSpace is with the user)."""
     script = "const INPUT = " + json.dumps(inp) + ";\n" + ACTION.read_text()
     if honor_stop and (bd / "STOP").exists():
-        return {}, "stopped"
+        return {}, "not-started"
     proc = subprocess.Popen([st["ego_binary"], "nodejs", script], stdin=subprocess.DEVNULL,
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=browser_ego.child_env())
     t_end = time.time() + max(5.0, timeout)
@@ -406,6 +407,15 @@ def _locked(path: Path, blocking: bool = True):
         os.close(fd)
 
 
+def _handoff_start(ho: dict) -> float:
+    """When the script handed the page over (its own clock, never later than now)."""
+    try:
+        at = float(ho.get("at_ms")) / 1000.0
+    except (TypeError, ValueError):
+        return time.time()
+    return min(at, time.time()) if at > 0 else time.time()
+
+
 def _expire_handoff(st: dict, led, n: str, ps: dict, force: bool = False) -> str | None:
     """Close paper `n` when its hand-off has run out (or, with `force`, at the end of the batch).  A challenge
     hand-off that the user did not clear cools the publisher.  Returns the closed reason, else None."""
@@ -425,7 +435,19 @@ def _expire_handoff(st: dict, led, n: str, ps: dict, force: bool = False) -> str
 
 def _sweep_handoffs(bd: Path, st: dict, led, skip: str | None = None, force: bool = False) -> None:
     """Expire the hand-offs of other papers too (a paper the agent stops polling must still be closed and its
-    publisher cooled).  Papers busy in another call are skipped (their own next call expires them)."""
+    publisher cooled).  Papers busy in another call are skipped (their own next call expires them).  At the end
+    of the batch (`force`), a call that still holds a publisher's hand-off slot (its wrapper was killed: the
+    hand-off state is unknown) is booked as a hand-off that was not cleared."""
+    inflight = {}
+    if force:
+        with _locked(bd / ".state.lock"):
+            state = _read_state(bd)
+            inflight = {str(v): k for k, v in (state.get("handoff_inflight") or {}).items()}
+            if inflight:
+                state["handoff_inflight"] = {}
+                for pk in inflight.values():
+                    state.setdefault("handoff", {})[pk] = True
+                _write_state(bd, state)
     for k in st["papers"]:
         if k == skip:
             continue
@@ -437,6 +459,9 @@ def _sweep_handoffs(bd: Path, st: dict, led, skip: str | None = None, force: boo
                 continue
             with contextlib.suppress(OSError, ValueError):
                 ps = json.loads(sp.read_text())
+                if k in inflight and not ps.get("handoff") and not ps.get("closed"):
+                    ps.update(handoff=True, handoff_used=True, handoff_kind="challenge",
+                              handoff_note="call interrupted (hand-off state unknown)")
                 if _expire_handoff(st, led, k, ps, force=force):
                     _atomic(sp, json.dumps(ps))
 
@@ -648,9 +673,9 @@ def _paper_run(bd, st, n, p, ps, action, arg, say, led, pkey, space, handoff_fre
     timeout = max(5.0, min(float(st["call_timeout_s"]), float(st["deadline"]) - time.time()))
     res, err = _run_script(st, inp, timeout, bd)
     sso_result = _sso_finalize(bd, slock, n, res) if sso_ok else None
-    if not res and err == "timeout" and handoff_free:
-        # the call may have handed the space to the user and then hung (its result line lost): the hand-off
-        # state is unknown.  Never re-open the publisher's hand-off and never act on the paper again: book it
+    if not res and err in ("timeout", "stopped") and handoff_free:
+        # the call (started, then timed out or stopped) may have handed the space to the user and then hung
+        # (its result line lost): the hand-off state is unknown.  Never re-open the publisher's hand-off and never act on the paper again: book it
         # as a hand-off that was not cleared (paper closed, publisher cooled)
         with _locked(slock):
             state = _read_state(bd)
@@ -661,6 +686,8 @@ def _paper_run(bd, st, n, p, ps, action, arg, say, led, pkey, space, handoff_fre
                    handoff_note=f"call timed out at={time.strftime('%H:%M:%S')} (hand-off state unknown)")
         why = _expire_handoff(st, led, n, cur, force=True)
         _atomic(sp, json.dumps(cur))
+        if err == "stopped":
+            return say("tbsgen: stopped (egress changed, deadline or call timeout). End now.", 3)
         return say(f"tbsgen: paper {n}: the browser call timed out - paper closed ({why}); move on.", 2)
 
     def save_ps(**kw):
@@ -697,8 +724,12 @@ def _paper_run(bd, st, n, p, ps, action, arg, say, led, pkey, space, handoff_fre
             _write_state(bd, state)
         save_ps(handoff=True, handoff_used=True, handoff_reason=reason[:80], handoff_kind=kind,
                 handoff_title=str(ho.get("title") or "")[:200], handoff_page=str(ho.get("page_label") or "")[:40],
-                handoff_deadline=min(time.time() + float(st["handoff_wait_s"]), float(st["deadline"])),
+                # counted from when the script handed the page over (the call may have returned much later)
+                handoff_deadline=min(_handoff_start(ho) + float(st["handoff_wait_s"]), float(st["deadline"])),
                 handoff_note=f"handoff at={time.strftime('%H:%M:%S')} kind={kind} host={ho.get('host', '')}")
+        if (why := _expire_handoff(st, led, n, ps := json.loads(sp.read_text()))):
+            _atomic(sp, json.dumps(ps))             # already past its window when the call returned
+            return say(f"tbsgen: paper {n}: hand-off timed out - paper closed ({why}).", 2)
         what = "验证" if kind == "challenge" else "登录"
         _notify_user(st, f"请在 ego lite 里完成 {ho.get('host') or '出版商'} 的{what}（论文 {n}），完成后不用做别的")
         return say("tbsgen: handed the page to the user (the notification explains what is needed). Work on "

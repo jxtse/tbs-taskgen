@@ -67,7 +67,7 @@ const hostIn = (u, domains) => {
 // raw result is never printed.  The wrapper keeps `look_url` for its own page-change check (same treatment).
 function cleanUrl(u) {
   try { const x = new URL(u); return /^(https?|ftp|wss?):$/.test(x.protocol) ? x.origin + x.pathname : x.protocol; }
-  catch (e) { return String(u).split(/[?#]/)[0]; }
+  catch (e) { return "[url]"; }                      // unparseable (e.g. cut off): never echoed
 }
 const URL_IN = /\b[a-z][a-z0-9+.-]*:\/\/[^\s"'<>`]+/gi;
 function scrub(v) {
@@ -200,6 +200,14 @@ function credScan() {
       const meta = [el.id, el.getAttribute("name"), el.getAttribute("autocomplete"), el.getAttribute("placeholder"),
                     el.getAttribute("aria-label"), el.getAttribute("inputmode")].join(" ");
       if (CRED.test(meta)) cred = true;
+      // an e-mail field counts as a login identifier when its form / page context is a sign-in (identifier-first
+      // login); a newsletter sign-up does not
+      if (!cred && (t === "email" || /e-?mail/i.test(meta))) {
+        const f = el.form || (el.closest && el.closest("form"));
+        const ctx = ((f && (f.innerText || "") + " " + (f.getAttribute("action") || "") + " " + (f.id || "") + " " + (f.className || ""))
+                     || "") + " " + (el.ownerDocument.title || "");
+        if (/sign[- ]?in|log[- ]?in|logon|password|account|auth|sso|登录|登入|账号|帐号/i.test(ctx)) cred = true;
+      }
       if (MFA.test(meta) || /one-time-code/i.test(el.getAttribute("autocomplete") || "")) mfa = true;
     }
     for (const f of doc.querySelectorAll("iframe")) {
@@ -292,13 +300,13 @@ async function closeForeignTabs(task, tabsBefore) {
   const tabs = await task.tabs().catch(() => []);
   const newTabs = tabs.filter((t) => !tabsBefore.has(t.label));
   if (newTabs.length) {
-    out.tabs = newTabs.map((t) => ({ label: t.label, url: (t.url || "").slice(0, 200), allowed: hostOk(t.url || "") }));
+    out.tabs = newTabs.map((t) => ({ label: t.label, url: cleanUrl(t.url || "").slice(0, 200), allowed: hostOk(t.url || "") }));
     // a new tab (opened by the action) that landed outside the allowed domains is closed at once
     const pages = await task.pages().catch(() => []);
-    for (const t of out.tabs) {
-      if (t.allowed || !t.url || t.url.startsWith("about:")) continue;
+    for (const [k, t] of newTabs.entries()) {
+      if (out.tabs[k].allowed || !t.url || t.url.startsWith("about:")) continue;
       const pg = pages.find((x) => x.label === t.label);
-      if (pg) { await pg.close().catch(() => {}); t.closed = true; }
+      if (pg) { await pg.close().catch(() => {}); out.tabs[k].closed = true; }
     }
   }
 }
@@ -328,7 +336,7 @@ async function handoff(task, page, why, host, kind, title) {
     return;
   }
   out.status = "handoff";
-  out.handoff = { reason: String(why).slice(0, 120), host: host || "", kind: kind || "challenge",
+  out.handoff = { reason: String(why).slice(0, 120), host: host || "", kind: kind || "challenge", at_ms: Date.now(),
                   page_label: (page && page.label) || "", title: String(title || "").slice(0, 200) };
   emit();
   try { await task.handOff(); } catch (e) { /* the space may already be with the user */ }
@@ -342,8 +350,12 @@ async function postCheck(task, page, i, opts) {
     await handoff(task, page, "challenge: " + (i.title || "").slice(0, 60), h, "challenge", i.title);
     return i;
   }
-  if (i.login_form && !hostIn(i.url, (INPUT.sso && INPUT.sso.domains) || []) && !(opts && opts.no_login_handoff)) {
-    if (INPUT.handoff && INPUT.handoff.enabled) return handoff(task, page, "login form", h, "login", i.title);
+  // the shared credential / MFA scan (password, user-name, e-mail sign-in, verification-code fields; frames,
+  // shadow roots): such a page outside the SSO domains goes to the user
+  const sc = i.login_form ? { cred: true, mfa: false } : await scan(page);
+  if (sc.cred) i.login_form = true;
+  if (sc.cred && !hostIn(i.url, (INPUT.sso && INPUT.sso.domains) || []) && !(opts && opts.no_login_handoff)) {
+    if (INPUT.handoff && INPUT.handoff.enabled) return handoff(task, page, sc.mfa ? "verification code" : "login form", h, sc.mfa ? "mfa" : "login", i.title);
     out.login_form = true;                       // reported; the agent books `login_required`
   }
   return i;
@@ -362,7 +374,7 @@ async function look(task, page) {
   const i = await info(page);
   const all = await items(page);
   const pageItems = all.slice(offset, offset + LIMIT).map((it, k) => ({
-    i: offset + k, kind: it.kind, text: it.text, href: (it.href || "").slice(0, 200),
+    i: offset + k, kind: it.kind, text: it.text, href: it.href ? cleanUrl(it.href).slice(0, 200) : "",
     allowed: it.href ? hostOk(it.href) : undefined,
     hidden: !!it.hidden, frame: it.frame || 0, ftype: it.ftype || undefined,
     widget: !!it.widget, login: !!it.login,
@@ -418,14 +430,19 @@ function domAct(walkSrc, k, allow, kind, value) {
     const aBtn = atag === "button" || (atag === "input" && ["submit", "image"].includes((actv.getAttribute("type") || "").toLowerCase()));
     if (form && aBtn && !ok((actv.hasAttribute("formaction") ? actv.formAction : "") || form.action || location.href)) return { refused: "form target is outside the allowed domains" };
     if (form && !aBtn && !ok(form.action || location.href)) return { refused: "form target is outside the allowed domains" };
-    if (tag === "a") {
-      const h = el.getAttribute("href") || "";
-      if (!h.startsWith("#") && !/^javascript:/i.test(h) && !ok(el.href)) return { refused: "link target is outside the allowed domains" };
+    // the link a click really follows: the element or its enclosing <a href> (a span inside a link)
+    const link = tag === "a" ? el : (el.closest && el.closest("a[href]"));
+    if (link) {
+      const h = link.getAttribute("href") || "";
+      if (!h.startsWith("#") && !/^javascript:/i.test(h) && !ok(link.href)) return { refused: "link target is outside the allowed domains" };
       // a new-tab link (top document or a frame): open its checked target in this page (no native click -
       // a native click lands on whatever is on top at that point)
-      if ((el.getAttribute("target") || "").toLowerCase() === "_blank" && !h.startsWith("#") && !/^javascript:/i.test(h)) {
-        return { open: el.href, text: text };
+      if ((link.getAttribute("target") || "").toLowerCase() === "_blank" && !h.startsWith("#") && !/^javascript:/i.test(h)) {
+        return { open: link.href, text: text };
       }
+      // a named target window ("viewer"): also opened here (checked) instead of by a click
+      const tg = (link.getAttribute("target") || "").trim();
+      if (tg && !/^_(self|top|parent)$/i.test(tg) && !h.startsWith("#") && !/^javascript:/i.test(h)) return { open: link.href, text: text };
     }
     if ((el.hasAttribute("formaction") && !ok(el.formAction)) || (actv.hasAttribute("formaction") && !ok(actv.formAction))) return { refused: "form target is outside the allowed domains" };
     el.click();
@@ -700,7 +717,7 @@ try {
       }
     } else if (INPUT.action === "tabs") {
       const tabs = await task.tabs();
-      out.tabs = tabs.map((t) => ({ label: t.label, url: (t.url || "").slice(0, 200), title: (t.title || "").slice(0, 80),
+      out.tabs = tabs.map((t) => ({ label: t.label, url: cleanUrl(t.url || "").slice(0, 200), title: (t.title || "").slice(0, 80),
                                     active: !!t.active, opened_by: t.openedBy || "", allowed: hostOk(t.url || "") }));
       out.status = "ok";
     } else if (INPUT.action === "switch") {

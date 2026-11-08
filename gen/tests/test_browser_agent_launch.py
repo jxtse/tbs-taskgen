@@ -515,3 +515,53 @@ def test_silent_timeout_with_a_handoff_budget_closes_the_paper_and_cools(tmp_pat
     assert ps.get("closed") and not ps.get("handoff")
     assert json.loads((bd / "state.json").read_text())["handoff"]["pub:" + _pub("10.1080/a.1")]   # not re-opened
     assert led.cooling("chrome:10.1080")
+
+
+
+def test_stop_during_a_call_with_a_handoff_budget_closes_the_paper_and_cools(tmp_path, monkeypatch):
+    bd, led = _batch(tmp_path, monkeypatch, ["10.1080/a.1", "10.1080/b.2"], handoff_enabled=True,
+                     sso_login_enabled=False, call_timeout_s=30)
+    (tmp_path / "ego").write_text(SILENT_HANG_EGO.replace("{py}", sys.executable))
+    pr = _call(bd, "1", "open", "https://pub.example/a")
+    time.sleep(2.0)
+    (bd / "STOP").write_text("x")
+    out, _ = pr.communicate(timeout=60)
+    assert "stopped" in out, out
+    ps = json.loads((bd / "papers" / "1.json").read_text())
+    assert ps.get("closed") and not ps.get("handoff"), ps
+    assert json.loads((bd / "state.json").read_text())["handoff"]["pub:" + _pub("10.1080/a.1")]
+    assert led.cooling("chrome:10.1080")
+
+
+LATE_HANDOFF_EGO = r"""#!{py}
+import json, time
+print("TBSGEN_RESULT " + json.dumps({"status": "handoff", "handoff": {"reason": "challenge: x", "host": "pub.example",
+      "kind": "challenge", "at_ms": int((time.time() - 500) * 1000)}}), flush=True)
+"""
+
+
+def test_handoff_window_counts_from_the_handover_not_the_return(tmp_path, monkeypatch):
+    bd, led = _batch(tmp_path, monkeypatch, ["10.1080/a.1"], handoff_enabled=True, sso_login_enabled=False,
+                     handoff_wait_s=120)
+    (tmp_path / "ego").write_text(LATE_HANDOFF_EGO.replace("{py}", sys.executable))
+    out, _ = _call(bd, "1", "open", "https://pub.example/a").communicate(timeout=60)
+    assert "hand-off timed out" in out, out                  # handed over 500 s ago: window already over
+    ps = json.loads((bd / "papers" / "1.json").read_text())
+    assert ps.get("closed") and not ps.get("handoff")
+    assert led.cooling("chrome:10.1080")
+
+
+def test_final_sweep_books_an_interrupted_handoff_call(tmp_path, monkeypatch):
+    from tbsgen.dlledger import DownloadLedger
+    bd, led = _batch(tmp_path, monkeypatch, ["10.1080/a.1"], handoff_enabled=True, sso_login_enabled=False)
+    st = json.loads((bd / "batch.json").read_text())
+    pk = "pub:" + _pub("10.1080/a.1")
+    rid = led.acquire("browser", "chrome:10.1080", "10.1080/a.1")
+    (bd / "papers" / "1.json").write_text(json.dumps({"calls": 1, "rid": rid, "lkey": "chrome:10.1080"}))
+    (bd / "state.json").write_text(json.dumps({"handoff_inflight": {pk: "1"}}))   # its wrapper was killed
+    browser_agent._sweep_handoffs(bd, st, led, force=True)
+    ps = json.loads((bd / "papers" / "1.json").read_text())
+    assert ps.get("closed") and "not cleared" in ps["closed"], ps
+    state = json.loads((bd / "state.json").read_text())
+    assert state["handoff"][pk] and not state["handoff_inflight"]
+    assert led.cooling("chrome:10.1080")

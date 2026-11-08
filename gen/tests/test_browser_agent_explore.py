@@ -262,3 +262,7 @@ def test_allowed_domains_cover_sso_and_prompt_lists_actions(tmp_path, monkeypatc
         assert s in prompt, s
     for s in ("click_xy", "screenshot", "vision", "look [full]", "@REF"):
         assert s not in prompt, s
+
+
+def test_save_pdf_is_paced_like_a_page_load():
+    assert "save_pdf" in browser_agent.NAV_ACTIONS          # a PDF request: per-publisher lock, budget, pacing
