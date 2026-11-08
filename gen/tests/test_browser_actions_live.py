@@ -80,6 +80,9 @@ SSO = """<!doctype html><html><head><title>Institution Login</title></head><body
 <input id="password" name="password" type="password" value="{pw}" autocomplete="current-password">
 {extra}<button type="submit" id="login">登录 / Login</button>
 </form></body></html>"""
+JUMP = """<!doctype html><html><head><title>Jump</title></head><body>
+<select id="jumpsel" onchange="location.href='https://denied.example/' + this.value">
+<option value="">-- select --</option><option value="nju">Nanjing University</option></select></body></html>"""
 CHALLENGE = """<!doctype html><html><head><title>Just a moment...</title></head><body>
 <div class="cf-turnstile" data-sitekey="x"></div>Checking your browser before accessing.</body></html>"""
 
@@ -91,13 +94,19 @@ def _pages(port, port2):
         "/pdf": ("application/pdf", PDF),
         "/other": ("text/html", OTHER),
         "/wayf": ("text/html", WAYF.encode()),
-        # the login form's success target leaves the SSO hostname (the "publisher" on 127.0.0.1)
-        "/sso": ("text/html", SSO.format(action=f"http://127.0.0.1:{port}/logged", user="u", pw="p",
-                                          extra="").encode()),
-        "/sso-empty": ("text/html", SSO.format(action=f"http://127.0.0.1:{port}/logged", user="", pw="",
-                                               extra="").encode()),
+        # the login form posts to the SSO host itself (as a real institution login server does)
+        "/sso": ("text/html", SSO.format(action="/logged", user="u", pw="p", extra="").encode()),
+        "/sso-empty": ("text/html", SSO.format(action="/logged", user="", pw="", extra="").encode()),
+        # a form on the SSO host that would post the credentials to another host: never submitted
+        "/sso-evil": ("text/html", SSO.format(action=f"http://127.0.0.1:{port}/logged", user="u", pw="p",
+                                              extra="").encode()),
+        # a WAYF select whose change handler jumps off the allowed domains
+        "/jump": ("text/html", JUMP.encode()),
+        # a login form inside a same-origin iframe
+        "/frame-login": ("text/html", b'<html><head><title>Frame Login</title></head><body><h1>x</h1>'
+                                      b'<iframe src="/sso" width="400" height="300"></iframe></body></html>'),
         "/sso-fail": ("text/html", SSO.format(action="/sso-fail", user="u", pw="p", extra="").encode()),
-        "/sso-captcha": ("text/html", SSO.format(action=f"http://127.0.0.1:{port}/logged", user="u", pw="p",
+        "/sso-captcha": ("text/html", SSO.format(action="/logged", user="u", pw="p",
                                                  extra='<div class="cf-turnstile" data-sitekey="x"></div>').encode()),
         "/logged": ("text/html", b"<html><head><title>Logged In</title></head><body>ok</body></html>"),
         "/challenge": ("text/html", CHALLENGE.encode()),
@@ -126,7 +135,11 @@ def _serve(pages):
         def do_POST(self):
             n = int(self.headers.get("content-length", 0))
             self.rfile.read(n)
-            self._x(b"<html><head><title>Logged In</title></head><body>ok</body></html>", "text/html")
+            p = self.path.split("?")[0]
+            if p in pages and p.startswith("/sso"):        # a failed login shows the login form again
+                self._x(pages[p][1], "text/html")
+            else:
+                self._x(b"<html><head><title>Logged In</title></head><body>ok</body></html>", "text/html")
 
         def log_message(self, *a):
             pass
@@ -344,6 +357,38 @@ def test_denied_paths(origins):
         # sso_login outside the configured SSO domains is refused
         r = _run(sp, "sso_login", sso_domains=("sso.elsewhere",))
         assert r["status"] == "refused", r
+        # hover on the (autofilled) user field never returns its value
+        r = _run(sp, "look")
+        user = next(it for it in r["page"]["items"] if it.get("ftype") == "text")
+        r = _run(sp, "hover", str(user["i"]), look_url=r["page"]["url"])
+        assert '"u"' not in json.dumps(r.get("acted")), r
+        # coordinate clicks on login pages are refused
+        r = _run(sp, "click_xy", "10 10")
+        assert r["status"] == "refused" and "login page" in r["error"], r
+    finally:
+        _finish(sp)
+
+
+def test_select_that_navigates_off_domain_is_reset(origins):
+    sp = "tbsgen-test-jump"
+    try:
+        assert _run(sp, "open", origins[0] + "/jump")["status"] == "ok"
+        r = _run(sp, "look")
+        k = _item(r, "jumpsel")["i"]
+        r = _run(sp, "select", f"{k} Nanjing University", look_url=r["page"]["url"])
+        assert r["status"] == "ok" and not r["page"]["url"].startswith("https://denied"), r
+        r = _run(sp, "look")
+        assert "denied.example" not in r["page"]["url"], r
+    finally:
+        _finish(sp)
+
+
+def test_screenshot_refused_with_a_login_form_in_an_iframe(origins):
+    sp = "tbsgen-test-frame-login"
+    try:
+        assert _run(sp, "open", origins[0] + "/frame-login", handoff=False)["status"] == "ok"
+        r = _run(sp, "screenshot", handoff=False)
+        assert r["status"] == "refused" and "credential" in r["error"], r
     finally:
         _finish(sp)
 
@@ -397,6 +442,7 @@ def test_sso_login_autofill_success_and_failures(origins):
         assert _run(sp, "open", origins[2] + "/sso")["status"] == "ok"
         r = _run(sp, "sso_login", sso_login=True)
         assert r["status"] == "ok" and r["sso"] == "ok" and "/logged" in r["page"]["url"], r
+        assert r["sso_submitted"] is True and r["sso_host"] == "sso.localhost", r
     finally:
         _finish(sp)
     # 2. no autofill: handed to the user instead (never typed into)
@@ -414,6 +460,22 @@ def test_sso_login_autofill_success_and_failures(origins):
         assert _take_over(sp, origins[2] + "/sso-captcha")
         r = _run(sp, "sso_login", sso_login=True)
         assert r["status"] == "handoff", r
+    finally:
+        _finish(sp)
+    # 3b. no autofill and no hand-off budget: reported as login_required, nothing typed or handed over
+    sp = "tbsgen-test-sso-empty-nohandoff"
+    try:
+        assert _run(sp, "open", origins[2] + "/sso-empty", handoff=False)["status"] == "ok"
+        r = _run(sp, "sso_login", sso_login=True, handoff=False)
+        assert r["status"] == "ok" and r.get("login_required") and r["sso_submitted"] is False, r
+    finally:
+        _finish(sp)
+    # 3c. a form that posts outside the SSO login domains is never submitted
+    sp = "tbsgen-test-sso-evil"
+    try:
+        assert _run(sp, "open", origins[2] + "/sso-evil")["status"] == "ok"
+        r = _run(sp, "sso_login", sso_login=True)
+        assert r["status"] == "refused" and "outside the SSO" in r["error"] and r["sso_submitted"] is False, r
     finally:
         _finish(sp)
     # 4. failed login (the form posts back to itself): fail, and the values never leak into the result

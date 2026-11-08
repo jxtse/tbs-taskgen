@@ -325,8 +325,11 @@ uv run tbsgen fetch --run runs/R --config config.toml --browser --wait-for-egres
   - verification pages (Cloudflare / Turnstile, captchas, sliders) are never solved. With `browser.handoff.enabled`
     the page is handed to you instead (macOS notification, optional local `handoff.bark_cmd`); the agent works on
     other papers and polls `handoff_status` for up to `handoff.wait_s` (120 s). One hand-off per paper and per
-    publisher per batch; a hand-off that times out cools the publisher. With hand-off off (the default), a
-    verification page cools the publisher at once.
+    publisher per batch; a hand-off that is not cleared in time (also when the agent stops polling, and at the
+    end of the batch) closes the paper and cools the publisher. With hand-off off (the default), a verification
+    page cools the publisher at once.
+  - concurrent tool calls are serialized per paper, and the batch-wide budgets (navigation pacing, the
+    publisher's hand-off, SSO submissions) are reserved under a lock before the action script runs;
   - Known limit: URLs, links and form targets are checked before the request, but a cross-domain navigation that
     the page itself starts (script or HTTP redirect) cannot be intercepted with the browser SDK; such a page is
     reset to about:blank as soon as it lands and reported, and nothing from it is saved.
@@ -343,10 +346,12 @@ uv run tbsgen fetch --run runs/R --config config.toml --browser --wait-for-egres
   `sso_login.domains` (your institution's own login server, e.g. reached through CARSI / WAYF). It relies on
   the browser's password manager: it checks that Chromium autofilled the user and password fields (by the length
   of their values; the values are never read, returned or logged) and clicks the login button. No credential is
-  ever typed, configured or stored by tbsgen. No autofill, a captcha / slider / SMS or other MFA code, or a login
-  that does not leave the login page is handed to you (with hand-off on) or reported as `login_required`; a
-  failed login is never retried, and a batch submits at most `sso_login.max_submissions` (2) logins. The ledger
-  note records only the time, host and result.
+  ever typed, configured or stored by tbsgen. The login button is clicked only if the page and the form's target
+  are both on an HTTPS `sso_login.domains` host. No autofill, a captcha / slider / SMS or other MFA code, or a
+  login that does not leave the login page is handed to you (with hand-off on) or reported as
+  `login_required`. A submission is counted before the click; any outcome other than a clear success (failure,
+  timeout, error, MFA after the click) ends the automatic logins of the batch, and a batch submits at most
+  `sso_login.max_submissions` (2) logins. The ledger note records only the time, host and result.
 
 ```toml
 [fulltext.browser.handoff]
@@ -431,10 +436,10 @@ Research code under active development.
 **Tests** (run by [GitHub Actions CI](.github/workflows/ci.yml) on every push to `main` and every pull request)
 
 - `retrieval/`: 47 offline unit tests that replay recorded API responses.
-- `gen/`: 245 tests: 218 offline unit tests (18 for the Jev screen, 6 for the S2 publisher blocklist and 141 for
+- `gen/`: 255 tests: 226 offline unit tests (18 for the Jev screen, 6 for the S2 publisher blocklist and 149 for
   the S3 full-text channels and browser batches, using recorded and scripted responses and fake `ego-browser` /
   `hermes` executables; no network, no real browser or model), 16 integration tests that run task code in
-  Docker, and 11 live tests of the browser agent's action script against local pages in a real ego-browser
+  Docker, and 13 live tests of the browser agent's action script against local pages in a real ego-browser
   (no website is contacted; skipped where ego-browser is not installed, as in CI). Locally the integration
   tests are skipped when Docker or the sandbox image is missing; CI builds the image and fails if any of them
   is skipped.

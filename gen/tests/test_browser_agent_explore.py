@@ -75,7 +75,7 @@ def test_shell_allowed_new_actions():
         # whitelist (institution names only) refuses it before the action script runs
         "tbsgen-browser 1 screenshot", "tbsgen-browser 1 tabs", "tbsgen-browser 1 switch p2",
         "tbsgen-browser 1 back", "tbsgen-browser 1 wait_for url /pdf 20",
-        "tbsgen-browser 1 wait_for sel #pdf-button", "tbsgen-browser 1 save_pdf",
+        "tbsgen-browser 1 wait_for sel a.pdf-link", "tbsgen-browser 1 wait_for sel div#pdf", "tbsgen-browser 1 save_pdf",
         "tbsgen-browser 1 sso_login", "tbsgen-browser 1 handoff_status", "tbsgen-browser finish",
         "sleep 30",
     ]
@@ -165,7 +165,7 @@ def test_handoff_flows_challenge_to_user_and_back(tmp_path, monkeypatch):
     assert log[0]["handoff"] is True and log[2]["handoff"] is not True   # only the challenge may hand off
     assert st["papers"][0]["status"] == "ok", st["papers"]
     notes = _notes(led)
-    assert "handoff: challenge" in notes["10.1080/paper.1"][1]        # the hand-off is noted in the ledger
+    assert "kind=challenge host=pub.example" in notes["10.1080/paper.1"][1]   # the hand-off is noted in the ledger
 
 
 def test_handoff_is_once_per_publisher(tmp_path, monkeypatch):

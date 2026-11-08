@@ -237,8 +237,9 @@ sys.exit({fn}({batch_dir!r}, sys.argv[1:]))
 """
 # One-token shapes (no quotes, shell metachars or newlines ever reach a shell: the hook matches the whole
 # command against these patterns and the wrapper re-parses argv).
-_SAFE_TOK = r"[^\s'\"`$;&|<>\\]{1,200}"
-_SAFE_TXT = r"[A-Za-z0-9 ,.\-'()_\u4e00-\u9fff]{1,60}"
+# (also no glob characters other than "?", which cannot match: a URL word contains "://")
+_SAFE_TOK = r"[^\s'\"`$;&|<>\\*\[\]{}!()]{1,200}"
+_SAFE_TXT = r"[A-Za-z0-9 ,.\-_\u4e00-\u9fff]{1,60}"     # no quotes / parentheses: the shell must pass it as is
 _PAPER_ACTIONS = "|".join((
     r"look( full)?( @\d{1,5})?( \d{1,4})?",
     r"open https?://" + _SAFE_TOK,
@@ -251,14 +252,17 @@ _PAPER_ACTIONS = "|".join((
     "screenshot", "tabs",
     r"switch [A-Za-z0-9_.-]{1,24}",
     "back",
-    r"wait_for (url|sel) " + _SAFE_TOK + r"( \d{1,3})?",
+    # the pattern never starts with '#' (a shell comment) and has no glob / quote characters
+    r"wait_for url [A-Za-z0-9/._%=:-]{1,200}( \d{1,3})?",
+    r"wait_for sel [A-Za-z][A-Za-z0-9_.#:-]{0,100}( \d{1,3})?",
     "save_pdf", "sso_login", "handoff_status",
 ))
 _TOOL_CMD = re.compile(rf"^tbsgen-browser (finish|[1-9]\d? ({_PAPER_ACTIONS}))$")
 _SLEEP_CMD = re.compile(r"^sleep ([1-9]\d?|[12]\d\d|300)$")
 DENY_TEXT = re.compile(r"sci-?hub|libgen|z-lib|annas-archive", re.I)
 # actions that can load a page of the publisher (paced per publisher and capped per paper)
-NAV_ACTIONS = frozenset({"open", "click", "click_xy", "back", "sso_login"})
+# (select / type can trigger a navigation from the page's change handlers; a hover that navigates is counted after)
+NAV_ACTIONS = frozenset({"open", "click", "click_xy", "back", "sso_login", "select", "type"})
 VISION_TOOL = "vision_analyze"
 
 
@@ -346,7 +350,7 @@ def _notify_user(st: dict, msg: str):
             subprocess.run(list(cmd) + [msg[:200]], timeout=10, check=False)
 
 
-def _run_script(st: dict, inp: dict, timeout: float, bd: Path) -> tuple[dict, str]:
+def _run_script(st: dict, inp: dict, timeout: float, bd: Path, honor_stop: bool = True) -> tuple[dict, str]:
     """Run the reviewed action script with one injected INPUT line; returns (result, stderr-tail).
 
     The script (~40 KB) is passed as an argument, not on a stdin pipe: `communicate(input, timeout)` stops
@@ -363,7 +367,7 @@ def _run_script(st: dict, inp: dict, timeout: float, bd: Path) -> tuple[dict, st
             so, se = proc.communicate(timeout=0.5)
             break
         except subprocess.TimeoutExpired:
-            if (bd / "STOP").exists() or time.time() > t_end:
+            if (honor_stop and (bd / "STOP").exists()) or time.time() > t_end:
                 proc.kill()
                 proc.communicate()
                 return {}, "stopped"
@@ -381,15 +385,70 @@ def _finish_spaces(bd: Path, st: dict, spaces: list[str]) -> list[str]:
     when a hand-off is still open, then closes it)."""
     done = []
     for sp_name in spaces:
-        r, _ = _run_script(st, dict(space=sp_name, action="finish", files_dir=str(bd / "files")), 90.0, bd)
+        # the batch's STOP file must not cancel the clean-up itself (it is written before the spaces close)
+        r, _ = _run_script(st, dict(space=sp_name, action="finish", files_dir=str(bd / "files")), 90.0, bd,
+                           honor_stop=False)
         done.append(f"{sp_name}:{r.get('status', 'error')}")
     return done
 
 
+@contextlib.contextmanager
+def _locked(path: Path, blocking: bool = True):
+    """An exclusive flock on `path` (across the agent's concurrent `tbsgen-browser` processes).  Yields False when
+    `blocking` is off and the lock is held elsewhere."""
+    import fcntl
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
+        except BlockingIOError:
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
+def _expire_handoff(st: dict, led, n: str, ps: dict, force: bool = False) -> str | None:
+    """Close paper `n` when its hand-off has run out (or, with `force`, at the end of the batch).  A challenge
+    hand-off that the user did not clear cools the publisher.  Returns the closed reason, else None."""
+    if not ps.get("handoff") or (not force and time.time() <= float(ps.get("handoff_deadline") or 0)):
+        return None
+    ps.pop("handoff", None)
+    if (ps.get("handoff_kind") or "challenge") == "challenge":
+        ps["closed"] = "challenge (hand-off not cleared)"
+        ps["challenge"] = "hand-off not cleared"
+        if ps.get("lkey") and not ps.get("accepted"):
+            _cool_publisher(led, ps, st["papers"][n]["doi"], "hand-off not cleared", float(st["challenge_cooldown_s"]))
+    else:
+        ps["closed"] = "login_required (hand-off not cleared)"
+    ps["handoff_note"] = (ps.get("handoff_note") or "handoff") + " (not cleared)"
+    return ps["closed"]
+
+
+def _sweep_handoffs(bd: Path, st: dict, led, skip: str | None = None, force: bool = False) -> None:
+    """Expire the hand-offs of other papers too (a paper the agent stops polling must still be closed and its
+    publisher cooled).  Papers busy in another call are skipped (their own next call expires them)."""
+    for k in st["papers"]:
+        if k == skip:
+            continue
+        sp = bd / "papers" / f"{k}.json"
+        if not sp.exists():
+            continue
+        with _locked(bd / "papers" / f".{k}.lock", blocking=force) as got:
+            if not got:
+                continue
+            with contextlib.suppress(OSError, ValueError):
+                ps = json.loads(sp.read_text())
+                if _expire_handoff(st, led, k, ps, force=force):
+                    _atomic(sp, json.dumps(ps))
+
+
 def wrapper_main(batch_dir: str, argv: list[str]) -> int:
     """`tbsgen-browser N <action> [arg...]` / `tbsgen-browser finish`."""
-    from .dlledger import COOLDOWN_429_S, DownloadLedger
-    from .fulltext import publisher_of
     bd = Path(batch_dir)
     st = json.loads((bd / "batch.json").read_text())
 
@@ -408,26 +467,41 @@ def wrapper_main(batch_dir: str, argv: list[str]) -> int:
              "wait_for url SUB|sel CSS [S]|save_pdf|sso_login|handoff_status  |  tbsgen-browser finish")
     if len(argv) < 2 or argv[0] not in st["papers"] or not _TOOL_CMD.match("tbsgen-browser " + " ".join(argv)):
         return say(usage, 2)
-    n, action, arg = argv[0], argv[1], " ".join(argv[2:])
+    n = argv[0]
+    # one call per paper at a time (budgets, hand-off and the paper's TaskSpace are per paper)
+    with _locked(bd / "papers" / f".{n}.lock"):
+        return _paper_call(bd, st, n, argv[1], " ".join(argv[2:]), say)
+
+
+def _paper_call(bd: Path, st: dict, n: str, action: str, arg: str, say) -> int:
+    from .dlledger import COOLDOWN_429_S, DownloadLedger
+    from .fulltext import publisher_of
     p = st["papers"][n]
     sp = bd / "papers" / f"{n}.json"
     ps: dict = json.loads(sp.read_text()) if sp.exists() else dict(calls=0)
+    led = DownloadLedger(st["ledger_path"], st["limits"], st["global_limits"], st["host_caps"])
+    if (why := _expire_handoff(st, led, n, ps)):
+        _atomic(sp, json.dumps(ps))
+        return say(f"tbsgen: paper {n}: hand-off timed out - paper closed ({why}).", 2)
+    _sweep_handoffs(bd, st, led, skip=n)
     if ps.get("closed"):
         return say(f"tbsgen: paper {n} is closed ({ps['closed']}); move on", 2)
     if action != "handoff_status" and ps.get("calls", 0) >= int(st["max_calls_per_paper"]):
         return say(f"tbsgen: paper {n}: call limit reached; give up on this paper", 2)
     if time.time() >= float(st["deadline"]):
         return say("tbsgen: the batch deadline has passed; end now.", 3)
-    led = DownloadLedger(st["ledger_path"], st["limits"], st["global_limits"], st["host_caps"])
-    _, keys, web_hosts = publisher_of(p["doi"])
+    pub, keys, web_hosts = publisher_of(p["doi"])
     lkey = "chrome:" + p["doi"].split("/", 1)[0]
     aliases = tuple(k for k in keys if k != lkey)
-    state = _read_state(bd)
+    pkey = "pub:" + pub                                 # one publisher, whatever DOI prefix (pacing, hand-off)
     space = f"{st['space']}-p{n}"                      # one TaskSpace per paper (hand-offs pause one paper only)
-    state.setdefault("spaces", [])
-    if space not in state["spaces"]:
-        state["spaces"].append(space)
-    _write_state(bd, state)
+    slock = bd / ".state.lock"
+    with _locked(slock):
+        state = _read_state(bd)
+        state.setdefault("spaces", [])
+        if space not in state["spaces"]:
+            state["spaces"].append(space)
+            _write_state(bd, state)
     if "rid" not in ps:
         # first call for this paper: book its slot (pacing / caps / cooldowns of the publisher)
         try:
@@ -447,53 +521,89 @@ def wrapper_main(batch_dir: str, argv: list[str]) -> int:
         ps["closed"] = "publisher in cooldown"
         _atomic(sp, json.dumps(ps))
         return say(f"tbsgen: paper {n}: {msg[:120]}; move on", 2)
-    # a hand-off that is still open: only handoff_status (or its expiry) may act on the paper
-    handoff_deadline = float(ps.get("handoff_deadline") or 0)
-    if ps.get("handoff"):
-        if action != "handoff_status":
-            return say("tbsgen: this paper is with the user (hand-off). Poll `tbsgen-browser N handoff_status` "
-                       "and work on other papers meanwhile.", 2)
-        if time.time() > handoff_deadline:
-            reason = str(ps.get("handoff_reason") or "")
-            ps.pop("handoff", None)
-            if "login" in reason:
-                ps["closed"] = "login_required (hand-off timed out)"
-            else:
-                ps["closed"] = "challenge (hand-off timed out)"
-                _cool_publisher(led, ps, p["doi"], "hand-off timed out", float(st["challenge_cooldown_s"]))
-            _atomic(sp, json.dumps(ps))
-            return say(f"tbsgen: paper {n}: hand-off timed out - paper closed ({ps['closed']}).", 2)
+    # a hand-off that is still open: only handoff_status may act on the paper
+    if ps.get("handoff") and action != "handoff_status":
+        _atomic(sp, json.dumps(ps))
+        return say("tbsgen: this paper is with the user (hand-off). Poll `tbsgen-browser N handoff_status` "
+                   "and work on other papers meanwhile.", 2)
     if action != "handoff_status":
         ps["calls"] = ps.get("calls", 0) + 1
     if action == "type":
         value = " ".join(arg.split(" ")[1:])
         if not value or value not in (st.get("type_allow") or []):
-            return say(f"tbsgen: paper {n}: only the configured institution names may be typed", 2)
-    if action in NAV_ACTIONS:
-        # pace the agent's page loads per publisher and cap them per paper
-        if ps.get("navs", 0) >= int(st["max_navigations_per_paper"]):
             _atomic(sp, json.dumps(ps))
-            return say(f"tbsgen: paper {n}: navigation limit reached; give up on this paper", 2)
+            return say(f"tbsgen: paper {n}: only the configured institution names may be typed", 2)
+    # budgets shared by the batch's concurrent calls are reserved under one lock: navigation pacing per
+    # publisher, the publisher's single hand-off and the SSO submission budget
+    nav_at = 0.0
+    with _locked(slock):
         state = _read_state(bd)
-        last = float((state.get("nav") or {}).get(lkey) or 0)
-        gap = float(st["nav_gap_s"]) - (time.time() - last)
-        if gap > 0:
-            if gap > float(st["deadline"]) - time.time():
+        if action in NAV_ACTIONS:
+            if ps.get("navs", 0) >= int(st["max_navigations_per_paper"]):
+                _atomic(sp, json.dumps(ps))
+                return say(f"tbsgen: paper {n}: navigation limit reached; give up on this paper", 2)
+            nav = state.setdefault("nav", {})
+            nav_at = max(time.time(), float(nav.get(pkey) or 0) + float(st["nav_gap_s"]))
+            if nav_at > float(st["deadline"]):
                 _atomic(sp, json.dumps(ps))
                 return say("tbsgen: the batch deadline comes before the next navigation; end now.", 3)
-            time.sleep(gap)
-        state.setdefault("nav", {})[lkey] = time.time()
+            nav[pkey] = nav_at
+            ps["navs"] = ps.get("navs", 0) + 1
+        handoff_free = (bool(st.get("handoff_enabled")) and not ps.get("handoff")
+                        and not (state.get("handoff") or {}).get(pkey)
+                        and not (state.get("handoff_inflight") or {}).get(pkey))
+        if handoff_free:
+            state.setdefault("handoff_inflight", {})[pkey] = n
+        sso_ok = False
+        if action == "sso_login":
+            s = state.setdefault("sso", {})
+            sso_ok = (bool(st.get("sso_login_enabled")) and bool(st.get("sso_domains"))
+                      and int(s.get("submissions") or 0) < int(st.get("sso_max_submissions", 2))
+                      and not s.get("failed") and not s.get("logged_in") and not s.get("pending"))
+            if sso_ok:                       # reserved before the script runs; released only if nothing was submitted
+                s["submissions"] = int(s.get("submissions") or 0) + 1
+                s["pending"] = n
         _write_state(bd, state)
-        ps["navs"] = ps.get("navs", 0) + 1
     _atomic(sp, json.dumps(ps))
+    try:
+        if (wait := nav_at - time.time()) > 0:
+            time.sleep(wait)
+        return _paper_run(bd, st, n, p, ps, action, arg, say, led, pkey, space, handoff_free, sso_ok, slock,
+                          COOLDOWN_429_S)
+    finally:
+        with _locked(slock):
+            state = _read_state(bd)
+            if (state.get("handoff_inflight") or {}).get(pkey) == n:
+                state["handoff_inflight"].pop(pkey, None)
+                _write_state(bd, state)
+
+
+def _sso_finalize(bd: Path, slock: Path, n: str, res: dict) -> str | None:
+    """Book the result of a reserved SSO submission.  Only an explicit `sso_submitted: false` (refused before
+    anything was submitted) returns the reservation; anything uncertain (timeout, error, hand-off after the
+    submit) counts as a submission and ends the automatic logins of this batch."""
+    with _locked(slock):
+        state = _read_state(bd)
+        s = state.get("sso") or {}
+        if s.get("pending") != n:
+            return None
+        s.pop("pending", None)
+        if res and res.get("sso_submitted") is False:
+            s["submissions"] = max(0, int(s.get("submissions") or 0) - 1)
+            result = None
+        else:
+            result = res.get("sso") if res.get("sso") in ("ok", "fail", "handoff") else "unknown"
+            s["logged_in" if result == "ok" else "failed"] = True
+        state["sso"] = s
+        _write_state(bd, state)
+    return result
+
+
+def _paper_run(bd, st, n, p, ps, action, arg, say, led, pkey, space, handoff_free, sso_ok, slock,
+               COOLDOWN_429_S) -> int:
+    sp = bd / "papers" / f"{n}.json"
     files = (bd / "files" / n).resolve()
     files.mkdir(parents=True, exist_ok=True)
-    handoff_free = (bool(st.get("handoff_enabled")) and not ps.get("handoff")
-                    and not (state.get("handoff") or {}).get(lkey))
-    sso_st = state.get("sso") or {}
-    sso_ok = (bool(st.get("sso_login_enabled")) and (st.get("sso_domains") or [])
-              and int(sso_st.get("submissions") or 0) < int(st.get("sso_max_submissions", 2))
-              and not sso_st.get("failed") and not sso_st.get("logged_in"))
     inp = dict(space=space, action=action, arg=arg, allow=p["allow"], files_dir=str(files),
                look_url=ps.get("look_url") if action in ("click", "hover", "select", "type") else None,
                look_scope=ps.get("look_scope") or "", page_label=ps.get("page_label") or "",
@@ -502,32 +612,50 @@ def wrapper_main(batch_dir: str, argv: list[str]) -> int:
                handoff={"enabled": handoff_free}, sso={"login": sso_ok, "domains": st.get("sso_domains") or []},
                type_allow=st.get("type_allow") or [],
                handoff_state={"active": bool(ps.get("handoff")),
-                              "deadline_ms": int(handoff_deadline * 1000) if ps.get("handoff") else 0})
+                              "deadline_ms": int(float(ps.get("handoff_deadline") or 0) * 1000),
+                              "title": ps.get("handoff_title") or "", "page_label": ps.get("handoff_page") or ""})
     timeout = max(5.0, min(float(st["call_timeout_s"]), float(st["deadline"]) - time.time()))
     res, _err = _run_script(st, inp, timeout, bd)
-    if not res:
-        return say("tbsgen: stopped (egress changed, deadline or call timeout). End now.", 3)
+    sso_result = _sso_finalize(bd, slock, n, res) if sso_ok else None
 
     def save_ps(**kw):
         cur = json.loads(sp.read_text())
         cur.update(kw)
         _atomic(sp, json.dumps(cur))
         return cur
-
+    if sso_result is not None:
+        host = str(res.get("sso_host") or "")[:80]
+        if not host:
+            with contextlib.suppress(ValueError):
+                host = urlparse((res.get("page") or {}).get("url") or "").hostname or ""
+        note = f"sso_login host={host} result={sso_result} at={time.strftime('%H:%M:%S')}"
+        if sso_result in ("ok", "handoff"):
+            save_ps(sso_note=note)
+        else:
+            save_ps(sso_note=note, closed="login_failed (sso, not retried)")
+            if sso_result == "fail":
+                return say(f"tbsgen: paper {n}: SSO login failed - no retry; report `login_required` and move on.", 2)
+    if not res:
+        return say("tbsgen: stopped (egress changed, deadline or call timeout). End now.", 3)
     if res.get("status") == "paused":
         return say("tbsgen: this paper's browser workspace is with the user (hand-off). Poll "
                    "`tbsgen-browser N handoff_status` and work on other papers meanwhile.", 2)
     if res.get("handoff") and res.get("status") == "handoff":
         # the tool handed the page to the user (verification / login): notify, mark, keep the paper open
-        state = _read_state(bd)
-        state.setdefault("handoff", {})[lkey] = True
-        _write_state(bd, state)
         ho = res.get("handoff") or {}
-        save_ps(handoff=True, handoff_used=True, handoff_reason=str(ho.get("reason") or "")[:80],
+        reason = str(ho.get("reason") or "")
+        kind = ho.get("kind") if ho.get("kind") in ("challenge", "login", "mfa") else (
+            "challenge" if "challenge" in reason else "login")
+        with _locked(slock):
+            state = _read_state(bd)
+            state.setdefault("handoff", {})[pkey] = True
+            _write_state(bd, state)
+        save_ps(handoff=True, handoff_used=True, handoff_reason=reason[:80], handoff_kind=kind,
+                handoff_title=str(ho.get("title") or "")[:200], handoff_page=str(ho.get("page_label") or "")[:40],
                 handoff_deadline=min(time.time() + float(st["handoff_wait_s"]), float(st["deadline"])),
-                handoff_note=f"handoff: {str(ho.get('reason'))[:60]} host={ho.get('host', '')}".strip())
-        kind = "验证" if "challenge" in str(ho.get("reason") or "") else "登录"
-        _notify_user(st, f"请在 ego lite 里完成 {ho.get('host') or '出版商'} 的{kind}（论文 {n}）")
+                handoff_note=f"handoff at={time.strftime('%H:%M:%S')} kind={kind} host={ho.get('host', '')}")
+        what = "验证" if kind == "challenge" else "登录"
+        _notify_user(st, f"请在 ego lite 里完成 {ho.get('host') or '出版商'} 的{what}（论文 {n}），完成后不用做别的")
         return say("tbsgen: handed the page to the user (the notification explains what is needed). Work on "
                    "other papers now and poll `tbsgen-browser N handoff_status`.", 0)
     if res.get("blocked"):
@@ -544,44 +672,33 @@ def wrapper_main(batch_dir: str, argv: list[str]) -> int:
         ps = save_ps()
         ps["accepted"] = sorted(set(ps.get("accepted") or []) | set(acc))
         _atomic(sp, json.dumps(ps))
+    if action == "hover" and res.get("navigated"):
+        # a hover that loaded a page counts as a page load (it could not be paced before)
+        ps = save_ps()
+        ps["navs"] = ps.get("navs", 0) + 1
+        _atomic(sp, json.dumps(ps))
+        with _locked(slock):
+            state = _read_state(bd)
+            state.setdefault("nav", {})[pkey] = time.time()
+            _write_state(bd, state)
     if action == "handoff_status":
         chk = res.get("handoff_check")
         if chk == "cleared":
             ps = save_ps()
-            ps.pop("handoff", None)
+            for k in ("handoff", "handoff_title", "handoff_page"):
+                ps.pop(k, None)
             _atomic(sp, json.dumps(ps))
             return say("tbsgen: the user cleared the page; continue with this paper (run `look`).", 0)
         if chk == "waiting":
             return say(f"tbsgen: still waiting for the user ({res.get('handoff_left_s')}s left); do other work "
                        "and poll again.", 0)
         if chk == "expired":
-            reason = str(ps.get("handoff_reason") or "")
             ps = save_ps()
-            ps.pop("handoff", None)
-            if "login" in reason:
-                ps["closed"] = "login_required (hand-off timed out)"
-            else:
-                ps["closed"] = "challenge (hand-off timed out)"
-                _cool_publisher(led, ps, p["doi"], "hand-off timed out", float(st["challenge_cooldown_s"]))
+            ps["handoff_deadline"] = 0
+            why = _expire_handoff(st, led, n, ps, force=True)
             _atomic(sp, json.dumps(ps))
-            return say(f"tbsgen: paper {n}: hand-off timed out - paper closed ({ps['closed']}).", 2)
+            return say(f"tbsgen: paper {n}: hand-off timed out - paper closed ({why}).", 2)
         return say("tbsgen: no hand-off in progress for this paper.", 0)
-    if res.get("sso") in ("ok", "fail"):
-        state = _read_state(bd)
-        s = state.get("sso") or {}
-        s["submissions"] = int(s.get("submissions") or 0) + 1
-        host = ""
-        with contextlib.suppress(ValueError):
-            host = urlparse((res.get("page") or {}).get("url") or "").hostname or ""
-        s["failed" if res["sso"] == "fail" else "logged_in"] = True
-        state["sso"] = s
-        _write_state(bd, state)
-        note = f"sso_login host={host} result={res['sso']}"
-        if res["sso"] == "ok":
-            save_ps(sso_note=note)
-        else:
-            save_ps(sso_note=note, closed="login_failed (sso, not retried)")
-            return say("tbsgen: paper {n}: SSO login failed - no retry; report `login_required` and move on.", 2)
     if res.get("shot"):
         ps = save_ps()
         ps["shots"] = sorted(set(ps.get("shots") or []) | {res["shot"]})   # viewable, never the paper's text
@@ -600,6 +717,7 @@ def wrapper_main(batch_dir: str, argv: list[str]) -> int:
         _atomic(sp, json.dumps(ps))
     show = dict(status=res.get("status"), error=res.get("error"), files_saved=len(res.get("files") or []),
                 page=res.get("page"), note=res.get("note"), left_allowed=res.get("left_allowed"),
+                login_required=res.get("login_required"),
                 shot=res.get("shot"), tabs=res.get("tabs"), acted=res.get("acted"), sso=res.get("sso"),
                 waited=res.get("waited"), scroll=res.get("scroll"), page_label=res.get("page_label"),
                 handoff_check=res.get("handoff_check"), handoff_left_s=res.get("handoff_left_s"))
@@ -625,17 +743,58 @@ def render_prompt(template: str, **kw) -> str:
 
 STDERR_KEEP = 64 * 1024           # bytes of the agent's stderr kept in the batch directory (the tail)
 STDERR_LOG_TAIL = 1500            # characters of it repeated in the agent_end log event
-_SECRETISH = re.compile(r"(?i)(bearer\s+|authorization:\s*|(?:api[_-]?key|token|secret|password|passwd|pwd)"
-                        r"[\"']?\s*[:=]\s*[\"']?)[^\s\"',;]+|\b(?:sk|ghp|gho|ghu|github_pat|xox[bp])[-_][A-Za-z0-9_\-]{8,}")
+# credential-like text in the agent's stderr: whole auth headers, key=value / key: value pairs (also with spaces
+# inside a quoted value), URL userinfo and well-known token shapes
+_SECRET_PATTERNS = (
+    re.compile(r"(?i)\b((?:proxy-)?authorization\s*[:=]\s*)[^\r\n]*"),
+    re.compile(r"(?i)\b(bearer\s+)[^\s\"',;]+"),
+    re.compile(r"(?i)((?:api[_-]?key|access[_-]?token|refresh[_-]?token|token|secret|password|passwd|pwd|cookie|"
+               r"session|credential)s?[\"']?\s*[:=]\s*)(\"[^\"\r\n]*\"|'[^'\r\n]*'|[^\s,;]+)"),
+    re.compile(r"(?i)(\w+://)[^/\s:@]+:[^/\s@]+@"),
+    re.compile(r"()\b(?:sk|pk|rk|ghp|gho|ghu|ghs|github_pat|xox[abprs]|glpat|hf)[-_][A-Za-z0-9_\-]{8,}"),
+    re.compile(r"()\beyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{4,}"),     # JWT
+)
 
 
 def redact(text: str) -> str:
     """Mask anything that looks like a credential (stderr of the agent process is logged)."""
-    return _SECRETISH.sub(lambda m: (m.group(1) or "") + "[redacted]", text)
+    for pat in _SECRET_PATTERNS:
+        text = pat.sub(lambda m: m.group(1) + "[redacted]", text)
+    return text
+
+
+class _StderrTail:
+    """Reads the agent's stderr pipe in a thread and keeps only its last `keep` bytes in memory; nothing
+    unredacted is ever written to disk."""
+
+    def __init__(self, pipe, keep: int = STDERR_KEEP):
+        self.buf = bytearray()
+        self.keep = keep
+        self.th = threading.Thread(target=self._read, args=(pipe,), daemon=True)
+        self.th.start()
+
+    def _read(self, pipe):
+        with contextlib.suppress(Exception):
+            for chunk in iter(lambda: pipe.read(8192), b""):
+                self.buf += chunk
+                if len(self.buf) > 2 * self.keep:
+                    del self.buf[:-self.keep]
+
+    def text(self) -> str:
+        self.th.join(timeout=5)
+        return redact(bytes(self.buf[-self.keep:]).decode("utf-8", "replace"))
+
+
+def _write_private(path: Path, text: str):
+    """Write a 0600 file (created with that mode, never readable by others in between)."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as fh:
+        fh.write(text)
+    os.chmod(path, 0o600)
 
 
 def _stderr_tail(path: Path | None, keep: int = STDERR_KEEP) -> str:
-    """Truncate the stderr file to its last `keep` bytes, redact it in place; return the redacted tail."""
+    """Truncate a stderr file to its last `keep` bytes, redact it in place; return the redacted tail."""
     if path is None:
         return ""
     try:
@@ -648,23 +807,18 @@ def _stderr_tail(path: Path | None, keep: int = STDERR_KEEP) -> str:
         return ""
     text = redact(data.decode("utf-8", "replace"))
     with contextlib.suppress(OSError):
-        _atomic(path, text)
-        path.chmod(0o600)
+        _write_private(path, text)
     return text
 
 
 def default_hermes_runner(argv: list[str], env: dict, timeout: float, on_event, stop: threading.Event,
                           stderr_path: Path | None = None) -> dict:
     """Run `hermes chat ... --format stream-json`; call on_event(ev) per JSON line (it returns a reason string
-    to kill the run).  stderr goes to `stderr_path` (truncated to its tail and redacted afterwards).  Returns
-    dict(exit, killed, result_event, stderr_tail)."""
-    err = open(stderr_path, "wb") if stderr_path is not None else subprocess.DEVNULL   # noqa: SIM115
-    try:
-        p = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=err, stdin=subprocess.DEVNULL,
-                             env=env, text=True, start_new_session=True)
-    finally:
-        if err is not subprocess.DEVNULL:
-            err.close()                       # the child holds its own copy of the descriptor
+    to kill the run).  stderr is read through a pipe; only its redacted tail is written, to `stderr_path` (0600).
+    Returns dict(exit, killed, result_event, stderr_tail)."""
+    p = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL,
+                         env=env, text=False, start_new_session=True)
+    err_tail = _StderrTail(p.stderr)
     killed = ""
     result = None
     t_end = time.time() + timeout
@@ -686,7 +840,8 @@ def default_hermes_runner(argv: list[str], env: dict, timeout: float, on_event, 
     th = threading.Thread(target=watch, daemon=True)
     th.start()
     assert p.stdout is not None
-    for line in p.stdout:
+    import io
+    for line in io.TextIOWrapper(p.stdout, encoding="utf-8", errors="replace"):
         line = line.strip()
         if not line.startswith("{"):
             continue
@@ -704,7 +859,11 @@ def default_hermes_runner(argv: list[str], env: dict, timeout: float, on_event, 
         with contextlib.suppress(ProcessLookupError):
             os.killpg(p.pid, signal.SIGKILL)
         p.wait()
-    return dict(exit=p.returncode, killed=killed, result=result, stderr_tail=_stderr_tail(stderr_path))
+    tail = err_tail.text()
+    if stderr_path is not None:
+        with contextlib.suppress(OSError):
+            _write_private(stderr_path, tail)
+    return dict(exit=p.returncode, killed=killed, result=result, stderr_tail=tail)
 
 
 def run_batch(fetcher, *, wait_for_egress: bool = False, max_wait_s: float | None = None, on_success=None,
@@ -1169,7 +1328,7 @@ def _agent_phase(fetcher, todo: list[dict], deadline: float, bd: Path, wd: Watch
     sso_login = b.get("sso_login") or {}
     led = fetcher.ledger
     papers = {}
-    sso_domains = [str(x).lower() for x in sso.get("domains") or []]
+    sso_domains = [str(x).lower() for x in [*(sso.get("domains") or []), *(sso_login.get("domains") or [])]]
     for i, e in enumerate(todo, 1):
         papers[str(i)] = dict(doi=e["doi"], title=e.get("title") or "", ident=paper_ident(e),
                               allow=allowed_domains(e["doi"], e.get("_landing"),
@@ -1257,6 +1416,9 @@ def _agent_phase(fetcher, todo: list[dict], deadline: float, bd: Path, wd: Watch
             kw["stderr_path"] = err_path
     rr = runner(argv, env, budget + float(ag.get("kill_grace_s", 20)), on_event, stop, **kw)
     (bd / "STOP").write_text("agent run ended")       # a late tool call cannot book anything any more
+    # hand-offs still open (the agent stopped polling): close the papers, cool challenge publishers
+    with contextlib.suppress(Exception):
+        _sweep_handoffs(bd, st, led, force=True)
     # the agent run is over: close the batch's TaskSpaces (a hand-off still open is taken back first)
     closed_spaces = []
     if fetcher.browser_runner is None and st.get("ego_binary"):

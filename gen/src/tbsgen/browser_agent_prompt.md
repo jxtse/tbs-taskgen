@@ -38,7 +38,8 @@ Use your terminal tool to run exactly one of these commands per call (nothing el
 - `tbsgen-browser N switch LABEL` — make page LABEL (from `tabs`) the current page.
 - `tbsgen-browser N back` — go back one history step.
 - `tbsgen-browser N wait_for url SUBSTR|sel CSS [S]` — wait until the URL contains SUBSTR or a CSS selector
-  matches (at most 60 s).
+  matches (at most 60 s). The selector must start with a letter and use only letters, digits and `_.#:-`
+  (e.g. `div#pdf`, `a.download`; not `#pdf`).
 - `tbsgen-browser N save_pdf` — the current page shows a PDF: save it.
 - `tbsgen-browser N sso_login` — on the institution's own SSO login page only: submit the browser's autofilled
   login (see rule 2).
