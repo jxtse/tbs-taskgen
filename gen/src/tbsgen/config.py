@@ -276,6 +276,9 @@ DEFAULTS: dict[str, Any] = {
         "frac": 0.5,                        # 待定: threshold position between ref and mid (log-midpoint)
         "min_ref_margin": 0.10,             # reference must clear each threshold by >=10% (relative)
         "loose_margin": 0.50,               # non-separating metrics: threshold = ref worsened by 50%
+        "noise_floor_abs": 1e-9,            # two values both below this are floating-point noise: never "separating"
+                                            # or "ref worse than naive"; a "<=" metric where ref, mid and naive are all
+                                            # below it gets it as threshold.  0 disables (metrics on a tiny scale)
         "resource_loose_margin": 2.0,       # non-separating resource metrics (runtime/memory, spec.is_resource_metric):
                                             # ref x3 -- run-to-run timing noise (e2e-prod-20261109: 0.58 s -> 0.93 s)
         "max_mid_fail": 2, "min_mid_fail": 1,

@@ -779,3 +779,34 @@ def test_resource_loose_margin_is_configurable():
             "mid": {"0": {"hidden_mae": 1.3, "hidden_runtime_sec": 0.60}},
             "naive": {"0": {"hidden_mae": 1.9, "hidden_runtime_sec": 2.0}}}
     assert set_thresholds(spec, meas, cfg)["thresholds"]["hidden_runtime_sec"]["threshold"] == pytest.approx(1.1)
+
+
+def test_metrics_at_the_floating_point_noise_floor():
+    """e2e-prod-20261109 (one-loop power spectrum): sigma metrics ref 4.3e-11 / mid 2.7e-11 / naive 4.3e-11 -> was
+    ref_worse_than_naive with threshold 6.5e-11 -> S8 x2 -> dropped."""
+    cfg = load_config()
+    spec = {"metrics": [{"name": "hidden_relerr", "direction": "<="}, {"name": "hidden_l2", "direction": "<="},
+                        {"name": "hidden_sigma_relerr", "direction": "<="}]}
+    meas = {"ref": {"0": {"hidden_relerr": 6.1e-9, "hidden_l2": 3.1e-10, "hidden_sigma_relerr": 4.3e-11}},
+            "mid": {"0": {"hidden_relerr": 0.41, "hidden_l2": 3e-10, "hidden_sigma_relerr": 2.7e-11}},
+            "naive": {"0": {"hidden_relerr": 0.29, "hidden_l2": 0.47, "hidden_sigma_relerr": 2.7e-11}}}
+    th = set_thresholds(spec, meas, cfg)
+    assert th["ref_worse_than_naive"] == [] and th["status"] == "ok", th
+    sig = th["thresholds"]["hidden_sigma_relerr"]
+    assert sig["threshold"] == pytest.approx(1e-9) and not sig["separating"] and sig["ref_passes"]
+    assert th["thresholds"]["hidden_relerr"]["separating"]                       # real separation unaffected
+    meas["ref"]["0"]["hidden_sigma_relerr"] = 5e-3                              # a real regression still counts
+    assert set_thresholds(spec, meas, cfg)["ref_worse_than_naive"] == ["hidden_sigma_relerr"]
+    # tiny-scale metric where one baseline is above the floor: plain rules (ref x1.5), separation kept
+    meas["ref"]["0"]["hidden_sigma_relerr"] = 1e-12
+    meas["mid"]["0"]["hidden_sigma_relerr"] = 1e-12
+    meas["naive"]["0"]["hidden_sigma_relerr"] = 5e-9
+    t3 = set_thresholds(spec, meas, cfg)["thresholds"]["hidden_sigma_relerr"]
+    assert t3["threshold"] == pytest.approx(1.5e-12)                            # plain loose rule, no floor
+    meas["mid"]["0"]["hidden_sigma_relerr"] = 2e-9                              # mid above the floor: separating
+    assert set_thresholds(spec, meas, cfg)["thresholds"]["hidden_sigma_relerr"]["separating"]
+    cfg0 = load_config(None, {"thresholds": {"noise_floor_abs": 0}})             # disabled: old behaviour
+    meas = {"ref": {"0": {"hidden_relerr": 6.1e-9, "hidden_l2": 3.1e-10, "hidden_sigma_relerr": 4.3e-11}},
+            "mid": {"0": {"hidden_relerr": 0.41, "hidden_l2": 3e-10, "hidden_sigma_relerr": 2.7e-11}},
+            "naive": {"0": {"hidden_relerr": 0.29, "hidden_l2": 0.47, "hidden_sigma_relerr": 2.7e-11}}}
+    assert set_thresholds(spec, meas, cfg0)["ref_worse_than_naive"] == ["hidden_sigma_relerr"]
