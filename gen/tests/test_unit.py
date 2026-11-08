@@ -200,6 +200,50 @@ def test_reference_worse_than_naive_is_flagged():
     assert th["status"] == "ref_worse_than_naive" and th["ref_worse_than_naive"] == ["hidden_rmse"], th
 
 
+def test_resource_metric_slower_than_naive_is_not_ref_worse():
+    """e2e-prod-20261109 (phase unwrapping): accurate reference 0.58 s vs a trivial naive 0.40 s on the hidden runtime
+    metric -> was ref_worse_than_naive -> S8 x2 -> dropped.  A resource metric does not trigger it; quality metrics do."""
+    from tbsgen.spec import is_resource_metric
+    cfg = load_config()
+    spec = {"metrics": [{"name": "hidden_frac_correct", "direction": ">="},
+                        {"name": "hidden_mae", "direction": "<="},
+                        {"name": "hidden_runtime_sec", "direction": "<="},
+                        {"name": "working_set_kib", "direction": "<=", "kind": "resource"}]}
+    meas = {"ref": {"0": {"hidden_frac_correct": 0.96, "hidden_mae": 0.20, "hidden_runtime_sec": 0.58, "working_set_kib": 900}},
+            "mid": {"0": {"hidden_frac_correct": 0.79, "hidden_mae": 1.35, "hidden_runtime_sec": 0.66, "working_set_kib": 800}},
+            "naive": {"0": {"hidden_frac_correct": 0.82, "hidden_mae": 1.17, "hidden_runtime_sec": 0.40,
+                            "working_set_kib": 100}}}
+    th = set_thresholds(spec, meas, cfg)
+    assert th["ref_worse_than_naive"] == [] and th["status"] != "ref_worse_than_naive", th
+    meas["ref"]["0"]["hidden_mae"] = 1.50                                       # a quality metric still counts
+    assert set_thresholds(spec, meas, cfg)["ref_worse_than_naive"] == ["hidden_mae"]
+    spec["metrics"][3].pop("kind")                                             # kind is what exempts it
+    assert set_thresholds(spec, meas, cfg)["ref_worse_than_naive"] == ["hidden_mae", "working_set_kib"]
+    assert [is_resource_metric({"name": n}) for n in
+            ("hidden_runtime_per_spectrum", "wall_time", "hidden_runtime_sec", "peak_mem_mb", "peak_rss", "runtime",
+             "membrane_err", "second_moment", "hidden_rmse", "hidden_rss", "rss", "size_mb", "sec_moment",
+             "hidden_delay_mae_seconds", "hidden_arrival_time_s_rmse", "latency_err", "elapsed_s")] == \
+        [True] * 6 + [False] * 11
+
+
+def test_resource_metric_exempt_item_passes_with_its_threshold_unchanged():
+    """mid fails 1-2 quality criteria, naive >= 2: status ok, and the runtime threshold is the plain loose rule."""
+    cfg = load_config()
+    spec = {"metrics": [{"name": "hidden_frac_correct", "direction": ">="}, {"name": "hidden_mae", "direction": "<="},
+                        {"name": "hidden_runtime_sec", "direction": "<="}]}
+    meas = {"ref": {"0": {"hidden_frac_correct": 0.96, "hidden_mae": 0.20, "hidden_runtime_sec": 0.58}},
+            "mid": {"0": {"hidden_frac_correct": 0.79, "hidden_mae": 1.35, "hidden_runtime_sec": 0.60}},
+            "naive": {"0": {"hidden_frac_correct": 0.50, "hidden_mae": 1.90, "hidden_runtime_sec": 0.40}}}
+    th = set_thresholds(spec, meas, cfg)
+    assert th["status"] == "ok" and th["ref_worse_than_naive"] == [], th
+    rt = th["thresholds"]["hidden_runtime_sec"]
+    assert rt["threshold"] == pytest.approx(0.87) and rt["ref_passes"] and not rt["separating"]
+    spec["metrics"][2]["name"] = "hidden_delay_mae_seconds"                     # quality metric in seconds: not exempt
+    meas = {w: {"0": {("hidden_delay_mae_seconds" if k == "hidden_runtime_sec" else k): v for k, v in d["0"].items()}}
+            for w, d in meas.items()}
+    assert set_thresholds(spec, meas, cfg)["status"] == "ref_worse_than_naive"
+
+
 @pytest.mark.parametrize("d,ref,naive", [("<=", 1.04, 1.15), (">=", 0.96, 0.85)])
 def test_naive_cap_survives_rounding(d, ref, naive):
     """Review #9: ref=mid=1.04, naive=1.15 -> floor 1.144 used to round to 1.2 and let naive pass."""

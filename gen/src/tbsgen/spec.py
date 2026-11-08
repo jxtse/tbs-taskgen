@@ -66,6 +66,21 @@ def metric_family(name: str) -> str:
     return re.sub(r"_(public|hidden)$", "", n)
 
 
+# Resource metrics (wall time, memory): an accurate reference is legitimately slower / bigger than a trivial naive
+# baseline, so "reference worse than naive" does not mean the metric fails to measure the method (e2e-prod-20261109:
+# 2/2 specs had a hidden runtime metric, ref 0.58 s vs naive 0.40 s, and the item was dropped after 2 S8 rounds that
+# could not make the reference faster than the shortcut).  Name-based; a spec may also mark {"kind": "resource"}.
+# Unambiguous compute-resource tokens only.  Units and generic words ("seconds", "time_s", "latency", "elapsed",
+# "rss" = residual sum of squares, "mb", "mem") are left out on purpose: a quality metric such as a delay-estimation
+# error in seconds misread as a resource metric would lose this check.  Anything else: declare kind="resource".
+RESOURCE_METRIC = re.compile(r"(?:^|_)(?:runtime|wall_?time|walltime|cpu_time|peak_memory|peak_rss|max_rss|peak_mem)"
+                             r"(?:_|$)", re.I)
+
+
+def is_resource_metric(m: dict) -> bool:
+    return m.get("kind") == "resource" or bool(RESOURCE_METRIC.search(m.get("name", "")))
+
+
 def _worse(direction: str, a: float, b: float) -> bool:
     """is a worse than b"""
     return a > b if direction == "<=" else a < b
@@ -161,8 +176,9 @@ def set_thresholds(spec: dict, measure: dict, cfg: dict) -> dict:
     # does not measure the method (e2e-iter1 IEnKS: on the hidden regime the reference diverged, filter RMSE 4.19
     # vs naive 3.39-3.52, and the loose rule still produced thresholds that both passed)
     ref_worse = []
+    resource = {m["name"] for m in spec["metrics"] if is_resource_metric(m)}
     for name, t in out.items():
-        if t.get("threshold") is None:
+        if t.get("threshold") is None or name in resource:
             continue
         nv = [v.get(name) for v in measure.get("naive", {}).values()]
         nv = [x for x in nv if x is not None and math.isfinite(x)]
