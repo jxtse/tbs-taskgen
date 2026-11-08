@@ -171,9 +171,9 @@ DEFAULTS: dict[str, Any] = {
                 "bark_cmd": [],             # optional local notification command; off by default, never group chats
             },
             # Institution / WAYF / institution-login domains every paper may navigate to (they are added to
-            # allowed_domains), e.g. add "authserver.nju.edu.cn".  The agent may type ONLY the institution names
-            # in agent.institution_names there; any login page (the institution's own SSO login too) is handed
-            # to the user (handoff.enabled), whose browser autofills it - the agent never submits a login.
+            # allowed_domains), e.g. add "authserver.nju.edu.cn".  The agent never changes a form field: institution
+            # selection (WAYF) and every login page (the institution's own SSO login too) are handed to the user
+            # (handoff.enabled), whose browser autofills the login - the agent never submits a login.
             "sso": {
                 "domains": ["carsi.edu.cn", "openathens.net", "shibboleth.net"],
             },
@@ -191,9 +191,8 @@ DEFAULTS: dict[str, Any] = {
                 "gate_max_wait_s": 150,     # the per-paper gate waits at most this long for the publisher's slot
                 "prompt_template": None,    # None -> packaged browser_agent_prompt.md
                 "max_calls_per_paper": 25,  # ego-browser calls the agent may make per paper
-                "max_navigations_per_paper": 12,   # page loads per paper (open / click / select / type / hover / save_pdf)
+                "max_navigations_per_paper": 12,   # page loads per paper (open / click / save_pdf)
                 "nav_gap_s": 2.5,           # min seconds between two page loads of the same publisher
-                "institution_names": [],    # the ONLY strings `type` may type, e.g. ["Nanjing University", "南京大学"]
                 "call_timeout_s": 150,      # one ego-browser call of the agent
                 "keep_batch_dir": False,    # keep prompt / wrapper state after the batch (debugging)
                 "hermes_installs_dir": None,  # Hermes' dependency state; None -> <HERMES_HOME or ~/.hermes>/installs

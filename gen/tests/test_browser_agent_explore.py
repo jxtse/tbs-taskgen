@@ -67,10 +67,7 @@ def test_shell_allowed_new_actions():
     ok = [
         "tbsgen-browser 1 look", "tbsgen-browser 1 look 40",
         "tbsgen-browser 1 open https://doi.org/10.1080/x",
-        "tbsgen-browser 1 click 12", "tbsgen-browser 1 hover 3",
-        "tbsgen-browser 1 select 2 Nanjing University", "tbsgen-browser 1 type 4 Nanjing University",
-        "tbsgen-browser 1 type 4 南京大学", "tbsgen-browser 1 type 4 hunter2",   # shape ok; the wrapper's
-        # whitelist (institution names only) refuses it before the action script runs
+        "tbsgen-browser 1 click 12",
         "tbsgen-browser 1 tabs", "tbsgen-browser 1 switch p2",
         "tbsgen-browser 1 wait_for url /pdf 20",
         "tbsgen-browser 1 wait_for sel a.pdf-link", "tbsgen-browser 1 wait_for sel div#pdf", "tbsgen-browser 1 save_pdf",
@@ -83,6 +80,10 @@ def test_shell_allowed_new_actions():
         "tbsgen-browser 1 scroll down", "tbsgen-browser 1 scroll up 800",   # removed (round 7)
         "tbsgen-browser 1 back",                                             # removed (round 8)
         "tbsgen-browser 1 sso_login",                                        # removed (round 9)
+        "tbsgen-browser 1 hover 3",                                          # removed (round 11)
+        "tbsgen-browser 1 select 2 Nanjing University",                      # removed (round 11)
+        "tbsgen-browser 1 type 4 Nanjing University", "tbsgen-browser 1 type 4 南京大学",   # removed (round 11)
+        "tbsgen-browser 1 click 3 x",
         "tbsgen-browser 1 open https://x.example/a;rm -rf /",     # shell metachar
         "tbsgen-browser 1 open https://x.example/a && echo hi",
         "tbsgen-browser 1 open \"https://x.example/a\"",
@@ -138,15 +139,15 @@ def test_nav_cap_and_pacing(tmp_path, monkeypatch):
     assert st["papers"][0]["status"] == "ok", st["papers"]       # the first three opens saved the file
 
 
-def test_type_is_whitelisted_institution_names_only(tmp_path, monkeypatch):
-    f, led, pr, _ = mk_agent(tmp_path, monkeypatch, hermes_mode="type", queue={"10.1080": 1},
-                             agent={"institution_names": ["Nanjing University"]})
+def test_form_field_actions_are_blocked_before_they_run(tmp_path, monkeypatch):
+    """round 11: hover / select / type are gone - the hook blocks them and the action script never runs them"""
+    f, led, pr, _ = mk_agent(tmp_path, monkeypatch, hermes_mode="type", queue={"10.1080": 1})
     st = _run(f, pr)
     log = _ego_log(tmp_path)
-    types = [e for e in log if e["action"] == "type"]
-    assert types and types[0]["arg"] == "4 Nanjing University"   # whitelisted: the action script ran
-    assert not [e for e in log if e["action"] == "type" and "hunter2" in (e["arg"] or "")]  # refused earlier
+    assert not [e for e in log if e["action"] in ("type", "select", "hover")], log
+    assert {e["action"] for e in log} == {"open", "finish"}, log
     assert st["papers"][0]["status"] == "ok", st["papers"]
+    assert not hasattr(browser_agent, "_SAFE_TXT")
 
 
 # --------------------------------------------------------------------------- hand-off
@@ -244,10 +245,11 @@ def test_allowed_domains_cover_sso_and_prompt_lists_actions(tmp_path, monkeypatc
         assert any(d in p["allow"] for p in st["papers"].values())
     assert st["handoff_enabled"] and "sso_login_enabled" not in st
     prompt = (_bd(f) / "prompt.md").read_text()
-    for s in ("hover", "tabs", "switch LABEL", "wait_for",
+    for s in ("tabs", "switch LABEL", "wait_for",
               "handoff_status", "25 tool calls", "12 page loads"):
         assert s in prompt, s
-    for s in ("click_xy", "screenshot", "vision", "look [full]", "@REF", "sso_login", "scroll", " back"):
+    for s in ("click_xy", "screenshot", "vision", "look [full]", "@REF", "sso_login", "scroll", " back",
+              "N hover", "N select", "N type", "$type_names", "institution_names"):
         assert s not in prompt, s
 
 

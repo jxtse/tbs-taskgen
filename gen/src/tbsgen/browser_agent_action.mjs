@@ -16,22 +16,19 @@
 //   open URL                      navigate (URL host must be in INPUT.allow); downloads and new tabs are saved /
 //                                 reported
 //   click I                       click item I of the last `look` list (same numbering; run `look` first)
-//   hover I                       hover item I of the top document (pointer / mouse events dispatched in the
-//                                 checking evaluation; opens JS dropdown menus; never inside frames)
-//   select I VALUE                choose VALUE (option value or label) of select item I
-//   type I TEXT                   type TEXT into text item I - only the whitelisted institution names in
-//                                 INPUT.type_allow, never into anything that can hold credentials
 //   tabs                          list the TaskSpace's pages (label, URL, allowed)
 //   switch LABEL                  make page LABEL the current page (never a page opened by the user)
 //   wait_for url SUBSTR|sel CSS [S]   wait until the URL contains SUBSTR / a CSS selector matches (<= 60 s)
 //   save_pdf                      the current page is a PDF document: save it
 //   handoff_status                poll a running hand-off (the tool handed the page to the user)
 //   finish                        close the TaskSpace
-// Rules enforced here: nothing is typed except whitelisted institution names into checked plain text fields,
-// no interaction with verification pages / widgets, no reading of input values, storage or the browser's
-// page snapshot (it carries field values), no screenshots, no native mouse / wheel input at all, no click / hover / select / type at all on a page with ANY login signal (credScan, checked in
-// the same page evaluation that acts, together with the looked-at URL and the allowed domains), login forms
-// are never submitted (every login page - the institution's SSO login too - is handed to the user, whose
+// NARROWED (round 11): the agent only reads pages, navigates and clicks - there is no hover, select or type,
+// and no form field is ever changed by this tool (institution selection / WAYF pages go to the user).
+// Rules enforced here: no form field is changed (fields cannot be clicked; a form with any editable control is
+// never submitted), no interaction with verification pages / widgets, no reading of input values, storage or
+// the browser's page snapshot (it carries field values), no screenshots, no native mouse / wheel input at all,
+// no click at all on a page with ANY login signal (credScan, checked in the same page evaluation that acts,
+// together with the looked-at URL and the allowed domains), login forms are never submitted (every login page - the institution's SSO login too - is handed to the user, whose
 // browser autofills it), no action inside any iframe (a frame is one item whose `click` opens its checked URL
 // as the page), navigation targets are checked before and the
 // landed URL is checked after (a page that ends up outside INPUT.allow is reset to about:blank), files are
@@ -179,8 +176,7 @@ async function info(page) {
 //   frames: a rendered cross-origin identity-provider frame (it cannot be inspected);
 //   mfa:    a one-time-code / SMS / verification-code field, or such a prompt where a text field could take it.
 // Only RENDERED fields count (publisher pages carry hidden header-login templates; the browser does not
-// autofill hidden fields); forms are never submitted with a free-text field this tool did not fill, rendered or
-// not (domAct).  Field VALUES are never read.
+// autofill hidden fields); a form with any editable control, rendered or not, is never submitted (domAct).  Field VALUES are never read.
 function credScan() {
   const NAME = /pass|pwd|user|login|account|otp|one-time|code|sms|\bpin\b|verif|captcha|e-?mail|phone|mobile|密码|账号|帐号|用户名|学号|工号|验证码|动态码|短信|手机|邮箱/i;
   const MFA = /otp|one-time|code|sms|verif|验证码|动态码|短信/i;
@@ -188,6 +184,10 @@ function credScan() {
   const WORDS = /\b(?:sign|log)[\s_-]?(?:in|on)\b|\blogin\b|\bsignin\b|continue with|(?:choose|select|switch|pick) (?:an |your )?account|登录|登入|登陆|统一身份认证|选择账[号户]/i;
   const URLW = /log[\s_-]?in|sign[\s_-]?in|log[\s_-]?on|sign[\s_-]?on|登录/i;
   const IDP = /login|signin|sign-in|\/auth\b|oauth|\bsso\b|passport|account|\bidp\b|shibboleth|wayf|\bcas\b/i;
+  // institution selection (WAYF / discovery service): the agent never chooses or types an institution - such a
+  // page goes to the user like a login (round 11)
+  const INST = /institution|\bwayf\b|identity provider|home organi[sz]ation|学校|机构|院校|高校/i;
+  const WAYF = /\bwayf\b|where are you from|(?:select|choose|find|search for) (?:your |an )?(?:institution|organi[sz]ation|university|identity provider)|discovery service|seamless ?access|选择(?:您的|你的)?(?:学校|机构|院校|高校|单位)/i;
   const TXT = /验证码|短信|动态码|一次性|二次验证|安全验证|身份验证|one[- ]time|verification code|security code|two[- ]factor|2fa|authenticator/i;
   const shown = (el) => { try { const v = el.ownerDocument.defaultView; return el.getClientRects().length > 0
     && v.getComputedStyle(el).visibility !== "hidden"; } catch (e) { return true; } };
@@ -202,7 +202,9 @@ function credScan() {
     }
     return t.slice(0, 300);
   };
-  let fields = false, strong = false, sem = false, mfa = false, text = 0, loose = 0, looseBtn = false;
+  const meta0 = (el) => [el.id, el.getAttribute("name"), el.getAttribute("placeholder"), el.getAttribute("aria-label"),
+                         el.getAttribute("title"), labelText(el)].join(" ");
+  let fields = false, strong = false, sem = false, mfa = false, text = 0, loose = 0, looseBtn = false, wayf = false;
   const walk = (doc) => {
     for (const host of doc.querySelectorAll("*")) if (host.shadowRoot) walk(host.shadowRoot);
     for (const el of doc.querySelectorAll("input, textarea")) {
@@ -210,6 +212,7 @@ function credScan() {
       if (["hidden", "submit", "button", "reset", "image", "checkbox", "radio", "file", "range", "color"].includes(t)) continue;
       if (!shown(el)) continue;
       text++;
+      if (INST.test(meta0(el))) wayf = true;
       if (!el.form && !(el.closest && el.closest("form"))) loose++;     // a script-driven widget may read it
       const ac = el.getAttribute("autocomplete") || "";
       const meta = [el.id, el.getAttribute("name"), ac, el.getAttribute("placeholder"), el.getAttribute("aria-label"),
@@ -224,6 +227,7 @@ function credScan() {
     // a select whose name / label is an account / user name (an account chooser) is a login field too
     for (const el of doc.querySelectorAll("select")) {
       if (!shown(el)) continue;
+      if (INST.test(meta0(el))) wayf = true;
       const ac = el.getAttribute("autocomplete") || "";
       const meta = [el.id, el.getAttribute("name"), ac, el.getAttribute("aria-label"), el.getAttribute("title"),
                     labelText(el)].join(" ");
@@ -261,13 +265,18 @@ function credScan() {
   };
   walk(document);
   if (looseBtn && loose > 0) sem = true;
+  // a WAYF wording in the title, URL or a rendered heading: an institution selection page, with or without
+  // fields (also a plain list of institution links goes to the user - the agent never picks an institution)
+  const heads = [...document.querySelectorAll("h1, h2, h3, legend")].filter(shown).slice(0, 20).map((h) => h.textContent || "").join(" ");
+  if (WAYF.test(document.title || "") || WAYF.test(path(location.href)) || WAYF.test(heads)) wayf = true;
+  if (wayf) sem = true;
   if (WORDS.test(document.title || "") || URLW.test(path(location.href))) sem = true;
   // a verification-code prompt in the text counts only where a text field could take the code
   if (text > 0 && TXT.test((document.body && document.body.innerText || "").slice(0, 3000))) mfa = true;
-  // cred: any signal - gates every click / hover / select / type.  login: unmistakable credential fields or
+  // cred: any signal - gates every click.  login: unmistakable credential fields or
   // login semantics - decides the hand-off and whether a handed-off page is cleared (a newsletter e-mail box
   // alone refuses interaction, but is no reason to call the user, and could never "clear")
-  return { cred: fields || sem || mfa, login: strong || sem || mfa, fields: fields, sem: sem, mfa: mfa };
+  return { cred: fields || sem || mfa, login: strong || sem || mfa, fields: fields, sem: sem, mfa: mfa, wayf: wayf };
 }
 async function scan(page) {
   try {
@@ -400,7 +409,7 @@ async function postCheck(task, page, i, opts) {
   const sc = i.login_form ? { cred: true, login: true, mfa: false } : await scan(page);
   if (sc.cred) i.login_form = true;
   if (sc.login && !(opts && opts.no_login_handoff)) {
-    if (INPUT.handoff && INPUT.handoff.enabled) return handoff(task, page, sc.mfa ? "verification code" : "login form", h, sc.mfa ? "mfa" : "login", i.title);
+    if (INPUT.handoff && INPUT.handoff.enabled) return handoff(task, page, sc.mfa ? "verification code" : (sc.wayf ? "institution selection" : "login form"), h, sc.mfa ? "mfa" : "login", i.title);
     out.login_form = true;                       // reported; the agent books `login_required`
   }
   return i;
@@ -453,20 +462,22 @@ async function look(task, page) {
   out.look_key = await urlKey(i.url);   // the wrapper's page-change check: a hash, never the URL (it can carry tokens)
   out.status = "ok";
   await postCheck(task, page, i);       // a challenge or login page is handed to the user here
+  out.page.login_form = !!i.login_form; // (postCheck's conservative scan, also WAYF pages)
   if (out.status === "handoff") return;
   out.status = "ok";
 }
 
-// The one evaluation that finds, checks and clicks / hovers / fills item k of the dom list.  `walk` is the
+// The one evaluation that finds, checks and clicks item k of the dom list.  `walk` is the
 // domWalk function itself; both run inside the page (ego's evaluate takes ONE argument, passed as an array).
-function domAct(walkSrc, k, allow, kind, value, expectUrl, scanSrc, infoSrc, chSrc, names) {
+function domAct(walkSrc, k, allow, kind, expectUrl, scanSrc, infoSrc, chSrc) {
   const ok = (u) => { try { const x = new URL(u, location.href); if (!/^https?:$/.test(x.protocol)) return false;
     const h = x.hostname.toLowerCase(); return allow.some((d) => h === d || h.endsWith("." + d)); } catch (e) { return false; } };
   // re-checked in the SAME evaluation that acts (the page may have changed since the Node-side checks): still
   // the page the agent looked at, still on an allowed host, still no credential / verification-code fields
+  if (kind !== "click") return { refused: "unknown action" };
   if (location.href !== expectUrl) return { refused: "the page changed since `look`; run look again" };
   if (!ok(location.href)) return { refused: "the page is outside the allowed domains" };
-  if ((new Function("return (" + scanSrc + ")")())().cred) return { refused: "login / verification-code page: no click, hover, select or type here" };
+  if ((new Function("return (" + scanSrc + ")")())().cred) return { refused: "login / verification-code page: no click here" };
   if ((new Function("return (" + infoSrc + ")")())(chSrc).challenge_page) return { refused: "verification page: do not interact" };
   const pair = new Function("return (" + walkSrc + ")")()()[k];   // domWalk: source -> function -> [el, frame]
   const el = pair && pair[0];
@@ -488,34 +499,29 @@ function domAct(walkSrc, k, allow, kind, value, expectUrl, scanSrc, infoSrc, chS
   // nothing inside (or submitting) a form with a password field (also one associated by form="..."): login
   // forms are only ever submitted by the user
   if (pwdForm(form)) return { refused: "login form: credentials are not entered by this tool" };
-  // a form holding a user-identifier field (e-mail / user name / account) is never submitted or changed by this
-  // tool, whatever the page calls it (identifier-first logins: only the user)
-  // NARROWED (round 6): no heuristics about what a form is for - a form with ANY free-text field (text, e-mail,
-  // tel, number, textarea, ...) is only submitted / changed when every such field was filled by this tool's
-  // `type` (a whitelisted institution name; marked below).  Anything else may hold an autofilled identifier.
-  const freeText = (x) => {
-    if (x.tagName === "TEXTAREA") return true;
-    if (x.tagName !== "INPUT") return false;
-    const t = (x.getAttribute("type") || "text").toLowerCase();
-    return !["hidden", "submit", "button", "reset", "image", "checkbox", "radio", "file", "range", "color"].includes(t);
-  };
-  // (round 10: a select counts too - it may be an account chooser; this tool only ever sets it to a
-  // whitelisted institution name)
-  const untouched = (f) => !!f && [...(f.elements || [])].some((x) => (freeText(x) || x.tagName === "SELECT")
-    && x !== el && x.getAttribute("data-tbsgen-typed") !== "1");
-  if ((kind === "click" || kind === "select") && untouched(form)) return { refused: "form with a text field this tool did not fill: not submitted (report login_required, or type an institution name first)" };
+  // NARROWED (round 11): this tool never changes a form field.  A field item itself is never clicked (a click
+  // could focus / toggle / open it), and a form with ANY editable control - free text, select, checkbox,
+  // radio, textarea, file ..., rendered or not - is never submitted or clicked inside: it may hold an
+  // autofilled identifier or need a choice only the user makes (WAYF, account choosers).  Only forms made of
+  // buttons and hidden inputs (e.g. a "Download PDF" form) may be submitted.
+  if (isField) return { refused: "form fields are not changed by this tool (an institution selection page is handed to the user; otherwise report login_required)" };
+  const editable = (f) => !!f && [...(f.elements || [])].some((x) => {
+    const xt = x.tagName;
+    if (xt === "TEXTAREA" || xt === "SELECT") return true;
+    if (xt !== "INPUT") return false;
+    return !["hidden", "submit", "button", "reset", "image"].includes((x.getAttribute("type") || "text").toLowerCase());
+  });
+  if (editable(form)) return { refused: "form with an input field: not submitted by this tool (report login_required)" };
   if (el.closest && el.closest(".cf-turnstile, .g-recaptcha, .h-captcha, #challenge-form, #px-captcha, [id*=captcha], [class*=captcha]")) return { refused: "verification widget: do not interact" };
-  if (kind === "click" && W.test(text)) return { refused: "verification widget: do not interact" };
+  if (W.test(text)) return { refused: "verification widget: do not interact" };
   const tag = el.tagName.toLowerCase();
   if (tag === "iframe") {
     // a frame (any origin): never acted on inside; `click` opens its (checked) URL as this page
-    if (kind !== "click") return { refused: "frame items can only be clicked (opens the frame's page)" };
     if (!ok(el.src)) return { refused: "frame URL is outside the allowed domains" };
     location.assign(el.src);                                   // navigated here, in the checking evaluation
     return { opened: el.src, text: text };
   }
-  if (kind === "click") {
-    if (tag === "input" && (el.getAttribute("type") || "").toLowerCase() === "password") return { refused: "password field: do not interact" };
+  {
     // the browser-resolved targets (respects <base href> and form= / formaction)
     // (button.formAction is the document URL when the button has no formaction attribute: use form.action then)
     const atag = actv.tagName.toLowerCase();
@@ -542,50 +548,11 @@ function domAct(walkSrc, k, allow, kind, value, expectUrl, scanSrc, infoSrc, chS
     el.click();
     return { clicked: text };
   }
-  if (kind === "hover") {
-    // NARROWED (round 7): top document only, and no native mouse move - the pointer events are dispatched
-    // here, in the same evaluation that checked the page (a native move would be a second, later step)
-    if (pair[1] > 0) return { refused: "hover is not available inside frames; click the item or open the frame" };
-    const r = el.getBoundingClientRect();
-    const o = { bubbles: true, cancelable: true, view: window, clientX: r.left + r.width / 2, clientY: r.top + r.height / 2 };
-    const ne = { ...o, bubbles: false };
-    el.dispatchEvent(new PointerEvent("pointerover", o)); el.dispatchEvent(new PointerEvent("pointerenter", ne));
-    el.dispatchEvent(new MouseEvent("mouseover", o)); el.dispatchEvent(new MouseEvent("mouseenter", ne));
-    el.dispatchEvent(new PointerEvent("pointermove", o)); el.dispatchEvent(new MouseEvent("mousemove", o));
-    return { hovered: text };
-  }
-  if (kind === "select") {
-    if (tag !== "select") return { refused: "item is not a select" };
-    let opt = [...el.options].find((o) => o.value === value) || [...el.options].find((o) => o.label === value)
-      || [...el.options].find((o) => o.label.toLowerCase() === String(value).toLowerCase());
-    if (!opt) return { refused: "no such option" };
-    // NARROWED (round 10): only an option that IS a whitelisted institution name (WAYF lists); anything else
-    // (an account chooser, whatever its labels say) is never changed
-    const nm = (x) => String(x || "").trim().toLowerCase();
-    if (!(names || []).some((n) => nm(n) === nm(opt.label) || nm(n) === nm(opt.text))) return { refused: "only an institution name from the configured list may be selected" };
-    el.value = opt.value;
-    el.setAttribute("data-tbsgen-typed", "1");               // set by this tool: its form may be submitted
-    el.dispatchEvent(new Event("input", { bubbles: true }));
-    el.dispatchEvent(new Event("change", { bubbles: true }));
-    return { selected: opt.label.slice(0, 80) };
-  }
-  if (kind === "type") {
-    const t = tag === "input" ? (el.getAttribute("type") || "text") : tag === "textarea" ? "textarea" : "";
-    if (!["text", "search", "textarea", ""].includes(t)) return { refused: "not a plain text field" };
-    const idn = [el.id, el.getAttribute("name"), el.getAttribute("autocomplete"), el.getAttribute("placeholder"), el.getAttribute("aria-label")].join(" ");
-    if (/pass|pwd|user|account|login|email|otp|verif|code|验证码|密码|账号|用户名/i.test(idn)) return { refused: "this field can hold credentials; typing is not allowed" };
-    if (pwdForm(el.form || el.closest("form"))) return { refused: "login form: typing is not allowed" };
-    const set = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(el), "value");
-    if (set && set.set) set.set.call(el, value); else el.value = value;
-    el.setAttribute("data-tbsgen-typed", "1");             // filled by this tool: its form may be submitted
-    el.dispatchEvent(new Event("input", { bubbles: true }));
-    el.dispatchEvent(new Event("change", { bubbles: true }));
-    return { typed: true };                                          // nothing of the field is read back
-  }
   return { refused: "unknown action" };
 }
 
-async function act(task, page, kind, k, value) {
+async function act(task, page, k) {
+  const kind = "click";
   // the page must be the one the agent last looked at.  `seen` - the URL whose hash is the look_key - is
   // passed into domAct, which compares it with location.href in the same evaluation that acts
   if (!INPUT.look_key) { out.status = "refused"; out.error = "run look first"; return; }
@@ -600,18 +567,18 @@ async function act(task, page, kind, k, value) {
   // interacted with: the hand-off only
   if (ip.login_form || await credPage(page)) {
     out.status = "refused";
-    out.error = "login / verification-code page: no click, hover, select or type here (it is handed to the user, otherwise report login_required)";
+    out.error = "login / verification-code page: no click here (it is handed to the user, otherwise report login_required)";
     return;
   }
   if (it.widget || WIDGET.test(it.text || "")) { out.status = "refused"; out.error = "verification widget: do not interact"; return; }
-  if (kind === "click" && it.login) { out.status = "refused"; out.error = "login form: credentials are not entered by this tool (report login_required)"; return; }
-  const domRun = () => page.evaluate(([src, walk, k, allow, kind, value, u, scanSrc, infoSrc, chSrc, names]) => {   // ONE arg for ego
+  if (it.login) { out.status = "refused"; out.error = "login form: credentials are not entered by this tool (report login_required)"; return; }
+  const domRun = () => page.evaluate(([src, walk, k, allow, kind, u, scanSrc, infoSrc, chSrc]) => {   // ONE arg for ego
     const f = new Function("return (" + src + ")")();        // domAct; walk is domWalk, both plain functions
-    return f(walk, k, allow, kind, value, u, scanSrc, infoSrc, chSrc, names);
-  }, [domAct.toString(), domWalk.toString(), k, INPUT.allow, kind, value || "", seen, credScan.toString(),
-      pageInfo.toString(), CHALLENGE.source, INPUT.type_allow || []]);
+    return f(walk, k, allow, kind, u, scanSrc, infoSrc, chSrc);
+  }, [domAct.toString(), domWalk.toString(), k, INPUT.allow, kind, seen, credScan.toString(),
+      pageInfo.toString(), CHALLENGE.source]);
   {
-    if (kind === "click") {
+    {
       await withDownload(task, page, async () => {
         // (a navigation started inside the evaluation may end its context before it returns: navigated)
         const r = await domRun().catch((e) => (/context|destroyed|navigat|detached/i.test(String(e)) ? { opened: "?" } : null));
@@ -626,32 +593,6 @@ async function act(task, page, kind, k, value) {
       if (out.status !== "handoff") out.status = "ok";
       return;
     }
-    if (kind === "hover") {
-      // like every other action: new tabs it opened are checked (outside the domains: closed), and the page is
-      // checked afterwards whether or not its URL changed (a login / verification overlay on the same URL)
-      let r = null;
-      await withDownload(task, page, async () => { r = await domRun().catch(() => null); await sleep(800); });
-      if (r && r.refused) { out.status = "refused"; out.error = r.refused; return; }
-      if (!r || r.hovered === undefined) { out.status = "error"; out.error = "hover failed (the page changed?)"; return; }
-      out.acted = { kind: "hover", text: r.hovered || "" };
-      const i = await after(page);
-      if (i.url !== seen) out.navigated = true;
-      if (!out.blocked && !out.left_allowed) await postCheck(task, page, i);
-      out.page = { url: i.url, title: i.title, pdf: /pdf/i.test(i.ctype), login_form: i.login_form };
-      if (out.status !== "handoff") out.status = "ok";
-      return;
-    }
-    // select / type: their change handlers may navigate - checked like a click (the wrapper counts and paces
-    // them as page loads)
-    let r = null;
-    await withDownload(task, page, async () => { r = await domRun(); });
-    if (r && r.refused) { out.status = "refused"; out.error = r.refused; return; }
-    out.acted = { kind: kind, text: (r && r.selected) || "" };
-    await sleep(1000);
-    const i = await after(page);
-    if (!out.blocked && !out.left_allowed) await postCheck(task, page, i);
-    out.page = { url: i.url, title: i.title, pdf: /pdf/i.test(i.ctype), login_form: i.login_form };
-    if (out.status !== "handoff") out.status = "ok";
   }
 }
 
@@ -699,15 +640,10 @@ try {
         out.page = { url: i.url, title: i.title, pdf: /pdf/i.test(i.ctype), login_form: i.login_form };
         if (out.status !== "handoff") out.status = "ok";
       }
-    } else if (INPUT.action === "click" || INPUT.action === "hover" || INPUT.action === "select" || INPUT.action === "type") {
-      const parts = String(INPUT.arg || "").split(" ");
-      const k = parseInt(parts[0], 10);
-      const value = parts.slice(1).join(" ");
-      if (INPUT.action === "type" && !(INPUT.type_allow || []).includes(value)) {
-        out.status = "refused"; out.error = "only the whitelisted institution names may be typed";
-      } else {
-        await act(task, page, INPUT.action, k, value);
-      }
+    } else if (INPUT.action === "click") {
+      const arg = String(INPUT.arg || "").trim();
+      if (!/^\d{1,3}$/.test(arg)) { out.status = "refused"; out.error = "usage: click I"; }
+      else await act(task, page, parseInt(arg, 10));
     } else if (INPUT.action === "tabs") {
       const tabs = await task.tabs();
       out.tabs = tabs.map((t) => ({ label: t.label, url: cleanUrl(t.url || "").slice(0, 200),

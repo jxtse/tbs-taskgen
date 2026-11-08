@@ -203,8 +203,7 @@ def _batch(tmp_path, monkeypatch, papers, **st_over):
               deadline=time.time() + 600, ledger_path=str(led.path), limits=led.limits, global_limits=led.g,
               host_caps=led.host_caps, ego_binary=str(ego), gate_max_wait_s=150, max_calls_per_paper=25,
               call_timeout_s=20, challenge_cooldown_s=3600, challenge_wait_ms=1000, max_navigations_per_paper=12,
-              nav_gap_s=0.0, handoff_enabled=False, handoff_wait_s=120, handoff_notify=False, bark_cmd=[],
-              type_allow=[])
+              nav_gap_s=0.0, handoff_enabled=False, handoff_wait_s=120, handoff_notify=False, bark_cmd=[])
     st.update(st_over)
     (bd / "batch.json").write_text(json.dumps(st))
     return bd, led
@@ -285,23 +284,25 @@ def test_allowed_commands_reach_the_wrapper_unchanged_through_a_real_shell(tmp_p
     probe.chmod(0o755)
     (tmp_path / "pdf").mkdir()                          # a glob would expand to this
     cmds = ["tbsgen-browser 1 wait_for sel div#pdf 20", "tbsgen-browser 1 wait_for url /pdf",
-            "tbsgen-browser 1 select 2 Nanjing University", "tbsgen-browser 1 type 4 南京大学",
             "tbsgen-browser 1 open https://doi.org/10.1080/x?a=1", "tbsgen-browser 1 look 40"]
     for c in cmds:
         assert browser_agent.shell_allowed(c) is None, c
         r = subprocess.run(c, shell=True, capture_output=True, text=True, cwd=tmp_path,
                            env=dict(os.environ, PATH=str(tmp_path) + os.pathsep + os.environ["PATH"]))
         assert json.loads(r.stdout) == shlex.split(c)[1:], (c, r.stdout)
-    for c in ["tbsgen-browser 1 wait_for sel #pdf", "tbsgen-browser 1 wait_for url *", "tbsgen-browser 1 type 4 a'b"]:
+    for c in ["tbsgen-browser 1 wait_for sel #pdf", "tbsgen-browser 1 wait_for url *", "tbsgen-browser 1 type 4 a'b",
+              "tbsgen-browser 1 type 4 南京大学", "tbsgen-browser 1 select 2 Nanjing University", "tbsgen-browser 1 hover 3"]:
         assert browser_agent.shell_allowed(c), c
 
 
-def test_hover_is_reserved_as_a_navigation(tmp_path, monkeypatch):
-    bd, _ = _batch(tmp_path, monkeypatch, ["10.1080/a.1"], max_navigations_per_paper=1)
-    _call(bd, "1", "hover", "3").communicate(timeout=60)
-    out, _ = _call(bd, "1", "hover", "3").communicate(timeout=60)
-    assert "navigation limit" in out
-    assert len([e for e in _ego_actions(tmp_path) if e["action"] == "hover"]) == 1
+def test_removed_actions_never_reach_the_script(tmp_path, monkeypatch):
+    """round 11: hover / select / type are not actions any more - the wrapper prints its usage, nothing runs"""
+    bd, _ = _batch(tmp_path, monkeypatch, ["10.1080/a.1"])
+    for a, arg in (("hover", "3"), ("select", "2 Nanjing University"), ("type", "4 Nanjing University")):
+        out, _ = _call(bd, "1", a, arg).communicate(timeout=60)
+        assert "usage:" in out, out
+    assert not (tmp_path / "ego.log").exists() or not _ego_actions(tmp_path)
+    assert browser_agent.NAV_ACTIONS == {"open", "click", "save_pdf"}
 
 
 def test_challenge_handoff_expiry_cools_even_with_earlier_files(tmp_path, monkeypatch):

@@ -208,6 +208,15 @@ def _pages(port, port2):
                                   b'<script>setTimeout(function(){location.href="/email-login"},1500)</script></body></html>'),
         "/frame-hover": ("text/html", b'<html><head><title>Frame Hover</title></head><body><h1>x</h1>'
                                       b'<iframe src="/frame" width="400" height="200" style="margin-left:300px"></iframe></body></html>'),
+        # round 11: a form of hidden inputs and a button (a "Download PDF" form) may be submitted; a form with
+        # a checkbox may not; a WAYF page made of institution links only (no field) goes to the user too
+        "/btn-form": ("text/html", b'<html><head><title>Article</title></head><body><form method="post" action="/logged">'
+                                   b'<input type="hidden" name="t" value="1"><button>Get PDF</button></form></body></html>'),
+        "/chk-form": ("text/html", b'<html><head><title>Article</title></head><body><a href="/other">Other</a>'
+                                   b'<form method="post" action="/logged"><input type="checkbox" name="agree">'
+                                   b'<button>Get PDF</button></form></body></html>'),
+        "/wayf-links": ("text/html", b'<html><head><title>Article access</title></head><body><h2>Select your institution</h2>'
+                                     b'<a href="/other">Nanjing University</a></body></html>'),
         "/wayf-form": ("text/html", b'<html><head><title>Find your institution</title></head><body><form method="post" '
                                     b'action="/logged"><input type="search" name="q" aria-label="Search for your institution">'
                                     b'<button>Find</button></form></body></html>'),
@@ -279,14 +288,14 @@ def origins():
 
 
 def _run(space, action, arg="", *, allow=("127.0.0.1", "localhost"),
-         handoff=True, type_allow=("Nanjing University",), handoff_state=None,
+         handoff=True, handoff_state=None,
          look_key=None, page_label="", challenge_wait_ms=2500, **over):
     inp = dict(space=space, action=action, arg=arg, allow=list(allow), files_dir=str(FILES),
                look_key=look_key, page_label=page_label,
                nav_timeout_ms=20000, download_timeout_ms=30000, download_wait_ms=3000,
                challenge_wait_ms=challenge_wait_ms,
                handoff={"enabled": handoff},
-               type_allow=list(type_allow), handoff_state=handoff_state or {"active": False, "deadline_ms": 0})
+               handoff_state=handoff_state or {"active": False, "deadline_ms": 0})
     inp.update(over)
     # ego-browser nodejs drops the output of a stdin script whose space is with the user; a script
     # given as an argument prints even then, so always pass it as an argument
@@ -355,17 +364,24 @@ def test_look_cookie_banner_dropdown_iframes(origins):
         _finish(sp)
 
 
-def test_hover_opens_the_menu(origins):
-    sp = f"tbsgen-test-hover"
+def test_removed_hover_select_type(origins):
+    """round 11: hover / select / type do not exist; a field item is never clicked; a dropdown item is
+    clicked directly (the hidden menu items are in the look list)"""
+    sp = "tbsgen-test-r11-removed"
     try:
         assert _run(sp, "open", origins[0] + "/landing")["status"] == "ok"
         r = _run(sp, "look")
-        r = _run(sp, "hover", str(_item(r, "Download")["i"]), look_key=r["look_key"])
-        assert r["status"] == "ok" and r["acted"]["kind"] == "hover", r
-        # the menu is open: a fresh look sees the items as visible snapshot items
-        r = _run(sp, "look")
         it = _item(r, "Download PDF")
-        assert it and not it.get("hidden"), r["page"]["items"]
+        assert it and it.get("hidden"), r["page"]["items"]               # listed although the menu is closed
+        k_sel = next(x for x in r["page"]["items"] if x.get("ftype") == "select")["i"]
+        for a, arg in (("hover", str(_item(r, "Download")["i"])), ("select", f"{k_sel} Nanjing University"),
+                       ("type", f"{k_sel} Nanjing University")):
+            r2 = _run(sp, a, arg, look_key=r["look_key"])
+            assert r2["status"] == "refused" and r2["error"] == "unknown action", (a, r2)
+        r2 = _run(sp, "click", str(k_sel), look_key=r["look_key"])
+        assert r2["status"] == "refused" and "form fields" in r2["error"], r2
+        r2 = _run(sp, "click", f"{k_sel} Nanjing University", look_key=r["look_key"])
+        assert r2["status"] == "refused", r2                                  # click takes an index only
     finally:
         _finish(sp)
 
@@ -429,21 +445,39 @@ def test_wait_for_and_removed_actions(origins):
         _finish(sp)
 
 
-def test_wayf_type_and_select(origins):
+def test_wayf_pages_go_to_the_user(origins):
+    """round 11: the agent never picks an institution - a WAYF page (fields or only links) is handed over;
+    without a hand-off nothing on it is clicked"""
     sp = "tbsgen-test-wayf"
     try:
-        assert _run(sp, "open", origins[0] + "/wayf")["status"] == "ok"
-        r = _run(sp, "look")
-        assert _item(r, "Search for your institution"), r["page"]["items"]
-        k_search = _item(r, "Search for your institution")["i"]
-        k_sel = _item(r, "instsel")["i"]
-        look_key = r["look_key"]
-        r = _run(sp, "type", f"{k_search} Nanjing University", look_key=look_key)
-        assert r["status"] == "ok", r
-        r = _run(sp, "type", f"{k_search} hunter2", look_key=look_key)
-        assert r["status"] == "refused" and "whitelisted" in r["error"], r   # only institution names
-        r = _run(sp, "select", f"{k_sel} Nanjing University", look_key=look_key)
-        assert r["status"] == "ok" and "Nanjing University" in r["acted"]["text"], r
+        for path in ("/wayf", "/wayf-form", "/wayf-links"):
+            r = _run(sp, "open", origins[0] + path)
+            assert r["status"] == "handoff" and r["handoff"]["kind"] == "login", (path, r)
+            assert _take_over(sp, origins[0] + path)
+            r = _run(sp, "look", handoff=False)
+            assert r["page"]["login_form"] is True, (path, r)
+            for it in r["page"]["items"]:
+                if it["kind"] == "frame":
+                    continue
+                r2 = _run(sp, "click", str(it["i"]), look_key=r["look_key"], handoff=False)
+                assert r2["status"] == "refused", (path, it, r2)
+            r = _run(sp, "look", handoff=False)
+            assert r["page"]["url"].endswith(path), (path, r)
+    finally:
+        _finish(sp)
+
+
+def test_button_only_form_is_submitted_but_not_one_with_fields(origins):
+    sp = "tbsgen-test-r11-forms"
+    try:
+        assert _run(sp, "open", origins[0] + "/chk-form", handoff=False)["status"] == "ok"
+        r = _run(sp, "look", handoff=False)
+        r2 = _run(sp, "click", str(_item(r, "Get PDF")["i"]), look_key=r["look_key"], handoff=False)
+        assert r2["status"] == "refused" and "input field" in r2["error"], r2
+        assert _run(sp, "open", origins[0] + "/btn-form", handoff=False)["status"] == "ok"
+        r = _run(sp, "look", handoff=False)
+        r2 = _run(sp, "click", str(_item(r, "Get PDF")["i"]), look_key=r["look_key"], handoff=False)
+        assert r2["status"] == "ok" and r2["page"]["url"].endswith("/logged"), r2
     finally:
         _finish(sp)
 
@@ -468,7 +502,7 @@ def test_denied_paths(origins):
         user = next((it for it in items if it.get("ftype") == "text"), None)
         assert user and "value" not in user                    # fields list types, never values
         look_key = r["look_key"]
-        r = _run(sp, "type", f"{user['i']} Nanjing University", look_key=look_key, handoff=False)
+        r = _run(sp, "click", str(user["i"]), look_key=look_key, handoff=False)
         assert r["status"] == "refused", r                                  # credential-shaped field
         r = _run(sp, "look", handoff=False)
         r = _run(sp, "click", str(_item(r, "Login")["i"]), look_key=r["look_key"], handoff=False)
@@ -476,25 +510,23 @@ def test_denied_paths(origins):
         # sso_login no longer exists (round 9): every login is the user's
         r = _run(sp, "sso_login")
         assert r["status"] == "refused" and r["error"] == "unknown action", r
-        # no hover on a login page either (and nothing returns a field value)
+        # nothing returns a field value
         r = _run(sp, "look", handoff=False)
-        user = next(it for it in r["page"]["items"] if it.get("ftype") == "text")
-        r = _run(sp, "hover", str(user["i"]), look_key=r["look_key"], handoff=False)
-        assert r["status"] == "refused" and '"u"' not in json.dumps(r), r
+        assert '"u"' not in json.dumps(r) and '"p"' not in json.dumps(r), r
     finally:
         _finish(sp)
 
 
-def test_select_that_navigates_off_domain_is_reset(origins):
+def test_select_field_is_never_changed(origins):
     sp = "tbsgen-test-jump"
     try:
         assert _run(sp, "open", origins[0] + "/jump")["status"] == "ok"
         r = _run(sp, "look")
         k = _item(r, "jumpsel")["i"]
-        r = _run(sp, "select", f"{k} Nanjing University", look_key=r["look_key"])
-        assert r["status"] == "ok" and not r["page"]["url"].startswith("https://denied"), r
+        r2 = _run(sp, "click", str(k), look_key=r["look_key"])
+        assert r2["status"] == "refused" and "form fields" in r2["error"], r2
         r = _run(sp, "look")
-        assert "denied.example" not in r["page"]["url"], r
+        assert r["page"]["url"].endswith("/jump"), r
     finally:
         _finish(sp)
 
@@ -711,22 +743,15 @@ def test_round6_guards(origins):
         assert r["status"] == "refused" and ("e-mail" in r["error"] or "login" in r["error"]), r
         r = _run(sp, "look", handoff=False)
         assert "/logged" not in r["page"]["url"], r
-        # a form with a free-text field is submitted only after this tool typed into every such field
+        # a form with a free-text field is never submitted (round 11: nothing is typed any more)
         assert _run(sp, "open", origins[0] + "/wayf-form", handoff=False)["status"] == "ok"
         r = _run(sp, "look", handoff=False)
-        k_find, k_q = _item(r, "Find")["i"], _item(r, "Search for your institution")["i"]
-        r2 = _run(sp, "click", str(k_find), look_key=r["look_key"], handoff=False)
-        assert r2["status"] == "refused" and "did not fill" in r2["error"], r2
-        assert _run(sp, "type", f"{k_q} Nanjing University", look_key=r["look_key"], handoff=False)["status"] == "ok"
-        r2 = _run(sp, "click", str(k_find), look_key=r["look_key"], handoff=False)
-        assert r2["status"] == "ok" and r2["page"]["url"].endswith("/logged"), r2
-        # nothing inside a frame is listed (round 9); a frame item cannot be hovered
+        r2 = _run(sp, "click", str(_item(r, "Find")["i"]), look_key=r["look_key"], handoff=False)
+        assert r2["status"] == "refused", r2
+        # nothing inside a frame is listed (round 9)
         assert _run(sp, "open", origins[0] + "/frame-hover", handoff=False)["status"] == "ok"
         r = _run(sp, "look", handoff=False)
         assert not any("Frame Other Page" in (x["text"] or "") for x in r["page"]["items"]), r
-        it = next(x for x in r["page"]["items"] if x["kind"] == "frame")
-        r = _run(sp, "hover", str(it["i"]), look_key=r["look_key"], handoff=False)
-        assert r["status"] == "refused" and "frame" in r["error"], r
     finally:
         _finish(sp)
 
@@ -741,7 +766,7 @@ def test_round7_conservative_login_detection_and_atomic_checks(origins):
             assert r["status"] == "ok" and r["page"]["login_form"] is True, (path, r)
             r = _run(sp, "look", handoff=False)
             it = _item(r, "Other") or _item(r, "Continue")
-            for act in ("click", "hover"):
+            for act in ("click",):
                 r2 = _run(sp, act, str(it["i"]), look_key=r["look_key"], handoff=False)
                 assert r2["status"] == "refused" and "login" in r2["error"], (path, act, r2)
         # a header "Sign in" entry point on an article without fields: still an article page
@@ -799,7 +824,7 @@ def test_round7_checks_run_in_the_evaluation_that_acts(origins):
                 "  if (setup) document.body.insertAdjacentHTML('beforeend', setup);\n"
                 "  const f = new Function('return (' + a + ')')();\n"
                 "  const k = new Function('return (' + w + ')')()().findIndex((p) => (p[0].innerText || '').trim() === 'Accept');\n"
-                "  return f(w, k, allow, 'hover', '', u, s, pi, 'just a moment');\n"
+                "  return f(w, k, allow, 'click', u, s, pi, 'just a moment');\n"
                 "}, [domAct.toString(), domWalk.toString(), credScan.toString(), u, allow, setup || '', pageInfo.toString()]);\n"
                 "const here = (await pg.info()).url;\n"
                 "const res = [await run(here + '#x', ['127.0.0.1'], ''), await run(here, ['example.org'], ''),\n"
@@ -837,7 +862,7 @@ def test_round9_account_chooser_and_frames(origins):
             assert r["status"] == "ok" and r["page"]["login_form"] is True, (path, r)
             r = _run(sp, "look", handoff=False)
             k = next(x for x in r["page"]["items"] if x.get("ftype") == "select")["i"]
-            r2 = _run(sp, "select", f"{k} a", look_key=r["look_key"], handoff=False)
+            r2 = _run(sp, "click", str(k), look_key=r["look_key"], handoff=False)
             assert r2["status"] == "refused" and "login" in r2["error"], (path, r2)
         # a verification page inside a same-origin frame: its button is not listed, so it cannot be clicked;
         # opening the frame makes it the page, where the challenge check applies
@@ -872,22 +897,19 @@ def test_round10_selects(origins):
         assert r["status"] == "ok" and r["page"]["login_form"] is True, r
         r = _run(sp, "look", handoff=False)
         k = next(x for x in r["page"]["items"] if x.get("ftype") == "select")["i"]
-        r2 = _run(sp, "select", f"{k} Personal", look_key=r["look_key"], handoff=False)
+        r2 = _run(sp, "click", str(k), look_key=r["look_key"], handoff=False)
         assert r2["status"] == "refused", r2
         r2 = _run(sp, "click", str(_item(r, "Continue")["i"]), look_key=r["look_key"], handoff=False)
         assert r2["status"] == "refused", r2
-        # a neutral select: only a whitelisted institution name may be chosen; the form is submitted only
-        # after the tool set its select
+        # a neutral select form (round 11): the select is never changed and the form never submitted
         assert _run(sp, "open", origins[0] + "/plain-select", handoff=False)["status"] == "ok"
         r = _run(sp, "look", handoff=False)
         k, go = next(x for x in r["page"]["items"] if x.get("ftype") == "select")["i"], _item(r, "Go")["i"]
-        r2 = _run(sp, "select", f"{k} Personal", look_key=r["look_key"], handoff=False)
-        assert r2["status"] == "refused" and "institution" in r2["error"], r2
+        r2 = _run(sp, "click", str(k), look_key=r["look_key"], handoff=False)
+        assert r2["status"] == "refused" and "form fields" in r2["error"], r2
         r2 = _run(sp, "click", str(go), look_key=r["look_key"], handoff=False)
-        assert r2["status"] == "refused" and "did not fill" in r2["error"], r2
-        r2 = _run(sp, "select", f"{k} Nanjing University", look_key=r["look_key"], handoff=False)
-        assert r2["status"] == "ok", r2
-        r2 = _run(sp, "click", str(go), look_key=r["look_key"], handoff=False)
-        assert r2["status"] == "ok" and r2["page"]["url"].endswith("/logged"), r2
+        assert r2["status"] == "refused" and "input field" in r2["error"], r2
+        r = _run(sp, "look", handoff=False)
+        assert not r["page"]["url"].endswith("/logged"), r
     finally:
         _finish(sp)

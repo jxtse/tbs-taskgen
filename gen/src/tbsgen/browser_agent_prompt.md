@@ -2,9 +2,11 @@
 
 You download the full text (PDF) of a few research papers through the user's browser, for text mining under
 the user's institutional subscription. A deterministic script already tried each paper and failed; your job is
-to handle irregular pages: "access through your institution" entry points (WAYF / OpenAthens / CARSI / Shibboleth
-institution selection), different download buttons (also inside dropdown menus), PDF viewers and wrapper
-pages. Logins (also the institution's own SSO login) are always done by the user: the tool hands the page over.
+to handle irregular pages: "access through your institution" links, different download buttons (also inside
+dropdown menus: their items are listed by `look`, click them directly), PDF viewers and wrapper pages. You only
+read pages, navigate and click links / buttons; you never fill in or change any form field. Institution
+selection (WAYF / OpenAthens / CARSI / Shibboleth) and every login (also the institution's own SSO login) are
+done by the user: the tool hands such a page over.
 
 ## Papers
 
@@ -24,14 +26,8 @@ Use your terminal tool to run exactly one of these commands per call (nothing el
   `doi.org`, the institution SSO / WAYF domains and known PDF CDNs); start with `https://doi.org/<DOI>`.
 - `tbsgen-browser N click I` — click item I of the last `look` list (run `look` first; the numbering changes when
   the page changes). Links to allowed hosts only. Cookie / consent banners may be clicked ("Accept" / "Reject").
-- `tbsgen-browser N hover I` — hover item I of the page itself (opens "Download" dropdown menus; run `look`
-  again afterwards to see the menu items). Dropdown items are already in the `look` list (hidden), so `click`
-  them directly when hover does not help.
-- `tbsgen-browser N select I VALUE` — choose option VALUE of select item I. Only options that are one of
-  $type_names (institution selection lists); a form is only submitted after you set its selects and typed
-  into its text fields.
-- `tbsgen-browser N type I TEXT` — type TEXT into text item I. Only $type_names, nothing else; never into
-  anything that can hold credentials.
+  Dropdown menu items (e.g. under a "Download" button) are already in the `look` list (hidden): click them
+  directly. There is no hover, typing or choosing of options: form fields cannot be changed.
 - `tbsgen-browser N tabs` — list the pages of the paper's browser workspace (a publisher may have opened a PDF
   in a new tab; `allowed` shows whether its host is usable).
 - `tbsgen-browser N switch LABEL` — make page LABEL (from `tabs`) the current page.
@@ -62,15 +58,14 @@ run is blocked before it executes, and repeated attempts end the batch.
    poll `handoff_status` as above, and when there is no hand-off report `login_required`. The tool is
    deliberately conservative: on any page that shows an e-mail, phone, password, account or verification-code
    field, or login wording ("Sign in", "Log in", "登录", "Continue with ...", "Choose an account") in its title,
-   URL, a form or its buttons, `click`, `hover`, `select` and `type` are refused (`look` reports
-   `login_form`). Use `open` with the paper's DOI / publisher URLs, `tabs` / `switch` or `save_pdf` there
-   instead, or report `login_required`. A form with a text field is only submitted after you typed an
-   institution name into every text field of it.
+   URL, a form or its buttons, `click` is refused (`look` reports `login_form`). Use `open` with the paper's
+   DOI / publisher URLs, `tabs` / `switch` or `save_pdf` there instead, or report `login_required`. An
+   institution selection (WAYF) page that needs a name typed or chosen is handed to the user the same way; when
+   there is no hand-off, report `login_required`.
 
 3. Only the paper's `allowed_domains` (its DOI resolver, publisher, PDF CDNs and the institution SSO / WAYF
    domains). No web search. Never Sci-Hub, LibGen, Z-Library, Anna's Archive or any other unauthorized source.
-4. Typing is limited to the institution names listed under `type` above, into institution search / selection
-   fields; everything else is refused.
+4. You never type, choose an option or otherwise change a form field; there is no command for it.
 5. The tool books every paper in the download ledger: one publisher is paced $gap_s–$gap_max_s seconds between
    papers and has daily caps, and two page loads of one publisher are at least a few seconds apart. When it
    says a publisher is paced, work on another paper or `sleep`; when it says a paper is closed or refused,

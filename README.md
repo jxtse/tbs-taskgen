@@ -312,10 +312,11 @@ uv run tbsgen fetch --run runs/R --config config.toml --browser --wait-for-egres
   action script [`browser_agent_action.mjs`](gen/src/tbsgen/browser_agent_action.mjs) in a TaskSpace of its own
   per paper. Actions: `look` (page summary with a numbered list of links, buttons and fields of the page's own
   DOM, including hidden dropdown items; every iframe is one item whose `click` opens its checked URL as the
-  page; an offset for long pages), `open URL`, `click I`, `hover I`, `select I VALUE`, `type I TEXT`, `tabs` /
-  `switch`, `wait_for`, `save_pdf`, `handoff_status` and `finish`. There are deliberately no coordinate clicks,
-  no screenshots, no native mouse / wheel input, no actions inside any iframe, no logins of any kind and no
-  interaction at all on anything that looks like a login page (each was a recurring source of credential /
+  page; an offset for long pages), `open URL`, `click I`, `tabs` / `switch`,
+  `wait_for`, `save_pdf`, `handoff_status` and `finish` - the agent only reads pages, navigates and clicks links /
+  buttons. There are deliberately no hover, no typing or choosing of options (no form field is ever changed),
+  no coordinate clicks, no screenshots, no native mouse / wheel input, no actions inside any iframe, no logins
+  of any kind and no interaction at all on anything that looks like a login or institution-selection page (each was a recurring source of credential /
   domain-check gaps in review; see "Removed by design" below). Code enforces the limits, not the prompt:
   - the paper is booked in the ledger before its first call; at most `agent.max_calls_per_paper` calls (25) and
     `agent.max_navigations_per_paper` page loads (12) per paper, page loads of one publisher at least
@@ -323,20 +324,22 @@ uv run tbsgen fetch --run runs/R --config config.toml --browser --wait-for-egres
   - only the paper's `allowed_domains` (its publisher, `doi.org`, known PDF CDNs and `browser.sso.domains`, the
     institution / WAYF domains) are opened or clicked (link and browser-resolved form targets are checked
     before the click; nothing inside a frame is acted on - `click` on a frame opens its checked URL as the page;
-    a page found outside the domains is reset before the next action); `type` only types, and `select` only selects, the strings in
-    `agent.institution_names` (never into a field that can hold credentials); a form with a text field or a
-    select is only submitted after the tool filled every one of them;
+    a page found outside the domains is reset before the next action);
+  - no form field is ever changed: a field item (text box, select, checkbox ...) cannot be clicked, and a form
+    with any editable control is never submitted - only forms made of buttons and hidden inputs (a "Download
+    PDF" form) are;
   - field values are never read: `look` lists field types and labels only, and the browser's page snapshot (which
     carries field values) is never taken;
   - login pages are detected conservatively (top document, same-origin frames, open shadow roots): any rendered
     e-mail, phone, password or one-time-code field, an account / user-name field or select, an `autocomplete`
     of username / email / current-password / one-time-code, a field the browser autofilled, a rendered
     identity-provider frame, or login wording ("sign in", "log in", "登录", "continue with ...", "choose an
-    account") in the page / frame title or URL, a form action or a form's button. On such a page `click`,
-    `hover`, `select` and `type` are refused - only the hand-off acts there. A false positive costs a paper (it is reported, or handed to you when
-    the page has unmistakable login fields or wording), never a credential. A form with a free-text field is
-    submitted / changed only when every such field was filled by `type`;
-  - every action that changes the page (click / hover / select / type) re-checks, in the **same page
+    account") in the page / frame title or URL, a form action or a form's button; institution-selection (WAYF)
+    pages count too (a field labelled as an institution search / list, or WAYF wording such as "Select your
+    institution" / "Where are you from?" in the title, URL or a heading). On such a page `click` is refused -
+    only the hand-off acts there. A false positive costs a paper (it is reported, or handed to you), never a
+    credential;
+  - every action that changes the page (`click`; `open` / `switch` / `save_pdf` check their own URL) re-checks, in the **same page
     evaluation that acts**, that the page is still the one the agent looked at (`look` is required first), on
     an allowed host, no verification page and free of any login signal; otherwise it is refused. `look` reads
     the page in one evaluation that checks the host first. Every URL in the tool's output loses
@@ -366,22 +369,27 @@ uv run tbsgen fetch --run runs/R --config config.toml --browser --wait-for-egres
   agent's own report is not used. Papers cut by an egress change or the window's end stay queued without
   backoff. Model usage per run is appended to `<queue>.browser/usage.jsonl`.
 
-  Removed by design (review rounds 4-9; fewer actions rather than more guards): coordinate clicks
+  Removed by design (review rounds 4-11; fewer actions rather than more guards): coordinate clicks
   (`click_xy`), screenshots / vision, the browser's page snapshot (`look full`, `@REF` items), every action
   inside an iframe (same-origin too: a frame is opened as the page instead), native clicks on `target=_blank`
   links (their checked URL is opened in the page instead), native mouse hover (and hover inside frames),
   `scroll` (its fallback was a native wheel at a fixed point; `look` already lists the whole page), `back` (the
   history may hold a page outside the allowed domains that was reset after it landed; `history.back()` would
   request it again - `open` the paper's DOI or publisher URL instead), the automatic institution login
-  `sso_login` (see below), and every click / hover / select / type on a page with any login signal.
+  `sso_login` (see below), every click on a page with any login signal, and (round 11) `hover`, `select` and
+  `type`: changing form fields kept producing edge cases (account choosers labelled only by a `<label>`, change
+  handlers that navigate, forms half-filled by autofill), and dropdown items are already listed by `look` and
+  clicked directly.
 
   Expected effect: publisher pages whose PDF link only appears after a canvas / coordinate interaction or
   behind an e-mail / "Sign in" prompt are not fetched by the agent; they are reported (`login_required`) or
-  handed to you. A WAYF / institution-selection page that itself carries login wording ("Sign in via your
-  institution" as its title or a form button) is handed to you instead of being filled in; CSS-only hover
-  menus no longer open (their items are still listed and clicked directly); a PDF viewer embedded in an iframe
-  is reached by clicking the frame item (it opens the viewer's URL as the page). Unchanged: a download link or
-  dropdown item (also hidden), a PDF viewer page, a new-tab PDF, a neutral institution search / selection form.
+  handed to you. Every WAYF / institution-selection page (search box, list or links) and every institution SSO
+  login is handed to you: you pick the institution / press Login once, the agent continues after
+  `handoff_status` reports `cleared` (with hand-off off, such papers are reported `login_required`). Menus that
+  only build their items on hover (not present in the DOM before) and download forms with any option (a
+  checkbox, a format select) are not reachable by the agent; a PDF viewer embedded in an iframe is reached by
+  clicking the frame item (it opens the viewer's URL as the page). Unchanged: a download link or dropdown item
+  (also hidden), a button-only download form, a PDF viewer page, a new-tab PDF.
 - Institution sign-in is always done by you. The automatic `sso_login` (one check-and-press of the
   browser-autofilled login form) was removed in review round 9: the page's own handlers can submit a form to
   another target after any check the tool can make inside the page, so no tool-side check guarantees where the
@@ -398,7 +406,6 @@ enabled = true                 # hand verification / login pages to the person a
 domains = ["carsi.edu.cn", "openathens.net", "shibboleth.net", "login.example.edu"]   # institution / WAYF / login
 [fulltext.browser.agent]
 enabled = true
-institution_names = ["Example University"]
 ```
 
 Terms: use only content your own subscriptions and API licences allow. The Elsevier and Wiley TDM licences are
@@ -510,8 +517,11 @@ Research code under active development.
 - The S3 publisher channels (TDM APIs, institution IP, browser) are off by default and need your own licences;
   their offline tests use recorded or scripted responses only. The browser agent's exploration actions,
   hand-off and institution sign-in are tested against local pages only; on real publisher and institution
-  sites they have not been run end to end yet. Institution sign-in depends on the browser autofilling a saved
-  account and stops at any captcha or MFA step.
+  sites they have not been run end to end yet. Institution selection (WAYF) and sign-in are always done by you
+  (hand-off); the agent only navigates and clicks. A cross-domain navigation the page starts by itself (script
+  or redirect) is reset only after it lands. A click handler on an allowed page can still do things after the
+  checks (e.g. post data through `fetch`); the agent only clicks buttons / links of forms without any editable
+  field.
 - Automatic S9 job submission needs your own Harbor launch scripts (`calib.*_launcher`).
 
 ## Repository layout

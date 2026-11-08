@@ -239,14 +239,10 @@ sys.exit({fn}({batch_dir!r}, sys.argv[1:]))
 # command against these patterns and the wrapper re-parses argv).
 # (also no glob characters other than "?", which cannot match: a URL word contains "://")
 _SAFE_TOK = r"[^\s'\"`$;&|<>\\*\[\]{}!()]{1,200}"
-_SAFE_TXT = r"[A-Za-z0-9 ,.\-_\u4e00-\u9fff]{1,60}"     # no quotes / parentheses: the shell must pass it as is
 _PAPER_ACTIONS = "|".join((
     r"look( \d{1,4})?",
     r"open https?://" + _SAFE_TOK,
     r"click \d{1,3}",
-    r"hover \d{1,3}",
-    r"select \d{1,3} " + _SAFE_TXT,
-    r"type \d{1,3} " + _SAFE_TXT,
     "tabs",
     r"switch [A-Za-z0-9_.-]{1,24}",
     # the pattern never starts with '#' (a shell comment) and has no glob / quote characters
@@ -258,9 +254,8 @@ _TOOL_CMD = re.compile(rf"^tbsgen-browser (finish|[1-9]\d? ({_PAPER_ACTIONS}))$"
 _SLEEP_CMD = re.compile(r"^sleep ([1-9]\d?|[12]\d\d|300)$")
 DENY_TEXT = re.compile(r"sci-?hub|libgen|z-lib|annas-archive", re.I)
 # actions that can load a page of the publisher (paced per publisher and capped per paper)
-# (select / type / hover can trigger a navigation from the page's handlers: reserved and paced like one)
 # actions that may load a page or request a file: navigation budget, per-publisher lock and pacing
-NAV_ACTIONS = frozenset({"open", "click", "select", "type", "hover", "save_pdf"})
+NAV_ACTIONS = frozenset({"open", "click", "save_pdf"})
 
 
 def shell_allowed(cmd) -> str | None:
@@ -495,8 +490,7 @@ def wrapper_main(batch_dir: str, argv: list[str]) -> int:
         spaces = sorted(set(state.get("spaces") or []) | {st["space"]})
         done = _finish_spaces(bd, st, spaces)
         return say(f"tbsgen: TaskSpaces closed ({', '.join(done)})", 0)
-    usage = ("usage: tbsgen-browser N look [OFFSET]|open URL|click I|hover I|"
-             "select I VALUE|type I TEXT|tabs|switch LABEL|"
+    usage = ("usage: tbsgen-browser N look [OFFSET]|open URL|click I|tabs|switch LABEL|"
              "wait_for url SUB|sel CSS [S]|save_pdf|handoff_status  |  tbsgen-browser finish")
     if len(argv) < 2 or argv[0] not in st["papers"] or not _TOOL_CMD.match("tbsgen-browser " + " ".join(argv)):
         return say(usage, 2)
@@ -574,11 +568,6 @@ def _paper_call(bd: Path, st: dict, n: str, action: str, arg: str, say) -> int:
                    "and work on other papers meanwhile.", 2)
     if action != "handoff_status":
         ps["calls"] = ps.get("calls", 0) + 1
-    if action == "type":
-        value = " ".join(arg.split(" ")[1:])
-        if not value or value not in (st.get("type_allow") or []):
-            _atomic(sp, json.dumps(ps))
-            return say(f"tbsgen: paper {n}: only the configured institution names may be typed", 2)
     # budgets shared by the batch's concurrent calls are reserved under one lock: navigation pacing per
     # publisher and the publisher's single hand-off
     with _locked(slock):
@@ -660,12 +649,11 @@ def _paper_run(bd, st, n, p, ps, action, arg, say, led, pkey, space, handoff_fre
     files = (bd / "files" / n).resolve()
     files.mkdir(parents=True, exist_ok=True)
     inp = dict(space=space, action=action, arg=arg, allow=p["allow"], files_dir=str(files),
-               look_key=ps.get("look_key") if action in ("click", "hover", "select", "type") else None,
+               look_key=ps.get("look_key") if action == "click" else None,
                page_label=ps.get("page_label") or "",
                nav_timeout_ms=45000, download_timeout_ms=120000, download_wait_ms=6000,
                challenge_wait_ms=int(st.get("challenge_wait_ms", 40000)),
                handoff={"enabled": handoff_free},
-               type_allow=st.get("type_allow") or [],
                handoff_state={"active": bool(ps.get("handoff")),
                               "deadline_ms": int(float(ps.get("handoff_deadline") or 0) * 1000),
                               "title": ps.get("handoff_title") or "", "page_label": ps.get("handoff_page") or ""})
@@ -1564,8 +1552,7 @@ def _agent_phase(fetcher, todo: list[dict], deadline: float, bd: Path, wd: Watch
               max_navigations_per_paper=int(ag.get("max_navigations_per_paper", 12)),
               nav_gap_s=float(ag.get("nav_gap_s", 2.5)),
               handoff_enabled=bool(ho.get("enabled")), handoff_wait_s=float(ho.get("wait_s", 120)),
-              handoff_notify=bool(ho.get("notify", True)), bark_cmd=[list(x) for x in ho.get("bark_cmd") or []],
-              type_allow=[str(x) for x in ag.get("institution_names") or []])
+              handoff_notify=bool(ho.get("notify", True)), bark_cmd=[list(x) for x in ho.get("bark_cmd") or []])
     (bd / "papers").mkdir(exist_ok=True)
     (bd / "files").mkdir(exist_ok=True)
     _atomic(bd / "batch.json", json.dumps(st))
@@ -1584,8 +1571,7 @@ def _agent_phase(fetcher, todo: list[dict], deadline: float, bd: Path, wd: Watch
     prompt = render_prompt(tmpl, papers_json=json.dumps(lines, indent=1, ensure_ascii=False),
                            minutes=f"{budget / 60:.0f}", gap_s=f"{float(lim['gap_s']):.0f}",
                            gap_max_s=f"{float(lim['gap_s']) + float(lim['jitter_s']):.0f}",
-                           calls=str(st["max_calls_per_paper"]), navs=str(st["max_navigations_per_paper"]),
-                           type_names=" / ".join(f"'{x}'" for x in st["type_allow"]) or "(none: typing is off)")
+                           calls=str(st["max_calls_per_paper"]), navs=str(st["max_navigations_per_paper"]))
     (bd / "prompt.md").write_text(prompt)
     hermes = ag.get("hermes_bin") or "hermes"
     toolsets = "terminal"                         # the wrapper is the only tool (no screenshots / vision)

@@ -684,9 +684,9 @@ elif mode == "handoff":                           # a challenge is handed to the
         tool(f"tbsgen-browser {n} handoff_status")
         tool(f"tbsgen-browser {n} open https://doi.org/10.1080/x")
     tool("tbsgen-browser finish")
-elif mode == "type":                               # typing is whitelisted institution names only
+elif mode == "type":                               # removed form-field actions: blocked by the hook
     tool("tbsgen-browser 1 type 4 Nanjing University")
-    tool("tbsgen-browser 1 type 4 hunter2")
+    tool("tbsgen-browser 1 select 2 Nanjing University")
     tool("tbsgen-browser 1 open https://doi.org/10.1080/x")
     tool("tbsgen-browser finish")
 elif mode == "handoff_timeout":                   # the user never finishes
