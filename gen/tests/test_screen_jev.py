@@ -216,6 +216,16 @@ def test_pipeline_s2_jev_keep_drop_and_resume_is_idempotent(tmp_path, key):
     assert read_json(sa.p("S2_screen.json"))["keep"] == ra["keep"]
 
 
+def test_pipeline_blocklisted_paper_gets_no_jev_call(tmp_path, key):
+    blocked = dict(FAY, doi="10.1177/14759217251415195")
+    P = mkp(tmp_path, [(200, {}, resp(answers()))], concurrency=1)
+    a, b = P.ingest([FAY, blocked])
+    P.run(only=[a, b], max_steps=4)
+    assert len(P.jev_transport.calls) == 1             # only FAY; the SAGE paper never reaches Jev
+    rb = read_json(P.store.item(b).p("S2_screen.json"))
+    assert rb["method"] == "blocklist" and P.store.item(b).state["status"] == "dropped"
+
+
 def test_pipeline_fallback_to_rules_when_key_missing(tmp_path, monkeypatch):
     monkeypatch.delenv("TYPESAFE_API_KEY", raising=False)
     P = mkp(tmp_path, [(200, {}, resp(answers()))])

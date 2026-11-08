@@ -8,21 +8,22 @@ A paper with no DOI, or with an unknown year under a year-limited rule, is never
 from __future__ import annotations
 
 import re
+import urllib.parse
 
 _PII_YEAR = re.compile(r"\((\d{2})\)")
+_YEAR = re.compile(r"^\s*(\d{4})\b")
 
 
 def _norm_doi(doi: str | None) -> str:
-    return re.sub(r"^(https?://(dx\.)?doi\.org/|doi:)", "", (doi or "").strip(), flags=re.I).lower()
+    d = urllib.parse.unquote(str(doi or "")).strip()
+    d = re.sub(r"^(https?://(dx\.)?doi\.org/|doi:)\s*", "", d, flags=re.I)
+    return d.strip().lower()
 
 
 def paper_year(c: dict) -> int | None:
-    y = c.get("year")
-    try:
-        if y is not None and str(y).strip():
-            return int(str(y).strip()[:4])
-    except ValueError:
-        pass
+    m = _YEAR.match(str(c.get("year") or ""))
+    if m and 1800 <= int(m.group(1)) <= 2100:
+        return int(m.group(1))
     doi = _norm_doi(c.get("doi"))
     if doi.startswith("10.1016/") and (m := _PII_YEAR.search(doi)):
         yy = int(m.group(1))

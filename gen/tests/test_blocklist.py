@@ -28,6 +28,19 @@ def test_elsevier_year_rule_uses_year_then_pii():
     assert blocklist.match({"doi": "10.1016/j.procs.2016.05.501"}, RULES) is None   # unknown year: never blocked
 
 
+def test_invalid_year_falls_back_and_doi_variants_normalise():
+    # implausible / malformed years are ignored (then the PII year, if any, decides)
+    assert blocklist.match({"doi": "10.1016/j.x.2021.1", "year": 0}, RULES) is None
+    assert blocklist.match({"doi": "10.1016/j.x.2021.1", "year": "20"}, RULES) is None
+    assert blocklist.match({"doi": "10.1016/s0022-5096(97)00086-0", "year": "n.d."}, RULES)["name"] == \
+        "elsevier-pre2000"
+    assert blocklist.paper_year({"year": "1997-03-01"}) == 1997
+    # "doi: " with a space, URL forms and percent-encoding
+    assert blocklist.match({"doi": "doi: 10.1177/x"}, RULES)["name"] == "sage"
+    assert blocklist.match({"doi": "https://doi.org/10.1016/S0022-5096%2897%2900086-0"}, RULES)["name"] == \
+        "elsevier-pre2000"
+
+
 def test_s2_drops_blocked_paper_without_screen_call(tmp_path):
     cfg = load_config(None, {"run": {"root": str(tmp_path / "run")}, "models": {"roles": {"screen": "rules"}}})
     P = Pipeline(cfg)
