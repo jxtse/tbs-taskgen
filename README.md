@@ -397,6 +397,9 @@ uv run tbsgen fetch --run runs/R --config config.toml --browser --wait-for-egres
   - `sso_login` presses the autofilled Login button after checking the form posts (POST) to an SSO login
     domain; the page's own handlers could change the target after that check (it then counts as a failed
     login and is not retried);
+  - the ego SDK returns the page snapshot (used for `look` items inside cross-origin frames and for the screenshot
+    field check) only as full text to the action script's Node process: it is reduced line by line inside one
+    function and never returned, printed or logged, but the raw text does exist briefly in that local process;
   - not run end to end on real publisher or institution sites yet.
 
 ```toml

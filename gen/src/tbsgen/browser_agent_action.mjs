@@ -63,6 +63,7 @@ const ssoDomains = () => (INPUT.sso && INPUT.sso.domains) || [];
 // VALUE (also in cross-origin frames), so every line below a textbox / searchbox / combobox / spinbutton /
 // editable container (and below a password-like node) is dropped.  Only this form is ever kept or printed.
 async function safeSnapshot(page, opts) {
+  // (the raw text stays inside this function: never returned, printed or put into an error message)
   let raw = await page.snapshot(opts).then(String).catch(() => null);
   if (raw === null) return null;
   const outL = [];
@@ -489,7 +490,7 @@ async function postCheck(task, page, i, opts) {
   // (`cred` - any login signal - is reported and refuses interaction; `login` hands the page to the user)
   const sc = i.login_form ? { cred: true, login: true, mfa: false } : await scan(page);
   if (sc.cred) i.login_form = true;
-  const onSso = INPUT.sso && INPUT.sso.login && hostIn(i.url, ssoDomains());
+  const onSso = INPUT.sso && (INPUT.sso.enabled || INPUT.sso.login) && hostIn(i.url, ssoDomains());
   if (onSso && sc.login) { out.sso_page = true; i.login_form = true; return i; }   // the agent runs sso_login
   if (sc.login && !(opts && opts.no_login_handoff)) {
     if (INPUT.handoff && INPUT.handoff.enabled) return handoff(task, page, sc.mfa ? "verification code" : (sc.wayf ? "institution selection" : "login form"), h, sc.mfa ? "mfa" : "login", i.title);
@@ -790,11 +791,17 @@ function ssoSubmit(args) {
   if (!form) return pre("no login form");
   const user = form.querySelector("input[autocomplete=username], input[type=text], input[type=email], input:not([type])");
   if (!user || !filled(pwd) || !filled(user)) return pre("the login form is not autofilled");
-  const b = [...form.elements].find((x) => (x.type || "").toLowerCase() === "submit" && !x.disabled)
-    || [...form.querySelectorAll("button")].find((x) => /log ?in|sign ?in|登录|登陆|submit/i.test((x.innerText || "")));
+  const FP = HTMLFormElement.prototype;
+  const fAction = (f) => Object.getOwnPropertyDescriptor(FP, "action").get.call(f);
+  const fMethod = (f) => Object.getOwnPropertyDescriptor(FP, "method").get.call(f);
+  const fElems = (f) => [...Object.getOwnPropertyDescriptor(FP, "elements").get.call(f)];
+  // the button must submit THIS form (a <button form="other"> inside it would submit another one)
+  const owner = (x) => { try { return Object.getOwnPropertyDescriptor(Object.getPrototypeOf(x), "form").get.call(x); } catch (e) { return x.form; } };
+  const b = fElems(form).find((x) => (x.getAttribute("type") || (x.tagName === "BUTTON" ? "submit" : "")).toLowerCase() === "submit" && !x.disabled && owner(x) === form)
+    || [...form.querySelectorAll("button")].find((x) => owner(x) === form && /log ?in|sign ?in|登录|登陆|submit/i.test((x.innerText || "")));
   if (!b) return pre("no submit button on the login form");
-  const target = (b.hasAttribute("formaction") ? b.formAction : "") || form.action || location.href;
-  const method = ((b.hasAttribute("formmethod") ? b.formMethod : "") || form.method || "get").toLowerCase();
+  const target = (b.hasAttribute("formaction") ? b.formAction : "") || fAction(form) || location.href;
+  const method = ((b.hasAttribute("formmethod") ? b.formMethod : "") || fMethod(form) || "get").toLowerCase();
   if (method !== "post") return pre("the login form does not use POST");
   if (!inDom(target)) return pre("the login form posts outside the SSO login domains");
   const r = b.getBoundingClientRect();
@@ -1030,22 +1037,45 @@ try {
         // every field is masked (top document, open shadow roots, same-origin frames).  Fields the mask cannot
         // reach (cross-origin frames, closed shadow roots) are counted in the snapshot: if there are any, no
         // screenshot is taken
-        const snap = (await safeSnapshot(page, { scope: "full_page" })) || "";
-        const snapFields = (snap.match(/^\s*(textbox|searchbox|combobox|spinbutton|password)\b/gm) || []).length;
+        const snap = await safeSnapshot(page, { scope: "full_page" });
+        // fields per area from the (reduced) snapshot: top document vs. inside any iframe
+        let topFields = 0, frameFields = 0;
+        {
+          const stack = [];
+          for (const ln of String(snap || "").split("\n")) {
+            if (!ln.trim()) continue;
+            const ind = ln.length - ln.trimStart().length;
+            while (stack.length && stack[stack.length - 1] >= ind) stack.pop();
+            if (/^\s*iframe\b/.test(ln)) { stack.push(ind); continue; }
+            if (/^\s*(textbox|searchbox|combobox|spinbutton|password|listbox|slider)\b/.test(ln)) { if (stack.length) frameFields++; else topFields++; }
+          }
+        }
         const MASK = "input:not([type=submit]):not([type=button]):not([type=image]):not([type=reset]),textarea,select,[contenteditable]{color:transparent!important;"
           + "-webkit-text-security:disc!important;text-shadow:none!important;background-image:none!important;caret-color:transparent!important}"
           + "input::placeholder,textarea::placeholder{color:#999!important}";
-        const masked = await page.evaluate((css) => {
-          let n = 0;
-          const add = (root) => { try {
+        // masks every reachable document; counts text-like fields per area and whether any frame is unreachable
+        const cov = await page.evaluate((css) => {
+          const TXT = "input:not([type]),input[type=text],input[type=search],input[type=email],input[type=tel],input[type=url],input[type=number],input[type=password],textarea,select,[contenteditable]";
+          const res = { top: 0, frames: 0, unreachable: 0 };
+          const add = (root, inFrame) => {
             const st = document.createElement("style"); st.className = "__tbsgen_mask"; st.textContent = css;
             (root.documentElement || root).appendChild(st);
-            n += root.querySelectorAll("input:not([type=hidden]):not([type=submit]):not([type=button]):not([type=image]):not([type=reset]),textarea,select").length;
-            for (const h of root.querySelectorAll("*")) if (h.shadowRoot) add(h.shadowRoot);
-            for (const fr of root.querySelectorAll("iframe")) { try { if (fr.contentDocument) add(fr.contentDocument); } catch (e) {} } } catch (e) {} };
-          add(document);
-          return n;
-        }, MASK).catch(() => -1);
+            const n = root.querySelectorAll(TXT).length;
+            if (inFrame) res.frames += n; else res.top += n;
+            for (const h of root.querySelectorAll("*")) if (h.shadowRoot) add(h.shadowRoot, inFrame);
+            for (const fr of root.querySelectorAll("iframe, frame")) {
+              let d = null; try { d = fr.contentDocument; } catch (e) { d = null; }
+              if (d) add(d, true); else res.unreachable++;
+            }
+          };
+          try { add(document, false); } catch (e) { return null; }
+          return res;
+        }, MASK).catch(() => null);
+        // refused unless every field the browser shows is in a masked document: no snapshot, a field in an
+        // unreachable (cross-origin) frame, or more fields than the masked documents hold (closed shadow roots)
+        const uncovered = !snap || !cov || (cov.unreachable > 0 && frameFields > cov.frames)
+          || topFields > cov.top || frameFields > cov.frames;
+        const masked = uncovered ? -1 : 1, snapFields = 0;
         if (masked < 0 || snapFields > masked) {
           await page.evaluate(() => { const rm = (r) => { try { r.querySelectorAll(".__tbsgen_mask").forEach((x) => x.remove());
             for (const h of r.querySelectorAll("*")) if (h.shadowRoot) rm(h.shadowRoot);

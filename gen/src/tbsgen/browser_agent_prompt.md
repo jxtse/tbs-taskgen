@@ -31,7 +31,8 @@ Use your terminal tool to run exactly one of these commands per call (nothing el
 - `tbsgen-browser N select I VALUE` — choose VALUE (option value or label) of select item I (e.g. institution
   lists).
 - `tbsgen-browser N type I TEXT` — type TEXT into text item I (e.g. an institution search box). Never into a
-  password, verification-code or account field (refused).
+  password, verification-code or account field (refused). Letters, digits, spaces and `,.@+-_/:` are written
+  as is; write other characters percent-encoded (`'` as `%27`, `&` as `%26`, `%` as `%25`).
 - `tbsgen-browser N screenshot` — save a PNG of the page (field contents masked); view it with your vision tool
   (only these screenshots).
 - `tbsgen-browser N back` — go back one history step (same site only).

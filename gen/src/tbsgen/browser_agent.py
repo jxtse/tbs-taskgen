@@ -240,7 +240,8 @@ sys.exit({fn}({batch_dir!r}, sys.argv[1:]))
 # (also no glob characters other than "?", which cannot match: a URL word contains "://")
 _SAFE_TOK = r"[^\s'\"`$;&|<>\\*\[\]{}!()]{1,200}"
 # type / select text: no quotes / parentheses / shell metacharacters (the shell must pass it as is)
-_SAFE_TXT = r"[A-Za-z0-9 ,.@+\-_/:\u00c0-\u024f\u4e00-\u9fff]{1,80}"
+# (other characters, e.g. ' or &, are written percent-encoded - %27, %26 - and decoded by the wrapper)
+_SAFE_TXT = r"[A-Za-z0-9 ,.@+%\-_/:\u00c0-\u024f\u4e00-\u9fff]{1,80}"
 _PAPER_ACTIONS = "|".join((
     r"look( full)?( @\d{1,5})?( \d{1,4})?",
     r"open https?://" + _SAFE_TOK,
@@ -530,8 +531,13 @@ def wrapper_main(batch_dir: str, argv: list[str]) -> int:
 
 
 def _paper_call(bd: Path, st: dict, n: str, action: str, arg: str, say) -> int:
+    from urllib.parse import unquote
+
     from .dlledger import COOLDOWN_429_S, DownloadLedger
     from .fulltext import publisher_of
+    if action in ("type", "select") and "%" in arg:
+        head, _, txt = arg.partition(" ")
+        arg = head + " " + unquote(txt)[:120]          # percent-encoded characters (', &, ...) decoded here
     p = st["papers"][n]
     sp = bd / "papers" / f"{n}.json"
     ps: dict = json.loads(sp.read_text()) if sp.exists() else dict(calls=0)
@@ -727,7 +733,7 @@ def _paper_run(bd, st, n, p, ps, action, arg, say, led, pkey, space, handoff_fre
                nav_timeout_ms=45000, download_timeout_ms=120000, download_wait_ms=6000,
                challenge_wait_ms=int(st.get("challenge_wait_ms", 40000)),
                handoff={"enabled": handoff_free},
-               sso={"login": sso_ok, "domains": st.get("sso_domains") or []},
+               sso={"login": sso_ok, "enabled": bool(st.get("sso_login_enabled")), "domains": st.get("sso_domains") or []},
                handoff_state={"active": bool(ps.get("handoff")),
                               "deadline_ms": int(float(ps.get("handoff_deadline") or 0) * 1000),
                               "title": ps.get("handoff_title") or "", "page_label": ps.get("handoff_page") or ""})
@@ -779,6 +785,15 @@ def _paper_run(bd, st, n, p, ps, action, arg, say, led, pkey, space, handoff_fre
     if res.get("status") == "paused":
         return say("tbsgen: this paper's browser workspace is with the user (hand-off). Poll "
                    "`tbsgen-browser N handoff_status` and work on other papers meanwhile.", 2)
+    # files the call saved are booked first, whatever happens next (a hand-off / block returns early)
+    for rj in res.get("rejected") or []:              # never validated, whatever the script managed to delete
+        with contextlib.suppress(OSError):
+            Path(rj).unlink()
+    acc0 = [x for x in res.get("files") or [] if Path(x).resolve().parent == files]
+    if acc0:
+        ps = save_ps()
+        ps["accepted"] = sorted(set(ps.get("accepted") or []) | set(acc0))
+        _atomic(sp, json.dumps(ps))
     if res.get("handoff") and res.get("status") == "handoff":
         # the tool handed the page to the user (verification / login): notify, mark, keep the paper open
         ho = res.get("handoff") or {}
@@ -807,14 +822,7 @@ def _paper_run(bd, st, n, p, ps, action, arg, say, led, pkey, space, handoff_fre
         ps = save_ps(closed="challenge", challenge=str(res["blocked"])[:80])
         _cool_publisher(led, ps, p["doi"], str(res["blocked"]), secs)
         return say(f"tbsgen: paper {n}: {res['blocked']} - publisher cooled down; report `challenge` and move on.", 2)
-    for rj in res.get("rejected") or []:              # never validated, whatever the script managed to delete
-        with contextlib.suppress(OSError):
-            Path(rj).unlink()
-    acc = [x for x in res.get("files") or [] if Path(x).resolve().parent == files]
-    if acc:
-        ps = save_ps()
-        ps["accepted"] = sorted(set(ps.get("accepted") or []) | set(acc))
-        _atomic(sp, json.dumps(ps))
+    acc = acc0
     if action == "handoff_status":
         chk = res.get("handoff_check")
         if res.get("handoff_kind_now") == "challenge" and ps.get("handoff_kind") != "challenge":

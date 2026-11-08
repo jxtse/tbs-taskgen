@@ -74,6 +74,7 @@ def test_shell_allowed_new_actions():
         "tbsgen-browser 1 sso_login",
         "tbsgen-browser 1 select 2 Nanjing University", "tbsgen-browser 1 type 4 Nanjing University",
         "tbsgen-browser 1 type 4 南京大学", "tbsgen-browser 1 type 4 deep learning",
+        "tbsgen-browser 1 type 4 King%27s College London",
         "tbsgen-browser 1 tabs", "tbsgen-browser 1 switch p2",
         "tbsgen-browser 1 wait_for url /pdf 20",
         "tbsgen-browser 1 wait_for sel a.pdf-link", "tbsgen-browser 1 wait_for sel div#pdf", "tbsgen-browser 1 save_pdf",

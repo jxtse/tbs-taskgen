@@ -760,3 +760,24 @@ def test_redaction_drops_any_url_userinfo():
               "https://SECRETU4:@host.example"):
         r = browser_agent.redact(f"fetch {u} failed\n")
         assert "SECRETU" not in r and ("host.example" in r or "h.example" in r), r
+
+
+def test_files_saved_by_a_call_that_hands_off_are_kept(tmp_path, monkeypatch):
+    """Round 14: a call that saved a file and then handed the page over still books the file"""
+    bd, led = _batch(tmp_path, monkeypatch, ["10.1080/a.1"], handoff_enabled=True)
+    files = (bd / "files" / "1").resolve()
+    files.mkdir(parents=True, exist_ok=True)
+    (tmp_path / "ego").write_text(f"#!{sys.executable}\nimport json\nopen({str(files / 'f1.bin')!r}, 'wb').write(b'%PDF-1.7 x')\n"
+                                  f"print('TBSGEN_RESULT ' + json.dumps({{'status': 'handoff', 'files': [{str(files / 'f1.bin')!r}], "
+                                  "'handoff': {'reason': 'challenge: x', 'host': 'pub.example', 'kind': 'challenge'}}))\n")
+    _call(bd, "1", "open", "https://pub.example/a").communicate(timeout=60)
+    ps = json.loads((bd / "papers" / "1.json").read_text())
+    assert ps.get("handoff") and ps.get("accepted") == [str(files / "f1.bin")], ps
+
+
+def test_type_text_is_percent_decoded_and_sso_flag_is_passed(tmp_path, monkeypatch):
+    bd, led = _batch(tmp_path, monkeypatch, ["10.1080/a.1"])
+    (tmp_path / "ego").write_text(CAPTURE_EGO.replace("{py}", sys.executable).replace("{out}", str(tmp_path / "inp.json")))
+    out, _ = _call(bd, "1", "type", "4 King%27s College").communicate(timeout=60)
+    inp = json.loads((tmp_path / "inp.json").read_text())
+    assert inp["arg"] == "4 King's College" and inp["sso"]["enabled"] is True and inp["sso"]["login"] is False, (out, inp)
