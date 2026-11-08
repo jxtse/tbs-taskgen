@@ -833,3 +833,15 @@ def test_noise_floor_threshold_is_exact_for_non_default_floor():
     meas = {"ref": {"0": {"hidden_a": 1e-11, "hidden_b": 0.1}}, "mid": {"0": {"hidden_a": 1e-11, "hidden_b": 0.9}},
             "naive": {"0": {"hidden_a": 1e-11, "hidden_b": 0.9}}}
     assert set_thresholds(spec, meas, cfg)["thresholds"]["hidden_a"]["threshold"] == 1e-10
+
+
+def test_load_candidates_accepts_tbsretr_per_target_files(tmp_path):
+    """`tbsretr run` writes one file per target whose `target` is the id string (crashed ingest before)."""
+    from tbsgen.intake import load_candidates
+    one = {"target": "task:x", "papers": [{"doi": "10.1/a", "title": "A"}]}
+    (tmp_path / "t.json").write_text(json.dumps(one))
+    assert load_candidates(tmp_path / "t.json") == [{"doi": "10.1/a", "title": "A", "_target": "task:x"}]
+    (tmp_path / "l.json").write_text(json.dumps([one, {"target": {"id": "task:y"}, "papers": [{"doi": "10.1/b"}]}]))
+    assert [c["_target"] for c in load_candidates(tmp_path / "l.json")] == ["task:x", "task:y"]
+    (tmp_path / "e.json").write_text(json.dumps({"target": {"id": "task:z"}, "selected": [{"doi": "10.1/c"}]}))
+    assert load_candidates(tmp_path / "e.json")[0]["_target"] == "task:z"
