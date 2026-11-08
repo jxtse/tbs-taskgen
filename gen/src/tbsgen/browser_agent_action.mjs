@@ -8,32 +8,36 @@
 // pauses only that paper while the others continue.
 //
 // Actions (one Page - INPUT.page_label, default the first - of the paper's TaskSpace):
-//   look [OFFSET]                 page summary: URL, title, PDF?, challenge?, login form?, text excerpt and a
-//                                 numbered list of links / buttons / fields of the page's own DOM (hidden
-//                                 dropdown items included; every iframe is one `frame` item - clicking it
-//                                 opens the frame's checked URL as the page);
-//                                 OFFSET paginates the item list
-//   open URL                      navigate (URL host must be in INPUT.allow); downloads and new tabs are saved /
-//                                 reported
-//   click I                       click item I of the last `look` list (same numbering; run `look` first)
-//   tabs                          list the TaskSpace's pages (label, URL, allowed)
-//   switch LABEL                  make page LABEL the current page (never a page opened by the user)
+//   look [full] [@REF] [OFFSET]   page summary: URL, title, PDF?, challenge?, login form?, text excerpt and a
+//                                 numbered list of links / buttons / fields: the page's DOM and same-origin
+//                                 iframes (hidden dropdown items included), then items of cross-origin iframes
+//                                 from the ego page snapshot (field texts removed); `full` = whole page,
+//                                 `@REF` one snapshot subtree, OFFSET paginates
+//   open URL                      navigate (URL host must be in INPUT.allow)
+//   click I                       click item I of the last `look` list (DOM items in the checking evaluation,
+//                                 a `_blank` link by a native click on its checked position, cross-origin
+//                                 frame items through their snapshot ref)
+//   click_xy X Y                  native click at viewport coordinates (the element there is checked first)
+//   hover I                       move the mouse onto item I (native pointer)
+//   scroll up|down [PX]           scroll the page
+//   select I VALUE                choose VALUE (option value or label) of select item I
+//   type I TEXT                   type TEXT into text item I (never into a password / one-time-code / login field)
+//   screenshot                    PNG of the viewport under INPUT.files_dir with every field masked (refused
+//                                 where fields cannot be masked: login pages, unreadable frames with fields)
+//   tabs / switch LABEL           list / select the TaskSpace's pages (never the user's)
+//   back                          one history step back - only to a same-origin entry on an allowed host
 //   wait_for url SUBSTR|sel CSS [S]   wait until the URL contains SUBSTR / a CSS selector matches (<= 60 s)
 //   save_pdf                      the current page is a PDF document: save it
+//   sso_login                     on a configured institution SSO login domain: submit the browser-autofilled
+//                                 login form (values never read; POST to the SSO domain only; no retry)
 //   handoff_status                poll a running hand-off (the tool handed the page to the user)
 //   finish                        close the TaskSpace
-// NARROWED (round 11): the agent only reads pages, navigates and clicks - there is no hover, select or type,
-// and no form field is ever changed by this tool (institution selection / WAYF pages go to the user).
-// Rules enforced here: no form field is changed (fields cannot be clicked; a form with any editable control is
-// never submitted), no interaction with verification pages / widgets, no reading of input values, storage or
-// the browser's page snapshot (it carries field values), no screenshots, no native mouse / wheel input at all,
-// no click at all on a page with ANY login signal (credScan, checked in the same page evaluation that acts,
-// together with the looked-at URL and the allowed domains), login forms are never submitted (every login page - the institution's SSO login too - is handed to the user, whose
-// browser autofills it), no action inside any iframe (a frame is one item whose `click` opens its checked URL
-// as the page), navigation targets are checked before and the
-// landed URL is checked after (a page that ends up outside INPUT.allow is reset to about:blank), files are
-// only written under INPUT.files_dir, and verification / login pages are handed to the user (task.handOff)
-// instead of being solved.
+// Hard rules enforced here: credential VALUES never reach the output (field values are never read in the page;
+// the ego snapshot is reduced in this process before use - every field's text is dropped - and screenshots
+// mask all fields or are refused); no interaction with verification pages / widgets (they are handed to the
+// user); no click / type / select / hover on a page with a login signal (sso_login or the hand-off only);
+// navigation targets are checked before (links, forms, frames, back) and the landed URL after (a page that ends
+// up outside INPUT.allow is reset to about:blank); files only under INPUT.files_dir, validated by the wrapper.
 const out = { status: "error", action: INPUT.action, files: [] };
 const CHALLENGE = /just a moment|verify you are human|attention required|access denied|are you a robot|security check|captcha|human verification|请稍候|请稍等|人机验证|安全验证/i;
 const WIDGET = /captcha|turnstile|challenge|recaptcha|hcaptcha|verify|i am human|not a robot|cf-|px-|验证/i;
@@ -44,6 +48,36 @@ const hostOk = (u) => {
   try { const x = new URL(u); if (!/^https?:$/.test(x.protocol)) return false; h = x.hostname.toLowerCase(); } catch (e) { return false; }
   return INPUT.allow.some((d) => h === d || h.endsWith("." + d));
 };
+
+const hostIn = (u, domains) => {
+  let h, pr;
+  try { const x = new URL(u); pr = x.protocol; h = x.hostname.toLowerCase(); } catch (e) { return false; }
+  // HTTPS only, except loopback names when INPUT.sso.local_test (set only by the local test suite)
+  const local = h === "127.0.0.1" || h === "localhost" || h.endsWith(".localhost");
+  if (pr !== "https:" && !(local && INPUT.sso && INPUT.sso.local_test === true)) return false;
+  return domains.some((d) => h === d || h.endsWith("." + d));
+};
+const ssoDomains = () => (INPUT.sso && INPUT.sso.domains) || [];
+
+// The ego page snapshot reduced in THIS process before anything uses it: a field's snapshot text is its current
+// VALUE (also in cross-origin frames), so every line below a textbox / searchbox / combobox / spinbutton /
+// editable container (and below a password-like node) is dropped.  Only this form is ever kept or printed.
+async function safeSnapshot(page, opts) {
+  let raw = await page.snapshot(opts).then(String).catch(() => null);
+  if (raw === null) return null;
+  const outL = [];
+  let fieldInd = -1;
+  for (const ln of raw.split("\n")) {
+    const ind = ln.length - ln.trimStart().length;
+    if (fieldInd >= 0 && ind > fieldInd) continue;            // inside a field: its text / value
+    fieldInd = -1;
+    if (/^\s*(textbox|searchbox|combobox|spinbutton|listbox|slider|password)\b/.test(ln)
+        || /^\s*container\b.*\[ref=/.test(ln)) fieldInd = ind;
+    outL.push(ln);
+  }
+  raw = null;
+  return outL.join("\n");
+}
 
 // Everything printed goes through emit(): every URL - a whole value or a URL inside a longer string (error
 // messages) - loses its query, fragment and userinfo, whatever its host (OAuth / SAML / SSO callbacks carry
@@ -92,11 +126,13 @@ function domWalk() {
   const walk = (doc, frame) => {
     if (pairs.length >= 240) return;
     for (const el of doc.querySelectorAll(SEL)) { pairs.push([el, frame]); if (pairs.length >= 240) return; }
-    // NARROWED (round 9): every iframe - same-origin too - is ONE `frame` item (its URL); nothing inside a
-    // frame is listed or acted on (`click` on the item opens the frame's checked URL as the page, where every
-    // check runs on the top document)
+    // same-origin frames are walked (their items act in place); a cross-origin frame is one `frame` item
+    // (click opens its checked URL as the page) and its items come from the snapshot (snapItems)
     for (const f of doc.querySelectorAll("iframe")) {
-      if (f.src && /^https?:/i.test(f.src) && pairs.length < 240) pairs.push([f, frame]);
+      let inner = null;
+      try { inner = f.contentDocument; } catch (e) { inner = null; }
+      if (inner) walk(inner, frame + 1);
+      else if (f.src && /^https?:/i.test(f.src) && pairs.length < 240) pairs.push([f, frame]);
     }
   };
   walk(document, 0);
@@ -137,9 +173,46 @@ function itemList(src) {
       };
     });
 }
-async function items(page) {
-  return await page.evaluate(([a, w]) => (new Function("return (" + a + ")")())(w),
-                             [itemList.toString(), domWalk.toString()]).catch(() => []);
+// ego snapshot lines: `  anchor [ref=4, url=...]` / `  iframe [ref=6]` / `    text "Download"`.  Only items
+// below an iframe that domWalk could not enter (cross-origin) are kept; field items never carry a text.
+function snapItems(snap, dom) {
+  const lines = String(snap || "").split("\n");
+  const res = [];
+  const stack = [];
+  const domKeys = new Set(dom.map((x) => x.kind + "|" + (x.href || "") + "|" + (x.itext || x.text || "")));
+  for (let i = 0; i < lines.length; i++) {
+    const ln = lines[i];
+    if (!ln.trim()) continue;
+    const ind = ln.length - ln.trimStart().length;
+    while (stack.length && stack[stack.length - 1].ind >= ind) stack.pop();
+    if (/^\s*iframe \[ref=\d+/.test(ln)) { stack.push({ ind: ind, iframe: true }); continue; }
+    const m = /^\s*(button|anchor|link|combobox|textbox|searchbox|menuitem|tab|option) (?:"[^"]*" )?\[ref=(\d+)(?:[^\]]*?url=(\S+?))?\]/.exec(ln);
+    if (!m || !stack.some((s) => s.iframe)) continue;
+    const field = ["textbox", "searchbox", "combobox"].includes(m[1]);
+    const t = field ? null : /^\s*text "(.*)"$/.exec(lines[i + 1] || "");
+    const nm = /^\s*\w+ "([^"]*)"/.exec(ln);
+    const it = { src: "snap", kind: m[1] === "anchor" ? "link" : (field ? "field" : m[1]),
+                 text: (field ? (nm ? nm[1] : "") : (t ? t[1] : (nm ? nm[1] : ""))).slice(0, 80),
+                 href: (m[3] || "").replace(/,$/, ""), ref: m[2], frame: 1,
+                 meta: ln.replace(/url=\S+/g, "").slice(0, 300) };
+    if (domKeys.has(it.kind + "|" + it.href + "|" + it.text)) continue;
+    res.push(it);
+  }
+  return res;
+}
+// a login form inside a cross-origin frame (credScan cannot read it): seen in the reduced snapshot
+function snapLogin(snap) {
+  return /^\s*(?:textbox|password)\b[^\n]*(?:pass|pwd|密码|one-?time|otp|验证码|动态码)/im.test(String(snap || ""))
+    || /^\s*textbox\b[^\n]*type=password/im.test(String(snap || ""));
+}
+async function items(page, scope) {
+  const dom = await page.evaluate(([a, w]) => (new Function("return (" + a + ")")())(w),
+                                  [itemList.toString(), domWalk.toString()]).catch(() => []);
+  // cross-origin frames only: no snapshot is taken when the page has none
+  if (!dom.some((d) => d.kind === "frame") && !scope) return dom;
+  const opts = scope === "full" ? { scope: "full_page" } : (scope && scope.startsWith("@") ? { scope: "subtree", root: scope } : undefined);
+  const snap = (await safeSnapshot(page, opts)) || "";
+  return dom.concat(snapItems(snap, dom));
 }
 
 // ---------- page state --------------------------------------------------------------------------
@@ -277,7 +350,7 @@ function credScan() {
   // fields (also a plain list of institution links goes to the user - the agent never picks an institution)
   const heads = [...document.querySelectorAll("h1, h2, h3, legend")].filter(shown).slice(0, 20).map((h) => h.textContent || "").join(" ");
   if (WAYF.test(document.title || "") || WAYF.test(path(location.href)) || WAYF.test(heads)) wayf = true;
-  if (wayf) sem = true;
+  // (a WAYF page is NOT a login page: the agent may search / choose the institution there)
   if (WORDS.test(document.title || "") || URLW.test(path(location.href))) sem = true;
   // a verification-code prompt in the text counts only where a text field could take the code
   if (text > 0 && TXT.test((document.body && document.body.innerText || "").slice(0, 3000))) mfa = true;
@@ -416,6 +489,8 @@ async function postCheck(task, page, i, opts) {
   // (`cred` - any login signal - is reported and refuses interaction; `login` hands the page to the user)
   const sc = i.login_form ? { cred: true, login: true, mfa: false } : await scan(page);
   if (sc.cred) i.login_form = true;
+  const onSso = INPUT.sso && INPUT.sso.login && hostIn(i.url, ssoDomains());
+  if (onSso && sc.login) { out.sso_page = true; i.login_form = true; return i; }   // the agent runs sso_login
   if (sc.login && !(opts && opts.no_login_handoff)) {
     if (INPUT.handoff && INPUT.handoff.enabled) return handoff(task, page, sc.mfa ? "verification code" : (sc.wayf ? "institution selection" : "login form"), h, sc.mfa ? "mfa" : "login", i.title);
     out.login_form = true;                       // reported; the agent books `login_required`
@@ -425,8 +500,13 @@ async function postCheck(task, page, i, opts) {
 
 // ---------- actions -----------------------------------------------------------------------------
 function parseLookArg(arg) {
-  const x = String(arg || "").trim();
-  return { offset: /^\d{1,4}$/.test(x) ? parseInt(x, 10) : 0 };
+  let scope = "", offset = 0;
+  for (const p of String(arg || "").trim().split(/\s+/)) {
+    if (p === "full") scope = "full";
+    else if (/^@\d{1,5}$/.test(p)) scope = p;
+    else if (/^\d{1,4}$/.test(p)) offset = parseInt(p, 10);
+  }
+  return { scope: scope, offset: offset };
 }
 
 const LIMIT = 120;                                   // items per `look` page
@@ -443,7 +523,7 @@ function lookEval(infoSrc, listSrc, walkSrc, allow, chSrc) {
 }
 
 async function look(task, page) {
-  const { offset } = parseLookArg(INPUT.arg);
+  const { scope, offset } = parseLookArg(INPUT.arg);
   const r = await page.evaluate(([f, a, b, w, allow, ch]) => (new Function("return (" + f + ")")())(a, b, w, allow, ch),
     [lookEval.toString(), pageInfo.toString(), itemList.toString(), domWalk.toString(), INPUT.allow, CHALLENGE.source])
     .catch((e) => ({ error: String(e).slice(0, 120) }));
@@ -458,12 +538,19 @@ async function look(task, page) {
     return;
   }
   const i = r.info;
-  const all = r.items || [];
+  let all = r.items || [];
+  if (all.some((d) => d.kind === "frame") || scope) {
+    const opts = scope === "full" ? { scope: "full_page" } : (scope.startsWith("@") ? { scope: "subtree", root: scope } : undefined);
+    const snap = (await safeSnapshot(page, opts)) || "";
+    all = all.concat(snapItems(snap, all));
+    if (snapLogin(snap)) i.login_form = true;
+  }
+  out.look_scope = scope;
   const pageItems = all.slice(offset, offset + LIMIT).map((it, k) => ({
     i: offset + k, kind: it.kind, text: it.text, href: it.href ? cleanUrl(it.href).slice(0, 200) : "",
     allowed: it.href ? hostOk(it.href) : undefined,
     hidden: !!it.hidden, frame: it.frame || 0, ftype: it.ftype || undefined,
-    widget: !!it.widget, login: !!it.login,
+    widget: !!it.widget, login: !!it.login, in_frame: it.src === "snap" || undefined,
   }));
   out.page = { url: i.url, title: i.title, pdf: /pdf/i.test(i.ctype), challenge: isChallenge(i), login_form: i.login_form,
                text: i.text, items: pageItems, more: offset + LIMIT < all.length, next_offset: offset + LIMIT < all.length ? offset + LIMIT : undefined };
@@ -475,157 +562,341 @@ async function look(task, page) {
   out.status = "ok";
 }
 
-// The one evaluation that finds, checks and clicks item k of the dom list.  `walk` is the
-// domWalk function itself; both run inside the page (ego's evaluate takes ONE argument, passed as an array).
-function domAct(walkSrc, k, allow, kind, expectUrl, scanSrc, infoSrc, chSrc) {
+// The one evaluation that finds, checks and acts on item k of the dom list (click / hover / select / type).
+// `walk` is the domWalk function itself; both run inside the page (ego's evaluate takes ONE argument).
+function domAct(walkSrc, k, allow, kind, value, expectUrl, scanSrc, infoSrc, chSrc) {
   const ok = (u) => { try { const x = new URL(u, location.href); if (!/^https?:$/.test(x.protocol)) return false;
     const h = x.hostname.toLowerCase(); return allow.some((d) => h === d || h.endsWith("." + d)); } catch (e) { return false; } };
-  // re-checked in the SAME evaluation that acts (the page may have changed since the Node-side checks): still
-  // the page the agent looked at, still on an allowed host, still no credential / verification-code fields
-  if (kind !== "click") return { refused: "unknown action" };
-  if (location.href !== expectUrl) return { refused: "the page changed since `look`; run look again" };
+  // re-checked in the SAME evaluation that acts: still the page the agent looked at, still on an allowed host,
+  // not a login / MFA page, not a verification page
   if (!ok(location.href)) return { refused: "the page is outside the allowed domains" };
-  if ((new Function("return (" + scanSrc + ")")())().cred) return { refused: "login / verification-code page: no click here" };
+  if (location.href !== expectUrl) return { refused: "the page changed since `look`; run look again" };
+  if ((new Function("return (" + scanSrc + ")")())().cred) return { refused: "login / verification-code page: no interaction here (sso_login on the SSO domain, otherwise it is handed to the user)" };
   if ((new Function("return (" + infoSrc + ")")())(chSrc).challenge_page) return { refused: "verification page: do not interact" };
   const pair = new Function("return (" + walkSrc + ")")()()[k];   // domWalk: source -> function -> [el, frame]
   const el = pair && pair[0];
   if (!el) return { refused: "no such item; run look first" };
   const W = /captcha|turnstile|challenge|recaptcha|hcaptcha|verify|i am human|not a robot|cf-|px-|验证/i;
-  const COOKIE = /^(accept|reject|allow all|reject all|agree|consent|dismiss|close|ok|got it|accept all|manage preferences|接受|拒绝|同意|全部接受|关闭|确定)/i;
-  // a form's own properties can be shadowed by its named controls (<input name=action>, name=elements ...):
-  // read them through the native getters only (round 11)
+  // a form's own properties can be shadowed by its named controls (<input name=action>): native getters only
   const FP = HTMLFormElement.prototype;
   const fAction = (f) => Object.getOwnPropertyDescriptor(FP, "action").get.call(f);
   const fElems = (f) => [...Object.getOwnPropertyDescriptor(FP, "elements").get.call(f)];
   const fHasPw = (f) => Element.prototype.querySelector.call(f, "input[type=password]") !== null;
-  const tag0 = el.tagName.toLowerCase();
-  const btnInput = tag0 === "input" && ["submit", "button", "reset", "image"].includes((el.getAttribute("type") || "").toLowerCase());
-  const isField = (tag0 === "input" && !btnInput) || tag0 === "textarea" || tag0 === "select";
+  const tag = el.tagName.toLowerCase();
+  const btnInput = tag === "input" && ["submit", "button", "reset", "image"].includes((el.getAttribute("type") || "").toLowerCase());
+  const isField = (tag === "input" && !btnInput) || tag === "textarea" || tag === "select";
   // a field's value is never read (it may be an autofilled credential): fields are named by their metadata
   const text = ((isField ? "" : (el.innerText || (btnInput ? el.value : "") || "")) || el.getAttribute("aria-label")
     || el.getAttribute("placeholder") || el.title || "").trim().slice(0, 80);
   if (W.test([el.id, el.className && String(el.className), el.getAttribute("name"), el.getAttribute("aria-label")].join(" "))) return { refused: "verification widget: do not interact" };
-  // the control a click really activates: the element itself or its enclosing button / input (a span with
-  // role=button inside <button form="f"> submits form f)
+  // an item inside a (same-origin) frame that shows a verification page: never acted on (no solving)
+  {
+    const C = new RegExp(chSrc, "i");
+    let d = el.ownerDocument, n = 0;
+    while (d && d !== document && n++ < 8) {
+      const body = (d.body && d.body.innerText || "").slice(0, 300);
+      if (C.test(d.title || "") || (/^\s*$/.test(d.title || "") && C.test(body))
+          || d.querySelector(".cf-turnstile, .g-recaptcha, .h-captcha, #challenge-form, #px-captcha, iframe[src*='captcha'], iframe[src*='challenges.cloudflare.com']"))
+        return { refused: "verification page inside a frame: do not interact (it is handed to the user)" };
+      const fe = d.defaultView && d.defaultView.frameElement;
+      d = fe ? fe.ownerDocument : null;
+    }
+  }
+  if (el.closest && el.closest(".cf-turnstile, .g-recaptcha, .h-captcha, #challenge-form, #px-captcha, [id*=captcha], [class*=captcha]")) return { refused: "verification widget: do not interact" };
+  const lbl = el.closest && el.closest("label");
+  if (lbl) {
+    const c = lbl.control;
+    if (c && (c.tagName === "BUTTON" || (c.tagName === "INPUT" && ["submit", "reset", "image", "button"].includes((c.getAttribute("type") || "").toLowerCase()))))
+      return { refused: "a label of a button: click the button itself" };
+  }
   const actv = (el.closest && el.closest("button, input")) || el;
   const form = actv.form || el.form || (el.closest ? el.closest("form") : null);
-  const pwdForm = ((f) => !!f && (fElems(f).some((x) => (x.getAttribute("type") || "").toLowerCase() === "password") || fHasPw(f)));
-  // nothing inside (or submitting) a form with a password field (also one associated by form="..."): login
-  // forms are only ever submitted by the user
+  const pwdForm = (f) => !!f && (fElems(f).some((x) => (x.getAttribute("type") || "").toLowerCase() === "password") || fHasPw(f));
+  // login forms are submitted only by sso_login (checked target) or by the user
   if (pwdForm(form)) return { refused: "login form: credentials are not entered by this tool" };
-  // NARROWED (round 11): this tool never changes a form field.  A field item itself is never clicked (a click
-  // could focus / toggle / open it), and a form with ANY editable control - free text, select, checkbox,
-  // radio, textarea, file ..., rendered or not - is never submitted or clicked inside: it may hold an
-  // autofilled identifier or need a choice only the user makes (WAYF, account choosers).  Only forms made of
-  // buttons and hidden inputs (e.g. a "Download PDF" form) may be submitted.
-  if (isField) return { refused: "form fields are not changed by this tool (an institution selection page is handed to the user; otherwise report login_required)" };
-  // a label activates its control: a click on (anything inside) a label of a field is a click on the field
-  // (round 12: every click inside any <label> is refused - a label can also activate a submit / reset button
-  // of a form elsewhere, around every form check)
-  if (el.closest && el.closest("label")) return { refused: "labels are not clicked by this tool (they activate form controls)" };
-  // NARROWED (round 13): only NATIVE links (<a href>), buttons, input buttons, <summary> and frames are
-  // clicked - no [role=...] element (it can be slotted into a shadow-root <label> and activate a control),
-  // and NO form is ever submitted or reset by this tool: a button / input button that belongs to any form
-  // (also by form="...") is refused (e.g. SAML POST "Continue" pages carry an authentication assertion).
-  // Links inside a page-wide wrapper form are still followed (a link submits nothing).
-  const nativeOk = (tag0 === "a" && el.hasAttribute("href")) || tag0 === "button" || tag0 === "summary" || tag0 === "iframe"
-    || (tag0 === "input" && ["submit", "button", "reset", "image"].includes((el.getAttribute("type") || "").toLowerCase()));
-  if (!nativeOk) return { refused: "only native links, buttons and frames are clicked by this tool" };
-  if ((tag0 === "button" || tag0 === "input") && (el.form || el.hasAttribute("form") || (el.closest && el.closest("form"))))
-    return { refused: "forms are not submitted by this tool (report login_required, or the page is handed to the user)" };
-  const editable = (f) => !!f && fElems(f).some((x) => {
-    const xt = x.tagName;
-    if (xt === "TEXTAREA" || xt === "SELECT") return true;
-    if (xt !== "INPUT") return false;
-    return !["hidden", "submit", "button", "reset", "image"].includes((x.getAttribute("type") || "text").toLowerCase());
-  });
-  if (editable(form)) return { refused: "form with an input field: not submitted by this tool (report login_required)" };
-  if (el.closest && el.closest(".cf-turnstile, .g-recaptcha, .h-captcha, #challenge-form, #px-captcha, [id*=captcha], [class*=captcha]")) return { refused: "verification widget: do not interact" };
-  if (W.test(text)) return { refused: "verification widget: do not interact" };
-  const tag = el.tagName.toLowerCase();
+  // the centre of the element in TOP-document coordinates (same-origin frames add their offsets)
+  const centre = () => {
+    el.scrollIntoView({ block: "center", inline: "center" });
+    const r = el.getBoundingClientRect();
+    let x = r.left + r.width / 2, y = r.top + r.height / 2, w = el.ownerDocument.defaultView;
+    while (w && w !== window && w.frameElement) { const fr = w.frameElement.getBoundingClientRect(); x += fr.left; y += fr.top; w = w.parent; }
+    return { x: Math.round(x), y: Math.round(y), vis: r.width >= 1 && r.height >= 1 };
+  };
   if (tag === "iframe") {
-    // a frame (any origin): never acted on inside; `click` opens its (checked) URL as this page
+    // a cross-origin frame as a whole: click opens its (checked) URL as this page
+    if (kind !== "click") return { refused: "frame items can only be clicked (opens the frame's page); use look full for its items" };
     if (!ok(el.src)) return { refused: "frame URL is outside the allowed domains" };
-    location.assign(el.src);                                   // navigated here, in the checking evaluation
+    location.assign(el.src);
     return { opened: el.src, text: text };
   }
-  {
-    // the browser-resolved targets (respects <base href> and form= / formaction)
-    // (button.formAction is the document URL when the button has no formaction attribute: use form.action then)
+  if (kind === "click") {
+    if (W.test(text)) return { refused: "verification widget: do not interact" };
     const atag = actv.tagName.toLowerCase();
     const aBtn = atag === "button" || (atag === "input" && ["submit", "image"].includes((actv.getAttribute("type") || "").toLowerCase()));
     if (form && aBtn && !ok((actv.hasAttribute("formaction") ? actv.formAction : "") || fAction(form) || location.href)) return { refused: "form target is outside the allowed domains" };
     if (form && !aBtn && !ok(fAction(form) || location.href)) return { refused: "form target is outside the allowed domains" };
-    // the link a click really follows: the element or its enclosing <a href> (a span inside a link)
+    if ((el.hasAttribute("formaction") && !ok(el.formAction)) || (actv.hasAttribute("formaction") && !ok(actv.formAction))) return { refused: "form target is outside the allowed domains" };
     const link = tag === "a" ? el : (el.closest && el.closest("a[href]"));
     if (link) {
       const h = link.getAttribute("href") || "";
-      // every link but javascript: is checked by its browser-resolved target - also "#frag" (a <base href> can
-      // point it at another host)
+      // checked by its browser-resolved target (also "#frag": a <base href> can point it elsewhere)
       if (!/^\s*javascript:/i.test(h) && !ok(link.href)) return { refused: "link target is outside the allowed domains" };
-      // a new-tab link (top document or a frame): open its checked target in this page (no native click -
-      // a native click lands on whatever is on top at that point)
-      // (navigated here, in the checking evaluation - no later step)
-      if ((link.getAttribute("target") || "").toLowerCase() === "_blank" && !h.startsWith("#") && !/^javascript:/i.test(h)) {
-        location.assign(link.href);
+      const tg = (link.getAttribute("target") || "").trim();
+      if (tg && !/^_(self|top|parent)$/i.test(tg) && !/^\s*javascript:/i.test(h)) {
+        // a new-tab link: a NATIVE click opens the publisher's tab (tracked; a foreign one is closed at once).
+        // The point is checked to land on this link (nothing laid over it)
+        const c = centre();
+        if (c.vis && pair[1] === 0) {
+          const hit = document.elementFromPoint(c.x, c.y);
+          if (hit && (hit === link || link.contains(hit))) return { native: [c.x, c.y], newtab: true, text: text };
+        }
+        location.assign(link.href);                               // hidden / covered / in a frame: open here
         return { opened: link.href, text: text };
       }
-      // a named target window ("viewer"): also opened here (checked) instead of by a click
-      const tg = (link.getAttribute("target") || "").trim();
-      if (tg && !/^_(self|top|parent)$/i.test(tg) && !h.startsWith("#") && !/^javascript:/i.test(h)) { location.assign(link.href); return { opened: link.href, text: text }; }
     }
-    if ((el.hasAttribute("formaction") && !ok(el.formAction)) || (actv.hasAttribute("formaction") && !ok(actv.formAction))) return { refused: "form target is outside the allowed domains" };
     el.click();
     return { clicked: text };
+  }
+  if (kind === "hover") {
+    const c = centre();
+    if (!c.vis) return { refused: "the item has no position (hidden?)" };
+    return { native: [c.x, c.y], text: text };                       // moved by the caller (native pointer)
+  }
+  // fields: never into a password / one-time-code / login-identifier field, never a credential's own form
+  const CRED = /pass|pwd|otp|one-?time|totp|verif|code|pin\b|token|secret|user|login|account|e-?mail|phone|mobile|tel\b|密码|验证码|动态码|短信|账号|帐号|用户名|学号|工号|手机|邮箱/i;
+  let lab = "";
+  try { for (const l of el.labels || []) lab += " " + (l.textContent || ""); } catch (e) {}
+  const idn = [el.id, el.getAttribute("name"), el.getAttribute("autocomplete"), el.getAttribute("placeholder"),
+               el.getAttribute("aria-label"), el.getAttribute("inputmode"), lab].join(" ");
+  let af = false; try { af = el.matches(":autofill") || el.matches(":-webkit-autofill"); } catch (e) {}
+  if (kind === "select") {
+    if (tag !== "select") return { refused: "item is not a select" };
+    if (af || CRED.test(idn)) return { refused: "this select can hold an account; it is not changed by this tool" };
+    const opt = [...el.options].find((o) => o.value === value) || [...el.options].find((o) => o.label === value)
+      || [...el.options].find((o) => o.label.toLowerCase() === String(value).toLowerCase());
+    if (!opt) return { refused: "no such option" };
+    el.value = opt.value;
+    el.dispatchEvent(new Event("input", { bubbles: true }));
+    el.dispatchEvent(new Event("change", { bubbles: true }));
+    return { selected: opt.label.slice(0, 80) };
+  }
+  if (kind === "type") {
+    const t = tag === "input" ? (el.getAttribute("type") || "text").toLowerCase() : (tag === "textarea" ? "textarea" : "");
+    if (!["text", "search", "textarea", "url", "number"].includes(t)) return { refused: "not a plain text field" };
+    if (af || CRED.test(idn)) return { refused: "this field can hold credentials (password / code / account); typing is not allowed" };
+    if (form && form !== null && fElems(form).some((x) => { try { return x.matches(":autofill") || x.matches(":-webkit-autofill"); } catch (e) { return false; } }))
+      return { refused: "a form with autofilled values: typing is not allowed" };
+    el.focus();
+    const set = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(el), "value");
+    if (set && set.set) set.set.call(el, value); else el.value = value;
+    el.dispatchEvent(new Event("input", { bubbles: true }));
+    el.dispatchEvent(new Event("change", { bubbles: true }));
+    return { typed: true };                                          // nothing of the field is read back
   }
   return { refused: "unknown action" };
 }
 
-async function act(task, page, k) {
-  const kind = "click";
+// a snapshot item (inside a cross-origin frame): acted on through its ref
+async function snapAct(task, page, kind, it, value) {
+  // no action inside cross-origin frames while the page carries a verification widget frame
+  const vf = await page.evaluate(() => [...document.querySelectorAll("iframe")].some((f) =>
+    /captcha|turnstile|challenges\.cloudflare\.com|hcaptcha|recaptcha|perimeterx|px-cdn|arkoselabs|geetest/i.test((f.src || "") + " " + (f.title || ""))))
+    .catch(() => true);
+  if (vf) { out.status = "refused"; out.error = "verification widget on the page: do not interact (it is handed to the user)"; return; }
+  if (it.widget || WIDGET.test(it.text || "") || WIDGET.test(it.meta || "")) { out.status = "refused"; out.error = "verification widget: do not interact"; return; }
+  if (it.href && !hostOk(it.href)) { out.status = "refused"; out.error = "link target is outside the allowed domains"; return; }
+  const CRED = /pass|pwd|otp|one-?time|verif|code|pin\b|token|secret|user|login|account|e-?mail|phone|mobile|密码|验证码|动态码|短信|账号|帐号|用户名|学号|工号|手机|邮箱/i;
+  if ((kind === "type" || kind === "select") && (it.kind !== "field" || CRED.test(it.meta || ""))) {
+    out.status = "refused"; out.error = it.kind !== "field" ? "item is not a field" : "this field can hold credentials; typing is not allowed"; return;
+  }
+  const sel = "@" + it.ref;
+  await withDownload(task, page, async () => {
+    if (kind === "click") await page.click(sel, { timeout: 8000 });
+    else if (kind === "hover") await page.hover(sel, { timeout: 8000 });
+    else if (kind === "type") await page.fill(sel, value, { timeout: 8000 });
+    else if (kind === "select") await page.selectOption(sel, value, { timeout: 8000 });
+  });
+  if (out.action_error) { out.status = "error"; out.error = "the item could not be used: " + out.action_error; return; }
+  await sleep(kind === "hover" ? 800 : 1500);
+  out.acted = { kind: kind, text: it.text || "" };
+  const i = await after(page);
+  if (!out.blocked && !out.left_allowed) await postCheck(task, page, i);
+  out.page = { url: i.url, title: i.title, pdf: /pdf/i.test(i.ctype), login_form: i.login_form };
+  if (out.status !== "handoff") out.status = "ok";
+}
+
+async function act(task, page, kind, k, value) {
   // the page must be the one the agent last looked at.  `seen` - the URL whose hash is the look_key - is
   // passed into domAct, which compares it with location.href in the same evaluation that acts
   if (!INPUT.look_key) { out.status = "refused"; out.error = "run look first"; return; }
   const ip = await info(page);
   const seen = ip.url;
   if (await urlKey(seen) !== INPUT.look_key) { out.status = "refused"; out.error = "the page changed since `look`; run look again"; return; }
-  const all = await items(page);
+  const all = await items(page, INPUT.look_scope || "");
   if (!(k >= 0) || k >= all.length) { out.status = "refused"; out.error = "no such item; run look first"; return; }
   const it = all[k];
   if (isChallenge(ip)) { out.status = "refused"; out.error = "verification page: do not interact"; await postCheck(task, page, ip); return; }
-  // a page with credential / MFA fields (anywhere: frames, shadow roots, identity-provider frames) is never
-  // interacted with: the hand-off only
   if (ip.login_form || await credPage(page)) {
     out.status = "refused";
-    out.error = "login / verification-code page: no click here (it is handed to the user, otherwise report login_required)";
+    out.error = "login / verification-code page: no interaction here (sso_login on the SSO domain, otherwise it is handed to the user / report login_required)";
     return;
   }
   if (it.widget || WIDGET.test(it.text || "")) { out.status = "refused"; out.error = "verification widget: do not interact"; return; }
-  if (it.login) { out.status = "refused"; out.error = "login form: credentials are not entered by this tool (report login_required)"; return; }
-  const domRun = () => page.evaluate(([src, walk, k, allow, kind, u, scanSrc, infoSrc, chSrc]) => {   // ONE arg for ego
-    const f = new Function("return (" + src + ")")();        // domAct; walk is domWalk, both plain functions
-    return f(walk, k, allow, kind, u, scanSrc, infoSrc, chSrc);
-  }, [domAct.toString(), domWalk.toString(), k, INPUT.allow, kind, seen, credScan.toString(),
-      pageInfo.toString(), CHALLENGE.source]);
-  {
-    {
-      await withDownload(task, page, async () => {
-        // (a navigation started inside the evaluation may end its context before it returns: navigated)
-        const r = await domRun().catch((e) => (/context|destroyed|navigat|detached/i.test(String(e)) ? { opened: "?" } : null));
-        if (r && r.refused) { out.status = "refused"; out.error = r.refused; }
-        else if (!r) { out.status = "error"; out.error = "the page changed during the click (no result)"; }
-      });
-      if (out.status === "refused") return;
-      await sleep(1500);
-      const i = await after(page);
-      if (!out.blocked && !out.left_allowed) await postCheck(task, page, i);
-      out.page = { url: i.url, title: i.title, pdf: /pdf/i.test(i.ctype), login_form: i.login_form };
-      if (out.status !== "handoff") out.status = "ok";
-      return;
+  if (it.src === "snap") {
+    if (snapLogin(await safeSnapshot(page, (INPUT.look_scope === "full") ? { scope: "full_page" } : undefined))) {
+      out.status = "refused"; out.error = "login form inside a frame: no interaction here (it is handed to the user / report login_required)"; return;
     }
+    return snapAct(task, page, kind, it, value);
   }
+  const domRun = () => page.evaluate(([src, walk, k, allow, kind, value, u, scanSrc, infoSrc, chSrc]) => {   // ONE arg for ego
+    const f = new Function("return (" + src + ")")();
+    return f(walk, k, allow, kind, value, u, scanSrc, infoSrc, chSrc);
+  }, [domAct.toString(), domWalk.toString(), k, INPUT.allow, kind, value || "", seen, credScan.toString(),
+      pageInfo.toString(), CHALLENGE.source]);
+  let r = null, failed = false;
+  await withDownload(task, page, async () => {
+    // (a navigation started inside the evaluation may end its context before it returns: navigated)
+    r = await domRun().catch((e) => (/context|destroyed|navigat|detached/i.test(String(e)) ? { opened: "?" } : null));
+    if (r && r.refused) { failed = true; out.status = "refused"; out.error = r.refused; return; }
+    if (!r) { failed = true; out.status = "error"; out.error = "the page changed during the action (no result)"; return; }
+    if (r.native && kind === "click") await page.mouse.click(r.native[0], r.native[1]);
+    else if (r.native && kind === "hover") await page.mouse.move(r.native[0], r.native[1]);
+  });
+  if (failed) return;
+  await sleep(kind === "hover" ? 800 : 1500);
+  out.acted = { kind: kind, text: (r && (r.selected || r.text || r.clicked)) || "" };
+  const i = await after(page);
+  if (!out.blocked && !out.left_allowed) await postCheck(task, page, i);
+  out.page = { url: i.url, title: i.title, pdf: /pdf/i.test(i.ctype), login_form: i.login_form };
+  if (out.status !== "handoff") out.status = "ok";
 }
 
+function ssoSubmit(args) {
+  const [domains, lt, scanSrc, infoSrc, chSrc] = args;
+  const pre = (why) => ({ refused: why, stage: "pre" });
+  const inDom = (u) => { try { const x = new URL(u); const hh = x.hostname.toLowerCase();
+    const local = hh === "127.0.0.1" || hh === "localhost" || hh.endsWith(".localhost");
+    if (x.protocol !== "https:" && !(local && lt)) return false;
+    return domains.some((d) => hh === d || hh.endsWith("." + d)); } catch (e) { return false; } };
+  if (!inDom(location.href)) return pre("the page left the SSO login domain");
+  // the same verification-page test as everywhere else (title rules, challenge forms, captcha widgets)
+  if ((new Function("return (" + infoSrc + ")")())(chSrc).challenge_page) return pre("verification page on the SSO login page");
+  if ((new Function("return (" + scanSrc + ")")())().mfa
+      || document.querySelector("iframe[src*='captcha'], .g-recaptcha, .h-captcha, .cf-turnstile")) return pre("MFA / captcha on the login page");
+  const af = (el) => { try { return el.matches(":autofill") || el.matches(":-webkit-autofill"); } catch (e) { return false; } };
+  const filled = (el) => af(el) || (lt && el.value.length > 0);
+  const pwd = document.querySelector("form input[type=password]") || document.querySelector("input[type=password]");
+  const form = pwd && (pwd.form || pwd.closest("form"));
+  if (!form) return pre("no login form");
+  const user = form.querySelector("input[autocomplete=username], input[type=text], input[type=email], input:not([type])");
+  if (!user || !filled(pwd) || !filled(user)) return pre("the login form is not autofilled");
+  const b = [...form.elements].find((x) => (x.type || "").toLowerCase() === "submit" && !x.disabled)
+    || [...form.querySelectorAll("button")].find((x) => /log ?in|sign ?in|登录|登陆|submit/i.test((x.innerText || "")));
+  if (!b) return pre("no submit button on the login form");
+  const target = (b.hasAttribute("formaction") ? b.formAction : "") || form.action || location.href;
+  const method = ((b.hasAttribute("formmethod") ? b.formMethod : "") || form.method || "get").toLowerCase();
+  if (method !== "post") return pre("the login form does not use POST");
+  if (!inDom(target)) return pre("the login form posts outside the SSO login domains");
+  const r = b.getBoundingClientRect();
+  if (r.width < 1 || r.height < 1) return pre("the login button is not visible");
+  b.click();
+  // the page's own click / submit handlers ran synchronously inside b.click(): if they changed the form's
+  // method or target, the submission (a navigation not yet started) is cancelled here, before any request.
+  // (A script of the SSO page that reads the autofilled values itself is outside what any tool can prevent:
+  // the configured SSO domain is trusted, as when the user logs in by hand.)
+  const t2 = (b.hasAttribute("formaction") ? b.formAction : "") || form.action || location.href;
+  const m2 = ((b.hasAttribute("formmethod") ? b.formMethod : "") || form.method || "get").toLowerCase();
+  if (m2 !== "post" || !inDom(t2) || !inDom(location.href)) {
+    window.stop();
+    return { submitted: true, aborted: "the login form changed while it was submitted; stopped" };
+  }
+  return { submitted: true };
+}
+
+async function ssoLogin(task, page) {
+  const sso = INPUT.sso || {};
+  const localTest = sso.local_test === true;          // only the local test suite sets this; never the wrapper
+  // sso_stage "pre": nothing was submitted (the wrapper may return the reserved submission).  It switches to
+  // "submit" BEFORE the login button is pressed, so any error or navigation from then on counts as submitted.
+  out.sso_submitted = false;
+  out.sso_stage = "pre";
+  if (!sso.login || !(sso.domains || []).length) { out.status = "refused"; out.error = "sso_login is not enabled for this batch (or its budget is used up); report login_required"; return; }
+  const i = await info(page);
+  if (!hostIn(i.url, sso.domains)) { out.status = "refused"; out.error = "sso_login is only allowed on the configured institution SSO login domains (HTTPS)"; return; }
+  const h = (() => { try { return new URL(i.url).hostname; } catch (e) { return ""; } })();
+  out.sso_host = h;
+  // Autofill is detected with the browser's own :autofill state of the two fields (no value is read).  Only
+  // in the local test mode a non-empty field (a page-provided stand-in) also counts.
+  const read = () => page.evaluate(([lt, scanSrc]) => {
+    const af = (el) => { try { return el.matches(":autofill") || el.matches(":-webkit-autofill"); } catch (e) { return false; } };
+    // MFA / verification step: the same scan as every other guard (credScan), plus captcha widgets
+    const mfa = (new Function("return (" + scanSrc + ")")())().mfa
+      || !!document.querySelector("iframe[src*='captcha'], .g-recaptcha, .h-captcha, .cf-turnstile");
+    const pwd = document.querySelector("form input[type=password]") || document.querySelector("input[type=password]");
+    if (!pwd) return { hasPwd: false, mfa: mfa };
+    const form = pwd.form || pwd.closest("form") || document;
+    const user = form.querySelector("input[autocomplete=username], input[type=text], input[type=email], input:not([type])");
+    const filled = (el) => af(el) || (lt && el.value.length > 0);
+    return { hasPwd: true, hasUser: !!user, mfa: mfa, pwFilled: filled(pwd), userFilled: !!user && filled(user) };
+  }, [localTest, credScan.toString()]).catch(() => ({ hasPwd: false }));
+  let st = await read();
+  if (st.mfa) return handoff(task, page, "MFA / verification code on the SSO login page", h, "mfa", i.title);
+  if (!st.hasPwd || !st.hasUser) return handoff(task, page, "not a recognizable SSO login form", h, "login", i.title);
+  if (!st.pwFilled || !st.userFilled) {
+    // the page may still be loading: look once more (no click - a click could submit), then hand over
+    await sleep(2000);
+    st = await read();
+    if (st.mfa) return handoff(task, page, "MFA / verification code on the SSO login page", h, "mfa", i.title);
+    if (!st.pwFilled || !st.userFilled) return handoff(task, page, "the browser did not autofill the login form", h, "login", i.title);
+  }
+  // ONE evaluation checks and submits (no later, separate click): it runs through CDP with a user gesture (the
+  // browser releases autofilled values to the page on a user activation), re-checks that the page is still an
+  // HTTPS configured SSO host, both fields are still autofilled, there is no MFA / captcha, the form posts
+  // (POST only - never GET, which would put the credentials into a URL) to a browser-resolved target
+  // (form.action / button.formAction; <base href> included) on such a host - and only then clicks the button
+  // (button.click(): the page's own click / submit handlers run as for a real click).
+  const expr = "(" + ssoSubmit.toString() + ")(" + JSON.stringify([sso.domains, localTest, credScan.toString(),
+                                                                    pageInfo.toString(), CHALLENGE.source]) + ")";
+  out.sso_stage = "submit";
+  out.sso_submitted = true;                          // from here on the outcome counts as a submission
+  let chk = null;
+  await withDownload(task, page, async () => {
+    const r = await page.cdp("Runtime.evaluate", { expression: expr, returnByValue: true, userGesture: true, awaitPromise: false },
+                             { timeout: 15000 });
+    chk = (r && r.result && r.result.value) || { refused: "the login form could not be checked" + (r && r.exceptionDetails ? " (exception)" : "") };
+  }).catch((e) => { chk = { refused: "the login form could not be checked: " + String(e).slice(0, 80), unknown: true }; });
+  if (!chk || !chk.submitted) {
+    if (chk && chk.refused && !chk.unknown && chk.stage === "pre") { out.sso_stage = "pre"; out.sso_submitted = false; }
+    out.status = "refused"; out.error = (chk && chk.refused) || "not submitted"; return;
+  }
+  if (chk.aborted) {                                 // counted as a (failed) submission: no more logins this batch
+    out.sso = "fail"; out.note = chk.aborted; out.status = "ok";
+    out.page = { url: bareUrl(i.url), title: i.title, login_form: true };
+    return;
+  }
+  // wait for the login page to go away (never resubmit; a failure ends the logins of this batch)
+  const t0 = Date.now();
+  for (;;) {
+    await sleep(1500);
+    const i2 = await info(page);
+    if (isChallenge(i2)) { out.sso = "handoff"; return handoff(task, page, "challenge after the SSO login", h, "challenge", i2.title); }
+    const st2 = await read();
+    if (st2.mfa) { out.sso = "handoff"; return handoff(task, page, "MFA / verification code after the SSO login", h, "mfa", i2.title); }
+    if (!st2.hasPwd && hostIn(i2.url, sso.domains) && await loginPage(page)) {
+      // still on the login server with other credential fields (a second step): the user finishes it
+      out.sso = "handoff"; return handoff(task, page, "a further login step on the SSO server", h, "mfa", i2.title);
+    }
+    if (!st2.hasPwd) {
+      const i3 = await after(page);                  // the landed page must be an allowed / SSO host
+      if (out.left_allowed) { out.sso = "fail"; out.status = "ok"; return; }
+      out.sso = "ok"; out.page = { url: bareUrl(i3.url), title: i3.title, pdf: /pdf/i.test(i3.ctype) }; out.status = "ok"; return;
+    }
+    if (Date.now() - t0 > (sso.wait_ms || 35000)) break;
+  }
+  out.sso = "fail";                                   // still on the login page: failed, never retried
+  out.page = { url: bareUrl(i.url), title: i.title, login_form: true };
+  out.status = "ok";
+}
 
 try {
   let task;
@@ -670,10 +941,154 @@ try {
         out.page = { url: i.url, title: i.title, pdf: /pdf/i.test(i.ctype), login_form: i.login_form };
         if (out.status !== "handoff") out.status = "ok";
       }
-    } else if (INPUT.action === "click") {
-      const arg = String(INPUT.arg || "").trim();
-      if (!/^\d{1,3}$/.test(arg)) { out.status = "refused"; out.error = "usage: click I"; }
-      else await act(task, page, parseInt(arg, 10));
+    } else if (["click", "hover", "select", "type"].includes(INPUT.action)) {
+      const parts = String(INPUT.arg || "").trim().split(" ");
+      const k = /^\d{1,3}$/.test(parts[0]) ? parseInt(parts[0], 10) : -1;
+      const value = parts.slice(1).join(" ");
+      const needsValue = INPUT.action === "select" || INPUT.action === "type";
+      if (k < 0 || (needsValue && !value) || (!needsValue && value)) { out.status = "refused"; out.error = `usage: ${INPUT.action} I${needsValue ? " VALUE" : ""}`; }
+      else await act(task, page, INPUT.action, k, value);
+    } else if (INPUT.action === "click_xy") {
+      const parts = String(INPUT.arg || "").split(" ").map((x) => parseInt(x, 10));
+      const i0 = await info(page);
+      if (isChallenge(i0)) { out.status = "refused"; out.error = "verification page: do not interact"; await postCheck(task, page, i0); }
+      else if (i0.login_form || await credPage(page)) { out.status = "refused"; out.error = "login page: coordinate clicks are not allowed (sso_login or hand-off only)"; }
+      else if (!(parts[0] >= 0) || !(parts[1] >= 0)) { out.status = "refused"; out.error = "usage: click_xy X Y"; }
+      else {
+        // the element at the point is checked (same rules as `click`) right before the native click
+        const pre = await page.evaluate(([x, y, allow]) => {
+          const ok = (u) => { try { const v = new URL(u, location.href); if (!/^https?:$/.test(v.protocol)) return false;
+            const h = v.hostname.toLowerCase(); return allow.some((d) => h === d || h.endsWith("." + d)); } catch (e) { return false; } };
+          let el = document.elementFromPoint(x, y);
+          if (!el) return { refused: "nothing at that point" };
+          // descend into open shadow roots and same-origin frames to the real target
+          for (let n = 0; n < 8; n++) {
+            if (el.shadowRoot) { const r = el.shadowRoot.elementFromPoint(x, y); if (r && r !== el) { el = r; continue; } }
+            break;
+          }
+          const W = /captcha|turnstile|challenge|recaptcha|hcaptcha|verify|i am human|not a robot|cf-|px-|验证/i;
+          if (el.tagName === "IFRAME" || el.tagName === "FRAME") {
+            const src = el.src || "";
+            if (W.test(src + " " + (el.title || "")) || /captcha|challenges\.cloudflare\.com|turnstile/i.test(src)) return { refused: "verification widget: do not interact" };
+            if (src && !ok(src)) return { refused: "the frame at that point is outside the allowed domains" };
+            return { ok: true, frame: true };          // a click inside a frame of an allowed host (native)
+          }
+          if (W.test([el.id, el.className && String(el.className), el.getAttribute("name"), el.getAttribute("aria-label")].join(" "))
+            || el.closest(".cf-turnstile, .g-recaptcha, .h-captcha, #challenge-form, #px-captcha, iframe[src*='captcha']")) return { refused: "verification widget: do not interact" };
+          if (el.tagName === "INPUT" && (el.getAttribute("type") || "").toLowerCase() === "password") return { refused: "password field: do not interact" };
+          const FP = HTMLFormElement.prototype;
+          const fAction = (f) => Object.getOwnPropertyDescriptor(FP, "action").get.call(f);
+          const fElems = (f) => [...Object.getOwnPropertyDescriptor(FP, "elements").get.call(f)];
+          const fa = el.closest("button, input");
+          const form = (fa && fa.form) || el.form || el.closest("form");
+          if (form && (fElems(form).some((v) => (v.getAttribute("type") || "").toLowerCase() === "password") || Element.prototype.querySelector.call(form, "input[type=password]"))) return { refused: "login form: credentials are not entered by this tool" };
+          const a = el.closest("a[href]");
+          if (a) { const h = a.getAttribute("href") || ""; if (!/^\s*javascript:/i.test(h) && !ok(a.href)) return { refused: "link target is outside the allowed domains" }; }
+          if (form && !ok((fa && fa.hasAttribute("formaction") ? fa.formAction : "") || fAction(form) || location.href)) return { refused: "form target is outside the allowed domains" };
+          if (W.test(((el.innerText || "") + " " + (el.getAttribute("aria-label") || "")).slice(0, 200))) return { refused: "verification widget: do not interact" };
+          return { ok: true };
+        }, [parts[0], parts[1], INPUT.allow]).catch(() => null);
+        if (!pre) { out.status = "refused"; out.error = "the point could not be checked; use click on a look item"; }
+        else if (pre.refused) { out.status = "refused"; out.error = pre.refused; }
+        else {
+          await withDownload(task, page, () => page.mouse.click(parts[0], parts[1]));
+          await sleep(1500);
+          const i = await after(page);
+          if (!out.blocked && !out.left_allowed) await postCheck(task, page, i);
+          out.page = { url: i.url, title: i.title, pdf: /pdf/i.test(i.ctype), login_form: i.login_form };
+          if (out.status !== "handoff") out.status = "ok";
+        }
+      }
+    } else if (INPUT.action === "scroll") {
+      const a = String(INPUT.arg || "").split(/\s+/);
+      const d = a[0] === "up" ? -1 : 1;
+      const px = Math.min(5000, Math.max(50, parseInt(a[1] || "700", 10) || 700));
+      const i0 = await info(page);
+      if (isChallenge(i0)) { out.status = "refused"; out.error = "verification page: do not interact"; await postCheck(task, page, i0); }
+      else {
+        const sy = () => page.evaluate(() => Math.round(window.scrollY)).catch(() => 0);
+        const from = await sy();
+        await page.evaluate(([d, px]) => window.scrollBy(0, d * px), [d, px]).catch(() => {});
+        await sleep(300);
+        let to = await sy();
+        if (to === from) {                                    // the window cannot scroll: wheel over the page
+          await page.mouse.move(400, 400).catch(() => {});
+          await page.mouse.wheel(0, d * px).catch(() => {});
+          await sleep(300);
+          to = await sy();
+        }
+        out.scroll = { from: from, to: to };
+        const i = await after(page);                          // scrolling may trigger a navigation
+        if (!out.blocked && !out.left_allowed && i.url !== i0.url) await postCheck(task, page, i);
+        if (out.status !== "handoff") out.status = "ok";
+      }
+    } else if (INPUT.action === "screenshot") {
+      const i = await info(page);
+      if (!i.url || isChallenge(i)) { out.status = "refused"; out.error = "no screenshot of this page"; }
+      else if (i.login_form || await credPage(page)) { out.status = "refused"; out.error = "the page has (or may have) credential fields; screenshots are disabled on login pages"; }
+      else {
+        // every field is masked (top document, open shadow roots, same-origin frames).  Fields the mask cannot
+        // reach (cross-origin frames, closed shadow roots) are counted in the snapshot: if there are any, no
+        // screenshot is taken
+        const snap = (await safeSnapshot(page, { scope: "full_page" })) || "";
+        const snapFields = (snap.match(/^\s*(textbox|searchbox|combobox|spinbutton|password)\b/gm) || []).length;
+        const MASK = "input:not([type=submit]):not([type=button]):not([type=image]):not([type=reset]),textarea,select,[contenteditable]{color:transparent!important;"
+          + "-webkit-text-security:disc!important;text-shadow:none!important;background-image:none!important;caret-color:transparent!important}"
+          + "input::placeholder,textarea::placeholder{color:#999!important}";
+        const masked = await page.evaluate((css) => {
+          let n = 0;
+          const add = (root) => { try {
+            const st = document.createElement("style"); st.className = "__tbsgen_mask"; st.textContent = css;
+            (root.documentElement || root).appendChild(st);
+            n += root.querySelectorAll("input:not([type=hidden]):not([type=submit]):not([type=button]):not([type=image]):not([type=reset]),textarea,select").length;
+            for (const h of root.querySelectorAll("*")) if (h.shadowRoot) add(h.shadowRoot);
+            for (const fr of root.querySelectorAll("iframe")) { try { if (fr.contentDocument) add(fr.contentDocument); } catch (e) {} } } catch (e) {} };
+          add(document);
+          return n;
+        }, MASK).catch(() => -1);
+        if (masked < 0 || snapFields > masked) {
+          await page.evaluate(() => { const rm = (r) => { try { r.querySelectorAll(".__tbsgen_mask").forEach((x) => x.remove());
+            for (const h of r.querySelectorAll("*")) if (h.shadowRoot) rm(h.shadowRoot);
+            for (const fr of r.querySelectorAll("iframe")) { try { if (fr.contentDocument) rm(fr.contentDocument); } catch (e) {} } } catch (e) {} }; rm(document); }).catch(() => {});
+          out.status = "refused"; out.error = "the page has fields that cannot be masked (cross-origin frame / closed component); use look instead";
+        } else {
+          const f = `${INPUT.files_dir}/shot-${Date.now()}-${Math.floor(Math.random() * 1e5)}.png`;
+          await page.screenshot({ path: f });
+          await page.evaluate(() => { const rm = (r) => { try { r.querySelectorAll(".__tbsgen_mask").forEach((x) => x.remove());
+            for (const h of r.querySelectorAll("*")) if (h.shadowRoot) rm(h.shadowRoot);
+            for (const fr of r.querySelectorAll("iframe")) { try { if (fr.contentDocument) rm(fr.contentDocument); } catch (e) {} } } catch (e) {} }; rm(document); }).catch(() => {});
+          out.shot = f;
+          out.page = { url: i.url, title: i.title, pdf: /pdf/i.test(i.ctype) };
+          out.status = "ok";
+        }
+      }
+    } else if (INPUT.action === "back") {
+      // only to the previous entry when it is same-origin and on an allowed host (Navigation API: entries()
+      // lists only same-origin entries) - checked and done in one evaluation; anything else is refused
+      let r = null;
+      await withDownload(task, page, async () => {
+        r = await page.evaluate((allow) => {
+          const ok = (u) => { try { const v = new URL(u); if (!/^https?:$/.test(v.protocol)) return false;
+            const h = v.hostname.toLowerCase(); return allow.some((d) => h === d || h.endsWith("." + d)); } catch (e) { return false; } };
+          if (typeof navigation === "undefined" || !navigation.currentEntry) return { refused: "back is not available on this page" };
+          const cur = navigation.currentEntry.index;
+          const prev = navigation.entries().find((e) => e.index === cur - 1);
+          if (!prev) return { refused: "the previous page is on another site (or there is none); use open" };
+          if (!ok(prev.url)) return { refused: "the previous page is outside the allowed domains" };
+          navigation.back();
+          return { ok: true };
+        }, INPUT.allow).catch((e) => (/context|destroyed|navigat/i.test(String(e)) ? { ok: true } : { refused: "back failed" }));
+      });
+      if (r && r.refused) { out.status = "refused"; out.error = r.refused; }
+      else {
+        await sleep(1500);
+        const i = await after(page);
+        if (!out.blocked && !out.left_allowed) await postCheck(task, page, i);
+        out.page = { url: i.url, title: i.title, pdf: /pdf/i.test(i.ctype), login_form: i.login_form };
+        if (out.status !== "handoff") out.status = "ok";
+      }
+    } else if (INPUT.action === "sso_login") {
+      await ssoLogin(task, page);
     } else if (INPUT.action === "tabs") {
       const tabs = await task.tabs();
       out.tabs = tabs.map((t) => ({ label: t.label, url: cleanUrl(t.url || "").slice(0, 200),

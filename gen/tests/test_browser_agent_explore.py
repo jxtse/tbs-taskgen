@@ -67,7 +67,13 @@ def test_shell_allowed_new_actions():
     ok = [
         "tbsgen-browser 1 look", "tbsgen-browser 1 look 40",
         "tbsgen-browser 1 open https://doi.org/10.1080/x",
-        "tbsgen-browser 1 click 12",
+        "tbsgen-browser 1 click 12", "tbsgen-browser 1 hover 3",
+        "tbsgen-browser 1 look full", "tbsgen-browser 1 look @12", "tbsgen-browser 1 look full 120",
+        "tbsgen-browser 1 click_xy 320 240", "tbsgen-browser 1 screenshot",
+        "tbsgen-browser 1 scroll down", "tbsgen-browser 1 scroll up 800", "tbsgen-browser 1 back",
+        "tbsgen-browser 1 sso_login",
+        "tbsgen-browser 1 select 2 Nanjing University", "tbsgen-browser 1 type 4 Nanjing University",
+        "tbsgen-browser 1 type 4 南京大学", "tbsgen-browser 1 type 4 deep learning",
         "tbsgen-browser 1 tabs", "tbsgen-browser 1 switch p2",
         "tbsgen-browser 1 wait_for url /pdf 20",
         "tbsgen-browser 1 wait_for sel a.pdf-link", "tbsgen-browser 1 wait_for sel div#pdf", "tbsgen-browser 1 save_pdf",
@@ -77,21 +83,15 @@ def test_shell_allowed_new_actions():
     for c in ok:
         assert browser_agent.shell_allowed(c) is None, c
     bad = [
-        "tbsgen-browser 1 scroll down", "tbsgen-browser 1 scroll up 800",   # removed (round 7)
-        "tbsgen-browser 1 back",                                             # removed (round 8)
-        "tbsgen-browser 1 sso_login",                                        # removed (round 9)
-        "tbsgen-browser 1 hover 3",                                          # removed (round 11)
-        "tbsgen-browser 1 select 2 Nanjing University",                      # removed (round 11)
-        "tbsgen-browser 1 type 4 Nanjing University", "tbsgen-browser 1 type 4 南京大学",   # removed (round 11)
-        "tbsgen-browser 1 click 3 x",
+        "tbsgen-browser 1 click 3 x", "tbsgen-browser 1 hover 3 x", "tbsgen-browser 1 scroll left",
+        "tbsgen-browser 1 type 4 a`id`", "tbsgen-browser 1 type 4 $HOME",
         "tbsgen-browser 1 open https://x.example/a;rm -rf /",     # shell metachar
         "tbsgen-browser 1 open https://x.example/a && echo hi",
         "tbsgen-browser 1 open \"https://x.example/a\"",
         "tbsgen-browser 1 type 4 'x';env",
         "tbsgen-browser 1 select 1 a|b",
         "tbsgen-browser 1 click 1234",                              # 4-digit item index: out of range
-        "tbsgen-browser 1 look full", "tbsgen-browser 1 look @12",          # removed: snapshot scopes
-        "tbsgen-browser 1 click_xy 320 240", "tbsgen-browser 1 screenshot",  # removed: coordinate clicks / shots
+        "tbsgen-browser 1 click_xy 320", "tbsgen-browser 1 screenshot x",
         "tbsgen-browser 1 wait_for url $(cat /etc/passwd)",
         "tbsgen-browser 1 wait_for exec x",
         "tbsgen-browser 1 look\n touch x",
@@ -118,9 +118,13 @@ def _hook(batch_dir, tool, inp):
 
 def test_hook_blocks_every_tool_but_the_wrapper(tmp_path):
     (tmp_path / "files" / "1").mkdir(parents=True)
-    shot = str(tmp_path / "files" / "1" / "shot-1.png")
+    shot = str(tmp_path / "files" / "1" / "shot-1-2.png")
     Path(shot).write_bytes(b"png")
-    assert "block" in _hook(tmp_path, "vision_analyze", {"image_url": shot, "question": "?"})   # no vision tool
+    assert _hook(tmp_path, "vision_analyze", {"image_url": shot, "question": "?"}) == ""      # its own screenshots
+    other = tmp_path / "files" / "1" / "f1.bin"
+    other.write_bytes(b"%PDF")
+    for bad in ("/etc/passwd", str(other), str(tmp_path / "files" / "1" / "shot-9-9.png"), "https://x.example/s.png"):
+        assert "block" in _hook(tmp_path, "vision_analyze", {"image_url": bad, "question": "?"}), bad
     assert "block" in _hook(tmp_path, "web_search", {"query": "x"})
     assert _hook(tmp_path, "terminal", {"command": "tbsgen-browser 1 look"}) == ""
     assert "block" in _hook(tmp_path, "terminal", {"command": "env"})
@@ -139,15 +143,14 @@ def test_nav_cap_and_pacing(tmp_path, monkeypatch):
     assert st["papers"][0]["status"] == "ok", st["papers"]       # the first three opens saved the file
 
 
-def test_form_field_actions_are_blocked_before_they_run(tmp_path, monkeypatch):
-    """round 11: hover / select / type are gone - the hook blocks them and the action script never runs them"""
+def test_type_reaches_the_script_with_any_text(tmp_path, monkeypatch):
+    """type is no longer limited to institution names (the script refuses credential fields)"""
     f, led, pr, _ = mk_agent(tmp_path, monkeypatch, hermes_mode="type", queue={"10.1080": 1})
     st = _run(f, pr)
     log = _ego_log(tmp_path)
-    assert not [e for e in log if e["action"] in ("type", "select", "hover")], log
-    assert {e["action"] for e in log} == {"open", "finish"}, log
+    assert [e["arg"] for e in log if e["action"] == "type"] == ["4 Nanjing University"], log
+    assert [e["arg"] for e in log if e["action"] == "select"] == ["2 Nanjing University"], log
     assert st["papers"][0]["status"] == "ok", st["papers"]
-    assert not hasattr(browser_agent, "_SAFE_TXT")
 
 
 # --------------------------------------------------------------------------- hand-off
@@ -212,45 +215,64 @@ def test_no_handoff_when_disabled(tmp_path, monkeypatch):
 
 # --------------------------------------------------------------------------- SSO login (removed)
 
-def test_sso_login_is_not_an_action_any_more(tmp_path, monkeypatch):
-    """Round 9: every login - the institution's SSO login too - is the user's (hand-off); the hook blocks
-    `sso_login` before it runs, and an old `sso_login` config section has no effect."""
+def test_sso_login_budget_and_no_retry_after_failure(tmp_path, monkeypatch):
+    f, led, pr, _ = mk_agent(tmp_path, monkeypatch, hermes_mode="sso", ego_mode="sso_fail",
+                             queue={"10.1080": 2}, agent={"keep_batch_dir": True},
+                             sso_login={"enabled": True, "domains": ["sso.example"], "max_submissions": 2})
+    st = _run(f, pr)
+    log = _ego_log(tmp_path)
+    # the first paper submits and fails; the second paper's sso_login runs with the budget closed
+    ssos = [e for e in log if e["action"] == "sso_login"]
+    assert len(ssos) == 2 and ssos[0]["sso_login"] is True and ssos[1]["sso_login"] is False
+    assert all(p["status"] == "failed" for p in st["papers"])
+    notes = _notes(led)
+    assert "sso_login host=sso.example result=fail" in notes["10.1080/paper.1"][1]
+
+
+def test_sso_login_success_marks_batch_logged_in(tmp_path, monkeypatch):
     f, led, pr, _ = mk_agent(tmp_path, monkeypatch, hermes_mode="sso", ego_mode="sso_ok",
-                             queue={"10.1080": 1}, agent={"keep_batch_dir": True},
+                             queue={"10.1080": 2}, agent={"keep_batch_dir": True},
                              sso_login={"enabled": True, "domains": ["sso.example"]})
     st = _run(f, pr)
-    assert not [e for e in _ego_log(tmp_path) if e["action"] == "sso_login"]
-    assert any("sso_login" in v for v in st["agent"]["usage"]["violations"])
-    assert "sso_login_enabled" not in json.loads((_bd(f) / "batch.json").read_text())
+    log = _ego_log(tmp_path)
+    ssos = [e for e in log if e["action"] == "sso_login"]
+    # one successful login signs the whole batch in: the second paper's sso_login is disabled
+    assert ssos[0]["sso_login"] is True and ssos[1]["sso_login"] is False
+    notes = _notes(led)
+    assert "sso_login host=pub.example result=ok" in notes["10.1080/paper.1"][1]
+
 
 
 # --------------------------------------------------------------------------- screenshots / domains
 
-def test_screenshot_is_not_an_action_any_more(tmp_path, monkeypatch):
+def test_screenshot_is_viewable_but_never_a_deliverable(tmp_path, monkeypatch):
     f, led, pr, _ = mk_agent(tmp_path, monkeypatch, hermes_mode="shot", ego_mode="shot",
                              queue={"10.1080": 1}, agent={"keep_batch_dir": True})
     st = _run(f, pr)
-    assert st["papers"][0]["status"] == "failed"
-    assert not list((_bd(f) / "files").rglob("shot-*.png"))     # the hook blocked it before it ran
-    assert any("screenshot" in v for v in st["agent"]["usage"]["violations"])
+    assert st["papers"][0]["status"] == "failed"    # no validated file: a screenshot is not the paper's text
+    ps = json.loads((_bd(f) / "papers" / "1.json").read_text())
+    assert ps.get("shots") and Path(ps["shots"][0]).is_file()
+    assert not ps.get("accepted")
+    bd = str(_bd(f))
+    assert browser_agent._vision_allowed(bd, {"image_url": ps["shots"][0]}) is None
+    for bad in ("/etc/passwd", str(Path(bd) / "prompt.md"), "https://x.example/a.png", ""):
+        assert browser_agent._vision_allowed(bd, {"image_url": bad}), bad
 
 
 def test_allowed_domains_cover_sso_and_prompt_lists_actions(tmp_path, monkeypatch):
     f, led, pr, _ = mk_agent(tmp_path, monkeypatch, agent={"keep_batch_dir": True},
                              sso={"domains": ["nju.edu.cn", "carsi.edu.cn"]},
-                             handoff={"enabled": True})
+                             handoff={"enabled": True}, sso_login={"enabled": True, "domains": ["authserver.nju.edu.cn"]})
     _run(f, pr)
     st = json.loads((_bd(f) / "batch.json").read_text())
-    for d in ("nju.edu.cn", "carsi.edu.cn"):
-        assert any(d in p["allow"] for p in st["papers"].values())
-    assert st["handoff_enabled"] and "sso_login_enabled" not in st
+    for d in ("nju.edu.cn", "carsi.edu.cn", "authserver.nju.edu.cn"):
+        assert any(d in p["allow"] for p in st["papers"].values()), d
+    assert st["handoff_enabled"] and st["sso_login_enabled"] and st["sso_domains"] == ["authserver.nju.edu.cn"]
     prompt = (_bd(f) / "prompt.md").read_text()
-    for s in ("tabs", "switch LABEL", "wait_for",
-              "handoff_status", "25 tool calls", "12 page loads"):
+    for s in ("look [full] [@REF]", "click_xy", "N hover", "scroll", "N select", "N type", "screenshot", "N back",
+              "tabs", "switch LABEL", "wait_for", "sso_login", "handoff_status", "25 tool calls", "12 page loads"):
         assert s in prompt, s
-    for s in ("click_xy", "screenshot", "vision", "look [full]", "@REF", "sso_login", "scroll", " back",
-              "N hover", "N select", "N type", "$type_names", "institution_names"):
-        assert s not in prompt, s
+    assert "$type_names" not in prompt and "institution_names" not in prompt
 
 
 def test_save_pdf_is_paced_like_a_page_load():

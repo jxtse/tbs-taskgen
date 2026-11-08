@@ -239,23 +239,32 @@ sys.exit({fn}({batch_dir!r}, sys.argv[1:]))
 # command against these patterns and the wrapper re-parses argv).
 # (also no glob characters other than "?", which cannot match: a URL word contains "://")
 _SAFE_TOK = r"[^\s'\"`$;&|<>\\*\[\]{}!()]{1,200}"
+# type / select text: no quotes / parentheses / shell metacharacters (the shell must pass it as is)
+_SAFE_TXT = r"[A-Za-z0-9 ,.@+\-_/:\u00c0-\u024f\u4e00-\u9fff]{1,80}"
 _PAPER_ACTIONS = "|".join((
-    r"look( \d{1,4})?",
+    r"look( full)?( @\d{1,5})?( \d{1,4})?",
     r"open https?://" + _SAFE_TOK,
     r"click \d{1,3}",
-    "tabs",
+    r"click_xy \d{1,4} \d{1,4}",
+    r"hover \d{1,3}",
+    r"scroll (up|down)( \d{1,4})?",
+    r"select \d{1,3} " + _SAFE_TXT,
+    r"type \d{1,3} " + _SAFE_TXT,
+    "screenshot", "tabs", "back",
     r"switch [A-Za-z0-9_.-]{1,24}",
     # the pattern never starts with '#' (a shell comment) and has no glob / quote characters
     r"wait_for url [A-Za-z0-9/._%=:-]{1,200}( \d{1,3})?",
     r"wait_for sel [A-Za-z][A-Za-z0-9_.#:-]{0,100}( \d{1,3})?",
-    "save_pdf", "handoff_status",
+    "save_pdf", "sso_login", "handoff_status",
 ))
 _TOOL_CMD = re.compile(rf"^tbsgen-browser (finish|[1-9]\d? ({_PAPER_ACTIONS}))$")
 _SLEEP_CMD = re.compile(r"^sleep ([1-9]\d?|[12]\d\d|300)$")
 DENY_TEXT = re.compile(r"sci-?hub|libgen|z-lib|annas-archive", re.I)
-# actions that can load a page of the publisher (paced per publisher and capped per paper)
 # actions that may load a page or request a file: navigation budget, per-publisher lock and pacing
-NAV_ACTIONS = frozenset({"open", "click", "save_pdf"})
+# (hover / select / type / scroll can trigger a navigation from the page's handlers: paced like one)
+NAV_ACTIONS = frozenset({"open", "click", "click_xy", "hover", "scroll", "select", "type", "back", "sso_login",
+                         "save_pdf"})
+VISION_TOOL = "vision_analyze"
 
 
 def shell_allowed(cmd) -> str | None:
@@ -271,6 +280,22 @@ def shell_allowed(cmd) -> str | None:
     return None
 
 
+def _vision_allowed(batch_dir: str, inp: dict) -> str | None:
+    """None if a vision_analyze call may run: only screenshots this batch saved (shot-*.png in its files dir)."""
+    url = inp.get("image_url")
+    if not isinstance(url, str) or not url:
+        return "vision: image_url is required"
+    try:
+        root = (Path(batch_dir) / "files").resolve()
+        pth = Path(url).resolve()
+        pth.relative_to(root)
+    except (OSError, ValueError):
+        return "vision: only screenshots inside this batch's files directory may be viewed"
+    if not re.fullmatch(r"shot-[0-9-]{1,40}\.png", pth.name) or not pth.is_file():
+        return "vision: only screenshots saved by `screenshot` may be viewed"
+    return None
+
+
 def hook_main(batch_dir: str, argv: list[str]) -> int:
     """Hermes pre_tool_call hook: stdin {tool_name, tool_input}; prints a block decision unless allowed."""
     try:
@@ -278,7 +303,9 @@ def hook_main(batch_dir: str, argv: list[str]) -> int:
     except ValueError:
         d = {}
     name, inp = d.get("tool_name"), d.get("tool_input") or {}
-    if name != "terminal":
+    if name == VISION_TOOL:
+        why = _vision_allowed(batch_dir, inp)
+    elif name != "terminal":
         why = f"tool {name} is not available in this batch"
     elif inp.get("background") or inp.get("pty"):
         why = "background / pty terminals are not available"
@@ -491,8 +518,9 @@ def wrapper_main(batch_dir: str, argv: list[str]) -> int:
         spaces = sorted(set(state.get("spaces") or []) | {st["space"]})
         done = _finish_spaces(bd, st, spaces)
         return say(f"tbsgen: TaskSpaces closed ({', '.join(done)})", 0)
-    usage = ("usage: tbsgen-browser N look [OFFSET]|open URL|click I|tabs|switch LABEL|"
-             "wait_for url SUB|sel CSS [S]|save_pdf|handoff_status  |  tbsgen-browser finish")
+    usage = ("usage: tbsgen-browser N look [full] [@REF] [OFFSET]|open URL|click I|click_xy X Y|hover I|"
+             "scroll up|down [PX]|select I VALUE|type I TEXT|screenshot|tabs|switch LABEL|back|"
+             "wait_for url SUB|sel CSS [S]|save_pdf|sso_login|handoff_status  |  tbsgen-browser finish")
     if len(argv) < 2 or argv[0] not in st["papers"] or not _TOOL_CMD.match("tbsgen-browser " + " ".join(argv)):
         return say(usage, 2)
     n = argv[0]
@@ -587,6 +615,15 @@ def _paper_call(bd: Path, st: dict, n: str, action: str, arg: str, say) -> int:
                 _atomic(sp, json.dumps(ps))
                 return say(f"tbsgen: paper {n}: navigation limit reached; give up on this paper", 2)
             ps["navs"] = ps.get("navs", 0) + 1
+        sso_ok = False
+        if action == "sso_login":
+            s_ = state.setdefault("sso", {})
+            sso_ok = (bool(st.get("sso_login_enabled")) and bool(st.get("sso_domains"))
+                      and int(s_.get("submissions") or 0) < int(st.get("sso_max_submissions", 2))
+                      and not s_.get("failed") and not s_.get("logged_in") and not s_.get("pending"))
+            if sso_ok:                       # reserved BEFORE the script runs; returned only if nothing was submitted
+                s_["submissions"] = int(s_.get("submissions") or 0) + 1
+                s_["pending"] = n
         handoff_free = (bool(st.get("handoff_enabled")) and not ps.get("handoff")
                         and not (state.get("handoff") or {}).get(pkey)
                         and not (state.get("handoff_inflight") or {}).get(pkey))
@@ -602,7 +639,7 @@ def _paper_call(bd: Path, st: dict, n: str, action: str, arg: str, say) -> int:
     try:
         with nav_lock:
             rc = _paced_run(bd, st, n, p, ps, action, arg, say, led, pkey, space, handoff_free, slock,
-                            COOLDOWN_429_S, aliases, web_hosts, sp)
+                            COOLDOWN_429_S, aliases, web_hosts, sp, sso_ok)
         returned = True
         return rc
     finally:
@@ -619,7 +656,8 @@ def _paper_call(bd: Path, st: dict, n: str, action: str, arg: str, say) -> int:
 
 
 def _paced_run(bd, st, n, p, ps, action, arg, say, led, pkey, space, handoff_free, slock, COOLDOWN_429_S,
-               aliases, web_hosts, sp) -> int:
+               aliases, web_hosts, sp, sso_ok=False) -> int:
+    ran = False
     try:
         if action in NAV_ACTIONS:
             last = float((_read_state(bd).get("nav") or {}).get(pkey) or 0)
@@ -640,9 +678,12 @@ def _paced_run(bd, st, n, p, ps, action, arg, say, led, pkey, space, handoff_fre
             ps["closed"] = "publisher in cooldown"
             _atomic(sp, json.dumps(ps))
             return say(f"tbsgen: paper {n}: {msg[:120]}; move on", 2)
+        ran = True
         return _paper_run(bd, st, n, p, ps, action, arg, say, led, pkey, space, handoff_free, slock,
-                          COOLDOWN_429_S)
+                          COOLDOWN_429_S, sso_ok)
     finally:
+        if sso_ok and not ran:                          # the script never started: nothing was submitted
+            _sso_finalize(bd, slock, n, {"sso_submitted": False, "sso_stage": "pre"})
         if action in NAV_ACTIONS:
             with _locked(slock):
                 state = _read_state(bd)
@@ -653,17 +694,40 @@ def _paced_run(bd, st, n, p, ps, action, arg, say, led, pkey, space, handoff_fre
 _VALID_STATUS = ("ok", "refused", "error", "handoff", "paused")
 
 
+def _sso_finalize(bd: Path, slock: Path, n: str, res: dict) -> str | None:
+    """Book a reserved SSO submission.  Only an explicit `sso_submitted: false` with `sso_stage: "pre"` (the
+    script ended before the login button was touched) returns the reservation; anything else - a result, no
+    result, an error - counts as a submission, and a failed / unknown one ends the logins of this batch."""
+    with _locked(slock):
+        state = _read_state(bd)
+        s = state.setdefault("sso", {})
+        if s.get("pending") != n:
+            return None
+        s.pop("pending", None)
+        if res and res.get("sso_submitted") is False and res.get("sso_stage") == "pre":
+            s["submissions"] = max(0, int(s.get("submissions") or 0) - 1)
+            result = None
+        else:
+            result = res.get("sso") if res and res.get("sso") in ("ok", "fail", "handoff") else "unknown"
+            # one success signs the batch in; a failed / unknown / handed-over one ends the automatic logins
+            s["logged_in" if result == "ok" else "failed"] = True
+        _write_state(bd, state)
+    return result
+
+
 def _paper_run(bd, st, n, p, ps, action, arg, say, led, pkey, space, handoff_free, slock,
-               COOLDOWN_429_S) -> int:
+               COOLDOWN_429_S, sso_ok=False) -> int:
     sp = bd / "papers" / f"{n}.json"
     files = (bd / "files" / n).resolve()
     files.mkdir(parents=True, exist_ok=True)
     inp = dict(space=space, action=action, arg=arg, allow=p["allow"], files_dir=str(files),
-               look_key=ps.get("look_key") if action == "click" else None,
+               look_key=ps.get("look_key") if action in ("click", "hover", "select", "type") else None,
+               look_scope=ps.get("look_scope") or "",
                page_label=ps.get("page_label") or "",
                nav_timeout_ms=45000, download_timeout_ms=120000, download_wait_ms=6000,
                challenge_wait_ms=int(st.get("challenge_wait_ms", 40000)),
                handoff={"enabled": handoff_free},
+               sso={"login": sso_ok, "domains": st.get("sso_domains") or []},
                handoff_state={"active": bool(ps.get("handoff")),
                               "deadline_ms": int(float(ps.get("handoff_deadline") or 0) * 1000),
                               "title": ps.get("handoff_title") or "", "page_label": ps.get("handoff_page") or ""})
@@ -674,6 +738,17 @@ def _paper_run(bd, st, n, p, ps, action, arg, say, led, pkey, space, handoff_fre
         res, err = {}, f"wrapper error {type(e).__name__}"
     if not (isinstance(res, dict) and res.get("status") in _VALID_STATUS):
         res = {}                                   # no valid result line: treated exactly like no output
+    sso_result = _sso_finalize(bd, slock, n, res) if sso_ok else None
+    if sso_result is not None:
+        cur = json.loads(sp.read_text())
+        host = str(res.get("sso_host") or "")[:80]
+        if not host:
+            with contextlib.suppress(ValueError):
+                host = urlparse((res.get("page") or {}).get("url") or "").hostname or ""
+        cur["sso_note"] = f"sso_login host={host} result={sso_result} at={time.strftime('%H:%M:%S')}"
+        if sso_result == "fail":
+            cur["closed"] = "login_failed (sso, not retried)"
+        _atomic(sp, json.dumps(cur))
     if not res and err != "not-started" and handoff_free:
         # ANY call that started and gave no valid result (timeout, STOP, a normal or an error exit without a
         # result line, an unparseable one) may have handed the space to the user before its output was lost:
@@ -768,14 +843,20 @@ def _paper_run(bd, st, n, p, ps, action, arg, say, led, pkey, space, handoff_fre
         ps = save_ps()
         ps["page_label"] = res["page_label"]
         _atomic(sp, json.dumps(ps))
+    if res.get("shot"):                                # viewable by the agent, never the paper's text
+        ps = save_ps()
+        ps["shots"] = sorted(set(ps.get("shots") or []) | {str(res["shot"])})
+        _atomic(sp, json.dumps(ps))
     if action == "look" and res.get("look_key"):
         ps = save_ps()
         ps["look_key"] = res["look_key"]
+        ps["look_scope"] = str(res.get("look_scope") or "")[:12]
         _atomic(sp, json.dumps(ps))
     show = dict(status=res.get("status"), error=res.get("error"), files_saved=len(res.get("files") or []),
                 page=res.get("page"), note=res.get("note"), left_allowed=res.get("left_allowed") or res.get("reset_foreign"),
                 login_required=res.get("login_required"),
-                tabs=res.get("tabs"), acted=res.get("acted"),
+                tabs=res.get("tabs"), acted=res.get("acted"), sso=res.get("sso"), sso_page=res.get("sso_page"),
+                shot=res.get("shot"), scroll=res.get("scroll"),
                 waited=res.get("waited"), page_label=res.get("page_label"),
                 handoff_check=res.get("handoff_check"), handoff_left_s=res.get("handoff_left_s"))
     return say(json.dumps({k: v for k, v in show.items() if v is not None}, ensure_ascii=False)[:9000],
@@ -1544,10 +1625,11 @@ def _agent_phase(fetcher, todo: list[dict], deadline: float, bd: Path, wd: Watch
     ag = b.get("agent") or {}
     ho = b.get("handoff") or {}
     sso = b.get("sso") or {}
+    sso_login = b.get("sso_login") or {}
     led = fetcher.ledger
     papers = {}
-    # institution / WAYF domains (the login itself is always handed to the user; the browser autofills it)
-    sso_domains = [str(x).lower() for x in sso.get("domains") or []]
+    # institution / WAYF / SSO login domains: allowed for every paper
+    sso_domains = [str(x).lower() for x in [*(sso.get("domains") or []), *(sso_login.get("domains") or [])]]
     for i, e in enumerate(todo, 1):
         papers[str(i)] = dict(doi=e["doi"], title=e.get("title") or "", ident=paper_ident(e),
                               allow=allowed_domains(e["doi"], e.get("_landing"),
@@ -1565,7 +1647,10 @@ def _agent_phase(fetcher, todo: list[dict], deadline: float, bd: Path, wd: Watch
               max_navigations_per_paper=int(ag.get("max_navigations_per_paper", 12)),
               nav_gap_s=float(ag.get("nav_gap_s", 2.5)),
               handoff_enabled=bool(ho.get("enabled")), handoff_wait_s=float(ho.get("wait_s", 120)),
-              handoff_notify=bool(ho.get("notify", True)), bark_cmd=[list(x) for x in ho.get("bark_cmd") or []])
+              handoff_notify=bool(ho.get("notify", True)), bark_cmd=[list(x) for x in ho.get("bark_cmd") or []],
+              sso_login_enabled=bool(sso_login.get("enabled")) and bool(sso_login.get("domains")),
+              sso_domains=[str(x).lower() for x in sso_login.get("domains") or []],
+              sso_max_submissions=int(sso_login.get("max_submissions", 2)))
     (bd / "papers").mkdir(exist_ok=True)
     (bd / "files").mkdir(exist_ok=True)
     _atomic(bd / "batch.json", json.dumps(st))
@@ -1587,7 +1672,8 @@ def _agent_phase(fetcher, todo: list[dict], deadline: float, bd: Path, wd: Watch
                            calls=str(st["max_calls_per_paper"]), navs=str(st["max_navigations_per_paper"]))
     (bd / "prompt.md").write_text(prompt)
     hermes = ag.get("hermes_bin") or "hermes"
-    toolsets = "terminal"                         # the wrapper is the only tool (no screenshots / vision)
+    # the wrapper, plus vision_analyze for the batch's own screenshots (hook: shot-*.png in the files dir only)
+    toolsets = "terminal,vision" if ag.get("vision", True) else "terminal"
     argv = [hermes, "chat", "--query-file", str(bd / "prompt.md"), "--oneshot", "--format", "stream-json",
             "--source", "tool", "--accept-hooks", "--ignore-rules", "--max-turns", str(int(ag.get("max_turns", 80))),
             "--run-budget", str(int(budget)), "-t", toolsets]
@@ -1604,7 +1690,9 @@ def _agent_phase(fetcher, todo: list[dict], deadline: float, bd: Path, wd: Watch
         if ev.get("type") == "tool_use":          # second line of defence (the hook already blocked it)
             events["tool_calls"] += 1
             inp = ev.get("input") or {}
-            if ev.get("name") != "terminal":
+            if ev.get("name") == VISION_TOOL and ag.get("vision", True):
+                why = _vision_allowed(str(bd), inp)
+            elif ev.get("name") != "terminal":
                 why = f"tool not allowed: {ev.get('name')}"
             elif inp.get("background") or inp.get("pty"):
                 why = "background / pty terminal not allowed"
@@ -1697,7 +1785,7 @@ def _agent_phase(fetcher, todo: list[dict], deadline: float, bd: Path, wd: Watch
         interrupted = not ok and (lost or cut) and not ps.get("challenge")
         # every hand-off of the paper is noted in the ledger row (time, host, kind; never credentials - the
         # action script never reads the values of credential fields)
-        extras = "; ".join(x for x in (ps.get("handoff_note"),) if x)
+        extras = "; ".join(x for x in (ps.get("handoff_note"), ps.get("sso_note")) if x)
         note = "" if ok else ("cancelled: batch stopped" if interrupted else fetcher._r(f"agent: {why}")[:300])
         if extras:
             note = (note + "; " if note else "") + extras

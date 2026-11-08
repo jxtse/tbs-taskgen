@@ -690,7 +690,7 @@ elif inp.get("action") == "sso_login":
     else:
         out = {"status": "refused", "error": "sso_login is not enabled for this batch"}
 elif inp.get("action") == "screenshot" and mode == "shot":
-    f = os.path.join(inp["files_dir"], "shot-1.png")
+    f = os.path.join(inp["files_dir"], "shot-1-1.png")
     open(f, "wb").write(b"\x89PNG fake")
     out = {"status": "ok", "shot": f}
 elif inp.get("action") == "open":
@@ -757,6 +757,7 @@ elif mode == "handoff":                           # a challenge is handed to the
 elif mode == "type":                               # removed form-field actions: blocked by the hook
     tool("tbsgen-browser 1 type 4 Nanjing University")
     tool("tbsgen-browser 1 select 2 Nanjing University")
+    tool("tbsgen-browser 1 type 4 x;env")                 # blocked by the hook (shell metacharacter)
     tool("tbsgen-browser 1 open https://doi.org/10.1080/x")
     tool("tbsgen-browser finish")
 elif mode == "handoff_timeout":                   # the user never finishes
@@ -835,7 +836,7 @@ def test_agent_fallback_saves_validated_files(tmp_path, monkeypatch):
     args = got["argv"]
     assert args[:2] == ["chat", "--query-file"] and "--oneshot" in args and "--accept-hooks" in args
     assert args[args.index("--provider") + 1] == "prov-x" and args[args.index("-m") + 1] == "model-y"
-    assert args[args.index("--max-turns") + 1] == "7" and args[args.index("-t") + 1] == "terminal"
+    assert args[args.index("--max-turns") + 1] == "7" and args[args.index("-t") + 1] == "terminal,vision"
     assert int(args[args.index("--run-budget") + 1]) <= 30
     assert "ELSEVIER_API_KEY" not in got["env"]                # the agent's process gets no credentials
     assert got["home"] and "hermes-home" in got["home"]       # isolated Hermes home with the hook

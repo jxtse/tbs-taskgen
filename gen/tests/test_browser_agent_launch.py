@@ -171,10 +171,23 @@ code = sys.argv[2] if len(sys.argv) > 2 else sys.stdin.read()
 inp = json.loads(re.match(r"const INPUT = (\{.*?\});\n", code).group(1))
 log = "{log}"
 open(log, "a").write(json.dumps({"action": inp.get("action"), "space": inp.get("space"),
+                                 "sso_login": (inp.get("sso") or {}).get("login"),
                                  "handoff": (inp.get("handoff") or {}).get("enabled")}) + "\n")
 mode = open("{mode}").read().strip() if os.path.exists("{mode}") else ""
 out = {"status": "ok", "files": []}
-if inp.get("action") == "open" and mode == "handoff":
+if inp.get("action") == "sso_login":
+    time.sleep(1.0)
+    if not (inp.get("sso") or {}).get("login"):
+        out = {"status": "refused", "error": "not enabled", "sso_submitted": False}
+    elif mode == "sso_crash":
+        print("crashed before the result line"); sys.exit(0)
+    elif mode == "sso_click_error":       # the click navigated and the evaluation died: unknown, not refundable
+        out = {"status": "error", "error": "context destroyed", "sso_submitted": True, "sso_stage": "submit"}
+    elif mode == "sso_pre_refused":       # refused before anything was clicked: refundable
+        out = {"status": "refused", "error": "no login form", "sso_submitted": False, "sso_stage": "pre"}
+    else:
+        out = {"status": "ok", "sso": "fail", "sso_submitted": True, "sso_host": "sso.example"}
+elif inp.get("action") == "open" and mode == "handoff":
     if (inp.get("handoff") or {}).get("enabled"):
         out = {"status": "handoff", "handoff": {"reason": "challenge: x", "host": "pub.example", "kind": "challenge"}}
     else:
@@ -203,7 +216,8 @@ def _batch(tmp_path, monkeypatch, papers, **st_over):
               deadline=time.time() + 600, ledger_path=str(led.path), limits=led.limits, global_limits=led.g,
               host_caps=led.host_caps, ego_binary=str(ego), gate_max_wait_s=150, max_calls_per_paper=25,
               call_timeout_s=20, challenge_cooldown_s=3600, challenge_wait_ms=1000, max_navigations_per_paper=12,
-              nav_gap_s=0.0, handoff_enabled=False, handoff_wait_s=120, handoff_notify=False, bark_cmd=[])
+              nav_gap_s=0.0, handoff_enabled=False, handoff_wait_s=120, handoff_notify=False, bark_cmd=[],
+              sso_login_enabled=True, sso_domains=["sso.example"], sso_max_submissions=2)
     st.update(st_over)
     (bd / "batch.json").write_text(json.dumps(st))
     return bd, led
@@ -284,25 +298,76 @@ def test_allowed_commands_reach_the_wrapper_unchanged_through_a_real_shell(tmp_p
     probe.chmod(0o755)
     (tmp_path / "pdf").mkdir()                          # a glob would expand to this
     cmds = ["tbsgen-browser 1 wait_for sel div#pdf 20", "tbsgen-browser 1 wait_for url /pdf",
-            "tbsgen-browser 1 open https://doi.org/10.1080/x?a=1", "tbsgen-browser 1 look 40"]
+            "tbsgen-browser 1 open https://doi.org/10.1080/x?a=1", "tbsgen-browser 1 look 40",
+            "tbsgen-browser 1 type 4 Nanjing University", "tbsgen-browser 1 type 4 a.b/c:d", "tbsgen-browser 1 look full @3 20"]
     for c in cmds:
         assert browser_agent.shell_allowed(c) is None, c
         r = subprocess.run(c, shell=True, capture_output=True, text=True, cwd=tmp_path,
                            env=dict(os.environ, PATH=str(tmp_path) + os.pathsep + os.environ["PATH"]))
         assert json.loads(r.stdout) == shlex.split(c)[1:], (c, r.stdout)
     for c in ["tbsgen-browser 1 wait_for sel #pdf", "tbsgen-browser 1 wait_for url *", "tbsgen-browser 1 type 4 a'b",
-              "tbsgen-browser 1 type 4 南京大学", "tbsgen-browser 1 select 2 Nanjing University", "tbsgen-browser 1 hover 3"]:
+              "tbsgen-browser 1 type 4 a*", "tbsgen-browser 1 type 4 $(id)"]:
         assert browser_agent.shell_allowed(c), c
 
 
-def test_removed_actions_never_reach_the_script(tmp_path, monkeypatch):
-    """round 11: hover / select / type are not actions any more - the wrapper prints its usage, nothing runs"""
+def test_concurrent_sso_logins_cannot_exceed_the_budget(tmp_path, monkeypatch):
+    bd, _ = _batch(tmp_path, monkeypatch, ["10.1080/a.1", "10.1093/b.2", "10.1287/c.3"], sso_max_submissions=1)
+    procs = [_call(bd, str(k), "sso_login") for k in ("1", "2", "3")]          # concurrent
+    for p in procs:
+        p.communicate(timeout=60)
+    enabled = [e for e in _ego_actions(tmp_path) if e["action"] == "sso_login" and e["sso_login"]]
+    assert len(enabled) == 1                                   # one reservation; the others ran disabled
+    s = json.loads((bd / "state.json").read_text())["sso"]
+    assert s["submissions"] == 1 and s["failed"] and "pending" not in s
+
+
+def test_sso_without_a_result_still_counts_as_a_submission(tmp_path, monkeypatch):
+    bd, _ = _batch(tmp_path, monkeypatch, ["10.1080/a.1", "10.1093/b.2"])
+    p = _call(bd, "1", "sso_login", env={"FAKE_EGO_MODE": "sso_crash"})
+    p.communicate(timeout=60)
+    p = _call(bd, "2", "sso_login")
+    p.communicate(timeout=60)
+    ssos = [e for e in _ego_actions(tmp_path) if e["action"] == "sso_login"]
+    # the first submission's outcome is unknown: no second automatic login in this batch
+    assert ssos[0]["sso_login"] is True and ssos[1]["sso_login"] is False
+    s = json.loads((bd / "state.json").read_text())["sso"]
+    assert s["submissions"] == 1 and s["failed"]
+
+
+def test_sso_click_that_errors_counts_and_only_pre_submit_refusals_refund(tmp_path, monkeypatch):
+    bd, _ = _batch(tmp_path, monkeypatch, ["10.1080/a.1", "10.1093/b.2", "10.1287/c.3"])
+    _call(bd, "1", "sso_login", env={"FAKE_EGO_MODE": "sso_pre_refused"}).communicate(timeout=60)
+    s = json.loads((bd / "state.json").read_text())["sso"]
+    assert s["submissions"] == 0 and not s.get("failed")          # nothing was submitted: refunded
+    _call(bd, "2", "sso_login", env={"FAKE_EGO_MODE": "sso_click_error"}).communicate(timeout=60)
+    _call(bd, "3", "sso_login").communicate(timeout=60)
+    ssos = [e for e in _ego_actions(tmp_path) if e["action"] == "sso_login"]
+    assert [e["sso_login"] for e in ssos] == [True, True, False]
+    s = json.loads((bd / "state.json").read_text())["sso"]
+    assert s["submissions"] == 1 and s["failed"]
+
+
+def test_hover_is_reserved_as_a_navigation(tmp_path, monkeypatch):
+    bd, _ = _batch(tmp_path, monkeypatch, ["10.1080/a.1"], max_navigations_per_paper=1, sso_login_enabled=False)
+    _call(bd, "1", "hover", "3").communicate(timeout=60)
+    out, _ = _call(bd, "1", "hover", "3").communicate(timeout=60)
+    assert "navigation limit" in out
+    assert len([e for e in _ego_actions(tmp_path) if e["action"] == "hover"]) == 1
+
+
+CAPTURE_EGO = r"""#!{py}
+import json, re, sys
+open("{out}", "w").write(re.match(r"const INPUT = (\{.*?\});\n", sys.argv[2]).group(1))
+print("TBSGEN_RESULT " + json.dumps({"status": "ok", "sso_submitted": False, "sso_stage": "pre"}))
+"""
+
+
+def test_wrapper_never_enables_the_local_sso_test_mode(tmp_path, monkeypatch):
     bd, _ = _batch(tmp_path, monkeypatch, ["10.1080/a.1"])
-    for a, arg in (("hover", "3"), ("select", "2 Nanjing University"), ("type", "4 Nanjing University")):
-        out, _ = _call(bd, "1", a, arg).communicate(timeout=60)
-        assert "usage:" in out, out
-    assert not (tmp_path / "ego.log").exists() or not _ego_actions(tmp_path)
-    assert browser_agent.NAV_ACTIONS == {"open", "click", "save_pdf"}
+    (tmp_path / "ego").write_text(CAPTURE_EGO.replace("{py}", sys.executable).replace("{out}", str(tmp_path / "inp.json")))
+    _call(bd, "1", "sso_login").communicate(timeout=60)
+    inp = json.loads((tmp_path / "inp.json").read_text())
+    assert inp["sso"]["login"] is True and "local_test" not in inp["sso"]
 
 
 def test_challenge_handoff_expiry_cools_even_with_earlier_files(tmp_path, monkeypatch):
@@ -603,20 +668,6 @@ def test_wrapper_crash_while_holding_the_handoff_budget_books_it(tmp_path, monke
     assert json.loads((bd / "papers" / "1.json").read_text())["closed"]
     assert led.cooling("chrome:10.1080")
     assert not json.loads((bd / "state.json").read_text()).get("handoff_unknown")
-
-
-def test_wrapper_never_passes_a_login_mode_to_the_script(tmp_path, monkeypatch):
-    """Round 9: no sso / local-test input reaches the action script, whatever the old config said."""
-    bd, _ = _batch(tmp_path, monkeypatch, ["10.1080/a.1"], sso_login_enabled=True, sso_domains=["sso.example"])
-    cap = tmp_path / "inp.json"
-    (tmp_path / "ego").write_text("#!" + sys.executable + "\nimport json, re, sys\n"
-                                  f"open({str(cap)!r}, 'w').write(re.match(r'const INPUT = (\\{{.*?\\}});\\n', sys.argv[2]).group(1))\n"
-                                  "print('TBSGEN_RESULT ' + json.dumps({'status': 'ok'}))\n")
-    _call(bd, "1", "look").communicate(timeout=60)
-    inp = json.loads(cap.read_text())
-    assert "sso" not in inp and "local_test" not in json.dumps(inp), inp
-    out, _ = _call(bd, "1", "sso_login").communicate(timeout=60)
-    assert "usage" in out, out                                  # not an action of the wrapper either
 
 
 def test_redaction_after_an_empty_sensitive_value_drops_the_rest():
