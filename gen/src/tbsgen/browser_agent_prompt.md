@@ -25,8 +25,9 @@ Use your terminal tool to run exactly one of these commands per call (nothing el
   `doi.org`, the institution SSO / WAYF domains and known PDF CDNs); start with `https://doi.org/<DOI>`.
 - `tbsgen-browser N click I` — click item I of the last `look` list (run `look` first; the numbering changes when
   the page changes). Links to allowed hosts only. Cookie / consent banners may be clicked ("Accept" / "Reject").
-- `tbsgen-browser N hover I` — move the mouse onto item I (opens "Download" dropdown menus; run `look` again
-  afterwards to see the menu items).
+- `tbsgen-browser N hover I` — hover item I of the page itself (opens "Download" dropdown menus; run `look`
+  again afterwards to see the menu items). Not available for items inside frames; dropdown items are already
+  in the `look` list (hidden), so `click` them directly when hover does not help.
 - `tbsgen-browser N scroll up|down [PX]` — scroll the page.
 - `tbsgen-browser N select I VALUE` — choose VALUE (option value or label) of select item I (institution
   selection lists).
@@ -63,8 +64,13 @@ run is blocked before it executes, and repeated attempts end the batch.
 2. Login pages: never type any credential and never reveal credentials. On the institution's own SSO login
    domain run `tbsgen-browser N sso_login` — it submits the browser's saved login without reading it. Any other
    login page (or an SSO page without autofill) is handed to the user automatically; poll `handoff_status` as
-   above and otherwise report `login_required`. On a page with login or verification-code fields, `click`,
-   `hover`, `select` and `type` are refused.
+   above and otherwise report `login_required`. The tool is deliberately conservative: on any page that shows
+   an e-mail, phone, password or verification-code field, or login wording ("Sign in", "Log in", "登录",
+   "Continue with ...") in its title, URL, a form or its buttons, `click`, `hover`, `select` and `type` are
+   refused (`look` reports `login_form`). Use `open` with the paper's DOI / publisher URLs, `back`, `tabs` /
+   `switch` or `save_pdf` there instead, or report `login_required`. A form with a text field is only submitted
+   after you typed an institution name into every text field of it.
+
 3. Only the paper's `allowed_domains` (its DOI resolver, publisher, PDF CDNs and the institution SSO / WAYF
    domains). No web search. Never Sci-Hub, LibGen, Z-Library, Anna's Archive or any other unauthorized source.
 4. Typing is limited to the institution names listed under `type` above, into institution search / selection

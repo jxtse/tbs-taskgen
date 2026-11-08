@@ -157,6 +157,36 @@ def _pages(port, port2):
                                     b'<span role="button">Get PDF</span></a></body></html>'),
         "/long-link": ("text/html", ('<html><head><title>Long</title></head><body><a href="https://alice:' + "S" * 300
                                      + '@127.0.0.1/x">Long link</a></body></html>').encode()),
+        # round 6: e-mail-only login form ("Continue") whose sign-in title is outside the form; a same-origin
+        # frame with a hover target
+        "/email-continue": ("text/html", b'<html><head><title>Example Publisher</title></head><body><h2>Sign in</h2>'
+                                         b'<form method="post" action="/logged"><input type="email" name="identifier">'
+                                         b'<button>Continue</button></form></body></html>'),
+        # round 7: login words on a page with no login fields (title, a form button, a continue-with button,
+        # a login form action, the URL); a page that redirects between look and click; a tel field; a clean
+        # page with a header "Sign in" link (no field: interaction allowed)
+        "/r7-title": ("text/html", b'<html><head><title>Sign in - Example</title></head><body><a href="/other">Other</a></body></html>'),
+        "/r7-btn": ("text/html", b'<html><head><title>Article</title></head><body><a href="/other">Other</a>'
+                                 b'<form method="post" action="/x"><button>Log in</button></form></body></html>'),
+        "/r7-cw": ("text/html", b'<html><head><title>Article</title></head><body><a href="/other">Other</a>'
+                                b'<button>Continue with Google</button></body></html>'),
+        "/r7-action": ("text/html", b'<html><head><title>Article</title></head><body><a href="/other">Other</a>'
+                                    b'<form method="post" action="/account/login"><input type="checkbox" name="r"><button>Go</button></form></body></html>'),
+        "/login/r7": ("text/html", b'<html><head><title>Article</title></head><body><a href="/other">Other</a></body></html>'),
+        "/r7-tel": ("text/html", b'<html><head><title>Article</title></head><body><a href="/other">Other</a>'
+                                 b'<input type="tel" name="x"></body></html>'),
+        "/r7-loose": ("text/html", b'<html><head><title>Article</title></head><body><a href="/other">Other</a>'
+                                   b'<input type="text" name="q"><button>Sign in</button></body></html>'),
+        "/r7-header": ("text/html", b'<html><head><title>Article</title></head><body><a href="/other">Other</a>'
+                                    b'<a href="/signin-page">Sign in</a><button>Sign in</button></body></html>'),
+        # the page goes to a login page 1.5 s after load (a late redirect between `look` and `click`)
+        "/r7-late": ("text/html", b'<html><head><title>Late</title></head><body><a href="/other">Other</a>'
+                                  b'<script>setTimeout(function(){location.href="/email-login"},1500)</script></body></html>'),
+        "/frame-hover": ("text/html", b'<html><head><title>Frame Hover</title></head><body><h1>x</h1>'
+                                      b'<iframe src="/frame" width="400" height="200" style="margin-left:300px"></iframe></body></html>'),
+        "/wayf-form": ("text/html", b'<html><head><title>Find your institution</title></head><body><form method="post" '
+                                    b'action="/logged"><input type="search" name="q" aria-label="Search for your institution">'
+                                    b'<button>Find</button></form></body></html>'),
         "/code-only": ("text/html", b'<html><head><title>Check</title></head><body><a href="/other">Other</a>'
                                     b'<form method="post" action="/logged"><input name="code"><button>OK</button></form>'
                                     b'</body></html>'),
@@ -684,10 +714,13 @@ def test_round5_guards(origins):
         r = _run(sp, "look", handoff=False)
         r = _run(sp, "click", str(_item(r, "Other")["i"]), look_key=r["look_key"], handoff=False)
         assert r["status"] == "refused" and "login" in r["error"], r
-        assert _run(sp, "open", origins[0] + "/newsletter", handoff=False)["status"] == "ok"
+        # round 7 (conservative): a rendered e-mail field anywhere - a newsletter box too - refuses all
+        # interaction on the page; it is reported, but (no unmistakable login signal) not handed to the user
+        r = _run(sp, "open", origins[0] + "/newsletter")
+        assert r["status"] == "ok" and r["page"]["login_form"] is True, r
         r = _run(sp, "look", handoff=False)
         r = _run(sp, "click", str(_item(r, "Other")["i"]), look_key=r["look_key"], handoff=False)
-        assert r["status"] == "ok" and r["page"]["url"].endswith("/other"), r
+        assert r["status"] == "refused" and "login" in r["error"], r
         # a span inside an off-site link: the link's target is checked
         assert _run(sp, "open", origins[0] + "/span-link", handoff=False)["status"] == "ok"
         r = _run(sp, "look", handoff=False)
@@ -705,5 +738,118 @@ def test_round5_guards(origins):
     try:
         r = _run(sp, "open", origins[0] + "/code-only")
         assert r["status"] == "handoff" and r["handoff"]["kind"] == "mfa", r
+    finally:
+        _finish(sp)
+
+
+
+def test_round6_guards(origins):
+    sp = "tbsgen-test-r6"
+    try:
+        # an e-mail form whose "Sign in" heading is outside it: its Continue button is never clicked
+        assert _run(sp, "open", origins[0] + "/email-continue", handoff=False)["status"] == "ok"
+        r = _run(sp, "look", handoff=False)
+        r = _run(sp, "click", str(_item(r, "Continue")["i"]), look_key=r["look_key"], handoff=False)
+        assert r["status"] == "refused" and ("e-mail" in r["error"] or "login" in r["error"]), r
+        r = _run(sp, "look", handoff=False)
+        assert "/logged" not in r["page"]["url"], r
+        # a form with a free-text field is submitted only after this tool typed into every such field
+        assert _run(sp, "open", origins[0] + "/wayf-form", handoff=False)["status"] == "ok"
+        r = _run(sp, "look", handoff=False)
+        k_find, k_q = _item(r, "Find")["i"], _item(r, "Search for your institution")["i"]
+        r2 = _run(sp, "click", str(k_find), look_key=r["look_key"], handoff=False)
+        assert r2["status"] == "refused" and "did not fill" in r2["error"], r2
+        assert _run(sp, "type", f"{k_q} Nanjing University", look_key=r["look_key"], handoff=False)["status"] == "ok"
+        r2 = _run(sp, "click", str(k_find), look_key=r["look_key"], handoff=False)
+        assert r2["status"] == "ok" and r2["page"]["url"].endswith("/logged"), r2
+        # no native hover inside a frame (frame-local coordinates)
+        assert _run(sp, "open", origins[0] + "/frame-hover", handoff=False)["status"] == "ok"
+        r = _run(sp, "look", handoff=False)
+        it = next(x for x in r["page"]["items"] if "Frame Other Page" in (x["text"] or "") and x["frame"] > 0)
+        r = _run(sp, "hover", str(it["i"]), look_key=r["look_key"], handoff=False)
+        assert r["status"] == "refused" and "frames" in r["error"], r
+    finally:
+        _finish(sp)
+
+
+def test_round7_conservative_login_detection_and_atomic_checks(origins):
+    sp = "tbsgen-test-r7"
+    try:
+        # every login signal refuses interaction (no hand-off budget here: reported, never handed over)
+        for path in ("/r7-title", "/r7-btn", "/r7-cw", "/r7-action", "/login/r7", "/r7-tel", "/r7-loose",
+                     "/email-continue"):
+            r = _run(sp, "open", origins[0] + path, handoff=False)
+            assert r["status"] == "ok" and r["page"]["login_form"] is True, (path, r)
+            r = _run(sp, "look", handoff=False)
+            it = _item(r, "Other") or _item(r, "Continue")
+            for act in ("click", "hover"):
+                r2 = _run(sp, act, str(it["i"]), look_key=r["look_key"], handoff=False)
+                assert r2["status"] == "refused" and "login" in r2["error"], (path, act, r2)
+        # a header "Sign in" entry point on an article without fields: still an article page
+        r = _run(sp, "open", origins[0] + "/r7-header", handoff=False)
+        assert r["status"] == "ok" and not r["page"]["login_form"], r
+        r = _run(sp, "look", handoff=False)
+        r = _run(sp, "click", str(_item(r, "Other")["i"]), look_key=r["look_key"], handoff=False)
+        assert r["status"] == "ok" and r["page"]["url"].endswith("/other"), r
+        # an acting call needs a look_key (the page the agent looked at)
+        r = _run(sp, "click", "0", handoff=False)
+        assert r["status"] == "refused" and "look" in r["error"], r
+        # a late redirect to a login page after `look`: the click is refused (re-checked where it acts)
+        assert _run(sp, "open", origins[0] + "/r7-late", handoff=False)["status"] == "ok"
+        r = _run(sp, "look", handoff=False)
+        k, key = _item(r, "Other")["i"], r["look_key"]
+        time.sleep(3)
+        r = _run(sp, "click", str(k), look_key=key, handoff=False)
+        assert r["status"] == "refused" and ("changed" in r["error"] or "login" in r["error"]), r
+        r = _run(sp, "look", handoff=False)
+        assert "/logged" not in r["page"]["url"] and "/other" not in r["page"]["url"], r
+    finally:
+        _finish(sp)
+
+
+def test_round7_newsletter_field_does_not_hand_off(origins):
+    sp = "tbsgen-test-r7-nl"
+    try:
+        # an e-mail box alone refuses interaction but is no reason to call the user (it would never clear)
+        r = _run(sp, "open", origins[0] + "/newsletter")
+        assert r["status"] == "ok" and r["page"]["login_form"] is True, r
+        # a page with unmistakable login semantics is handed over
+        r = _run(sp, "open", origins[0] + "/r7-title")
+        assert r["status"] == "handoff" and r["handoff"]["kind"] == "login", r
+    finally:
+        _finish(sp)
+
+
+def _fn_src(name):
+    """The source of a top-level function of the action script (to exercise it in a page directly)."""
+    a = ACTION.index("function " + name + "(")
+    return ACTION[a:ACTION.index("\n}\n", a) + 2]
+
+
+def test_round7_checks_run_in_the_evaluation_that_acts(origins):
+    """domAct itself (the one page evaluation that acts) refuses when the page is not the looked-at URL, is off
+    the allowed domains or shows any login signal - whatever the Node-side checks before it saw."""
+    sp = "tbsgen-test-r7-dom"
+    try:
+        assert _run(sp, "open", origins[0] + "/landing")["status"] == "ok"
+        body = (f"const domAct = {_fn_src('domAct')};\nconst domWalk = {_fn_src('domWalk')};\n"
+                f"const credScan = {_fn_src('credScan')};\n"
+                "const t = await taskSpace(" + json.dumps(sp) + ");\nconst pg = (await t.pages())[0];\n"
+                "const run = (u, allow, setup) => pg.evaluate(([a, w, s, u, allow, setup]) => {\n"
+                "  if (setup) document.body.insertAdjacentHTML('beforeend', setup);\n"
+                "  const f = new Function('return (' + a + ')')();\n"
+                "  const k = new Function('return (' + w + ')')()().findIndex((p) => (p[0].innerText || '').trim() === 'Accept');\n"
+                "  return f(w, k, allow, 'hover', '', u, s);\n"
+                "}, [domAct.toString(), domWalk.toString(), credScan.toString(), u, allow, setup || '']);\n"
+                "const here = (await pg.info()).url;\n"
+                "const res = [await run(here + '#x', ['127.0.0.1'], ''), await run(here, ['example.org'], ''),\n"
+                "             await run(here, ['127.0.0.1'], '<form><input type=email name=e><button>Continue</button></form>')];\n"
+                "console.log('R7 ' + JSON.stringify(res));\nprocess.exit(0);")
+        p = subprocess.run([EGO, "nodejs", body], capture_output=True, text=True, timeout=90)
+        line = next(x for x in (p.stdout + p.stderr).splitlines() if x.startswith("R7 "))
+        res = json.loads(line[3:])
+        assert "changed" in res[0]["refused"], res
+        assert "outside the allowed" in res[1]["refused"], res
+        assert "login" in res[2]["refused"], res
     finally:
         _finish(sp)

@@ -16,7 +16,8 @@
 //   open URL                      navigate (URL host must be in INPUT.allow); downloads and new tabs are saved /
 //                                 reported
 //   click I                       click item I of the last `look` list (same numbering; run `look` first)
-//   hover I                       move the mouse onto item I (opens CSS / JS dropdown menus)
+//   hover I                       hover item I of the top document (pointer / mouse events dispatched in the
+//                                 checking evaluation; opens JS dropdown menus; never inside frames)
 //   scroll up|down [PX]           scroll the page
 //   select I VALUE                choose VALUE (option value or label) of select item I
 //   type I TEXT                   type TEXT into text item I - only the whitelisted institution names in
@@ -34,8 +35,9 @@
 //   finish                        close the TaskSpace
 // Rules enforced here: nothing is typed except whitelisted institution names into checked plain text fields,
 // no interaction with verification pages / widgets, no reading of input values, storage or the browser's
-// page snapshot (it carries field values), no screenshots, no native mouse clicks except sso_login's checked
-// Login button, no click / hover / select / type at all on a page with credential or MFA fields, login forms
+// page snapshot (it carries field values), no screenshots, no native mouse actions except sso_login's checked
+// Login button, no click / hover / select / type at all on a page with ANY login signal (credScan, checked in
+// the same page evaluation that acts, together with the looked-at URL and the allowed domains), login forms
 // are never submitted except by `sso_login` with browser autofill, navigation targets are checked before and the
 // landed URL is checked after (a page that ends up outside INPUT.allow is reset to about:blank), files are
 // only written under INPUT.files_dir, and verification / login pages are handed to the user (task.handOff)
@@ -170,68 +172,98 @@ async function info(page) {
     return { url: "", title: "", ctype: "", text: "", challenge: false, login_form: false };
   }
 }
-// ONE credential / MFA scan, used by every guard (interaction refusal, sso_login, the hand-off poll): runs in
-// the page (source serialized).  Walks the top document, open shadow roots and same-origin iframes.  `cred`:
-// a password field, or a text-like field whose metadata looks like a user name / account / one-time code; or a
-// cross-origin iframe of an identity / captcha provider (it cannot be inspected).  `mfa`: a one-time-code /
-// SMS / verification-code field or such a prompt in the page text.  Field VALUES are never read.
+// ONE conservative login / MFA scan, used by every guard (interaction refusal - inside the same evaluation that
+// acts -, the hand-off decision, sso_login, the hand-off poll): runs in the page (source serialized).  Walks the
+// top document, open shadow roots and same-origin iframes.  NARROWED (round 7): no judgement about what a form
+// is "for" - any login signal makes the page a login page, and a false positive only hands the page to the user:
+//   fields: a rendered input of type password / email / tel, an autocomplete token username / email /
+//           current-password / new-password / one-time-code, a field in the browser's :autofill state, a
+//           text-like field whose name / label looks like an account, user name or code;
+//   sem:    login words ("sign in", "log in", "登录", "continue with" ...) in the page / frame title or URL, in a
+//           form action, in the text of a form's button or a "continue with ..." button, or in any button's
+//           text while a rendered text field outside any form exists (a script-driven login widget);
+//   frames: a rendered cross-origin identity-provider frame (it cannot be inspected);
+//   mfa:    a one-time-code / SMS / verification-code field, or such a prompt where a text field could take it.
+// Only RENDERED fields count (publisher pages carry hidden header-login templates; the browser does not
+// autofill hidden fields); forms are never submitted with a free-text field this tool did not fill, rendered or
+// not (domAct).  Field VALUES are never read.
 function credScan() {
-  // (a plain e-mail field - newsletter sign-up - is not a credential; an identifier-first login field carries
-  // autocomplete=username, which matches `user`)
-  const CRED = /pass|pwd|user|login|account|otp|one-time|code|sms|\bpin\b|verif|captcha|密码|账号|帐号|用户名|学号|工号|验证码|动态码|短信/i;
+  const NAME = /pass|pwd|user|login|account|otp|one-time|code|sms|\bpin\b|verif|captcha|e-?mail|phone|mobile|密码|账号|帐号|用户名|学号|工号|验证码|动态码|短信|手机|邮箱/i;
   const MFA = /otp|one-time|code|sms|verif|验证码|动态码|短信/i;
-  // (captcha widgets are not credentials: an invisible reCAPTCHA badge sits on many article pages; challenge
-  // pages are caught by the challenge detection)
+  const AC = /\b(?:username|email|current-password|new-password|one-time-code|tel|webauthn)\b/i;
+  const WORDS = /\b(?:sign|log)[\s_-]?(?:in|on)\b|\blogin\b|\bsignin\b|continue with|登录|登入|登陆|统一身份认证/i;
+  const URLW = /log[\s_-]?in|sign[\s_-]?in|log[\s_-]?on|sign[\s_-]?on|登录/i;
   const IDP = /login|signin|sign-in|\/auth\b|oauth|\bsso\b|passport|account|\bidp\b|shibboleth|wayf|\bcas\b/i;
   const TXT = /验证码|短信|动态码|一次性|二次验证|安全验证|身份验证|one[- ]time|verification code|security code|two[- ]factor|2fa|authenticator/i;
-  // only fields that are rendered count (a publisher page often carries a hidden header-login template; the
-  // browser does not autofill hidden fields); a field inside a frame counts when the frame is rendered too
   const shown = (el) => { try { const v = el.ownerDocument.defaultView; return el.getClientRects().length > 0
     && v.getComputedStyle(el).visibility !== "hidden"; } catch (e) { return true; } };
-  let cred = false, mfa = false, fields = 0;
+  const path = (u) => { try { const x = new URL(u, location.href); return x.hostname + x.pathname; } catch (e) { return String(u || ""); } };
+  let fields = false, strong = false, sem = false, mfa = false, text = 0, loose = 0, looseBtn = false;
   const walk = (doc) => {
     for (const host of doc.querySelectorAll("*")) if (host.shadowRoot) walk(host.shadowRoot);
     for (const el of doc.querySelectorAll("input, textarea")) {
+      const t = (el.tagName === "TEXTAREA" ? "textarea" : (el.getAttribute("type") || "text").toLowerCase());
+      if (["hidden", "submit", "button", "reset", "image", "checkbox", "radio", "file", "range", "color"].includes(t)) continue;
       if (!shown(el)) continue;
-      const t = (el.getAttribute("type") || "text").toLowerCase();
-      if (t === "password") { cred = true; continue; }
-      if (!["text", "email", "tel", "number", "search", "textarea", ""].includes(el.tagName === "TEXTAREA" ? "textarea" : t)) continue;
-      fields++;
-      const meta = [el.id, el.getAttribute("name"), el.getAttribute("autocomplete"), el.getAttribute("placeholder"),
-                    el.getAttribute("aria-label"), el.getAttribute("inputmode")].join(" ");
-      if (CRED.test(meta)) cred = true;
-      // an e-mail field counts as a login identifier when its form / page context is a sign-in (identifier-first
-      // login); a newsletter sign-up does not
-      if (!cred && (t === "email" || /e-?mail/i.test(meta))) {
-        const f = el.form || (el.closest && el.closest("form"));
-        const ctx = ((f && (f.innerText || "") + " " + (f.getAttribute("action") || "") + " " + (f.id || "") + " " + (f.className || ""))
-                     || "") + " " + (el.ownerDocument.title || "");
-        if (/sign[- ]?in|log[- ]?in|logon|password|account|auth|sso|登录|登入|账号|帐号/i.test(ctx)) cred = true;
-      }
-      if (MFA.test(meta) || /one-time-code/i.test(el.getAttribute("autocomplete") || "")) mfa = true;
+      text++;
+      if (!el.form && !(el.closest && el.closest("form"))) loose++;     // a script-driven widget may read it
+      const ac = el.getAttribute("autocomplete") || "";
+      const meta = [el.id, el.getAttribute("name"), ac, el.getAttribute("placeholder"), el.getAttribute("aria-label"),
+                    el.getAttribute("inputmode")].join(" ");
+      if (["password", "email", "tel"].includes(t) || AC.test(ac) || NAME.test(meta)) fields = true;
+      // `strong`: unmistakable credential fields (these alone also decide the hand-off / its clearing)
+      if (t === "password" || /\b(?:username|current-password|new-password|one-time-code)\b/i.test(ac)
+          || /pass|pwd|user|login|account|otp|one-time|密码|账号|帐号|用户名|学号|工号|验证码|动态码/i.test(meta)) strong = true;
+      try { if (el.matches(":autofill") || el.matches(":-webkit-autofill")) { fields = true; strong = true; } } catch (e) {}
+      if (MFA.test(meta) || /one-time-code/i.test(ac)) mfa = true;
+    }
+    for (const b of doc.querySelectorAll("button, input[type=submit], input[type=button], input[type=image], [role=button]")) {
+      if (!shown(b)) continue;
+      const bt = [b.innerText || "", b.tagName === "INPUT" ? (b.getAttribute("value") || "") : "",
+                  b.getAttribute("aria-label") || "", b.getAttribute("title") || ""].join(" ");
+      if (!WORDS.test(bt)) continue;
+      // a login button of a form, or a "continue with ..." button, is login semantics; a header "Sign in"
+      // button outside any form counts only together with a rendered text field outside any form (a
+      // script-driven login widget) - a header entry point submits nothing (the login page it leads to is
+      // checked when it loads)
+      if (b.form || (b.closest && b.closest("form")) || /continue with/i.test(bt)) sem = true;
+      else looseBtn = true;
+    }
+    // a form whose action is a login endpoint, when any control of it is rendered (publisher pages carry hidden
+    // header-login templates)
+    for (const f of doc.querySelectorAll("form")) {
+      if (URLW.test(path(f.getAttribute("action") || "")) && [...(f.elements || [])].some((x) => (x.type || "") !== "hidden" && shown(x))) sem = true;
     }
     for (const f of doc.querySelectorAll("iframe")) {
       let inner = null;
       try { inner = f.contentDocument; } catch (e) { inner = null; }
-      if (inner) walk(inner);
-      else if (IDP.test((f.getAttribute("src") || "") + " " + (f.getAttribute("title") || ""))) {
-        // a cross-origin identity / captcha frame cannot be inspected: a rendered one counts as credentials
+      if (inner) {
+        if (WORDS.test(inner.title || "") || URLW.test(path(inner.location ? inner.location.href : ""))) sem = true;
+        walk(inner);
+      } else if (IDP.test((f.getAttribute("src") || "") + " " + (f.getAttribute("title") || ""))) {
+        // a cross-origin identity frame cannot be inspected: a rendered one counts as login fields
         const r = f.getBoundingClientRect();
-        if (r.width >= 20 && r.height >= 20 && shown(f)) cred = true;
+        if (r.width >= 20 && r.height >= 20 && shown(f)) { fields = true; strong = true; }
       }
     }
   };
   walk(document);
+  if (looseBtn && loose > 0) sem = true;
+  if (WORDS.test(document.title || "") || URLW.test(path(location.href))) sem = true;
   // a verification-code prompt in the text counts only where a text field could take the code
-  if (fields > 0 && TXT.test((document.body && document.body.innerText || "").slice(0, 3000))) mfa = true;
-  return { cred: cred || mfa, mfa: mfa };
+  if (text > 0 && TXT.test((document.body && document.body.innerText || "").slice(0, 3000))) mfa = true;
+  // cred: any signal - gates every click / hover / select / type.  login: unmistakable credential fields or
+  // login semantics - decides the hand-off and whether a handed-off page is cleared (a newsletter e-mail box
+  // alone refuses interaction, but is no reason to call the user, and could never "clear")
+  return { cred: fields || sem || mfa, login: strong || sem || mfa, fields: fields, sem: sem, mfa: mfa };
 }
 async function scan(page) {
   try {
     return await page.evaluate((src) => (new Function("return (" + src + ")")())(), credScan.toString());
-  } catch (e) { return { cred: true, mfa: false, unknown: true }; }   // cannot be checked -> treated as a login page
+  } catch (e) { return { cred: true, login: true, fields: true, sem: true, mfa: false, unknown: true }; }   // cannot be checked -> a login page
 }
 async function credPage(page) { return (await scan(page)).cred; }
+async function loginPage(page) { return (await scan(page)).login; }
 const isChallenge = (i) => i.challenge || CHALLENGE.test(i.title) || (/^\s*$/.test(i.title) && CHALLENGE.test(i.text.slice(0, 300)));
 
 async function settle(page) {
@@ -352,9 +384,10 @@ async function postCheck(task, page, i, opts) {
   }
   // the shared credential / MFA scan (password, user-name, e-mail sign-in, verification-code fields; frames,
   // shadow roots): such a page outside the SSO domains goes to the user
-  const sc = i.login_form ? { cred: true, mfa: false } : await scan(page);
+  // (`cred` - any login signal - is reported and refuses interaction; `login` hands the page to the user)
+  const sc = i.login_form ? { cred: true, login: true, mfa: false } : await scan(page);
   if (sc.cred) i.login_form = true;
-  if (sc.cred && !hostIn(i.url, (INPUT.sso && INPUT.sso.domains) || []) && !(opts && opts.no_login_handoff)) {
+  if (sc.login && !hostIn(i.url, (INPUT.sso && INPUT.sso.domains) || []) && !(opts && opts.no_login_handoff)) {
     if (INPUT.handoff && INPUT.handoff.enabled) return handoff(task, page, sc.mfa ? "verification code" : "login form", h, sc.mfa ? "mfa" : "login", i.title);
     out.login_form = true;                       // reported; the agent books `login_required`
   }
@@ -390,9 +423,14 @@ async function look(task, page) {
 
 // The one evaluation that finds, checks and clicks / hovers / fills item k of the dom list.  `walk` is the
 // domWalk function itself; both run inside the page (ego's evaluate takes ONE argument, passed as an array).
-function domAct(walkSrc, k, allow, kind, value) {
+function domAct(walkSrc, k, allow, kind, value, expectUrl, scanSrc) {
   const ok = (u) => { try { const x = new URL(u, location.href); if (!/^https?:$/.test(x.protocol)) return false;
     const h = x.hostname.toLowerCase(); return allow.some((d) => h === d || h.endsWith("." + d)); } catch (e) { return false; } };
+  // re-checked in the SAME evaluation that acts (the page may have changed since the Node-side checks): still
+  // the page the agent looked at, still on an allowed host, still no credential / verification-code fields
+  if (location.href !== expectUrl) return { refused: "the page changed since `look`; run look again" };
+  if (!ok(location.href)) return { refused: "the page is outside the allowed domains" };
+  if ((new Function("return (" + scanSrc + ")")())().cred) return { refused: "login / verification-code page: no click, hover, select or type here" };
   const pair = new Function("return (" + walkSrc + ")")()()[k];   // domWalk: source -> function -> [el, frame]
   const el = pair && pair[0];
   if (!el) return { refused: "no such item; run look first" };
@@ -413,6 +451,19 @@ function domAct(walkSrc, k, allow, kind, value) {
   // nothing inside (or submitting) a form with a password field (also one associated by form="..."): only
   // sso_login submits login forms
   if (pwdForm(form)) return { refused: "login form: credentials are not entered by this tool" };
+  // a form holding a user-identifier field (e-mail / user name / account) is never submitted or changed by this
+  // tool, whatever the page calls it (identifier-first logins: only sso_login or the user)
+  // NARROWED (round 6): no heuristics about what a form is for - a form with ANY free-text field (text, e-mail,
+  // tel, number, textarea, ...) is only submitted / changed when every such field was filled by this tool's
+  // `type` (a whitelisted institution name; marked below).  Anything else may hold an autofilled identifier.
+  const freeText = (x) => {
+    if (x.tagName === "TEXTAREA") return true;
+    if (x.tagName !== "INPUT") return false;
+    const t = (x.getAttribute("type") || "text").toLowerCase();
+    return !["hidden", "submit", "button", "reset", "image", "checkbox", "radio", "file", "range", "color"].includes(t);
+  };
+  const untouched = (f) => !!f && [...(f.elements || [])].some((x) => freeText(x) && x.getAttribute("data-tbsgen-typed") !== "1");
+  if ((kind === "click" || kind === "select") && untouched(form)) return { refused: "form with a text field this tool did not fill: not submitted (report login_required, or type an institution name first)" };
   if (el.closest && el.closest(".cf-turnstile, .g-recaptcha, .h-captcha, #challenge-form, #px-captcha, [id*=captcha], [class*=captcha]")) return { refused: "verification widget: do not interact" };
   if (kind === "click" && W.test(text)) return { refused: "verification widget: do not interact" };
   const tag = el.tagName.toLowerCase();
@@ -449,8 +500,16 @@ function domAct(walkSrc, k, allow, kind, value) {
     return { clicked: text };
   }
   if (kind === "hover") {
+    // NARROWED (round 7): top document only, and no native mouse move - the pointer events are dispatched
+    // here, in the same evaluation that checked the page (a native move would be a second, later step)
+    if (pair[1] > 0) return { refused: "hover is not available inside frames; click the item or open the frame" };
     const r = el.getBoundingClientRect();
-    return { center: [Math.round(r.left + r.width / 2), Math.round(r.top + r.height / 2)], text: text };
+    const o = { bubbles: true, cancelable: true, view: window, clientX: r.left + r.width / 2, clientY: r.top + r.height / 2 };
+    const ne = { ...o, bubbles: false };
+    el.dispatchEvent(new PointerEvent("pointerover", o)); el.dispatchEvent(new PointerEvent("pointerenter", ne));
+    el.dispatchEvent(new MouseEvent("mouseover", o)); el.dispatchEvent(new MouseEvent("mouseenter", ne));
+    el.dispatchEvent(new PointerEvent("pointermove", o)); el.dispatchEvent(new MouseEvent("mousemove", o));
+    return { hovered: text };
   }
   if (kind === "select") {
     if (tag !== "select") return { refused: "item is not a select" };
@@ -470,6 +529,7 @@ function domAct(walkSrc, k, allow, kind, value) {
     if (pwdForm(el.form || el.closest("form"))) return { refused: "login form: typing is not allowed" };
     const set = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(el), "value");
     if (set && set.set) set.set.call(el, value); else el.value = value;
+    el.setAttribute("data-tbsgen-typed", "1");             // filled by this tool: its form may be submitted
     el.dispatchEvent(new Event("input", { bubbles: true }));
     el.dispatchEvent(new Event("change", { bubbles: true }));
     return { typed: true, len: el.value.length };                    // the length only - never the value
@@ -478,14 +538,15 @@ function domAct(walkSrc, k, allow, kind, value) {
 }
 
 async function act(task, page, kind, k, value) {
-  if (INPUT.look_key) {
-    const i0 = await info(page);                       // the page must be the one the agent last looked at
-    if (await urlKey(i0.url) !== INPUT.look_key) { out.status = "refused"; out.error = "the page changed since `look`; run look again"; return; }
-  }
+  // the page must be the one the agent last looked at.  `seen` - the URL whose hash is the look_key - is
+  // passed into domAct, which compares it with location.href in the same evaluation that acts
+  if (!INPUT.look_key) { out.status = "refused"; out.error = "run look first"; return; }
+  const ip = await info(page);
+  const seen = ip.url;
+  if (await urlKey(seen) !== INPUT.look_key) { out.status = "refused"; out.error = "the page changed since `look`; run look again"; return; }
   const all = await items(page);
   if (!(k >= 0) || k >= all.length) { out.status = "refused"; out.error = "no such item; run look first"; return; }
   const it = all[k];
-  const ip = await info(page);
   if (isChallenge(ip)) { out.status = "refused"; out.error = "verification page: do not interact"; await postCheck(task, page, ip); return; }
   // a page with credential / MFA fields (anywhere: frames, shadow roots, identity-provider frames) is never
   // interacted with: sso_login (configured SSO domains) or the hand-off only
@@ -496,18 +557,21 @@ async function act(task, page, kind, k, value) {
   }
   if (it.widget || WIDGET.test(it.text || "")) { out.status = "refused"; out.error = "verification widget: do not interact"; return; }
   if (kind === "click" && it.login) { out.status = "refused"; out.error = "login form: credentials are not entered by this tool (report login_required)"; return; }
-  const domRun = () => page.evaluate(([src, walk, k, allow, kind, value]) => {   // ego's evaluate takes ONE arg
+  const domRun = () => page.evaluate(([src, walk, k, allow, kind, value, u, scanSrc]) => {   // ONE arg for ego
     const f = new Function("return (" + src + ")")();        // domAct; walk is domWalk, both plain functions
-    return f(walk, k, allow, kind, value);
-  }, [domAct.toString(), domWalk.toString(), k, INPUT.allow, kind, value || ""]);
+    return f(walk, k, allow, kind, value, u, scanSrc);
+  }, [domAct.toString(), domWalk.toString(), k, INPUT.allow, kind, value || "", seen, credScan.toString()]);
   {
     if (kind === "click") {
       await withDownload(task, page, async () => {
         const r = await domRun();
         if (r && r.refused) { out.status = "refused"; out.error = r.refused; }
         else if (r && r.open) {
-          await page.goto(r.open, { timeout: INPUT.nav_timeout_ms, waitUntil: "domcontentloaded" });
+          // a checked new-tab link / cross-origin frame URL: a navigation of this page (no native click)
+          if (!hostOk(r.open)) { out.status = "refused"; out.error = "link target is outside the allowed domains"; }
+          else await page.goto(r.open, { timeout: INPUT.nav_timeout_ms, waitUntil: "domcontentloaded" });
         }
+        else if (!r) { out.status = "error"; out.error = "the page changed during the click (no result)"; }
       });
       if (out.status === "refused") return;
       await sleep(1500);
@@ -518,15 +582,13 @@ async function act(task, page, kind, k, value) {
       return;
     }
     if (kind === "hover") {
-      const r = await domRun();
+      const r = await domRun().catch(() => null);
       if (r && r.refused) { out.status = "refused"; out.error = r.refused; return; }
-      if (!r || !r.center) { out.status = "error"; out.error = "the item has no position (hidden?)"; return; }
-      const u0 = (await info(page)).url;
-      await page.mouse.move(r.center[0], r.center[1]).catch(() => {});
+      if (!r || r.hovered === undefined) { out.status = "error"; out.error = "hover failed (the page changed?)"; return; }
       await sleep(800);
-      out.acted = { kind: "hover", text: r.text || "" };
+      out.acted = { kind: "hover", text: r.hovered || "" };
       const i = await info(page);
-      if (i.url !== u0) {                                // a hover that navigated: checked like a click
+      if (i.url !== seen) {                              // a hover that navigated: checked like a click
         out.navigated = true;
         const i2 = await after(page);
         if (!out.blocked && !out.left_allowed) await postCheck(task, page, i2);
@@ -624,7 +686,7 @@ async function ssoLogin(task, page) {
     if (isChallenge(i2)) { out.sso = "handoff"; return handoff(task, page, "challenge after the SSO login", h, "challenge", i2.title); }
     const st2 = await read();
     if (st2.mfa) { out.sso = "handoff"; return handoff(task, page, "MFA / verification code after the SSO login", h, "mfa", i2.title); }
-    if (!st2.hasPwd && hostIn(i2.url, sso.domains) && await credPage(page)) {
+    if (!st2.hasPwd && hostIn(i2.url, sso.domains) && await loginPage(page)) {
       // still on the login server with other credential fields (a second step): the user finishes it
       out.sso = "handoff"; return handoff(task, page, "a further login step on the SSO server", h, "mfa", i2.title);
     }
@@ -803,7 +865,7 @@ try {
             const i = await settle(page2);
             out.page = { url: i.url, title: i.title, pdf: /pdf/i.test(i.ctype), login_form: i.login_form };
             // cleared only when no challenge, no login / MFA form is left on that page
-            if (isChallenge(i) || i.login_form || await credPage(page2)) {
+            if (isChallenge(i) || i.login_form || await loginPage(page2)) {
               // the user has not finished: hand the space back and keep waiting
               await task.handOff();
               out.handoff_check = "waiting";

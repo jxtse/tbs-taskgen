@@ -314,27 +314,41 @@ uv run tbsgen fetch --run runs/R --config config.toml --browser --wait-for-egres
   DOM, including hidden dropdown items and same-origin iframes; a cross-origin iframe is one item whose `click`
   opens its checked URL; an offset for long pages), `open URL`, `click I`, `hover I`, `scroll`,
   `select I VALUE`, `type I TEXT`, `tabs` / `switch`, `back`, `wait_for`, `save_pdf`, `sso_login`,
-  `handoff_status` and `finish`. There are deliberately no coordinate clicks, no screenshots and no actions
-  inside cross-origin iframes (each was a recurring source of credential / domain-check gaps in review). Code enforces the limits, not the prompt:
+  `handoff_status` and `finish`. There are deliberately no coordinate clicks, no screenshots, no native mouse
+  actions (hover dispatches pointer events, top document only), no actions inside cross-origin iframes and no
+  interaction at all on anything that looks like a login page (each was a recurring source of credential /
+  domain-check gaps in review; see "Removed by design" below). Code enforces the limits, not the prompt:
   - the paper is booked in the ledger before its first call; at most `agent.max_calls_per_paper` calls (25) and
     `agent.max_navigations_per_paper` page loads (12) per paper, page loads of one publisher at least
     `agent.nav_gap_s` (2.5 s) apart;
   - only the paper's `allowed_domains` (its publisher, `doi.org`, known PDF CDNs and `browser.sso.domains`, the
     institution / WAYF domains) are opened or clicked (link and browser-resolved form targets are checked
-    before the click; inside cross-origin frames only links are clicked; a page found outside the domains is
-    reset before the next action); `type` only types the strings in
+    before the click; a cross-origin frame is never acted in - `click` on it opens its checked URL as the page;
+    a page found outside the domains is reset before the next action); `type` only types the strings in
     `agent.institution_names`, never into a field that can hold credentials;
-  - field values are never read: `look` lists field types and labels only, the browser's page snapshot (which
-    carries field values) is never taken, and on a page with credential or verification-code fields
-    (top document, same-origin frames, open shadow roots, or a rendered identity-provider frame) `click`,
-    `hover`, `select` and `type` are refused - only `sso_login` acts there. Every URL in the tool's output
-    loses its query and fragment;
+  - field values are never read: `look` lists field types and labels only, and the browser's page snapshot (which
+    carries field values) is never taken;
+  - login pages are detected conservatively (top document, same-origin frames, open shadow roots): any rendered
+    e-mail, phone, password or one-time-code field, an `autocomplete` of username / email / current-password /
+    one-time-code, a field the browser autofilled, a rendered identity-provider frame, or login wording ("sign
+    in", "log in", "登录", "continue with ...") in the page / frame title or URL, a form action or a form's
+    button. On such a page `click`, `hover`, `select` and `type` are refused - only `sso_login` (on the SSO
+    domains) and the hand-off act there. A false positive costs a paper (it is reported, or handed to you when
+    the page has unmistakable login fields or wording), never a credential. A form with a free-text field is
+    submitted / changed only when every such field was filled by `type`;
+  - every action that changes the page (click / hover / select / type) re-checks, in the **same page
+    evaluation that acts**, that the page is still the one the agent looked at (`look` is required first), on
+    an allowed host and free of any login signal; otherwise it is refused. Every URL in the tool's output loses
+    its query and fragment;
   - verification pages (Cloudflare / Turnstile, captchas, sliders) are never solved. With `browser.handoff.enabled`
     the page is handed to you instead (macOS notification, optional local `handoff.bark_cmd`); the agent works on
     other papers and polls `handoff_status` for up to `handoff.wait_s` (120 s). One hand-off per paper and per
     publisher per batch; a hand-off that is not cleared in time (also when the agent stops polling, and at the
     end of the batch) closes the paper and cools the publisher. With hand-off off (the default), a verification
     page cools the publisher at once.
+  - a tool call that started and returned no valid result (timeout, stop, crash, lost output) may have handed
+    the page over before its output was lost: it is booked as a hand-off that was not cleared (paper closed,
+    publisher cooled; only a call that never started is exempt);
   - concurrent tool calls are serialized per paper, and the batch-wide budgets (navigation pacing, the
     publisher's hand-off, SSO submissions) are reserved under a lock before the action script runs;
   - Known limit: URLs, links and form targets are checked before the request, but a cross-domain navigation that
@@ -344,10 +358,24 @@ uv run tbsgen fetch --run runs/R --config config.toml --browser --wait-for-egres
   The run uses an isolated Hermes home (no user memory, rules, plugins or credentials; only Hermes' own
   dependency environments, `installs/`, are linked from your Hermes data root so the CLI can start, or from
   `agent.hermes_installs_dir`) whose `pre_tool_call` hook blocks every other command before it runs; repeated
-  attempts end the run. The agent's stderr is kept (tail, credential-like strings masked) in the batch directory
+  attempts end the run. The agent's stderr is kept (tail, credential-like strings masked; a multi-line record,
+  such as a traceback, a JSON object or a multi-line value, with a credential-like field is dropped whole) in the batch directory
   as `agent-stderr.log` and in the `agent_end` log event. Saved files are validated and booked by code; the
   agent's own report is not used. Papers cut by an egress change or the window's end stay queued without
   backoff. Model usage per run is appended to `<queue>.browser/usage.jsonl`.
+
+  Removed by design (review rounds 4-7; fewer actions rather than more guards): coordinate clicks
+  (`click_xy`), screenshots / vision, the browser's page snapshot (`look full`, `@REF` items), any action
+  inside a cross-origin iframe, native clicks on `target=_blank` links (their checked URL is opened in the page
+  instead), native mouse hover (and hover inside any frame), and every click / hover / select / type on a
+  page with any login signal. Expected effect: publisher pages whose PDF link only appears after a canvas /
+  coordinate interaction, inside a cross-origin viewer frame or behind an e-mail / "Sign in" prompt are not
+  fetched by the agent; they are reported (`login_required`) or handed to you. A WAYF / institution-selection
+  page that itself carries login wording ("Sign in via your institution" as its title or a form button) is
+  treated the same way (handed to you) instead of being filled in by the agent; CSS-only hover menus no longer
+  open (their items are still listed and clicked directly). Unchanged: a download link or dropdown item (also
+  hidden, also in same-origin frames), a PDF viewer page, a new-tab PDF, a neutral institution search /
+  selection form, and the institution SSO login with browser autofill.
 - Institution sign-in (`browser.sso_login`, off by default). Enable it only on the machine whose browser profile
   has the institution account saved. `tbsgen-browser N sso_login` works only on a page of an HTTPS domain in
   `sso_login.domains` (your institution's own login server, e.g. reached through CARSI / WAYF). It relies on

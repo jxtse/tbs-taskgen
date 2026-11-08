@@ -428,9 +428,14 @@ def test_wrapper_never_enables_the_local_sso_test_mode(tmp_path, monkeypatch):
 def test_long_stderr_line_never_leaks_its_tail():
     import io
     body = b"x" * (browser_agent._StderrTail.MAX_LINE + 100) + b"password=" + b"\n"
-    data = body[:-1] + b"LEAKEDSECRET\nnext line\n"
+    data = body[:-1] + b"LEAKEDSECRET\nmaybe still the value\n\nnext record\n"
     tail = browser_agent._StderrTail(io.BytesIO(data), keep=4096).text()
-    assert "LEAKEDSECRET" not in tail and "next line" in tail and "long line dropped" in tail
+    # an over-long line with a sensitive key: the lines after it are dropped up to a blank line
+    assert "LEAKEDSECRET" not in tail and "still the value" not in tail, tail
+    assert "next record" in tail and "long line dropped" in tail, tail
+    # without a sensitive key the next line is kept
+    data = b"x" * (browser_agent._StderrTail.MAX_LINE + 100) + b"\nnext line\n"
+    assert "next line" in browser_agent._StderrTail(io.BytesIO(data), keep=4096).text()
 
 
 def test_redaction_ignores_quote_tricks():
@@ -510,7 +515,7 @@ def test_silent_timeout_with_a_handoff_budget_closes_the_paper_and_cools(tmp_pat
                      sso_login_enabled=False, call_timeout_s=3)
     (tmp_path / "ego").write_text(SILENT_HANG_EGO.replace("{py}", sys.executable))
     out, _ = _call(bd, "1", "open", "https://pub.example/a").communicate(timeout=60)
-    assert "timed out" in out, out
+    assert "gave no result" in out, out
     ps = json.loads((bd / "papers" / "1.json").read_text())
     assert ps.get("closed") and not ps.get("handoff")
     assert json.loads((bd / "state.json").read_text())["handoff"]["pub:" + _pub("10.1080/a.1")]   # not re-opened
@@ -565,3 +570,59 @@ def test_final_sweep_books_an_interrupted_handoff_call(tmp_path, monkeypatch):
     state = json.loads((bd / "state.json").read_text())
     assert state["handoff"][pk] and not state["handoff_inflight"]
     assert led.cooling("chrome:10.1080")
+
+
+
+@pytest.mark.parametrize("body", ["import sys\nsys.exit(0)\n", "import sys\nprint('boom', file=sys.stderr)\nsys.exit(1)\n",
+                                  # a result line without a valid status, or one that does not parse
+                                  "print('TBSGEN_RESULT {\"files\": []}')\n", "print('TBSGEN_RESULT {broken')\n",
+                                  "import os, sys\nsys.stdout.flush()\nos.kill(os.getpid(), 9)\n"])
+def test_started_call_without_a_result_books_an_unknown_handoff(tmp_path, monkeypatch, body):
+    bd, led = _batch(tmp_path, monkeypatch, ["10.1080/a.1", "10.1080/b.2"], handoff_enabled=True,
+                     sso_login_enabled=False)
+    (tmp_path / "ego").write_text("#!" + sys.executable + "\n" + body)
+    out, _ = _call(bd, "1", "open", "https://pub.example/a").communicate(timeout=60)
+    assert "gave no result" in out, out
+    ps = json.loads((bd / "papers" / "1.json").read_text())
+    assert ps.get("closed") and not ps.get("handoff")
+    state = json.loads((bd / "state.json").read_text())
+    assert state["handoff"]["pub:" + _pub("10.1080/a.1")] and not (state.get("handoff_inflight") or {})
+    assert led.cooling("chrome:10.1080")
+
+
+def test_redaction_masks_multi_line_values():
+    import io
+    txt = 'password: "one\ntwo"\nnext\ntoken=\'a\nb\nc\'\nfine\n'
+    for r in (browser_agent.redact(txt), browser_agent._StderrTail(io.BytesIO(txt.encode()), keep=4096).text()):
+        assert "one" not in r and "two" not in r and "\nb\n" not in r and "c'" not in r, r
+        assert "next" in r and "fine" in r
+
+
+def test_redaction_drops_a_multi_line_record_whole():
+    import io
+    cases = [
+        # the sensitive key on a continuation line: the whole record (its first line too) is dropped
+        ("Traceback (most recent call last):\n  headers = {'Authorization': 'Bearer SECRET'}\nnext\n", "Traceback"),
+        # a JSON object over several lines with a multi-line value
+        ('{\n  "password": "SEC\nRET"\n}\nnext\n', "SEC"),
+        # an open bracket, a backslash continuation
+        ("token = [SECRET,\nSECRET2]\nnext\n", "SECRET"),
+        ("secret=SECRET\\\nSECRET2\nnext\n", "SECRET"),
+        # an open value is not closed by a blank line
+        ('password: "SECRET\n\nSECRET2"\nnext\n', "SECRET"),
+    ]
+    for txt, gone in cases:
+        for r in (browser_agent.redact(txt), browser_agent._StderrTail(io.BytesIO(txt.encode()), keep=4096).text()):
+            assert gone not in r and "SECRET" not in r and "dropped" in r, (txt, r)
+            assert r.rstrip().endswith("next"), (txt, r)
+    # a one-line record keeps its key and is masked from it on; neighbouring records are untouched
+    r = browser_agent.redact("before\npassword=SECRET\nafter\n")
+    assert r == "before\npassword=[redacted]\nafter\n", r
+
+
+def test_redaction_drop_survives_the_tail_cut():
+    import io
+    # a record that started before the kept tail: what is left of it is still dropped
+    txt = "rec:\n" + "".join(f"  line {k}\n" for k in range(50)) + "  password=SECRET\n  more\nnext\n"
+    r = browser_agent._StderrTail(io.BytesIO(txt.encode()), keep=120).text()
+    assert "SECRET" not in r and "line 49" not in r and "more" not in r and r.rstrip().endswith("next"), r

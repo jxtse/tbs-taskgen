@@ -655,6 +655,9 @@ def _sso_finalize(bd: Path, slock: Path, n: str, res: dict) -> str | None:
     return result
 
 
+_VALID_STATUS = ("ok", "refused", "error", "handoff", "paused")
+
+
 def _paper_run(bd, st, n, p, ps, action, arg, say, led, pkey, space, handoff_free, sso_ok, slock,
                COOLDOWN_429_S) -> int:
     sp = bd / "papers" / f"{n}.json"
@@ -672,23 +675,28 @@ def _paper_run(bd, st, n, p, ps, action, arg, say, led, pkey, space, handoff_fre
                               "title": ps.get("handoff_title") or "", "page_label": ps.get("handoff_page") or ""})
     timeout = max(5.0, min(float(st["call_timeout_s"]), float(st["deadline"]) - time.time()))
     res, err = _run_script(st, inp, timeout, bd)
+    if not (isinstance(res, dict) and res.get("status") in _VALID_STATUS):
+        res = {}                                   # no valid result line: treated exactly like no output
     sso_result = _sso_finalize(bd, slock, n, res) if sso_ok else None
-    if not res and err in ("timeout", "stopped") and handoff_free:
-        # the call (started, then timed out or stopped) may have handed the space to the user and then hung
-        # (its result line lost): the hand-off state is unknown.  Never re-open the publisher's hand-off and never act on the paper again: book it
-        # as a hand-off that was not cleared (paper closed, publisher cooled)
+    if not res and err != "not-started" and handoff_free:
+        # ANY call that started and gave no valid result (timeout, STOP, a normal or an error exit without a
+        # result line, an unparseable one) may have handed the space to the user before its output was lost:
+        # the hand-off state is unknown.  Only `not-started` is exempt.  Never re-open the publisher's
+        # hand-off and never act on the paper again: book it as a hand-off that was not cleared (paper
+        # closed, publisher cooled)
         with _locked(slock):
             state = _read_state(bd)
             state.setdefault("handoff", {})[pkey] = True
             _write_state(bd, state)
         cur = json.loads(sp.read_text())
         cur.update(handoff=True, handoff_used=True, handoff_kind="challenge", handoff_deadline=0,
-                   handoff_note=f"call timed out at={time.strftime('%H:%M:%S')} (hand-off state unknown)")
+                   handoff_note=f"call without a result ({err if err in ('timeout', 'stopped') else 'exit'}) "
+                                f"at={time.strftime('%H:%M:%S')} (hand-off state unknown)")
         why = _expire_handoff(st, led, n, cur, force=True)
         _atomic(sp, json.dumps(cur))
         if err == "stopped":
             return say("tbsgen: stopped (egress changed, deadline or call timeout). End now.", 3)
-        return say(f"tbsgen: paper {n}: the browser call timed out - paper closed ({why}); move on.", 2)
+        return say(f"tbsgen: paper {n}: the browser call gave no result - paper closed ({why}); move on.", 2)
 
     def save_ps(**kw):
         cur = json.loads(sp.read_text())
@@ -820,58 +828,167 @@ _SECRET_PATTERNS = (
 )
 
 
+class _Redactor:
+    """Record-wise redaction of the agent's stderr (kept as a tail in memory: `keep` characters, None = all).
+
+    A record is a line plus its continuation lines (indented, starting with a closing bracket / quote, or inside
+    a sensitive value that is still open).  A one-line record with a credential-like field is masked from the
+    key to the end of the line; a record with such a field that spans lines is DROPPED WHOLE - its earlier lines
+    are taken back and the following ones are discarded up to the next record - with no attempt to find where
+    the value ends inside it.  A sensitive value counts as open while, after its key, a quote (counted with and
+    without backslash escapes; either count odd = open) or a bracket is unbalanced, or the line ends in a
+    backslash; an open value is only closed by balance, never by a blank line or a new-looking line."""
+
+    MARK = "[record with a credential-like field dropped]\n"
+    _CLOSERS = ")]}\"'"
+
+    def __init__(self, keep: int | None = None):
+        self.out: list[str] = []
+        self.size = 0
+        self.keep = keep
+        self.base = 0                      # absolute index of out[0] (the tail drops lines at the front)
+        self.rec_start = None              # absolute index of the current record's first line
+        self.rec_lines = 0
+        self.sensitive = False             # the current record has a credential-like field
+        self.dropping = False              # the current record is being discarded
+        self.val = ""                      # text of the sensitive value(s) so far (for the balance check)
+        self.hold = False                  # after an over-long line with a sensitive key: drop to a blank line
+
+    def _push(self, s: str):
+        self.out.append(s)
+        self.size += len(s)
+        if self.keep is not None:
+            while self.size > self.keep and len(self.out) > 1:
+                self.size -= len(self.out.pop(0))
+                self.base += 1
+
+    def _open(self) -> bool:
+        v = self.val
+        if not v:
+            return False
+        esc = re.sub(r"\\.", "", v)
+        if any(x.count(q) % 2 for x in (v, esc) for q in ('"', "'")):
+            return True
+        if sum(v.count(c) for c in "([{") > sum(v.count(c) for c in ")]}"):
+            return True
+        return v.rstrip("\n").endswith("\\")
+
+    def _drop_record(self):
+        k = max(0, (self.rec_start or 0) - self.base)
+        gone = self.out[k:]
+        del self.out[k:]
+        self.size -= sum(len(x) for x in gone)
+        self._push(self.MARK)
+        self.dropping = True
+
+    def opaque(self, marker: str, sensitive: bool):
+        """A line that is not shown (too long).  With a sensitive key in it, its value may go on over the next
+        lines: those are dropped up to the next blank line."""
+        if self.hold:
+            return                          # still inside an opaque sensitive record
+        if self.dropping and self._open():
+            return                          # still inside an open sensitive value
+        self.rec_start, self.rec_lines, self.sensitive, self.dropping, self.val = (
+            self.base + len(self.out), 1, False, False, "")
+        self._push(marker)
+        self.hold = sensitive
+
+    def line(self, line: str):
+        nl = "\n" if line.endswith("\n") else ""
+        body = line[:-1] if nl else line
+        if self.hold:
+            if body.strip():
+                return                       # an opaque sensitive record goes on up to a blank line
+            self.hold = False
+        still_open = self.sensitive and self._open()
+        new = (self.rec_start is None or not still_open) and (
+            not body.strip() or (body[:1] not in " \t" and body[:1] not in self._CLOSERS))
+        if new:
+            self.rec_start, self.rec_lines, self.sensitive, self.dropping, self.val = (
+                self.base + len(self.out), 0, False, False, "")
+        self.rec_lines += 1
+        m = _SECRET_PATTERNS[0].search(body) or _SECRET_PATTERNS[1].search(body)
+        if m:
+            self.val = (self.val + "\n" + body) if self.sensitive else body[m.end(1):]
+            self.sensitive = True
+        elif self.sensitive:
+            self.val += "\n" + body
+        if self.dropping:
+            return
+        if self.sensitive and self.rec_lines > 1:
+            self._drop_record()              # a credential-like field in a multi-line record: drop it whole
+            return
+        for pat in _SECRET_PATTERNS:
+            body = pat.sub(lambda m: m.group(1) + "[redacted]", body)
+        self._push(body + nl)
+
+    def text(self) -> str:
+        return "".join(self.out)
+
+
 def redact(text: str) -> str:
     """Mask anything that looks like a credential (stderr of the agent process is logged)."""
-    for pat in _SECRET_PATTERNS:
-        text = pat.sub(lambda m: m.group(1) + "[redacted]", text)
-    return text
+    r = _Redactor()
+    for x in text.splitlines(keepends=True):
+        r.line(x)
+    return r.text()
 
 
 class _StderrTail:
-    """Reads the agent's stderr pipe in a thread.  Every complete line is redacted as it arrives (before any
-    truncation, so a secret is never cut away from its key); only the last `keep` bytes of redacted text are
-    kept in memory.  A line longer than the limit is replaced by a marker.  Nothing unredacted reaches disk."""
+    """Reads the agent's stderr pipe in a thread.  Every complete line is redacted as it arrives, record by
+    record (_Redactor: before any truncation, so a secret is never cut away from its key); only the last
+    `keep` characters of redacted text are kept in memory.  A line longer than the limit is replaced by a
+    marker (and with a sensitive key in it, the lines after it up to a blank line are dropped too).  Nothing
+    unredacted reaches disk."""
 
     MAX_LINE = 16 * 1024
 
     def __init__(self, pipe, keep: int = STDERR_KEEP):
-        self.out: list[str] = []
-        self.size = 0
         self.keep = keep
+        self.red = _Redactor(keep=keep)
         self.th = threading.Thread(target=self._read, args=(pipe,), daemon=True)
         self.th.start()
 
     def _add(self, raw: bytes):
-        line = raw.decode("utf-8", "replace")
-        line = "[long line dropped]\n" if len(raw) > self.MAX_LINE else redact(line)
-        self.out.append(line)
-        self.size += len(line)
-        while self.size > self.keep and len(self.out) > 1:
-            self.size -= len(self.out.pop(0))
+        self.red.line(raw.decode("utf-8", "replace"))
 
     def _read(self, pipe):
         buf = b""
         skipping = False                  # inside an over-long line: drop everything up to its newline
+        hit = False                       # the over-long line has a sensitive key
+        tail = b""
         with contextlib.suppress(Exception):
             for chunk in iter(lambda: pipe.read(8192), b""):
                 buf += chunk
                 while b"\n" in buf:
                     line, buf = buf.split(b"\n", 1)
                     if skipping:
-                        skipping = False          # the rest of the long line ends here; never shown
+                        hit = hit or self._key_in(tail + line)
+                        self.red.opaque("[long line dropped]\n", hit)
+                        skipping, hit, tail = False, False, b""
+                        continue
+                    if len(line) + 1 > self.MAX_LINE:
+                        self.red.opaque("[long line dropped]\n", self._key_in(line))
                         continue
                     self._add(line + b"\n")
                 if len(buf) > self.MAX_LINE:
-                    if not skipping:
-                        self._add(b"x" * (self.MAX_LINE + 1))      # the "[long line dropped]" marker
+                    hit = hit or self._key_in(tail + buf)
+                    tail = buf[-256:]            # a key cut by the chunk boundary is still found
                     skipping = True
                     buf = b""
-        if buf and not skipping:
+        if skipping:
+            self.red.opaque("[long line dropped]\n", hit or self._key_in(tail + buf))
+        elif buf:
             self._add(buf)
+
+    @staticmethod
+    def _key_in(b: bytes) -> bool:
+        t = b.decode("utf-8", "replace")
+        return bool(_SECRET_PATTERNS[0].search(t) or _SECRET_PATTERNS[1].search(t))
 
     def text(self) -> str:
         self.th.join(timeout=5)
-        return "".join(self.out)[-self.keep:]
+        return self.red.text()[-self.keep:]
 
 
 def _write_private(path: Path, text: str):
