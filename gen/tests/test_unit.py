@@ -200,6 +200,28 @@ def test_reference_worse_than_naive_is_flagged():
     assert th["status"] == "ref_worse_than_naive" and th["ref_worse_than_naive"] == ["hidden_rmse"], th
 
 
+def test_resource_metric_slower_than_naive_is_not_ref_worse():
+    """e2e-prod-20261109 (phase unwrapping): accurate reference 0.58 s vs a trivial naive 0.40 s on the hidden runtime
+    metric -> was ref_worse_than_naive -> S8 x2 -> dropped.  A resource metric does not trigger it; quality metrics do."""
+    from tbsgen.spec import is_resource_metric
+    cfg = load_config()
+    spec = {"metrics": [{"name": "hidden_frac_correct", "direction": ">="},
+                        {"name": "hidden_mae", "direction": "<="},
+                        {"name": "hidden_runtime_sec", "direction": "<="},
+                        {"name": "peak_rss", "direction": "<=", "kind": "resource"}]}
+    meas = {"ref": {"0": {"hidden_frac_correct": 0.96, "hidden_mae": 0.20, "hidden_runtime_sec": 0.58, "peak_rss": 900}},
+            "mid": {"0": {"hidden_frac_correct": 0.79, "hidden_mae": 1.35, "hidden_runtime_sec": 0.66, "peak_rss": 800}},
+            "naive": {"0": {"hidden_frac_correct": 0.82, "hidden_mae": 1.17, "hidden_runtime_sec": 0.40,
+                            "peak_rss": 100}}}
+    th = set_thresholds(spec, meas, cfg)
+    assert th["ref_worse_than_naive"] == [] and th["status"] != "ref_worse_than_naive", th
+    meas["ref"]["0"]["hidden_mae"] = 1.50                                       # a quality metric still counts
+    assert set_thresholds(spec, meas, cfg)["ref_worse_than_naive"] == ["hidden_mae"]
+    assert [is_resource_metric({"name": n}) for n in
+            ("hidden_runtime_per_spectrum", "wall_time", "elapsed_s", "peak_mem_mb", "membrane_err", "second_moment",
+             "hidden_rmse", "runtime")] == [True, True, True, True, False, False, False, True]
+
+
 @pytest.mark.parametrize("d,ref,naive", [("<=", 1.04, 1.15), (">=", 0.96, 0.85)])
 def test_naive_cap_survives_rounding(d, ref, naive):
     """Review #9: ref=mid=1.04, naive=1.15 -> floor 1.144 used to round to 1.2 and let naive pass."""
