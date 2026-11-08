@@ -658,3 +658,36 @@ def test_login_handoff_that_turns_into_a_challenge_cools_on_timeout(tmp_path, mo
     out, _ = _call(bd, "1", "handoff_status").communicate(timeout=60)
     assert "timed out" in out, out
     assert led.cooling("chrome:10.1080")
+
+
+def test_unpolled_login_handoff_cools_the_publisher(tmp_path, monkeypatch):
+    """Round 11: every hand-off that is not cleared cools the publisher - also a login hand-off whose page
+    turned into a verification page without a poll seeing it"""
+    bd, led = _batch(tmp_path, monkeypatch, ["10.1080/a.1"], handoff_enabled=True, handoff_wait_s=1.0)
+    (tmp_path / "ego").write_text(POLL_CHALLENGE_EGO.replace("{py}", sys.executable))
+    _call(bd, "1", "open", "https://pub.example/a").communicate(timeout=60)
+    assert json.loads((bd / "papers" / "1.json").read_text())["handoff_kind"] == "login"
+    time.sleep(1.5)
+    out, _ = _call(bd, "1", "handoff_status").communicate(timeout=60)
+    assert "timed out" in out, out
+    assert json.loads((bd / "papers" / "1.json").read_text())["closed"].startswith("login_required")
+    assert led.cooling("chrome:10.1080")
+
+
+def test_handoff_status_without_a_handoff_runs_nothing_and_polls_are_budgeted(tmp_path, monkeypatch):
+    """Round 11: handoff_status without an open hand-off never starts the browser script; polls of an open
+    hand-off have their own budget"""
+    bd, led = _batch(tmp_path, monkeypatch, ["10.1080/a.1"], max_calls_per_paper=2, handoff_enabled=True,
+                     handoff_wait_s=300)
+    for _ in range(3):
+        out, _ = _call(bd, "1", "handoff_status").communicate(timeout=60)
+        assert "no hand-off is open" in out, out
+    assert not (tmp_path / "ego.log").exists() or not _ego_actions(tmp_path)
+    log = tmp_path / "polls.log"
+    (tmp_path / "ego").write_text(POLL_CHALLENGE_EGO.replace("{py}", sys.executable).replace(
+        "inp = json.loads", f"open({str(log)!r}, 'a').write('x\\n')\ninp = json.loads"))
+    _call(bd, "1", "open", "https://pub.example/a").communicate(timeout=60)
+    for _ in range(4):
+        out, _ = _call(bd, "1", "handoff_status").communicate(timeout=60)
+    assert "poll limit" in out, out
+    assert len(log.read_text().splitlines()) == 1 + 2            # the open + two polls, nothing more

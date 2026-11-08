@@ -53,7 +53,9 @@ function cleanUrl(u) {
   try { const x = new URL(u); return /^(https?|ftp|wss?):$/.test(x.protocol) ? x.origin + x.pathname : x.protocol; }
   catch (e) { return "[url]"; }                      // unparseable (e.g. cut off): never echoed
 }
-const URL_IN = /\b[a-z][a-z0-9+.-]*:\/\/[^\s"'<>`]+/gi;
+// (a URL runs to the next whitespace / double quote / angle bracket: a location.href may legally carry ' and `
+// in its query or fragment, so those never end it - over-cleaning a quoted URL in a message is harmless)
+const URL_IN = /\b[a-z][a-z0-9+.-]*:\/\/[^\s"<>]+/gi;
 function scrub(v) {
   if (typeof v === "string") return v.replace(URL_IN, (m) => cleanUrl(m));
   if (Array.isArray(v)) return v.map(scrub);
@@ -127,7 +129,7 @@ function itemList(src) {
         href: t === "a" ? el.href : undefined,
         hidden: r.width < 1 || r.height < 1,
         widget: W.test([el.id, el.className && String(el.className), el.getAttribute("name"), el.getAttribute("aria-label")].join(" ")),
-        login: ((f) => !!f && ([...(f.elements || [])].some((x) => (x.type || "").toLowerCase() === "password") || !!f.querySelector("input[type=password]")))(el.form || form),
+        login: ((f) => !!f && ([...Object.getOwnPropertyDescriptor(HTMLFormElement.prototype, "elements").get.call(f)].some((x) => (x.getAttribute("type") || "").toLowerCase() === "password") || Element.prototype.querySelector.call(f, "input[type=password]") !== null))(el.form || form),
         form_action: form ? (form.getAttribute("action") || "") : "",
       };
     });
@@ -248,7 +250,7 @@ function credScan() {
     // a form whose action is a login endpoint, when any control of it is rendered (publisher pages carry hidden
     // header-login templates)
     for (const f of doc.querySelectorAll("form")) {
-      if (URLW.test(path(f.getAttribute("action") || "")) && [...(f.elements || [])].some((x) => (x.type || "") !== "hidden" && shown(x))) sem = true;
+      if (URLW.test(path(f.getAttribute("action") || "")) && [...Object.getOwnPropertyDescriptor(HTMLFormElement.prototype, "elements").get.call(f)].some((x) => (x.getAttribute("type") || "") !== "hidden" && shown(x))) sem = true;
     }
     for (const f of doc.querySelectorAll("iframe")) {
       let inner = null;
@@ -484,6 +486,12 @@ function domAct(walkSrc, k, allow, kind, expectUrl, scanSrc, infoSrc, chSrc) {
   if (!el) return { refused: "no such item; run look first" };
   const W = /captcha|turnstile|challenge|recaptcha|hcaptcha|verify|i am human|not a robot|cf-|px-|验证/i;
   const COOKIE = /^(accept|reject|allow all|reject all|agree|consent|dismiss|close|ok|got it|accept all|manage preferences|接受|拒绝|同意|全部接受|关闭|确定)/i;
+  // a form's own properties can be shadowed by its named controls (<input name=action>, name=elements ...):
+  // read them through the native getters only (round 11)
+  const FP = HTMLFormElement.prototype;
+  const fAction = (f) => Object.getOwnPropertyDescriptor(FP, "action").get.call(f);
+  const fElems = (f) => [...Object.getOwnPropertyDescriptor(FP, "elements").get.call(f)];
+  const fHasPw = (f) => Element.prototype.querySelector.call(f, "input[type=password]") !== null;
   const tag0 = el.tagName.toLowerCase();
   const btnInput = tag0 === "input" && ["submit", "button", "reset", "image"].includes((el.getAttribute("type") || "").toLowerCase());
   const isField = (tag0 === "input" && !btnInput) || tag0 === "textarea" || tag0 === "select";
@@ -495,7 +503,7 @@ function domAct(walkSrc, k, allow, kind, expectUrl, scanSrc, infoSrc, chSrc) {
   // role=button inside <button form="f"> submits form f)
   const actv = (el.closest && el.closest("button, input")) || el;
   const form = actv.form || el.form || (el.closest ? el.closest("form") : null);
-  const pwdForm = ((f) => !!f && ([...(f.elements || [])].some((x) => (x.type || "").toLowerCase() === "password") || !!f.querySelector("input[type=password]")));
+  const pwdForm = ((f) => !!f && (fElems(f).some((x) => (x.getAttribute("type") || "").toLowerCase() === "password") || fHasPw(f)));
   // nothing inside (or submitting) a form with a password field (also one associated by form="..."): login
   // forms are only ever submitted by the user
   if (pwdForm(form)) return { refused: "login form: credentials are not entered by this tool" };
@@ -505,7 +513,15 @@ function domAct(walkSrc, k, allow, kind, expectUrl, scanSrc, infoSrc, chSrc) {
   // autofilled identifier or need a choice only the user makes (WAYF, account choosers).  Only forms made of
   // buttons and hidden inputs (e.g. a "Download PDF" form) may be submitted.
   if (isField) return { refused: "form fields are not changed by this tool (an institution selection page is handed to the user; otherwise report login_required)" };
-  const editable = (f) => !!f && [...(f.elements || [])].some((x) => {
+  // a label activates its control: a click on (anything inside) a label of a field is a click on the field
+  const lab = el.closest && el.closest("label");
+  if (lab) {
+    const c = lab.control || lab.querySelector("input, select, textarea");
+    const ct = c ? c.tagName : "";
+    if (c && (ct === "SELECT" || ct === "TEXTAREA" || (ct === "INPUT" && !["submit", "button", "reset", "image"].includes((c.getAttribute("type") || "text").toLowerCase()))))
+      return { refused: "form fields are not changed by this tool (a label of a field)" };
+  }
+  const editable = (f) => !!f && fElems(f).some((x) => {
     const xt = x.tagName;
     if (xt === "TEXTAREA" || xt === "SELECT") return true;
     if (xt !== "INPUT") return false;
@@ -526,13 +542,15 @@ function domAct(walkSrc, k, allow, kind, expectUrl, scanSrc, infoSrc, chSrc) {
     // (button.formAction is the document URL when the button has no formaction attribute: use form.action then)
     const atag = actv.tagName.toLowerCase();
     const aBtn = atag === "button" || (atag === "input" && ["submit", "image"].includes((actv.getAttribute("type") || "").toLowerCase()));
-    if (form && aBtn && !ok((actv.hasAttribute("formaction") ? actv.formAction : "") || form.action || location.href)) return { refused: "form target is outside the allowed domains" };
-    if (form && !aBtn && !ok(form.action || location.href)) return { refused: "form target is outside the allowed domains" };
+    if (form && aBtn && !ok((actv.hasAttribute("formaction") ? actv.formAction : "") || fAction(form) || location.href)) return { refused: "form target is outside the allowed domains" };
+    if (form && !aBtn && !ok(fAction(form) || location.href)) return { refused: "form target is outside the allowed domains" };
     // the link a click really follows: the element or its enclosing <a href> (a span inside a link)
     const link = tag === "a" ? el : (el.closest && el.closest("a[href]"));
     if (link) {
       const h = link.getAttribute("href") || "";
-      if (!h.startsWith("#") && !/^javascript:/i.test(h) && !ok(link.href)) return { refused: "link target is outside the allowed domains" };
+      // every link but javascript: is checked by its browser-resolved target - also "#frag" (a <base href> can
+      // point it at another host)
+      if (!/^\s*javascript:/i.test(h) && !ok(link.href)) return { refused: "link target is outside the allowed domains" };
       // a new-tab link (top document or a frame): open its checked target in this page (no native click -
       // a native click lands on whatever is on top at that point)
       // (navigated here, in the checking evaluation - no later step)

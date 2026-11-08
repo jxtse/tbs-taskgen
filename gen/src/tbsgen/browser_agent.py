@@ -412,16 +412,17 @@ def _handoff_start(ho: dict) -> float:
 
 
 def _expire_handoff(st: dict, led, n: str, ps: dict, force: bool = False) -> str | None:
-    """Close paper `n` when its hand-off has run out (or, with `force`, at the end of the batch).  A challenge
-    hand-off that the user did not clear cools the publisher.  Returns the closed reason, else None."""
+    """Close paper `n` when its hand-off has run out (or, with `force`, at the end of the batch).  EVERY hand-off
+    that the user did not clear - challenge, login, MFA or institution selection, whatever the last poll saw -
+    closes the paper and cools the publisher (round 11).  Returns the closed reason, else None."""
     if not ps.get("handoff") or (not force and time.time() <= float(ps.get("handoff_deadline") or 0)):
         return None
     ps.pop("handoff", None)
+    if ps.get("lkey"):
+        _cool_publisher(led, ps, st["papers"][n]["doi"], "hand-off not cleared", float(st["challenge_cooldown_s"]))
     if (ps.get("handoff_kind") or "challenge") == "challenge":
         ps["closed"] = "challenge (hand-off not cleared)"
         ps["challenge"] = "hand-off not cleared"
-        if ps.get("lkey"):
-            _cool_publisher(led, ps, st["papers"][n]["doi"], "hand-off not cleared", float(st["challenge_cooldown_s"]))
     else:
         ps["closed"] = "login_required (hand-off not cleared)"
     ps["handoff_note"] = (ps.get("handoff_note") or "handoff") + " (not cleared)"
@@ -526,8 +527,15 @@ def _paper_call(bd: Path, st: dict, n: str, action: str, arg: str, say) -> int:
         return say(f"tbsgen: paper {n}: its last browser call failed - paper closed ({why}); move on.", 2)
     if ps.get("closed"):
         return say(f"tbsgen: paper {n} is closed ({ps['closed']}); move on", 2)
+    if action == "handoff_status" and not ps.get("handoff"):
+        # nothing is with the user: answered here, no browser call (round 11)
+        return say(f"tbsgen: paper {n}: no hand-off is open; continue with this paper or move on", 0)
     if action != "handoff_status" and ps.get("calls", 0) >= int(st["max_calls_per_paper"]):
         return say(f"tbsgen: paper {n}: call limit reached; give up on this paper", 2)
+    if action == "handoff_status" and ps.get("polls", 0) >= int(st["max_calls_per_paper"]):
+        # hand-off polls have a budget of their own (the hand-off still expires at its deadline)
+        return say(f"tbsgen: paper {n}: hand-off poll limit reached; work on other papers - the hand-off is "
+                   "closed when its time is up", 2)
     if time.time() >= float(st["deadline"]):
         return say("tbsgen: the batch deadline has passed; end now.", 3)
     pub, keys, web_hosts = publisher_of(p["doi"])
@@ -568,6 +576,8 @@ def _paper_call(bd: Path, st: dict, n: str, action: str, arg: str, say) -> int:
                    "and work on other papers meanwhile.", 2)
     if action != "handoff_status":
         ps["calls"] = ps.get("calls", 0) + 1
+    else:
+        ps["polls"] = ps.get("polls", 0) + 1
     # budgets shared by the batch's concurrent calls are reserved under one lock: navigation pacing per
     # publisher and the publisher's single hand-off
     with _locked(slock):

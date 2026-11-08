@@ -348,7 +348,9 @@ uv run tbsgen fetch --run runs/R --config config.toml --browser --wait-for-egres
     the page is handed to you instead (macOS notification, optional local `handoff.bark_cmd`); the agent works on
     other papers and polls `handoff_status` for up to `handoff.wait_s` (120 s). One hand-off per paper and per
     publisher per batch; a hand-off that is not cleared in time (also when the agent stops polling, and at the
-    end of the batch) closes the paper and cools the publisher. With hand-off off (the default), a verification
+    end of the batch) closes the paper and cools the publisher - a login / institution-selection hand-off too.
+    `handoff_status` without an open hand-off is answered by the wrapper (no browser call); polls of an open
+    hand-off are limited to the per-paper call budget. With hand-off off (the default), a verification
     page cools the publisher at once.
   - a tool call that started and returned no valid result (timeout, stop, crash, lost output) may have handed
     the page over before its output was lost: it is booked as a hand-off that was not cleared (paper closed,

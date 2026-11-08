@@ -217,6 +217,15 @@ def _pages(port, port2):
                                    b'<button>Get PDF</button></form></body></html>'),
         "/wayf-links": ("text/html", b'<html><head><title>Article access</title></head><body><h2>Select your institution</h2>'
                                      b'<a href="/other">Nanjing University</a></body></html>'),
+        # round 11: a label of a checkbox, a form whose `action` property is shadowed by a control, a fragment
+        # link resolved against an off-site <base href>
+        "/label-chk": ("text/html", b'<html><head><title>Article</title></head><body><input id="c" type="checkbox">'
+                                    b'<label for="c"><span role="button" id="lb">Download</span></label></body></html>'),
+        "/shadow-action": ("text/html", b'<html><head><title>Article</title></head><body><form method="get" '
+                                        b'action="https://denied.example/collect"><input type="hidden" name="action" value="x">'
+                                        b'<button id="sb">Get PDF</button></form></body></html>'),
+        "/base-frag": ("text/html", b'<html><head><title>Article</title><base href="https://denied.example/article">'
+                                    b'</head><body><a href="#pdf" id="fl">Download PDF</a></body></html>'),
         "/wayf-form": ("text/html", b'<html><head><title>Find your institution</title></head><body><form method="post" '
                                     b'action="/logged"><input type="search" name="q" aria-label="Search for your institution">'
                                     b'<button>Find</button></form></body></html>'),
@@ -911,5 +920,24 @@ def test_round10_selects(origins):
         assert r2["status"] == "refused" and "input field" in r2["error"], r2
         r = _run(sp, "look", handoff=False)
         assert not r["page"]["url"].endswith("/logged"), r
+    finally:
+        _finish(sp)
+
+
+def test_round11_label_shadowed_action_base_fragment_and_url_scrub(origins):
+    sp = "tbsgen-test-r11-b"
+    try:
+        for path, label in (("/label-chk", "Download"), ("/shadow-action", "Get PDF"), ("/base-frag", "Download PDF")):
+            assert _run(sp, "open", origins[0] + path, handoff=False)["status"] == "ok", path
+            r = _run(sp, "look", handoff=False)
+            r2 = _run(sp, "click", str(_item(r, label)["i"]), look_key=r["look_key"], handoff=False)
+            assert r2["status"] == "refused", (path, r2)
+            r = _run(sp, "look", handoff=False)
+            assert r["page"]["url"].endswith(path), (path, r)
+        # a token in a fragment with quotes / backticks never comes back
+        r = _run(sp, "open", origins[0] + "/other#code='SECRETFRAG'&x=`SECRETTICK`", handoff=False)
+        r2 = _run(sp, "look", handoff=False)
+        for x in (r, r2):
+            assert "SECRETFRAG" not in json.dumps(x) and "SECRETTICK" not in json.dumps(x), x
     finally:
         _finish(sp)
