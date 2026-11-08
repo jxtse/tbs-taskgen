@@ -56,10 +56,15 @@ const hostIn = (u, domains) => {
   let h, pr;
   try { const x = new URL(u); pr = x.protocol; h = x.hostname.toLowerCase(); } catch (e) { return false; }
   // HTTPS only, except loopback hosts and *.localhost (local tests); real SSO login domains are never local
-  // (exact loopback names only: "127.0.0.1.example.org" is a public host)
-  if (pr !== "https:" && h !== "127.0.0.1" && h !== "localhost" && h !== "[::1]" && !h.endsWith(".localhost")) return false;
+  // HTTPS only.  INPUT.sso.local_test (set only by the local test suite, never by the batch wrapper) admits
+  // exact loopback names; "127.0.0.1.example.org" is a public host either way
+  const local = h === "127.0.0.1" || h === "localhost" || h.endsWith(".localhost");
+  if (pr !== "https:" && !(local && INPUT.sso && INPUT.sso.local_test === true)) return false;
   return domains.some((d) => h === d || h.endsWith("." + d));
 };
+
+// a URL as reported back to the agent from login pages: no query or fragment (they can carry tokens)
+const bareUrl = (u) => { try { const x = new URL(u); return x.origin + x.pathname; } catch (e) { return ""; } };
 
 // ---------- page / item enumeration -----------------------------------------------------------
 async function currentPage(task) {
@@ -139,12 +144,13 @@ async function items(page, scope) {
         href: t === "a" ? el.href : undefined,
         hidden: r.width < 1 || r.height < 1,
         widget: W.test([el.id, el.className && String(el.className), el.getAttribute("name"), el.getAttribute("aria-label")].join(" ")),
-        login: !!((el.form || form) && (el.form || form).querySelector("input[type=password]")),
+        login: ((f) => !!f && ([...(f.elements || [])].some((x) => (x.type || "").toLowerCase() === "password") || !!f.querySelector("input[type=password]")))(el.form || form),
         form_action: form ? (form.getAttribute("action") || "") : "",
       };
     });
   }, domWalk.toString()).catch(() => []);
   let snap = "";
+  if (dom.some((d) => d.login)) return dom;           // login page: no raw snapshot (it could hold field texts)
   if (scope === "full") snap = await page.snapshot({ scope: "full_page" }).then(String).catch(() => "");
   else if (scope && scope.startsWith("@")) snap = await page.snapshot({ scope: "subtree", root: scope }).then(String).catch(() => "");
   else snap = await page.snapshot().then(String).catch(() => "");
@@ -194,8 +200,25 @@ async function credPage(page) {
       };
       walk(document);
       return found;
-    });
+    }) || await crossFrameFields(page);
   } catch (e) { return true; }
+}
+
+// Do cross-origin iframes (unreadable from the page) contain form fields?  Read from the ego snapshot (it
+// reaches them); no snapshot -> unknown -> true.  Field texts of the snapshot are never returned.
+async function crossFrameFields(page) {
+  const snap = await page.snapshot({ scope: "full_page" }).then(String).catch(() => null);
+  if (snap === null) return true;
+  const lines = snap.split("\n");
+  const stack = [];
+  for (const ln of lines) {
+    if (!ln.trim()) continue;
+    const ind = ln.length - ln.trimStart().length;
+    while (stack.length && stack[stack.length - 1] >= ind) stack.pop();
+    if (/^\s*iframe \[ref=/.test(ln)) { stack.push(ind); continue; }
+    if (stack.length && /^\s*(textbox|combobox|searchbox)\b/.test(ln)) return true;
+  }
+  return false;
 }
 const isChallenge = (i) => i.challenge || CHALLENGE.test(i.title) || (/^\s*$/.test(i.title) && CHALLENGE.test(i.text.slice(0, 300)));
 
@@ -245,15 +268,23 @@ async function withDownload(task, page, act) {
     w = page.waitForEvent("download", { timeout: Math.max(500, left) }).catch(() => null);
   }
   await p;
-  if (dl) {
-    let u = "";
-    try { u = dl.url(); } catch (e) {}
-    if (u && !u.startsWith("blob:") && !u.startsWith("data:") && !hostOk(u)) { out.note = "download from a host outside the allowed domains ignored"; return; }
-    const f = fileName();
-    await dl.saveAs(f);
-    if (await savedIsChallenge(f)) { out.blocked = "downloaded bot-wall page"; (await import("node:fs/promises")).unlink(f).catch(() => {}); return; }
-    out.files.push(f);
+  try {
+    if (dl) {
+      let u = "";
+      try { u = dl.url(); } catch (e) {}
+      if (u && !u.startsWith("blob:") && !u.startsWith("data:") && !hostOk(u)) { out.note = "download from a host outside the allowed domains ignored"; return; }
+      const f = fileName();
+      await dl.saveAs(f);
+      if (await savedIsChallenge(f)) { out.blocked = "downloaded bot-wall page"; (await import("node:fs/promises")).unlink(f).catch(() => {}); return; }
+      out.files.push(f);
+    }
+  } finally {
+    await closeForeignTabs(task, tabsBefore);
   }
+}
+
+// new tabs the action opened (never the user's): reported; those outside the allowed domains are closed
+async function closeForeignTabs(task, tabsBefore) {
   const tabs = await task.tabs().catch(() => []);
   const newTabs = tabs.filter((t) => !tabsBefore.has(t.label));
   if (newTabs.length) {
@@ -367,15 +398,26 @@ function domAct(walkSrc, k, allow, kind, value) {
     || el.getAttribute("placeholder") || el.title || "").trim().slice(0, 80);
   if (W.test([el.id, el.className && String(el.className), el.getAttribute("name"), el.getAttribute("aria-label")].join(" "))) return { refused: "verification widget: do not interact" };
   const form = el.form || (el.closest ? el.closest("form") : null);
-  // nothing inside (or submitting) a form with a password field: only sso_login submits login forms
-  if (form && form.querySelector("input[type=password]")) return { refused: "login form: credentials are not entered by this tool" };
+  const pwdForm = ((f) => !!f && ([...(f.elements || [])].some((x) => (x.type || "").toLowerCase() === "password") || !!f.querySelector("input[type=password]")));
+  // nothing inside (or submitting) a form with a password field (also one associated by form="..."): only
+  // sso_login submits login forms
+  if (pwdForm(form)) return { refused: "login form: credentials are not entered by this tool" };
+  if (el.closest && el.closest(".cf-turnstile, .g-recaptcha, .h-captcha, #challenge-form, #px-captcha, [id*=captcha], [class*=captcha]")) return { refused: "verification widget: do not interact" };
+  if (kind === "click" && W.test(text)) return { refused: "verification widget: do not interact" };
   const tag = el.tagName.toLowerCase();
   if (kind === "click") {
     if (tag === "input" && (el.getAttribute("type") || "").toLowerCase() === "password") return { refused: "password field: do not interact" };
-    if (form && !ok(form.getAttribute("action") || location.href)) return { refused: "form target is outside the allowed domains" };
+    // the browser-resolved targets (respects <base href> and form= / formaction)
+    if (form && (tag === "button" || btnInput) && !ok(el.formAction || form.action || location.href)) return { refused: "form target is outside the allowed domains" };
+    if (form && !(tag === "button" || btnInput) && !ok(form.action || location.href)) return { refused: "form target is outside the allowed domains" };
     if (tag === "a") {
       const h = el.getAttribute("href") || "";
       if (!h.startsWith("#") && !/^javascript:/i.test(h) && !ok(el.href)) return { refused: "link target is outside the allowed domains" };
+      if (el.getAttribute("target") === "_blank" && pair[1] > 0) {
+        // a new-tab link inside a frame: frame-local coordinates are useless at the top level; open its
+        // (checked) target in this page instead
+        return { open: el.href, text: text };
+      }
       if (el.getAttribute("target") === "_blank") {
         // a synthetic el.click() does NOT open target=_blank in a new tab - the native mouse click does.
         // Return the coordinates: the caller clicks with native input (the publisher's new tab is tracked).
@@ -386,7 +428,7 @@ function domAct(walkSrc, k, allow, kind, value) {
         el.removeAttribute("target");                     // hidden new-tab link: open it in this Page
       }
     }
-    if (el.getAttribute("formaction") && !ok(el.getAttribute("formaction"))) return { refused: "form target is outside the allowed domains" };
+    if (el.getAttribute("formaction") && !ok(el.formAction || el.getAttribute("formaction"))) return { refused: "form target is outside the allowed domains" };
     el.click();
     return { clicked: text };
   }
@@ -409,7 +451,7 @@ function domAct(walkSrc, k, allow, kind, value) {
     if (!["text", "search", "textarea", ""].includes(t)) return { refused: "not a plain text field" };
     const idn = [el.id, el.getAttribute("name"), el.getAttribute("autocomplete"), el.getAttribute("placeholder"), el.getAttribute("aria-label")].join(" ");
     if (/pass|pwd|user|account|login|email|otp|verif|code|验证码|密码|账号|用户名/i.test(idn)) return { refused: "this field can hold credentials; typing is not allowed" };
-    if (el.closest("form") && el.closest("form").querySelector("input[type=password]")) return { refused: "login form: typing is not allowed" };
+    if (pwdForm(el.form || el.closest("form"))) return { refused: "login form: typing is not allowed" };
     const set = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(el), "value");
     if (set && set.set) set.set.call(el, value); else el.value = value;
     el.dispatchEvent(new Event("input", { bubbles: true }));
@@ -426,7 +468,14 @@ async function snapClickCheck(page, item) {
   if (isChallenge(i)) return "verification page: do not interact";
   if (WIDGET.test(item.text || "")) return "verification widget: do not interact";
   if (item.kind === "link" && item.href && !hostOk(item.href)) return "link target is outside the allowed domains";
-  if (i.login_form || await credPage(page)) return "login page: items inside frames are not clicked there";
+  if (i.login_form || await credPage(page)) return "login page / form in a frame: items inside frames are not clicked there";
+  if (item.kind !== "link") {
+    // a control inside a cross-origin frame: its own target cannot be read, so every cross-origin frame of the
+    // page must come from an allowed host
+    const srcs = await page.evaluate(() => [...document.querySelectorAll("iframe")].map((f) => {
+      try { if (f.contentDocument) return null; } catch (e) {} return f.src || ""; }).filter((x) => x !== null)).catch(() => null);
+    if (!srcs || srcs.some((u) => !u || !hostOk(u))) return "a control inside a frame from a host outside the allowed domains";
+  }
   return null;
 }
 
@@ -438,7 +487,9 @@ async function act(task, page, kind, k, value) {
   const all = await items(page, INPUT.look_scope || "");
   if (!(k >= 0) || k >= all.length) { out.status = "refused"; out.error = "no such item; run look first"; return; }
   const it = all[k];
-  if (it.widget || (kind !== "click" && WIDGET.test(it.text || ""))) { out.status = "refused"; out.error = "verification widget: do not interact"; return; }
+  const ip = await info(page);
+  if (isChallenge(ip)) { out.status = "refused"; out.error = "verification page: do not interact"; await postCheck(task, page, ip); return; }
+  if (it.widget || WIDGET.test(it.text || "")) { out.status = "refused"; out.error = "verification widget: do not interact"; return; }
   if (kind === "click" && it.login) { out.status = "refused"; out.error = "login form: credentials are not entered by this tool (report login_required)"; return; }
   if (kind === "type" && (it.src || "dom") !== "dom") { out.status = "refused"; out.error = "typing is only allowed into fields of the page itself"; return; }
   const isDom = (it.src || "dom") === "dom";        // domWalk items carry no src field
@@ -451,6 +502,9 @@ async function act(task, page, kind, k, value) {
       await withDownload(task, page, async () => {
         const r = await domRun();
         if (r && r.refused) { out.status = "refused"; out.error = r.refused; }
+        else if (r && r.open) {
+          await page.goto(r.open, { timeout: INPUT.nav_timeout_ms, waitUntil: "domcontentloaded" });
+        }
         else if (r && r.newtab && r.center) {
           // a target=_blank link: click with native input so the publisher's new tab really opens
           await page.mouse.click(r.center[0], r.center[1]).catch(() => {});
@@ -509,65 +563,79 @@ async function act(task, page, kind, k, value) {
 
 async function ssoLogin(task, page) {
   const sso = INPUT.sso || {};
-  out.sso_submitted = false;                         // set to true right before the login button is clicked
+  const localTest = sso.local_test === true;          // only the local test suite sets this; never the wrapper
+  // sso_stage "pre": nothing was submitted (the wrapper may return the reserved submission).  It switches to
+  // "submit" BEFORE the login button is pressed, so any error or navigation from then on counts as submitted.
+  out.sso_submitted = false;
+  out.sso_stage = "pre";
   if (!sso.login || !(sso.domains || []).length) { out.status = "refused"; out.error = "sso_login is not enabled for this batch (or its budget is used up); report login_required"; return; }
   const i = await info(page);
   if (!hostIn(i.url, sso.domains)) { out.status = "refused"; out.error = "sso_login is only allowed on the configured institution SSO login domains (HTTPS)"; return; }
   const h = (() => { try { return new URL(i.url).hostname; } catch (e) { return ""; } })();
   out.sso_host = h;
-  // only the LENGTH of the two fields is read, to see whether the browser autofilled them; never the values
-  const read = () => page.evaluate(() => {
+  // Autofill is detected with the browser's own :autofill state of the two fields (no value is read).  Only
+  // in the local test mode a non-empty field (a page-provided stand-in) also counts.
+  const read = () => page.evaluate((lt) => {
+    const af = (el) => { try { return el.matches(":autofill") || el.matches(":-webkit-autofill"); } catch (e) { return false; } };
     const pwd = document.querySelector("form input[type=password]") || document.querySelector("input[type=password]");
     if (!pwd) return { hasPwd: false };
     const form = pwd.form || pwd.closest("form") || document;
     const user = form.querySelector("input[autocomplete=username], input[type=text], input[type=email], input:not([type])");
     const mfa = !!form.querySelector("input[autocomplete='one-time-code'], input[name*=otp], input[name*='sms'], iframe[src*='captcha'], .g-recaptcha, .h-captcha, .cf-turnstile")
       || /验证码|短信|动态码|一次性|one[- ]time|verification code/i.test((document.body && document.body.innerText || "").slice(0, 2000));
-    return { hasPwd: true, hasUser: !!user, mfa: mfa, pwFilled: pwd.value.length > 0, userFilled: !!user && user.value.length > 0 };
-  }).catch(() => ({ hasPwd: false }));
+    const filled = (el) => af(el) || (lt && el.value.length > 0);
+    return { hasPwd: true, hasUser: !!user, mfa: mfa, pwFilled: filled(pwd), userFilled: !!user && filled(user) };
+  }, localTest).catch(() => ({ hasPwd: false }));
   let st = await read();
   if (st.mfa) return handoff(task, page, "MFA / verification code on the SSO login page", h, "mfa", i.title);
   if (!st.hasPwd || !st.hasUser) return handoff(task, page, "not a recognizable SSO login form", h, "login", i.title);
   if (!st.pwFilled || !st.userFilled) {
-    // some Chromium versions autofill only after the field was focused once
-    await page.evaluate(() => {
+    // some Chromium versions autofill only after the user field was clicked once (a click, never typing)
+    const c = await page.evaluate(() => {
       const pwd = document.querySelector("form input[type=password]") || document.querySelector("input[type=password]");
       const form = (pwd && (pwd.form || pwd.closest("form"))) || document;
       const user = form.querySelector("input[autocomplete=username], input[type=text], input[type=email], input:not([type])");
-      if (user) { user.focus(); user.click(); }
-    }).catch(() => {});
+      if (!user) return null;
+      const r = user.getBoundingClientRect();
+      return r.width >= 1 ? [Math.round(r.left + r.width / 2), Math.round(r.top + r.height / 2)] : null;
+    }).catch(() => null);
+    if (c) await page.mouse.click(c[0], c[1]).catch(() => {});
     await sleep(2000);
     st = await read();
     if (st.mfa) return handoff(task, page, "MFA / verification code on the SSO login page", h, "mfa", i.title);
     if (!st.pwFilled || !st.userFilled) return handoff(task, page, "the browser did not autofill the login form", h, "login", i.title);
   }
-  // submit with the browser's autofilled values (never read here).  In the same page evaluation: the page is
-  // still on an HTTPS configured SSO host, and the form / button target is one too - credentials never go
-  // anywhere else.
-  let sub = null;
-  await withDownload(task, page, async () => {
-    sub = await page.evaluate(([domains]) => {
-      const inDom = (u) => { try { const x = new URL(u, location.href); const hh = x.hostname.toLowerCase();
-        const local = hh === "127.0.0.1" || hh === "localhost" || hh.endsWith(".localhost");
-        if (x.protocol !== "https:" && !local) return false;
-        return domains.some((d) => hh === d || hh.endsWith("." + d)); } catch (e) { return false; } };
-      if (!inDom(location.href)) return { refused: "the page left the SSO login domain" };
-      const pwd = document.querySelector("form input[type=password]") || document.querySelector("input[type=password]");
-      const form = pwd && (pwd.form || pwd.closest("form"));
-      if (!form) return { refused: "no login form" };
-      const b = form.querySelector("input[type=submit], button[type=submit]")
-        || [...form.querySelectorAll("button")].find((x) => /log ?in|sign ?in|登录|登陆|submit/i.test((x.innerText || "")));
-      if (!b) return { refused: "no submit button on the login form" };
-      const target = (b.getAttribute("formaction") || form.getAttribute("action") || location.href);
-      if (!inDom(target)) return { refused: "the login form posts outside the SSO login domains" };
-      b.click();
-      return { submitted: true };
-    }, [sso.domains]).catch((e) => ({ refused: "submit failed: " + String(e).slice(0, 80) }));
-  });
-  if (!sub || !sub.submitted) {
-    out.status = "refused"; out.error = (sub && sub.refused) || "not submitted"; return;
-  }
-  out.sso_submitted = true;
+  // Check, in one page evaluation: the page is still on an HTTPS configured SSO host, the form posts (method
+  // POST - never GET, which would put the credentials into a URL) to the browser-resolved target (form.action /
+  // button.formAction; <base href> included) on such a host.  Then press the button with a native click (the
+  // browser releases autofilled values to the page on a real user gesture only).
+  const chk = await page.evaluate(([domains, lt]) => {
+    const inDom = (u) => { try { const x = new URL(u); const hh = x.hostname.toLowerCase();
+      const local = hh === "127.0.0.1" || hh === "localhost" || hh.endsWith(".localhost");
+      if (x.protocol !== "https:" && !(local && lt)) return false;
+      return domains.some((d) => hh === d || hh.endsWith("." + d)); } catch (e) { return false; } };
+    if (!inDom(location.href)) return { refused: "the page left the SSO login domain" };
+    const pwd = document.querySelector("form input[type=password]") || document.querySelector("input[type=password]");
+    const form = pwd && (pwd.form || pwd.closest("form"));
+    if (!form) return { refused: "no login form" };
+    const b = [...form.elements].find((x) => (x.type || "").toLowerCase() === "submit" && !x.disabled)
+      || [...form.querySelectorAll("button")].find((x) => /log ?in|sign ?in|登录|登陆|submit/i.test((x.innerText || "")));
+    if (!b) return { refused: "no submit button on the login form" };
+    const target = (b.hasAttribute("formaction") ? b.formAction : "") || form.action || location.href;
+    const method = ((b.hasAttribute("formmethod") ? b.formMethod : "") || form.method || "get").toLowerCase();
+    if (method !== "post") return { refused: "the login form does not use POST" };
+    if (!inDom(target)) return { refused: "the login form posts outside the SSO login domains" };
+    b.scrollIntoView({ block: "center" });
+    const r = b.getBoundingClientRect();
+    if (r.width < 1 || r.height < 1) return { refused: "the login button is not visible" };
+    const cx = Math.round(r.left + r.width / 2), cy = Math.round(r.top + r.height / 2);
+    if (document.elementFromPoint(cx, cy) !== b && !b.contains(document.elementFromPoint(cx, cy))) return { refused: "the login button is covered" };
+    return { center: [cx, cy] };
+  }, [sso.domains, localTest]).catch((e) => ({ refused: "the login form could not be checked: " + String(e).slice(0, 80) }));
+  if (!chk || !chk.center) { out.status = "refused"; out.error = (chk && chk.refused) || "not submitted"; return; }
+  out.sso_stage = "submit";
+  out.sso_submitted = true;                          // from here on the outcome counts as a submission
+  await withDownload(task, page, () => page.mouse.click(chk.center[0], chk.center[1]));
   // wait for the login page to go away (never resubmit; a failure ends the logins of this batch)
   const t0 = Date.now();
   for (;;) {
@@ -579,12 +647,12 @@ async function ssoLogin(task, page) {
     if (!st2.hasPwd) {
       const i3 = await after(page);                  // the landed page must be an allowed / SSO host
       if (out.left_allowed) { out.sso = "fail"; out.status = "ok"; return; }
-      out.sso = "ok"; out.page = { url: i3.url, title: i3.title, pdf: /pdf/i.test(i3.ctype) }; out.status = "ok"; return;
+      out.sso = "ok"; out.page = { url: bareUrl(i3.url), title: i3.title, pdf: /pdf/i.test(i3.ctype) }; out.status = "ok"; return;
     }
     if (Date.now() - t0 > (sso.wait_ms || 35000)) break;
   }
   out.sso = "fail";                                   // still on the login page: failed, never retried
-  out.page = { url: i.url, title: i.title, login_form: true };
+  out.page = { url: bareUrl(i.url), title: i.title, login_form: true };
   out.status = "ok";
 }
 
@@ -644,14 +712,15 @@ try {
           if (el.tagName === "INPUT" && (el.getAttribute("type") || "").toLowerCase() === "password") return { refused: "password field: do not interact" };
           if (el.tagName === "IFRAME" || el.tagName === "FRAME") return { refused: "a point inside a frame cannot be checked; use click on a look item" };
           const form = el.form || el.closest("form");
-          if (form && form.querySelector("input[type=password]")) return { refused: "login form: credentials are not entered by this tool" };
+          if (((f) => !!f && ([...(f.elements || [])].some((x) => (x.type || "").toLowerCase() === "password") || !!f.querySelector("input[type=password]")))(form)) return { refused: "login form: credentials are not entered by this tool" };
           const ok = (u) => { try { const x = new URL(u, location.href); if (!/^https?:$/.test(x.protocol)) return false;
             const h = x.hostname.toLowerCase(); return allow.some((d) => h === d || h.endsWith("." + d)); } catch (e) { return false; } };
           const a = el.closest("a[href]");
           if (a) { const h = a.getAttribute("href") || ""; if (!h.startsWith("#") && !/^javascript:/i.test(h) && !ok(a.href)) return { refused: "link target is outside the allowed domains" }; }
-          if (form && !ok(form.getAttribute("action") || location.href)) return { refused: "form target is outside the allowed domains" };
-          const fa = el.closest("[formaction]");
-          if (fa && !ok(fa.getAttribute("formaction"))) return { refused: "form target is outside the allowed domains" };
+          if (form && !ok(form.action || location.href)) return { refused: "form target is outside the allowed domains" };
+          const fa = el.closest("button, input");
+          if (fa && fa.formAction && fa.form && !ok(fa.formAction)) return { refused: "form target is outside the allowed domains" };
+          if (W.test(((el.innerText || "") + " " + (el.getAttribute("aria-label") || "")).slice(0, 200))) return { refused: "verification widget: do not interact" };
           return { ok: true };
         }, [parts[0], parts[1], INPUT.allow]).catch(() => null);
         if (!pre) { out.status = "refused"; out.error = "the point could not be checked; use click on a look item"; }
@@ -681,6 +750,12 @@ try {
       }
       out.scroll = { from: before.sy || 0, to: afterI.sy || 0 };
       out.status = "ok";
+      if ((afterI.url || "") && before.url && afterI.url !== before.url) {   // scrolling triggered a navigation
+        out.navigated = true;
+        const i = await after(page);
+        if (!out.blocked && !out.left_allowed) await postCheck(task, page, i);
+        if (out.status !== "handoff") out.status = "ok";
+      }
     } else if (INPUT.action === "screenshot") {
       const i = await info(page);
       if (!i.url || i.login_form || await credPage(page)) { out.status = "refused"; out.error = "the page has (or may have) credential fields; screenshots are disabled on login pages"; }
@@ -791,6 +866,11 @@ try {
               out.handoff_left_s = Math.round(left / 1000);
             } else {
               out.handoff_check = "cleared";
+              if (i.url && !i.url.startsWith("about:") && !hostOk(i.url)) {   // never resume on a foreign page
+                await page2.goto("about:blank", { timeout: 5000 }).catch(() => {});
+                out.left_allowed = (() => { try { return new URL(i.url).hostname; } catch (e) { return ""; } })();
+                out.page = { url: "about:blank", title: "" };
+              }
             }
             out.status = "ok";
           }

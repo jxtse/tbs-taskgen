@@ -321,7 +321,9 @@ uv run tbsgen fetch --run runs/R --config config.toml --browser --wait-for-egres
     institution / WAYF domains) are opened or clicked; `type` only types the strings in
     `agent.institution_names`, never into a field that can hold credentials;
   - field values are never read: `look` lists field types and labels only, and `screenshot` is refused on pages
-    with a password field. The agent may view its own screenshots (`vision_analyze`, batch directory only);
+    with credential fields (also in frames, or when a cross-origin frame has form fields or the page cannot be
+    checked); field contents are masked in screenshots. The agent may view its own screenshots
+    (`vision_analyze`, batch directory only);
   - verification pages (Cloudflare / Turnstile, captchas, sliders) are never solved. With `browser.handoff.enabled`
     the page is handed to you instead (macOS notification, optional local `handoff.bark_cmd`); the agent works on
     other papers and polls `handoff_status` for up to `handoff.wait_s` (120 s). One hand-off per paper and per
@@ -344,10 +346,10 @@ uv run tbsgen fetch --run runs/R --config config.toml --browser --wait-for-egres
 - Institution sign-in (`browser.sso_login`, off by default). Enable it only on the machine whose browser profile
   has the institution account saved. `tbsgen-browser N sso_login` works only on a page of an HTTPS domain in
   `sso_login.domains` (your institution's own login server, e.g. reached through CARSI / WAYF). It relies on
-  the browser's password manager: it checks that Chromium autofilled the user and password fields (by the length
-  of their values; the values are never read, returned or logged) and clicks the login button. No credential is
-  ever typed, configured or stored by tbsgen. The login button is clicked only if the page and the form's target
-  are both on an HTTPS `sso_login.domains` host. No autofill, a captcha / slider / SMS or other MFA code, or a
+  the browser's password manager: it checks the browser's own autofill state (`:autofill`) of the user and
+  password fields (their values are never read, returned or logged) and presses the login button with a real
+  click. No credential is ever typed, configured or stored by tbsgen. The button is pressed only if the page and
+  the browser-resolved form target are both on an HTTPS `sso_login.domains` host and the form uses POST. No autofill, a captcha / slider / SMS or other MFA code, or a
   login that does not leave the login page is handed to you (with hand-off on) or reported as
   `login_required`. A submission is counted before the click; any outcome other than a clear success (failure,
   timeout, error, MFA after the click) ends the automatic logins of the batch, and a batch submits at most
@@ -436,10 +438,10 @@ Research code under active development.
 **Tests** (run by [GitHub Actions CI](.github/workflows/ci.yml) on every push to `main` and every pull request)
 
 - `retrieval/`: 47 offline unit tests that replay recorded API responses.
-- `gen/`: 255 tests: 226 offline unit tests (18 for the Jev screen, 6 for the S2 publisher blocklist and 149 for
+- `gen/`: 264 tests: 234 offline unit tests (18 for the Jev screen, 6 for the S2 publisher blocklist and 157 for
   the S3 full-text channels and browser batches, using recorded and scripted responses and fake `ego-browser` /
   `hermes` executables; no network, no real browser or model), 16 integration tests that run task code in
-  Docker, and 13 live tests of the browser agent's action script against local pages in a real ego-browser
+  Docker, and 14 live tests of the browser agent's action script against local pages in a real ego-browser
   (no website is contacted; skipped where ego-browser is not installed, as in CI). Locally the integration
   tests are skipped when Docker or the sandbox image is missing; CI builds the image and fails if any of them
   is skipped.

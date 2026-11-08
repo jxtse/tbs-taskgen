@@ -171,7 +171,7 @@ allow_submit = false
 | `fulltext.browser.*` | 关闭；并发 2；验证页等 40 秒 | ego-browser 通道；S3 只入队，`tbsgen fetch` 执行；同一出版商间隔 60–120 秒，不点击任何验证 |
 | `fulltext.browser.batch` / `.agent` | 窗口 600 s、余量 60 s；agent 关闭；每篇 ≤25 次工具调用、≤12 次页面加载，同出版商两次加载间隔 ≥2.5 s | `tbsgen fetch --browser [--wait-for-egress]`：出口门控的限时批次；agent 为 Hermes CLI，每篇独立 TaskSpace，唯一工具 `tbsgen-browser`（look/open/click/click_xy/hover/scroll/select/type/screenshot/tabs/switch/back/wait_for/save_pdf/sso_login/handoff_status/finish）；`type` 只允许 `agent.institution_names` 里的机构名；agent 的 stderr 尾部（凭据样式字符串打码）写入批次目录 `agent-stderr.log` 和 `agent_end` 日志 |
 | `fulltext.browser.handoff` | 关闭；等 120 s | 验证页（Cloudflare/Turnstile/验证码/滑块）与非机构登录页交给本机用户处理（macOS 通知，可选本地 `bark_cmd`），agent 从不自己过验证；每篇、每出版商每批最多 1 次，超时则冷却该出版商 |
-| `fulltext.browser.sso` / `.sso_login` | 域名为空；登录关闭；每批 ≤2 次提交 | `sso.domains`：机构/WAYF 域，加入每篇的可访问域。`sso_login`：只在 `sso_login.domains` 内的 HTTPS 机构登录页上，**只用浏览器自动填充**并点登录；代码与 agent 都不读取、输入或记录凭据（只看输入框值长度是否 >0）；无自动填充、验证码/短信/MFA、登录失败一律交给用户，失败不重试；账本只记时间、域名和结果 |
+| `fulltext.browser.sso` / `.sso_login` | 域名为空；登录关闭；每批 ≤2 次提交 | `sso.domains`：机构/WAYF 域，加入每篇的可访问域。`sso_login`：只在 `sso_login.domains` 内的 HTTPS 机构登录页上，**只用浏览器自动填充**并点登录；代码与 agent 都不读取、输入或记录凭据（只看浏览器自身的 `:autofill` 状态；表单须 POST 到 HTTPS 机构登录域）；无自动填充、验证码/短信/MFA、登录失败一律交给用户，失败不重试；账本只记时间、域名和结果 |
 | `fulltext.remote` | 关闭 | HTTP 通道（oa/elsevier/wiley/inst）经 ssh 在 `host` 上运行；远端须开启 egress_check |
 | `package.dockerfile_mode` | selfcontained | Dockerfile 里用 pip 安装固定版本；`local_base` 只用于本机检查 |
 
@@ -190,7 +190,7 @@ hard 和 unstable 保留。reward=1 一律算通过，即使之后报了 API 错
 
 **已验证（实际跑过）**
 
-- 测试：gen 共 255 个（226 个离线单测，含 S3 全文通道与浏览器批次的 149 个；16 个在 Docker 里执行任务代码的集成测试；13 个用本机真实 ego-browser 打本地测试页的动作脚本 live 测试，CI 上无 ego-browser 时跳过），每次推送由 GitHub Actions CI 运行。
+- 测试：gen 共 264 个（234 个离线单测，含 S3 全文通道与浏览器批次的 157 个；16 个在 Docker 里执行任务代码的集成测试；14 个用本机真实 ego-browser 打本地测试页的动作脚本 live 测试，CI 上无 ego-browser 时跳过），每次推送由 GitHub Actions CI 运行。
 - 集成测试覆盖的情况：断点续跑（中途停止，换新进程继续，已完成阶段不重复调用模型）；预算上限触发暂停，`resume` 后继续；quota 错误触发熔断并暂停；参考解崩溃 → S8 修复 → 恢复；注入泄漏 → L2 阻塞 → 修复后通过；修不好 → 2 轮后丢弃；S6A 截断续写；mid 不可区分时 S6M 只重写 mid；真值隔离探针；筛选丢弃；取不到全文 → 暂存。
 - fake 模型端到端干跑：人造条目走完 S1→S9，再用模拟的校准结果走到 S10。
 - 打包出的 Harbor 任务：用本机 Docker 实际跑 Harbor，oracle reward=1，nop reward=0（`tbsgen harbor-local`，Dockerfile 换成本地基础镜像）。

@@ -181,6 +181,10 @@ if inp.get("action") == "sso_login":
         out = {"status": "refused", "error": "not enabled", "sso_submitted": False}
     elif mode == "sso_crash":
         print("crashed before the result line"); sys.exit(0)
+    elif mode == "sso_click_error":       # the click navigated and the evaluation died: unknown, not refundable
+        out = {"status": "error", "error": "context destroyed", "sso_submitted": True, "sso_stage": "submit"}
+    elif mode == "sso_pre_refused":       # refused before anything was clicked: refundable
+        out = {"status": "refused", "error": "no login form", "sso_submitted": False, "sso_stage": "pre"}
     else:
         out = {"status": "ok", "sso": "fail", "sso_submitted": True, "sso_host": "sso.example"}
 elif inp.get("action") == "open" and mode == "handoff":
@@ -329,3 +333,93 @@ def test_allowed_commands_reach_the_wrapper_unchanged_through_a_real_shell(tmp_p
         assert json.loads(r.stdout) == shlex.split(c)[1:], (c, r.stdout)
     for c in ["tbsgen-browser 1 wait_for sel #pdf", "tbsgen-browser 1 wait_for url *", "tbsgen-browser 1 type 4 a'b"]:
         assert browser_agent.shell_allowed(c), c
+
+
+def test_sso_click_that_errors_counts_and_only_pre_submit_refusals_refund(tmp_path, monkeypatch):
+    bd, _ = _batch(tmp_path, monkeypatch, ["10.1080/a.1", "10.1093/b.2", "10.1287/c.3"])
+    _call(bd, "1", "sso_login", env={"FAKE_EGO_MODE": "sso_pre_refused"}).communicate(timeout=60)
+    s = json.loads((bd / "state.json").read_text())["sso"]
+    assert s["submissions"] == 0 and not s.get("failed")          # nothing was submitted: refunded
+    _call(bd, "2", "sso_login", env={"FAKE_EGO_MODE": "sso_click_error"}).communicate(timeout=60)
+    _call(bd, "3", "sso_login").communicate(timeout=60)
+    ssos = [e for e in _ego_actions(tmp_path) if e["action"] == "sso_login"]
+    assert [e["sso_login"] for e in ssos] == [True, True, False]
+    s = json.loads((bd / "state.json").read_text())["sso"]
+    assert s["submissions"] == 1 and s["failed"]
+
+
+def test_hover_is_reserved_as_a_navigation(tmp_path, monkeypatch):
+    bd, _ = _batch(tmp_path, monkeypatch, ["10.1080/a.1"], max_navigations_per_paper=1, sso_login_enabled=False)
+    _call(bd, "1", "hover", "3").communicate(timeout=60)
+    out, _ = _call(bd, "1", "hover", "3").communicate(timeout=60)
+    assert "navigation limit" in out
+    assert len([e for e in _ego_actions(tmp_path) if e["action"] == "hover"]) == 1
+
+
+def test_challenge_handoff_expiry_cools_even_with_earlier_files(tmp_path, monkeypatch):
+    bd, led = _batch(tmp_path, monkeypatch, ["10.1080/a.1"], handoff_enabled=True, sso_login_enabled=False)
+    _call(bd, "1", "open", "https://pub.example/a", env={"FAKE_EGO_MODE": "handoff"}).communicate(timeout=60)
+    sp = bd / "papers" / "1.json"
+    ps = json.loads(sp.read_text())
+    ps["accepted"] = [str(bd / "files" / "1" / "x.bin")]
+    sp.write_text(json.dumps(ps))
+    browser_agent._sweep_handoffs(bd, json.loads((bd / "batch.json").read_text()), led, force=True)
+    assert led.cooling("chrome:10.1080")
+
+
+def test_stop_during_the_navigation_wait_cancels_the_call(tmp_path, monkeypatch):
+    bd, _ = _batch(tmp_path, monkeypatch, ["10.1080/a.1", "10.1080/b.2"], nav_gap_s=30.0, sso_login_enabled=False)
+    _call(bd, "1", "open", "https://pub.example/a").communicate(timeout=60)
+    p = _call(bd, "2", "open", "https://pub.example/b")             # waits ~30 s for the publisher's slot
+    time.sleep(1.5)
+    (bd / "STOP").write_text("egress lost")
+    out, _ = p.communicate(timeout=20)
+    assert "STOP" in out
+    assert len([e for e in _ego_actions(tmp_path) if e["action"] == "open"]) == 1
+
+
+def test_redaction_of_json_headers_cookies_and_long_logs(tmp_path):
+    txt = ('{"Authorization": "Basic dXNlcjpwYXNz"}\nCookie: csrf=x; sid=SIDSECRET; other=y\n'
+           '"password": "with space"\n')
+    r = browser_agent.redact(txt)
+    for secret in ("dXNlcjpwYXNz", "SIDSECRET", "with space"):
+        assert secret not in r, (secret, r)
+    # a secret near the truncation point is never left without its key
+    p = tmp_path / "err.log"
+    head = "password=" + "Q" * 40 + "\n"
+    p.write_text("x" * 10 + "\n" + head + "y" * (browser_agent.STDERR_KEEP - 20) + "\n")
+    assert "QQQQ" not in browser_agent._stderr_tail(p)
+
+
+def test_stderr_pipe_tail_is_redacted_line_by_line():
+    import io
+    data = ("noise\n" * 5000 + "token=TOPSECRET123\nlast\n").encode()
+    tail = browser_agent._StderrTail(io.BytesIO(data), keep=200).text()
+    assert "TOPSECRET123" not in tail and tail.endswith("last\n") and len(tail) <= 200
+
+
+def test_agent_runner_crash_still_cleans_up(tmp_path, monkeypatch):
+    _user_home(tmp_path, monkeypatch)
+    f, led, pr, _ = mk_agent(tmp_path, monkeypatch, queue={"10.1080": 1}, agent={"keep_batch_dir": True},
+                             handoff={"enabled": True})
+
+    def boom(argv, env, timeout, on_event, stop):
+        raise RuntimeError("runner crashed")
+    with pytest.raises(RuntimeError):
+        browser_agent.run_batch(f, prober=pr, sleep=lambda s: None, log=lambda m: None, hermes_runner=boom)
+    assert (_bd(f) / "STOP").exists()
+
+
+CAPTURE_EGO = r"""#!{py}
+import json, re, sys
+open("{out}", "w").write(re.match(r"const INPUT = (\{.*?\});\n", sys.argv[2]).group(1))
+print("TBSGEN_RESULT " + json.dumps({"status": "ok", "sso_submitted": False, "sso_stage": "pre"}))
+"""
+
+
+def test_wrapper_never_enables_the_local_sso_test_mode(tmp_path, monkeypatch):
+    bd, _ = _batch(tmp_path, monkeypatch, ["10.1080/a.1"])
+    (tmp_path / "ego").write_text(CAPTURE_EGO.replace("{py}", sys.executable).replace("{out}", str(tmp_path / "inp.json")))
+    _call(bd, "1", "sso_login").communicate(timeout=60)
+    inp = json.loads((tmp_path / "inp.json").read_text())
+    assert inp["sso"]["login"] is True and "local_test" not in inp["sso"]

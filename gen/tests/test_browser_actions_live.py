@@ -102,6 +102,17 @@ def _pages(port, port2):
                                               extra="").encode()),
         # a WAYF select whose change handler jumps off the allowed domains
         "/jump": ("text/html", JUMP.encode()),
+        # login forms that must never be submitted by sso_login: GET method, <base href> to another host
+        "/sso-get": ("text/html", SSO.replace('method="post"', 'method="get"').format(action="/logged", user="u", pw="p", extra="").encode()),
+        "/sso-base": ("text/html", SSO.replace("<h1>", f'<base href="http://127.0.0.1:{port}/"><h1>').format(
+            action="logged", user="u", pw="p", extra="").encode()),
+        # a password field associated with an outside form by form="f"; its submit button outside the form
+        "/form-attr": ("text/html", b'<html><head><title>Form Attr</title></head><body><form id="f" method="post" action="/logged"></form>'
+                                    b'<input type="password" form="f" id="pw"><button form="f" id="go">Continue</button></body></html>'),
+        # a plain-text verification button, and a same-origin frame with a new-tab link
+        "/verify-btn": ("text/html", b'<html><head><title>Article</title></head><body><button id="b1">Verify you are human</button></body></html>'),
+        "/frame-blank": ("text/html", b'<html><head><title>Frame Blank</title></head><body><iframe src="/blank-inner" width="400" height="200"></iframe></body></html>'),
+        "/blank-inner": ("text/html", b'<html><body><a href="/other" target="_blank" id="nb">Open Other</a></body></html>'),
         # a login form inside a same-origin iframe
         "/frame-login": ("text/html", b'<html><head><title>Frame Login</title></head><body><h1>x</h1>'
                                       b'<iframe src="/sso" width="400" height="300"></iframe></body></html>'),
@@ -171,7 +182,7 @@ def _run(space, action, arg="", *, allow=("127.0.0.1", "localhost"), sso_domains
                nav_timeout_ms=20000, download_timeout_ms=30000, download_wait_ms=3000,
                challenge_wait_ms=challenge_wait_ms,
                handoff={"enabled": handoff}, sso={"login": sso_login, "domains": list(sso_domains),
-                                                  "wait_ms": 5000},
+                                                  "wait_ms": 5000, "local_test": True},
                type_allow=list(type_allow), handoff_state=handoff_state or {"active": False, "deadline_ms": 0})
     inp.update(over)
     # ego-browser nodejs drops the output of a stdin script whose space is with the user; a script
@@ -508,3 +519,34 @@ def test_look_on_login_pages_hands_off_only_outside_sso_domains(origins):
         assert r["status"] == "handoff" and "login" in r["handoff"]["reason"], r
     finally:
         _finish(sp)
+
+
+def test_round2_click_and_sso_guards(origins):
+    sp = "tbsgen-test-r2-guards"
+    try:
+        # a password field tied to a form by form="f": its outside submit button is never clicked
+        assert _run(sp, "open", origins[0] + "/form-attr", handoff=False)["status"] == "ok"
+        r = _run(sp, "look", handoff=False)
+        r = _run(sp, "click", str(_item(r, "Continue")["i"]), look_url=r["page"]["url"], handoff=False)
+        assert r["status"] == "refused" and "login form" in r["error"], r
+        # a plain "Verify you are human" button is never clicked
+        assert _run(sp, "open", origins[0] + "/verify-btn", handoff=False)["status"] == "ok"
+        r = _run(sp, "look", handoff=False)
+        r = _run(sp, "click", str(_item(r, "Verify you are human")["i"]), look_url=r["page"]["url"], handoff=False)
+        assert r["status"] == "refused" and "verification" in r["error"], r
+        # a new-tab link inside a same-origin frame opens its (checked) target in this page
+        assert _run(sp, "open", origins[0] + "/frame-blank", handoff=False)["status"] == "ok"
+        r = _run(sp, "look", handoff=False)
+        r = _run(sp, "click", str(_item(r, "Open Other")["i"]), look_url=r["page"]["url"], handoff=False)
+        assert r["status"] == "ok" and r["page"]["url"].endswith("/other"), r
+    finally:
+        _finish(sp)
+    for path, why in (("/sso-get", "POST"), ("/sso-base", "outside the SSO")):
+        sp = "tbsgen-test-r2-sso" + path.replace("/", "-")
+        try:
+            assert _run(sp, "open", origins[2] + path)["status"] == "ok"
+            r = _run(sp, "sso_login", sso_login=True)
+            assert r["status"] == "refused" and why in r["error"] and r["sso_submitted"] is False, r
+            assert r["sso_stage"] == "pre", r
+        finally:
+            _finish(sp)

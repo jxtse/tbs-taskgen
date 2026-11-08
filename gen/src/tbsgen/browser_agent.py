@@ -261,8 +261,8 @@ _TOOL_CMD = re.compile(rf"^tbsgen-browser (finish|[1-9]\d? ({_PAPER_ACTIONS}))$"
 _SLEEP_CMD = re.compile(r"^sleep ([1-9]\d?|[12]\d\d|300)$")
 DENY_TEXT = re.compile(r"sci-?hub|libgen|z-lib|annas-archive", re.I)
 # actions that can load a page of the publisher (paced per publisher and capped per paper)
-# (select / type can trigger a navigation from the page's change handlers; a hover that navigates is counted after)
-NAV_ACTIONS = frozenset({"open", "click", "click_xy", "back", "sso_login", "select", "type"})
+# (select / type / hover / scroll can trigger a navigation from the page's handlers: reserved and paced like one)
+NAV_ACTIONS = frozenset({"open", "click", "click_xy", "back", "sso_login", "select", "type", "hover", "scroll"})
 VISION_TOOL = "vision_analyze"
 
 
@@ -358,6 +358,8 @@ def _run_script(st: dict, inp: dict, timeout: float, bd: Path, honor_stop: bool 
     pipe never saw EOF and the call hung until its timeout (ego-browser also drops the output of a stdin
     script whose TaskSpace is with the user)."""
     script = "const INPUT = " + json.dumps(inp) + ";\n" + ACTION.read_text()
+    if honor_stop and (bd / "STOP").exists():
+        return {}, "stopped"
     proc = subprocess.Popen([st["ego_binary"], "nodejs", script], stdin=subprocess.DEVNULL,
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=browser_ego.child_env())
     t_end = time.time() + max(5.0, timeout)
@@ -385,10 +387,14 @@ def _finish_spaces(bd: Path, st: dict, spaces: list[str]) -> list[str]:
     when a hand-off is still open, then closes it)."""
     done = []
     for sp_name in spaces:
-        # the batch's STOP file must not cancel the clean-up itself (it is written before the spaces close)
-        r, _ = _run_script(st, dict(space=sp_name, action="finish", files_dir=str(bd / "files")), 90.0, bd,
-                           honor_stop=False)
-        done.append(f"{sp_name}:{r.get('status', 'error')}")
+        # the batch's STOP file must not cancel the clean-up itself (it is written before the spaces close);
+        # one space failing to close does not keep the others open
+        try:
+            r, _ = _run_script(st, dict(space=sp_name, action="finish", files_dir=str(bd / "files")), 90.0, bd,
+                               honor_stop=False)
+            done.append(f"{sp_name}:{r.get('status', 'error')}")
+        except Exception as e:                       # noqa: BLE001
+            done.append(f"{sp_name}:error {type(e).__name__}")
     return done
 
 
@@ -421,7 +427,7 @@ def _expire_handoff(st: dict, led, n: str, ps: dict, force: bool = False) -> str
     if (ps.get("handoff_kind") or "challenge") == "challenge":
         ps["closed"] = "challenge (hand-off not cleared)"
         ps["challenge"] = "hand-off not cleared"
-        if ps.get("lkey") and not ps.get("accepted"):
+        if ps.get("lkey"):
             _cool_publisher(led, ps, st["papers"][n]["doi"], "hand-off not cleared", float(st["challenge_cooldown_s"]))
     else:
         ps["closed"] = "login_required (hand-off not cleared)"
@@ -566,8 +572,22 @@ def _paper_call(bd: Path, st: dict, n: str, action: str, arg: str, say) -> int:
         _write_state(bd, state)
     _atomic(sp, json.dumps(ps))
     try:
-        if (wait := nav_at - time.time()) > 0:
-            time.sleep(wait)
+        # wait for the reserved navigation slot (cancellable), then re-check everything that may have changed
+        while (wait := nav_at - time.time()) > 0:
+            if (bd / "STOP").exists():
+                return say("tbsgen: STOP - the batch was stopped (egress changed or deadline). End now.", 3)
+            time.sleep(min(0.5, wait))
+        if (bd / "STOP").exists():
+            return say("tbsgen: STOP - the batch was stopped (egress changed or deadline). End now.", 3)
+        if time.time() >= float(st["deadline"]):
+            return say("tbsgen: the batch deadline has passed; end now.", 3)
+        if (msg := led.cooling(ps["lkey"], *aliases, *web_hosts)):
+            if sso_ok:
+                _sso_finalize(bd, slock, n, {"sso_submitted": False, "sso_stage": "pre"})
+            ps = json.loads(sp.read_text())
+            ps["closed"] = "publisher in cooldown"
+            _atomic(sp, json.dumps(ps))
+            return say(f"tbsgen: paper {n}: {msg[:120]}; move on", 2)
         return _paper_run(bd, st, n, p, ps, action, arg, say, led, pkey, space, handoff_free, sso_ok, slock,
                           COOLDOWN_429_S)
     finally:
@@ -588,7 +608,8 @@ def _sso_finalize(bd: Path, slock: Path, n: str, res: dict) -> str | None:
         if s.get("pending") != n:
             return None
         s.pop("pending", None)
-        if res and res.get("sso_submitted") is False:
+        # "sso_stage": "pre" is set by the script only on paths that end before the login button is touched
+        if res and res.get("sso_submitted") is False and res.get("sso_stage") == "pre":
             s["submissions"] = max(0, int(s.get("submissions") or 0) - 1)
             result = None
         else:
@@ -672,15 +693,6 @@ def _paper_run(bd, st, n, p, ps, action, arg, say, led, pkey, space, handoff_fre
         ps = save_ps()
         ps["accepted"] = sorted(set(ps.get("accepted") or []) | set(acc))
         _atomic(sp, json.dumps(ps))
-    if action == "hover" and res.get("navigated"):
-        # a hover that loaded a page counts as a page load (it could not be paced before)
-        ps = save_ps()
-        ps["navs"] = ps.get("navs", 0) + 1
-        _atomic(sp, json.dumps(ps))
-        with _locked(slock):
-            state = _read_state(bd)
-            state.setdefault("nav", {})[pkey] = time.time()
-            _write_state(bd, state)
     if action == "handoff_status":
         chk = res.get("handoff_check")
         if chk == "cleared":
@@ -746,10 +758,13 @@ STDERR_LOG_TAIL = 1500            # characters of it repeated in the agent_end l
 # credential-like text in the agent's stderr: whole auth headers, key=value / key: value pairs (also with spaces
 # inside a quoted value), URL userinfo and well-known token shapes
 _SECRET_PATTERNS = (
-    re.compile(r"(?i)\b((?:proxy-)?authorization\s*[:=]\s*)[^\r\n]*"),
-    re.compile(r"(?i)\b(bearer\s+)[^\s\"',;]+"),
-    re.compile(r"(?i)((?:api[_-]?key|access[_-]?token|refresh[_-]?token|token|secret|password|passwd|pwd|cookie|"
-               r"session|credential)s?[\"']?\s*[:=]\s*)(\"[^\"\r\n]*\"|'[^'\r\n]*'|[^\s,;]+)"),
+    # auth / cookie headers, also inside JSON ("Authorization": "Basic ...") - the whole rest of the value
+    re.compile(r"(?i)([\"']?(?:proxy-)?(?:authorization|cookie|set-cookie|x-api-key|api-key)[\"']?\s*[:=]\s*)"
+               r"(\"[^\"\r\n]*\"?|'[^'\r\n]*'?|[^\r\n]*)"),
+    re.compile(r"(?i)\b((?:bearer|basic)\s+)[A-Za-z0-9._~+/=\-]+"),
+    re.compile(r"(?i)([\"']?(?:api[_-]?key|access[_-]?token|refresh[_-]?token|id[_-]?token|token|secret|"
+               r"client[_-]?secret|password|passwd|pwd|session(?:id)?|sid|credentials?)[\"']?\s*[:=]\s*)"
+               r"(\"[^\"\r\n]*\"?|'[^'\r\n]*'?|[^\s,;&]+)"),
     re.compile(r"(?i)(\w+://)[^/\s:@]+:[^/\s@]+@"),
     re.compile(r"()\b(?:sk|pk|rk|ghp|gho|ghu|ghs|github_pat|xox[abprs]|glpat|hf)[-_][A-Za-z0-9_\-]{8,}"),
     re.compile(r"()\beyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{4,}"),     # JWT
@@ -764,25 +779,44 @@ def redact(text: str) -> str:
 
 
 class _StderrTail:
-    """Reads the agent's stderr pipe in a thread and keeps only its last `keep` bytes in memory; nothing
-    unredacted is ever written to disk."""
+    """Reads the agent's stderr pipe in a thread.  Every complete line is redacted as it arrives (before any
+    truncation, so a secret is never cut away from its key); only the last `keep` bytes of redacted text are
+    kept in memory.  A line longer than the limit is replaced by a marker.  Nothing unredacted reaches disk."""
+
+    MAX_LINE = 16 * 1024
 
     def __init__(self, pipe, keep: int = STDERR_KEEP):
-        self.buf = bytearray()
+        self.out: list[str] = []
+        self.size = 0
         self.keep = keep
         self.th = threading.Thread(target=self._read, args=(pipe,), daemon=True)
         self.th.start()
 
+    def _add(self, raw: bytes):
+        line = raw.decode("utf-8", "replace")
+        line = "[long line dropped]\n" if len(raw) > self.MAX_LINE else redact(line)
+        self.out.append(line)
+        self.size += len(line)
+        while self.size > self.keep and len(self.out) > 1:
+            self.size -= len(self.out.pop(0))
+
     def _read(self, pipe):
+        buf = b""
         with contextlib.suppress(Exception):
             for chunk in iter(lambda: pipe.read(8192), b""):
-                self.buf += chunk
-                if len(self.buf) > 2 * self.keep:
-                    del self.buf[:-self.keep]
+                buf += chunk
+                while b"\n" in buf:
+                    line, buf = buf.split(b"\n", 1)
+                    self._add(line + b"\n")
+                if len(buf) > self.MAX_LINE:
+                    self._add(buf)
+                    buf = b""
+        if buf:
+            self._add(buf)
 
     def text(self) -> str:
         self.th.join(timeout=5)
-        return redact(bytes(self.buf[-self.keep:]).decode("utf-8", "replace"))
+        return "".join(self.out)[-self.keep:]
 
 
 def _write_private(path: Path, text: str):
@@ -798,14 +832,14 @@ def _stderr_tail(path: Path | None, keep: int = STDERR_KEEP) -> str:
     if path is None:
         return ""
     try:
-        with open(path, "rb") as fh:
-            fh.seek(0, os.SEEK_END)
-            size = fh.tell()
-            fh.seek(max(0, size - keep))
-            data = fh.read()
+        data = path.read_bytes()
     except OSError:
         return ""
+    # redact the whole text first (a cut must never separate a secret from its key), then keep whole lines
     text = redact(data.decode("utf-8", "replace"))
+    if len(text) > keep:
+        text = text[-keep:]
+        text = text.split("\n", 1)[1] if "\n" in text else ""
     with contextlib.suppress(OSError):
         _write_private(path, text)
     return text
@@ -1414,16 +1448,20 @@ def _agent_phase(fetcher, todo: list[dict], deadline: float, bd: Path, wd: Watch
     with contextlib.suppress(TypeError, ValueError):
         if "stderr_path" in inspect.signature(runner).parameters:
             kw["stderr_path"] = err_path
-    rr = runner(argv, env, budget + float(ag.get("kill_grace_s", 20)), on_event, stop, **kw)
-    (bd / "STOP").write_text("agent run ended")       # a late tool call cannot book anything any more
-    # hand-offs still open (the agent stopped polling): close the papers, cool challenge publishers
-    with contextlib.suppress(Exception):
-        _sweep_handoffs(bd, st, led, force=True)
-    # the agent run is over: close the batch's TaskSpaces (a hand-off still open is taken back first)
-    closed_spaces = []
-    if fetcher.browser_runner is None and st.get("ego_binary"):
-        spaces = sorted(set(_read_state(bd).get("spaces") or []) | {agent_space(b)})
-        closed_spaces = _finish_spaces(bd, st, spaces)
+    rr: dict = {}
+    closed_spaces: list = []
+    try:
+        rr = runner(argv, env, budget + float(ag.get("kill_grace_s", 20)), on_event, stop, **kw)
+    finally:
+        # also when the runner raised / was interrupted: no late tool call can book anything any more, open
+        # hand-offs are closed (challenge publishers cooled) and the batch's TaskSpaces are closed
+        with contextlib.suppress(OSError):
+            (bd / "STOP").write_text("agent run ended")
+        with contextlib.suppress(Exception):
+            _sweep_handoffs(bd, st, led, force=True)
+        if fetcher.browser_runner is None and st.get("ego_binary"):
+            spaces = sorted(set(_read_state(bd).get("spaces") or []) | {agent_space(b)})
+            closed_spaces = _finish_spaces(bd, st, spaces)
     res = rr.get("result") or {}
     usage = dict(tokens=res.get("tokens"), duration_ms=res.get("duration_ms"), session_id=res.get("session_id"),
                  exit=rr.get("exit"), killed=rr.get("killed"), tool_calls=events["tool_calls"],
