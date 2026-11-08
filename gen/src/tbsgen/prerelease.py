@@ -153,6 +153,7 @@ def signals(candidate: dict, spec: dict | None) -> dict:
     return dict(repos=repos, names=names)
 
 
+_NAME_AT_URL = re.compile(r"([A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?)(?:\[[^\]]*\])?\s*@\s*(\S+)$")
 _REQ_NAME = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?")
 
 
@@ -162,11 +163,17 @@ def _spec_name(tok: str) -> list[str]:
     tok = tok.strip().strip("'\"")
     if not tok or tok.startswith("-"):
         return []
+    if (m := _NAME_AT_URL.match(tok)):                # PEP 508 `name[extra] @ url`, spaces around @ optional
+        return [m.group(1)] + [n for n in _spec_name(m.group(2)) if n != m.group(1)]
     out = []
     if (m := re.search(r"[#&]egg=([A-Za-z0-9._-]+)", tok)):
         out.append(m.group(1))
     url = re.sub(r"^[a-z]+\+", "", tok)
     if re.match(r"(https?|ssh|file)://", url) or re.match(r"[\w.-]+\.[a-z]{2,}/", url):
+        # a VCS ref (`repo.git@release/v1`) may contain "/": cut the path at its first "@" before naming
+        pre, _, rest = re.split(r"[#?]", url, maxsplit=1)[0].partition("://")
+        host_part, slash, path = (rest if pre else url).partition("/")
+        url = (pre + "://" if pre else "") + host_part + slash + path.split("@", 1)[0]
         out += [r["name"] for r in repo_names([url])]
         # always also the last path segment (any host): a direct archive (`.../DecayFit-1.2.tar.gz`, version and
         # #sha256= fragment removed) or a VCS repo (`.../DecayFit.git@v1` -> DecayFit)
@@ -195,9 +202,7 @@ def _req_names(text: str) -> list[str]:
         if (m := re.match(r"(-e|--editable)\s+(.+)", line)):
             out += _spec_name(m.group(2))
         elif not line.startswith("-"):
-            out += _spec_name(line.split(";")[0].split(" @ ")[-1] if " @ " in line else line.split(";")[0])
-            if " @ " in line:
-                out += _spec_name(line.split(" @ ")[0])
+            out += _spec_name(line.split(";")[0].strip())
     return out
 
 
