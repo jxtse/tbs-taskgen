@@ -744,6 +744,10 @@ def _paper_run(bd, st, n, p, ps, action, arg, say, led, pkey, space, handoff_fre
         _atomic(sp, json.dumps(ps))
     if action == "handoff_status":
         chk = res.get("handoff_check")
+        if res.get("handoff_kind_now") == "challenge" and ps.get("handoff_kind") != "challenge":
+            # a login hand-off that turned into a verification page: from now on booked as a challenge (a
+            # timeout cools the publisher)
+            ps = save_ps(handoff_kind="challenge")
         if chk == "cleared" and time.time() > float(ps.get("handoff_deadline") or 0):
             chk = "expired"                   # the deadline passed while the poll ran: not a clear
         if chk == "cleared":
@@ -913,7 +917,7 @@ class _Redactor:
         self.rec_lines += 1
         m = _SECRET_PATTERNS[0].search(body) or _SECRET_PATTERNS[1].search(body)
         if m:
-            if not self.sensitive and not body[m.end(1):].strip():
+            if not body[m.end(1):].strip():
                 # nothing after the key: the value (if any) follows on lines whose end no delimiter marks -
                 # everything after it is dropped (round 9), no guess at where a new record starts
                 self.unbounded = True

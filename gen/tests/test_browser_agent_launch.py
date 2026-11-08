@@ -624,3 +624,36 @@ def test_redaction_after_an_empty_sensitive_value_drops_the_rest():
     for txt in ("password:\nSECRET1\nSECRET2\nnext\n", "a\ntoken =\n  SECRET1\n  SECRET2\nnext\n"):
         for r in (browser_agent.redact(txt), browser_agent._StderrTail(io.BytesIO(txt.encode()), keep=4096).text()):
             assert "SECRET" not in r and "next" not in r and "rest of stderr dropped" in r, (txt, r)
+
+
+def test_redaction_empty_sensitive_value_inside_a_sensitive_record():
+    import io
+    # round 10: an empty-valued sensitive key on a continuation of an already sensitive record
+    txt = "password: FIRST\n  token:\nSECRET1\nSECRET2\n"
+    for r in (browser_agent.redact(txt), browser_agent._StderrTail(io.BytesIO(txt.encode()), keep=4096).text()):
+        assert "SECRET" not in r and "FIRST" not in r, r
+
+
+POLL_CHALLENGE_EGO = r"""#!{py}
+import json, re, sys
+inp = json.loads(re.match(r"const INPUT = (\{.*?\});\n", sys.argv[2]).group(1))
+if inp.get("action") == "open":
+    out = {"status": "handoff", "handoff": {"reason": "login form", "host": "pub.example", "kind": "login"}}
+else:
+    out = {"status": "ok", "handoff_check": "waiting", "handoff_left_s": 1, "handoff_kind_now": "challenge"}
+print("TBSGEN_RESULT " + json.dumps(out))
+"""
+
+
+def test_login_handoff_that_turns_into_a_challenge_cools_on_timeout(tmp_path, monkeypatch):
+    """Round 10: a login hand-off whose page became a verification page is booked as a challenge."""
+    bd, led = _batch(tmp_path, monkeypatch, ["10.1080/a.1"], handoff_enabled=True, handoff_wait_s=1.5)
+    (tmp_path / "ego").write_text(POLL_CHALLENGE_EGO.replace("{py}", sys.executable))
+    _call(bd, "1", "open", "https://pub.example/a").communicate(timeout=60)
+    assert json.loads((bd / "papers" / "1.json").read_text())["handoff_kind"] == "login"
+    _call(bd, "1", "handoff_status").communicate(timeout=60)
+    assert json.loads((bd / "papers" / "1.json").read_text())["handoff_kind"] == "challenge"
+    time.sleep(2)
+    out, _ = _call(bd, "1", "handoff_status").communicate(timeout=60)
+    assert "timed out" in out, out
+    assert led.cooling("chrome:10.1080")

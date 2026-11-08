@@ -192,6 +192,16 @@ function credScan() {
   const shown = (el) => { try { const v = el.ownerDocument.defaultView; return el.getClientRects().length > 0
     && v.getComputedStyle(el).visibility !== "hidden"; } catch (e) { return true; } };
   const path = (u) => { try { const x = new URL(u, location.href); return x.hostname + x.pathname; } catch (e) { return String(u || ""); } };
+  // the text of the labels really associated with a field (<label for>, a wrapping <label>, aria-labelledby)
+  const labelText = (el) => {
+    let t = "";
+    try { for (const l of el.labels || []) t += " " + (l.textContent || ""); } catch (e) {}
+    for (const id of (el.getAttribute("aria-labelledby") || "").split(/\s+/).filter(Boolean)) {
+      const l = el.ownerDocument.getElementById(id);
+      if (l) t += " " + (l.textContent || "");
+    }
+    return t.slice(0, 300);
+  };
   let fields = false, strong = false, sem = false, mfa = false, text = 0, loose = 0, looseBtn = false;
   const walk = (doc) => {
     for (const host of doc.querySelectorAll("*")) if (host.shadowRoot) walk(host.shadowRoot);
@@ -203,7 +213,7 @@ function credScan() {
       if (!el.form && !(el.closest && el.closest("form"))) loose++;     // a script-driven widget may read it
       const ac = el.getAttribute("autocomplete") || "";
       const meta = [el.id, el.getAttribute("name"), ac, el.getAttribute("placeholder"), el.getAttribute("aria-label"),
-                    el.getAttribute("inputmode")].join(" ");
+                    el.getAttribute("inputmode"), labelText(el)].join(" ");
       if (["password", "email", "tel"].includes(t) || AC.test(ac) || NAME.test(meta)) fields = true;
       // `strong`: unmistakable credential fields (these alone also decide the hand-off / its clearing)
       if (t === "password" || /\b(?:username|current-password|new-password|one-time-code)\b/i.test(ac)
@@ -215,7 +225,8 @@ function credScan() {
     for (const el of doc.querySelectorAll("select")) {
       if (!shown(el)) continue;
       const ac = el.getAttribute("autocomplete") || "";
-      const meta = [el.id, el.getAttribute("name"), ac, el.getAttribute("aria-label"), el.getAttribute("title")].join(" ");
+      const meta = [el.id, el.getAttribute("name"), ac, el.getAttribute("aria-label"), el.getAttribute("title"),
+                    labelText(el)].join(" ");
       if (AC.test(ac) || NAME.test(meta)) { fields = true; strong = true; }
     }
     for (const b of doc.querySelectorAll("button, input[type=submit], input[type=button], input[type=image], [role=button]")) {
@@ -448,7 +459,7 @@ async function look(task, page) {
 
 // The one evaluation that finds, checks and clicks / hovers / fills item k of the dom list.  `walk` is the
 // domWalk function itself; both run inside the page (ego's evaluate takes ONE argument, passed as an array).
-function domAct(walkSrc, k, allow, kind, value, expectUrl, scanSrc, infoSrc, chSrc) {
+function domAct(walkSrc, k, allow, kind, value, expectUrl, scanSrc, infoSrc, chSrc, names) {
   const ok = (u) => { try { const x = new URL(u, location.href); if (!/^https?:$/.test(x.protocol)) return false;
     const h = x.hostname.toLowerCase(); return allow.some((d) => h === d || h.endsWith("." + d)); } catch (e) { return false; } };
   // re-checked in the SAME evaluation that acts (the page may have changed since the Node-side checks): still
@@ -488,7 +499,10 @@ function domAct(walkSrc, k, allow, kind, value, expectUrl, scanSrc, infoSrc, chS
     const t = (x.getAttribute("type") || "text").toLowerCase();
     return !["hidden", "submit", "button", "reset", "image", "checkbox", "radio", "file", "range", "color"].includes(t);
   };
-  const untouched = (f) => !!f && [...(f.elements || [])].some((x) => freeText(x) && x.getAttribute("data-tbsgen-typed") !== "1");
+  // (round 10: a select counts too - it may be an account chooser; this tool only ever sets it to a
+  // whitelisted institution name)
+  const untouched = (f) => !!f && [...(f.elements || [])].some((x) => (freeText(x) || x.tagName === "SELECT")
+    && x !== el && x.getAttribute("data-tbsgen-typed") !== "1");
   if ((kind === "click" || kind === "select") && untouched(form)) return { refused: "form with a text field this tool did not fill: not submitted (report login_required, or type an institution name first)" };
   if (el.closest && el.closest(".cf-turnstile, .g-recaptcha, .h-captcha, #challenge-form, #px-captcha, [id*=captcha], [class*=captcha]")) return { refused: "verification widget: do not interact" };
   if (kind === "click" && W.test(text)) return { refused: "verification widget: do not interact" };
@@ -497,7 +511,8 @@ function domAct(walkSrc, k, allow, kind, value, expectUrl, scanSrc, infoSrc, chS
     // a frame (any origin): never acted on inside; `click` opens its (checked) URL as this page
     if (kind !== "click") return { refused: "frame items can only be clicked (opens the frame's page)" };
     if (!ok(el.src)) return { refused: "frame URL is outside the allowed domains" };
-    return { open: el.src, text: text };
+    location.assign(el.src);                                   // navigated here, in the checking evaluation
+    return { opened: el.src, text: text };
   }
   if (kind === "click") {
     if (tag === "input" && (el.getAttribute("type") || "").toLowerCase() === "password") return { refused: "password field: do not interact" };
@@ -514,12 +529,14 @@ function domAct(walkSrc, k, allow, kind, value, expectUrl, scanSrc, infoSrc, chS
       if (!h.startsWith("#") && !/^javascript:/i.test(h) && !ok(link.href)) return { refused: "link target is outside the allowed domains" };
       // a new-tab link (top document or a frame): open its checked target in this page (no native click -
       // a native click lands on whatever is on top at that point)
+      // (navigated here, in the checking evaluation - no later step)
       if ((link.getAttribute("target") || "").toLowerCase() === "_blank" && !h.startsWith("#") && !/^javascript:/i.test(h)) {
-        return { open: link.href, text: text };
+        location.assign(link.href);
+        return { opened: link.href, text: text };
       }
       // a named target window ("viewer"): also opened here (checked) instead of by a click
       const tg = (link.getAttribute("target") || "").trim();
-      if (tg && !/^_(self|top|parent)$/i.test(tg) && !h.startsWith("#") && !/^javascript:/i.test(h)) return { open: link.href, text: text };
+      if (tg && !/^_(self|top|parent)$/i.test(tg) && !h.startsWith("#") && !/^javascript:/i.test(h)) { location.assign(link.href); return { opened: link.href, text: text }; }
     }
     if ((el.hasAttribute("formaction") && !ok(el.formAction)) || (actv.hasAttribute("formaction") && !ok(actv.formAction))) return { refused: "form target is outside the allowed domains" };
     el.click();
@@ -542,7 +559,12 @@ function domAct(walkSrc, k, allow, kind, value, expectUrl, scanSrc, infoSrc, chS
     let opt = [...el.options].find((o) => o.value === value) || [...el.options].find((o) => o.label === value)
       || [...el.options].find((o) => o.label.toLowerCase() === String(value).toLowerCase());
     if (!opt) return { refused: "no such option" };
+    // NARROWED (round 10): only an option that IS a whitelisted institution name (WAYF lists); anything else
+    // (an account chooser, whatever its labels say) is never changed
+    const nm = (x) => String(x || "").trim().toLowerCase();
+    if (!(names || []).some((n) => nm(n) === nm(opt.label) || nm(n) === nm(opt.text))) return { refused: "only an institution name from the configured list may be selected" };
     el.value = opt.value;
+    el.setAttribute("data-tbsgen-typed", "1");               // set by this tool: its form may be submitted
     el.dispatchEvent(new Event("input", { bubbles: true }));
     el.dispatchEvent(new Event("change", { bubbles: true }));
     return { selected: opt.label.slice(0, 80) };
@@ -583,21 +605,17 @@ async function act(task, page, kind, k, value) {
   }
   if (it.widget || WIDGET.test(it.text || "")) { out.status = "refused"; out.error = "verification widget: do not interact"; return; }
   if (kind === "click" && it.login) { out.status = "refused"; out.error = "login form: credentials are not entered by this tool (report login_required)"; return; }
-  const domRun = () => page.evaluate(([src, walk, k, allow, kind, value, u, scanSrc, infoSrc, chSrc]) => {   // ONE arg for ego
+  const domRun = () => page.evaluate(([src, walk, k, allow, kind, value, u, scanSrc, infoSrc, chSrc, names]) => {   // ONE arg for ego
     const f = new Function("return (" + src + ")")();        // domAct; walk is domWalk, both plain functions
-    return f(walk, k, allow, kind, value, u, scanSrc, infoSrc, chSrc);
+    return f(walk, k, allow, kind, value, u, scanSrc, infoSrc, chSrc, names);
   }, [domAct.toString(), domWalk.toString(), k, INPUT.allow, kind, value || "", seen, credScan.toString(),
-      pageInfo.toString(), CHALLENGE.source]);
+      pageInfo.toString(), CHALLENGE.source, INPUT.type_allow || []]);
   {
     if (kind === "click") {
       await withDownload(task, page, async () => {
-        const r = await domRun();
+        // (a navigation started inside the evaluation may end its context before it returns: navigated)
+        const r = await domRun().catch((e) => (/context|destroyed|navigat|detached/i.test(String(e)) ? { opened: "?" } : null));
         if (r && r.refused) { out.status = "refused"; out.error = r.refused; }
-        else if (r && r.open) {
-          // a checked new-tab link / cross-origin frame URL: a navigation of this page (no native click)
-          if (!hostOk(r.open)) { out.status = "refused"; out.error = "link target is outside the allowed domains"; }
-          else await page.goto(r.open, { timeout: INPUT.nav_timeout_ms, waitUntil: "domcontentloaded" });
-        }
         else if (!r) { out.status = "error"; out.error = "the page changed during the click (no result)"; }
       });
       if (out.status === "refused") return;
@@ -609,19 +627,18 @@ async function act(task, page, kind, k, value) {
       return;
     }
     if (kind === "hover") {
-      const r = await domRun().catch(() => null);
+      // like every other action: new tabs it opened are checked (outside the domains: closed), and the page is
+      // checked afterwards whether or not its URL changed (a login / verification overlay on the same URL)
+      let r = null;
+      await withDownload(task, page, async () => { r = await domRun().catch(() => null); await sleep(800); });
       if (r && r.refused) { out.status = "refused"; out.error = r.refused; return; }
       if (!r || r.hovered === undefined) { out.status = "error"; out.error = "hover failed (the page changed?)"; return; }
-      await sleep(800);
       out.acted = { kind: "hover", text: r.hovered || "" };
-      const i = await info(page);
-      if (i.url !== seen) {                              // a hover that navigated: checked like a click
-        out.navigated = true;
-        const i2 = await after(page);
-        if (!out.blocked && !out.left_allowed) await postCheck(task, page, i2);
-        if (out.status === "handoff") return;
-      }
-      out.status = "ok";
+      const i = await after(page);
+      if (i.url !== seen) out.navigated = true;
+      if (!out.blocked && !out.left_allowed) await postCheck(task, page, i);
+      out.page = { url: i.url, title: i.title, pdf: /pdf/i.test(i.ctype), login_form: i.login_form };
+      if (out.status !== "handoff") out.status = "ok";
       return;
     }
     // select / type: their change handlers may navigate - checked like a click (the wrapper counts and paces
@@ -772,7 +789,9 @@ try {
             out.page = { url: i.url, title: i.title, pdf: /pdf/i.test(i.ctype), login_form: i.login_form };
             // cleared only when no challenge, no login / MFA form is left on that page
             if (isChallenge(i) || i.login_form || await loginPage(page2)) {
-              // the user has not finished: hand the space back and keep waiting
+              // the user has not finished: hand the space back and keep waiting.  A verification page seen
+              // now is reported (the wrapper upgrades a login hand-off to a challenge: cooled on timeout)
+              if (isChallenge(i)) out.handoff_kind_now = "challenge";
               await task.handOff();
               out.handoff_check = "waiting";
               out.handoff_left_s = Math.round(left / 1000);

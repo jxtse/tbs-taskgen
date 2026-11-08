@@ -166,6 +166,16 @@ def _pages(port, port2):
         "/choose": ("text/html", b'<html><head><title>Choose an account</title></head><body><a href="/other">Other</a>'
                                  b'<form method="post" action="/logged"><select name="username" autocomplete="username">'
                                  b'<option>a</option><option>b</option></select><button>Go</button></form></body></html>'),
+        # round 10: an account chooser whose only hint is its associated <label>
+        "/choose-label": ("text/html", b'<html><head><title>Continue</title></head><body><a href="/other">Other</a>'
+                                       b'<form method="post" action="/logged"><label for="who">Username</label>'
+                                       b'<select id="who" name="subject"><option value="alice">Personal</option>'
+                                       b'<option value="bob">Work</option></select><button>Continue</button></form></body></html>'),
+        # a neutral select form (no login hint): only a whitelisted institution option may be set
+        "/plain-select": ("text/html", b'<html><head><title>Article</title></head><body><a href="/other">Other</a>'
+                                       b'<form method="post" action="/logged"><select name="inst"><option value="">-</option>'
+                                       b'<option value="x">Personal</option><option value="nju">Nanjing University</option></select>'
+                                       b'<button>Go</button></form></body></html>'),
         "/choose-plain": ("text/html", b'<html><head><title>Article</title></head><body><a href="/other">Other</a>'
                                        b'<select name="account"><option>a</option></select></body></html>'),
         "/verify-frame": ("text/html", b'<html><head><title>Article</title></head><body><a href="/other">Other</a>'
@@ -850,5 +860,34 @@ def test_round9_account_chooser_and_frames(origins):
         fr = next(x for x in r["page"]["items"] if x["kind"] == "frame")
         r = _run(sp, "click", str(fr["i"]), look_key=r["look_key"], handoff=False, challenge_wait_ms=1000)
         assert r.get("blocked") and "verification" in r["blocked"], r
+    finally:
+        _finish(sp)
+
+
+def test_round10_selects(origins):
+    sp = "tbsgen-test-r10"
+    try:
+        # an account chooser labelled only by an associated <label>: a login page
+        r = _run(sp, "open", origins[0] + "/choose-label", handoff=False)
+        assert r["status"] == "ok" and r["page"]["login_form"] is True, r
+        r = _run(sp, "look", handoff=False)
+        k = next(x for x in r["page"]["items"] if x.get("ftype") == "select")["i"]
+        r2 = _run(sp, "select", f"{k} Personal", look_key=r["look_key"], handoff=False)
+        assert r2["status"] == "refused", r2
+        r2 = _run(sp, "click", str(_item(r, "Continue")["i"]), look_key=r["look_key"], handoff=False)
+        assert r2["status"] == "refused", r2
+        # a neutral select: only a whitelisted institution name may be chosen; the form is submitted only
+        # after the tool set its select
+        assert _run(sp, "open", origins[0] + "/plain-select", handoff=False)["status"] == "ok"
+        r = _run(sp, "look", handoff=False)
+        k, go = next(x for x in r["page"]["items"] if x.get("ftype") == "select")["i"], _item(r, "Go")["i"]
+        r2 = _run(sp, "select", f"{k} Personal", look_key=r["look_key"], handoff=False)
+        assert r2["status"] == "refused" and "institution" in r2["error"], r2
+        r2 = _run(sp, "click", str(go), look_key=r["look_key"], handoff=False)
+        assert r2["status"] == "refused" and "did not fill" in r2["error"], r2
+        r2 = _run(sp, "select", f"{k} Nanjing University", look_key=r["look_key"], handoff=False)
+        assert r2["status"] == "ok", r2
+        r2 = _run(sp, "click", str(go), look_key=r["look_key"], handoff=False)
+        assert r2["status"] == "ok" and r2["page"]["url"].endswith("/logged"), r2
     finally:
         _finish(sp)

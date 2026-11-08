@@ -323,8 +323,9 @@ uv run tbsgen fetch --run runs/R --config config.toml --browser --wait-for-egres
   - only the paper's `allowed_domains` (its publisher, `doi.org`, known PDF CDNs and `browser.sso.domains`, the
     institution / WAYF domains) are opened or clicked (link and browser-resolved form targets are checked
     before the click; nothing inside a frame is acted on - `click` on a frame opens its checked URL as the page;
-    a page found outside the domains is reset before the next action); `type` only types the strings in
-    `agent.institution_names`, never into a field that can hold credentials;
+    a page found outside the domains is reset before the next action); `type` only types, and `select` only selects, the strings in
+    `agent.institution_names` (never into a field that can hold credentials); a form with a text field or a
+    select is only submitted after the tool filled every one of them;
   - field values are never read: `look` lists field types and labels only, and the browser's page snapshot (which
     carries field values) is never taken;
   - login pages are detected conservatively (top document, same-origin frames, open shadow roots): any rendered

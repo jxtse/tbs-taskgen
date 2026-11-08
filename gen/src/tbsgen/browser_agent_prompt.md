@@ -27,8 +27,9 @@ Use your terminal tool to run exactly one of these commands per call (nothing el
 - `tbsgen-browser N hover I` — hover item I of the page itself (opens "Download" dropdown menus; run `look`
   again afterwards to see the menu items). Dropdown items are already in the `look` list (hidden), so `click`
   them directly when hover does not help.
-- `tbsgen-browser N select I VALUE` — choose VALUE (option value or label) of select item I (institution
-  selection lists).
+- `tbsgen-browser N select I VALUE` — choose option VALUE of select item I. Only options that are one of
+  $type_names (institution selection lists); a form is only submitted after you set its selects and typed
+  into its text fields.
 - `tbsgen-browser N type I TEXT` — type TEXT into text item I. Only $type_names, nothing else; never into
   anything that can hold credentials.
 - `tbsgen-browser N tabs` — list the pages of the paper's browser workspace (a publisher may have opened a PDF
