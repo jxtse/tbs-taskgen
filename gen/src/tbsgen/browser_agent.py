@@ -811,6 +811,9 @@ _SECRET_PATTERNS = (
                r"password|passwd|pwd|session(?:id)?|sid|credentials?)(?:[\\\"'\s]|%2[27]|%5c|%20)*(?:[:=]|%3a|%3d)).*$"),
     re.compile(r"(?i)\b((?:bearer|basic)\s+).*$", re.M),
     re.compile(r"(?i)(\w+://)[^/\s:@]+:[^/\s@]+@"),
+    # every URL loses its query and fragment (OAuth / SAML / API callbacks: code, signature, ticket, key ...);
+    # ' and ` are legal URL characters, so only whitespace, " and <> end it (round 12)
+    re.compile(r"(?i)(\b[a-z][a-z0-9+.-]*://[^\s?#\"<>]*)[?#][^\s\"<>]*"),
     re.compile(r"()\b(?:sk|pk|rk|ghp|gho|ghu|ghs|github_pat|xox[abprs]|glpat|hf)[-_][A-Za-z0-9_\-]{8,}"),
     re.compile(r"()\beyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{4,}"),     # JWT
 )

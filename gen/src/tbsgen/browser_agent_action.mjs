@@ -113,7 +113,10 @@ function itemList(src) {
       const field = t === "input" || t === "select" || t === "textarea";
       const form = el.closest ? el.closest("form") : null;
       const r = el.getBoundingClientRect();
-      const itext = ((field ? "" : (el.innerText || el.value || ""))
+      // (a <button>'s value is never shown and may carry a token: only an input button's value - its visible
+      // label - is used; round 12)
+      const ibtn = t === "input" && ["submit", "button", "reset"].includes((el.getAttribute("type") || "").toLowerCase());
+      const itext = ((field && !ibtn ? "" : (el.innerText || (ibtn ? el.value : "") || ""))
         + " " + (el.getAttribute("aria-label") || el.getAttribute("placeholder") || "")).trim().slice(0, 80);
       if (t === "iframe") {
         return { frame: frame, tag: t, kind: "frame", ftype: "", text: (el.getAttribute("title") || el.name || "iframe").slice(0, 80),
@@ -514,13 +517,9 @@ function domAct(walkSrc, k, allow, kind, expectUrl, scanSrc, infoSrc, chSrc) {
   // buttons and hidden inputs (e.g. a "Download PDF" form) may be submitted.
   if (isField) return { refused: "form fields are not changed by this tool (an institution selection page is handed to the user; otherwise report login_required)" };
   // a label activates its control: a click on (anything inside) a label of a field is a click on the field
-  const lab = el.closest && el.closest("label");
-  if (lab) {
-    const c = lab.control || lab.querySelector("input, select, textarea");
-    const ct = c ? c.tagName : "";
-    if (c && (ct === "SELECT" || ct === "TEXTAREA" || (ct === "INPUT" && !["submit", "button", "reset", "image"].includes((c.getAttribute("type") || "text").toLowerCase()))))
-      return { refused: "form fields are not changed by this tool (a label of a field)" };
-  }
+  // (round 12: every click inside any <label> is refused - a label can also activate a submit / reset button
+  // of a form elsewhere, around every form check)
+  if (el.closest && el.closest("label")) return { refused: "labels are not clicked by this tool (they activate form controls)" };
   const editable = (f) => !!f && fElems(f).some((x) => {
     const xt = x.tagName;
     if (xt === "TEXTAREA" || xt === "SELECT") return true;

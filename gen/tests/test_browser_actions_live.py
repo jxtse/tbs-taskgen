@@ -226,6 +226,13 @@ def _pages(port, port2):
                                         b'<button id="sb">Get PDF</button></form></body></html>'),
         "/base-frag": ("text/html", b'<html><head><title>Article</title><base href="https://denied.example/article">'
                                     b'</head><body><a href="#pdf" id="fl">Download PDF</a></body></html>'),
+        # round 12: a label (outside any form) of a submit button of an off-site form; a <button> whose value
+        # carries a token
+        "/label-submit": ("text/html", b'<html><head><title>Article</title></head><body><form id="f" method="get" '
+                                       b'action="https://denied.example/collect"><button id="s">Go</button></form>'
+                                       b'<label for="s"><span role="button">Download now</span></label></body></html>'),
+        "/btn-value": ("text/html", b'<html><head><title>Article</title></head><body><button name="access_token" '
+                                    b'value="SECRETBTN" aria-label="Download PDF"></button></body></html>'),
         "/wayf-form": ("text/html", b'<html><head><title>Find your institution</title></head><body><form method="post" '
                                     b'action="/logged"><input type="search" name="q" aria-label="Search for your institution">'
                                     b'<button>Find</button></form></body></html>'),
@@ -939,5 +946,20 @@ def test_round11_label_shadowed_action_base_fragment_and_url_scrub(origins):
         r2 = _run(sp, "look", handoff=False)
         for x in (r, r2):
             assert "SECRETFRAG" not in json.dumps(x) and "SECRETTICK" not in json.dumps(x), x
+    finally:
+        _finish(sp)
+
+
+def test_round12_label_of_a_submit_button_and_button_value(origins):
+    sp = "tbsgen-test-r12"
+    try:
+        assert _run(sp, "open", origins[0] + "/label-submit", handoff=False)["status"] == "ok"
+        r = _run(sp, "look", handoff=False)
+        r2 = _run(sp, "click", str(_item(r, "Download now")["i"]), look_key=r["look_key"], handoff=False)
+        assert r2["status"] == "refused" and "label" in r2["error"], r2
+        assert _run(sp, "look", handoff=False)["page"]["url"].endswith("/label-submit")
+        assert _run(sp, "open", origins[0] + "/btn-value", handoff=False)["status"] == "ok"
+        r = _run(sp, "look", handoff=False)
+        assert _item(r, "Download PDF") and "SECRETBTN" not in json.dumps(r), r
     finally:
         _finish(sp)

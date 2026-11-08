@@ -691,3 +691,13 @@ def test_handoff_status_without_a_handoff_runs_nothing_and_polls_are_budgeted(tm
         out, _ = _call(bd, "1", "handoff_status").communicate(timeout=60)
     assert "poll limit" in out, out
     assert len(log.read_text().splitlines()) == 1 + 2            # the open + two polls, nothing more
+
+
+def test_redaction_drops_url_query_and_fragment():
+    """Round 12: every URL in the agent's stderr loses its query and fragment"""
+    txt = ("error: GET https://provider.example/v1?key=SECRETQ#ticket=SECRETF failed\n"
+           "see https://pub.example/cb#code='SECRETC' and http://x.example/p?signature=SECRETS&a=1\n")
+    r = browser_agent.redact(txt)
+    for s in ("SECRETQ", "SECRETF", "SECRETC", "SECRETS"):
+        assert s not in r, r
+    assert "https://provider.example/v1" in r and "https://pub.example/cb" in r
