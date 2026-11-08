@@ -60,7 +60,7 @@ jobs:
           enable-cache: true
           cache-dependency-glob: gen/uv.lock
       - run: uv sync --locked
-      - run: uv run --locked pytest -q tests/test_unit.py tests/test_screen_jev.py tests/test_fulltext.py
+      - run: uv run --locked pytest -q tests --ignore=tests/test_integration.py
 
   gen-integration:
     name: gen (Docker integration tests)

@@ -29,6 +29,15 @@ Flow of one job (`run_job`):
 Only one ledger is authoritative: the local one.  The remote ledger is a per-job working copy seeded from it;
 its new rows come back exactly once.  Cooldowns set on one side reach the other at the next job (bounded by
 max_job_s); see README.
+
+Preflight (before a new job is leased): the local package source must be committed (`remote.require_clean_tree`)
+and the remote code fingerprint (`info`) must equal the local one; otherwise no job is started and the result
+carries `refused` (the CLI prints it, exits non-zero and points at `tbsgen remote deploy`).  A job the remote
+side refuses at submit is reported the same way (`error`); its papers stay due.
+
+Deployment (`tbsgen remote deploy`, see `deploy`): bundle the local HEAD, copy it with scp, `git fetch` +
+`checkout --detach <sha>` in `remote.code_dir`, `uv sync`, then check that the remote fingerprint and HEAD equal
+the local ones.  `tbsgen remote status` (`status`) shows both sides and the remote jobs.
 """
 from __future__ import annotations
 
@@ -50,6 +59,7 @@ from pathlib import Path
 
 HTTP_CHANNELS = ("oa", "elsevier", "wiley", "inst")
 PKG = Path(__file__).resolve().parent
+SRC_REL = "gen/src/tbsgen"            # the fingerprinted package, relative to the repository root
 _TEST_TRANSPORT = None          # tests: fake HTTP for the worker
 
 
@@ -60,6 +70,26 @@ def code_fingerprint() -> str:
     for p in sorted(PKG.glob("*.py")) + sorted(PKG.glob("*.mjs")):
         h.update(p.name.encode() + b"\0" + p.read_bytes() + b"\0")
     return h.hexdigest()
+
+
+def _git(*args: str, cwd: Path = PKG) -> str | None:
+    try:
+        p = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return p.stdout.strip() if p.returncode == 0 else None
+
+
+def local_code_state() -> dict:
+    """This checkout: repository root, HEAD, and whether the fingerprinted package has uncommitted changes
+    (tracked or untracked files under gen/src/tbsgen).  repo=None: not a git checkout (nothing to check)."""
+    root = _git("rev-parse", "--show-toplevel")
+    if not root:
+        return dict(repo=None, head=None, dirty=None, fingerprint=code_fingerprint())
+    st = _git("status", "--porcelain", "--untracked-files=normal", "--", SRC_REL, cwd=Path(root))
+    dirty = [ln[3:] for ln in (st or "").splitlines() if ln.strip() and "__pycache__" not in ln]
+    return dict(repo=root, head=_git("rev-parse", "HEAD", cwd=Path(root)), dirty=dirty,
+                fingerprint=code_fingerprint())
 
 
 def _atomic(path: Path, data: str | bytes):
@@ -114,7 +144,7 @@ def merge_rows(ledger, job: str, rows: dict, keep_lease: bool = False) -> dict:
     """Merge the remote job's new ledger rows into the local ledger and drop the job's lease, atomically and at
     most once per remote row (table remote_merged).  Remote rows still pending (worker died) become
     'fail' / 'cancelled: remote worker ended' (they still count as attempts, never towards a breaker)."""
-    n = dict(attempts=0, blocks=0, meta_calls=0, cooldown=0, hosts=0)
+    n = dict(attempts=0, blocks=0, meta_calls=0, cooldown=0, hosts=0, not_entitled=0)
     with ledger._tx() as db:
         db.execute("create table if not exists remote_merged(job text, kind text, rid int, "
                    "primary key(job, kind, rid))")
@@ -136,6 +166,11 @@ def merge_rows(ledger, job: str, rows: dict, keep_lease: bool = False) -> dict:
             db.execute("insert into hosts values(?,?) on conflict(host) do update set "
                        "next_ts = max(next_ts, excluded.next_ts)", (host, nxt))
             n["hosts"] += 1
+        for ch, doi, ts, note in rows.get("not_entitled") or []:     # incl. ones booked before a worker crash
+            db.execute("insert into not_entitled values(?,?,?,?) on conflict(channel, doi) do update set "
+                       "ts = max(ts, excluded.ts), note = case when excluded.ts > ts then excluded.note else note end",
+                       (ch, doi, ts, note))
+            n["not_entitled"] += 1
         if not keep_lease:
             db.execute("delete from attempts where note=? and channel='lease'", (f"lease:{job}",))
     return n
@@ -222,6 +257,152 @@ def outstanding_jobs(cfg: dict) -> list[dict]:
     return out
 
 
+def remote_info(fetcher, run) -> dict:
+    """`info` on the remote host: its code fingerprint, git HEAD and jobs.  {} if the remote code is too old to
+    answer (or ssh failed); `error` says why."""
+    rcfg = fetcher.ft["remote"]
+    rc, so, se = run(_remote_cmd(rcfg, "info", rcfg["workdir"], "-"), b"", 120)
+    info = _last_json(so) if rc == 0 else {}
+    if not info.get("fingerprint"):
+        why = fetcher._r(se.decode("utf-8", "replace"))[-200:].strip() or f"rc={rc}"
+        if rc == 255:                            # ssh itself failed: not a code problem
+            return dict(error=f"ssh to {rcfg.get('host')} failed ({why})", ssh_failed=True)
+        return dict(error=f"remote `info` failed ({why}); the remote code is missing or older than this revision")
+    return info
+
+
+def preflight(fetcher, run) -> str | None:
+    """Why a new remote job must not be started (local code not committed, or remote code differs), else None."""
+    rcfg = fetcher.ft["remote"]
+    hint = "run `tbsgen remote deploy` (after committing) so both sides run the same revision"
+    if rcfg.get("require_clean_tree", True):
+        st = local_code_state()
+        if st["dirty"]:
+            return (f"local tbsgen package has uncommitted changes ({', '.join(st['dirty'][:5])}): commit them and "
+                    f"{hint}")
+    if not rcfg.get("preflight", True):
+        return None
+    info = remote_info(fetcher, run)
+    if info.get("ssh_failed"):
+        return info["error"]
+    if info.get("error"):
+        return f"{info['error']}; {hint}"
+    if info["fingerprint"] != code_fingerprint():
+        return (f"code fingerprint mismatch (local {code_fingerprint()[:12]}, remote {info['fingerprint'][:12]}, "
+                f"remote HEAD {str(info.get('head'))[:12]}); {hint}")
+    return None
+
+
+# ------------------------------------------------------------------------------------------- deploy / status
+def default_scp_runner(rcfg: dict):
+    base = list(rcfg.get("scp") or ["scp", "-q", "-o", "BatchMode=yes"])
+
+    def copy(local: str, remote_path: str, timeout: float = 600) -> tuple[int, bytes, bytes]:
+        try:
+            p = subprocess.run(base + [local, f"{rcfg['host']}:{remote_path}"], capture_output=True,
+                               timeout=timeout, env=ssh_env())
+        except subprocess.TimeoutExpired:
+            return 255, b"", b"scp timeout"
+        return p.returncode, p.stdout, p.stderr
+    return copy
+
+
+def deploy_plan(rcfg: dict, sha: str) -> list[str]:
+    """Remote shell commands of a deployment (after the bundle was copied to <code_dir>.deploy.bundle)."""
+    code = rcfg["code_dir"]
+    q = shlex.quote
+    bundle = code.rstrip("/") + ".deploy.bundle"
+    sync = rcfg.get("deploy_sync") or "uv sync -q --no-dev"
+    # `~/x` must stay unquoted to be expanded by the remote shell
+    qc = (lambda s: "~/" + q(s[2:]) if s.startswith("~/") else q(s))
+    return [f"test -d {qc(code)}/.git || git clone -q --no-checkout {qc(bundle)} {qc(code)}",
+            f"cd {qc(code)} && git fetch -q {qc(bundle)} HEAD && git checkout -q --detach {q(sha)} && "
+            f"rm -f {qc(bundle)}",
+            f"cd {qc(code)}/gen && {sync}"]
+
+
+def deploy(fetcher, *, dry_run: bool = False, force: bool = False, ssh_runner=None, scp_runner=None,
+           repo: Path | None = None, log=print) -> dict:
+    """`tbsgen remote deploy`: ship the local HEAD to `remote.code_dir` and check both sides run the same code.
+    Refused when the package has uncommitted changes (HEAD would not be the code that runs locally)."""
+    rcfg = fetcher.ft["remote"]
+    for k in ("host", "code_dir", "python", "workdir"):
+        if not rcfg.get(k):
+            return dict(ok=False, error=f"fulltext.remote.{k} is not set")
+    if not str(rcfg["code_dir"]).startswith(("/", "~/")):
+        return dict(ok=False, error="fulltext.remote.code_dir must be absolute (/...) or start with ~/")
+    st = local_code_state() if repo is None else dict(
+        repo=str(repo), head=_git("rev-parse", "HEAD", cwd=repo), fingerprint=code_fingerprint(),
+        dirty=[ln[3:] for ln in (_git("status", "--porcelain", "--", SRC_REL, cwd=repo) or "").splitlines()
+               if ln.strip()])
+    if not st["repo"] or not st["head"]:
+        return dict(ok=False, error="not a git checkout: nothing to deploy")
+    out = dict(ok=False, sha=st["head"], local_fingerprint=st["fingerprint"], host=rcfg["host"],
+               code_dir=rcfg["code_dir"], plan=deploy_plan(rcfg, st["head"]))
+    if st["dirty"]:
+        out["error"] = f"uncommitted changes in {SRC_REL}: {', '.join(st['dirty'][:5])} (commit first)"
+        return out
+    if dry_run:
+        out.update(ok=True, dry_run=True)
+        return out
+    run = ssh_runner or default_ssh_runner(rcfg)
+    copy = scp_runner or default_scp_runner(rcfg)
+    if not force:
+        # a job directory on the remote host = a job not collected yet; its export must run the code it started with
+        if outstanding_jobs(fetcher.cfg):
+            out["error"] = "a remote job is not collected yet (run `tbsgen fetch` first, or --force)"
+            return out
+        wd = rcfg["workdir"]
+        qwd = "~/" + shlex.quote(wd[2:]) if wd.startswith("~/") else shlex.quote(wd)
+        rc, so, _ = run(f"ls -A {qwd}/jobs 2>/dev/null | head -1", b"", 60)
+        if rc == 0 and so.strip():
+            out["error"] = "the remote host has job directories (a job is running or not collected); or --force"
+            return out
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        b = Path(td) / "tbsgen.bundle"
+        p = subprocess.run(["git", "bundle", "create", str(b), "HEAD"], cwd=st["repo"], capture_output=True)
+        if p.returncode != 0:
+            out["error"] = "git bundle failed: " + p.stderr.decode("utf-8", "replace")[-200:]
+            return out
+        rc, _, se = copy(str(b), rcfg["code_dir"].rstrip("/") + ".deploy.bundle")
+        if rc != 0:
+            out["error"] = f"scp failed (rc={rc}): " + fetcher._r(se.decode("utf-8", "replace"))[-200:]
+            return out
+    for cmd in out["plan"]:
+        rc, so, se = run(cmd, b"", 900)
+        log(json.dumps(dict(step=cmd[:80], rc=rc)))
+        if rc != 0:
+            out["error"] = f"remote step failed (rc={rc}): {cmd[:80]}: " + \
+                fetcher._r(se.decode("utf-8", "replace"))[-300:]
+            return out
+    info = remote_info(fetcher, run)
+    out.update(remote_fingerprint=info.get("fingerprint"), remote_head=info.get("head"))
+    if info.get("error"):
+        out["error"] = info["error"]
+    elif info["fingerprint"] != st["fingerprint"] or info.get("head") != st["head"]:
+        out["error"] = "remote code differs after deploy (fingerprint / HEAD)"
+    else:
+        out["ok"] = True
+    return out
+
+
+def status(fetcher, *, ssh_runner=None) -> dict:
+    """`tbsgen remote status`: both sides' code (HEAD, fingerprint) and the remote jobs."""
+    rcfg = fetcher.ft["remote"]
+    st = local_code_state()
+    out = dict(local=dict(head=st["head"], fingerprint=st["fingerprint"], dirty=st["dirty"]), host=rcfg.get("host"),
+               local_jobs=outstanding_jobs(fetcher.cfg))
+    if not rcfg.get("host"):
+        out["error"] = "fulltext.remote.host is not set"
+        return out
+    info = remote_info(fetcher, ssh_runner or default_ssh_runner(rcfg))
+    out["remote"] = info
+    out["same_code"] = bool(info.get("fingerprint")) and info["fingerprint"] == st["fingerprint"]
+    out["running"] = [j for j in info.get("jobs") or [] if j.get("state") in ("running", "starting")]
+    return out
+
+
 def remote_spec(fetcher, job: str, entries: list[dict], channels: list[str], lease_n: int, snap: dict,
                 now: float) -> dict:
     import copy
@@ -243,6 +424,11 @@ def remote_spec(fetcher, job: str, entries: list[dict], channels: list[str], lea
     ft["limits"] = {ch: dict(v) for ch, v in led.limits.items()}       # the local effective limits
     ft["host_caps"] = dict(led.host_caps)
     deadline = min(now + float(rcfg.get("max_job_s", 7200)), _midnight_after(now) - 60)
+    from .fulltext import norm_doi
+    dois = sorted({norm_doi(e.get("doi")) for e in entries if e.get("doi")})
+    snap = dict(snap, rows=dict(snap.get("rows") or {}, not_entitled=[
+        list(r) for d in dois for r in led.db.execute("select channel, doi, ts, note from not_entitled where doi=?",
+                                                      (d,)).fetchall()]))
     return dict(job=job, fingerprint=code_fingerprint(), tz=posix_tz(now), fulltext=ft, entries=entries, channels=channels, deadline=deadline, seed=snap)
 
 
@@ -286,6 +472,10 @@ def _run_job_locked(fetcher, entries, channels, run, log, poll_s, sleep, max_pol
     if not fetcher.ft.get("allow_network"):
         out["note"] = "allow_network=false: remote job not started"
         return out
+    if (why := preflight(fetcher, run)):
+        out["refused"] = why                      # nothing leased or submitted; the papers stay due
+        log(json.dumps(dict(remote_refused=why)))
+        return out
     led = fetcher.ledger
     # one remote job per LEDGER (not per queue): its seeded copy is only valid while no other job uses the quota
     live = led.db.execute("select distinct host from attempts where channel='lease'").fetchall()
@@ -302,11 +492,12 @@ def _run_job_locked(fetcher, entries, channels, run, log, poll_s, sleep, max_pol
     now = led.clock()
     # the job file is written before the lease, so a crash right after leasing is still visible
     _atomic(_job_state(fetcher.cfg, job), json.dumps(dict(job=job, stage="leasing", created=now, n=len(entries),
+                                                          channels=channels,
                                                           idents=[paper_ident(e) for e in entries])))
     snap = lease_and_snapshot(led, job, lease_n, now)
     spec = remote_spec(fetcher, job, entries, channels, lease_n, snap, now)
     _atomic(_job_state(fetcher.cfg, job), json.dumps(dict(job=job, stage="leased", created=now, n=len(entries),
-                                                          lease_n=lease_n,
+                                                          lease_n=lease_n, channels=channels,
                                                           idents=[paper_ident(e) for e in entries])))
     names = secret_names(fetcher.ft, channels)
     secrets = load_secrets(fetcher, names)
@@ -382,7 +573,7 @@ def collect(fetcher, job: str, run, *, log=print, poll_s: float = 15.0, sleep=ti
     rc, so, se = run(_remote_cmd(rcfg, "export", rcfg["workdir"], job), b"", 600)
     if rc != 0:
         return dict(job=job, stage=js.get("stage"), error=f"export failed rc={rc}")
-    res = import_export(fetcher, job, so)
+    res = import_export(fetcher, job, so, channels=js.get("channels"))
     _set_stage(fetcher.cfg, job, "collected", merged=res["merged"], n_results=len(res["results"]))
     run(_remote_cmd(rcfg, "cleanup", rcfg["workdir"], job), b"", 60)
     log(json.dumps(dict(remote_job=job, collected=len(res["results"]), ok=sum(r["ok"] for r in res["results"].values()),
@@ -390,7 +581,7 @@ def collect(fetcher, job: str, run, *, log=print, poll_s: float = 15.0, sleep=ti
     return dict(job=job, stage="collected", results=res["results"], merged=res["merged"], status=status)
 
 
-def import_export(fetcher, job: str, blob: bytes) -> dict:
+def import_export(fetcher, job: str, blob: bytes, channels: list[str] | None = None) -> dict:
     """Unpack the export tar (only regular files under results/ and cache/, plus ledger.json), save texts to the
     local write cache, merge ledger rows.  Returns {results: {ident: dict(ok, text, rec)}, merged}."""
     files: dict[str, bytes] = {}
@@ -418,7 +609,14 @@ def import_export(fetcher, job: str, blob: bytes) -> dict:
             prov = dict(prov, path=saved.get("path"))
             rec = dict(rec, provenance=prov, remote_job=job)
         rec = dict(rec, remote_seconds=r.get("seconds"))
-        results[r["ident"]] = dict(ok=text is not None, text=text, rec=rec)
+        doi = (r.get("entry") or {}).get("doi")
+        for ch in rec.get("not_entitled") or []:     # metadata-only answers seen remotely: never ask again
+            from .fulltext import norm_doi
+            fetcher.ledger.mark_not_entitled(ch, norm_doi(doi), f"remote:{job}")
+        results[r["ident"]] = dict(ok=text is not None, text=text, rec=rec,
+                                   entry_ver=int((r.get("entry") or {}).get("ver") or 0),
+                                   # the job's channel scope (None: unknown, e.g. a job file of an older version)
+                                   channels=list(channels) if channels is not None else None)
     rows = json.loads(files.get("ledger.json", b"{}"))
     merged = merge_rows(fetcher.ledger, job, rows)
     return dict(results=results, merged=merged)
@@ -437,7 +635,8 @@ def _seed_ledger(path: Path, seed: dict) -> dict:
     db = sqlite3.connect(path, isolation_level=None)
     db.execute("begin immediate")
     rows = seed.get("rows") or {}
-    for kind, n in (("attempts", 9), ("cooldown", 3), ("hosts", 2), ("blocks", 5), ("meta_calls", 5)):
+    for kind, n in (("attempts", 9), ("cooldown", 3), ("hosts", 2), ("blocks", 5), ("meta_calls", 5),
+                    ("not_entitled", 4)):
         for r in rows.get(kind) or []:
             db.execute(f"insert or replace into {kind} values({','.join('?' * n)})", r)
     marks = {k: db.execute(f"select coalesce(max(rowid),0) from {k}").fetchone()[0]
@@ -653,6 +852,7 @@ def cmd_export(workdir: str, job: str, stdout) -> int:
             for k in ("attempts", "blocks", "meta_calls")}
     rows["cooldown"] = db.execute("select host, until, reason from cooldown").fetchall()
     rows["hosts"] = db.execute("select host, next_ts from hosts").fetchall()
+    rows["not_entitled"] = db.execute("select channel, doi, ts, note from not_entitled").fetchall()
     db.close()
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w:") as tf:
@@ -675,6 +875,23 @@ def cmd_export(workdir: str, job: str, stdout) -> int:
     return 0
 
 
+def cmd_info(workdir: str, job: str, stdout) -> int:
+    """Code fingerprint, git HEAD of the code checkout, and the jobs under <workdir>/jobs with their state."""
+    jobs = []
+    jd = Path(os.path.expanduser(workdir)) / "jobs"
+    for d in sorted(jd.iterdir()) if jd.exists() else []:
+        if d.is_dir():
+            buf = io.StringIO()
+            cmd_status(workdir, d.name, buf)
+            with contextlib.suppress(ValueError):
+                st = json.loads(buf.getvalue())
+                jobs.append(dict(job=d.name, state=st.get("state"), done=st.get("done"), n=st.get("n")))
+    st = local_code_state()
+    print(json.dumps(dict(fingerprint=code_fingerprint(), head=st["head"], dirty=st["dirty"], jobs=jobs)),
+          file=stdout)
+    return 0
+
+
 def cmd_cleanup(workdir: str, job: str, stdout) -> int:
     import shutil
     d = _job_dir(workdir, job)
@@ -688,15 +905,15 @@ def main(argv=None, stdin=None, stdout=None, daemon: bool = True) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     stdin = stdin or sys.stdin
     stdout = stdout or sys.stdout
-    if len(argv) != 3 or argv[0] not in ("submit", "status", "export", "cleanup"):
-        print("usage: python -m tbsgen.remote {submit|status|export|cleanup} WORKDIR JOB", file=sys.stderr)
+    if len(argv) != 3 or argv[0] not in ("submit", "status", "export", "cleanup", "info"):
+        print("usage: python -m tbsgen.remote {submit|status|export|cleanup|info} WORKDIR JOB", file=sys.stderr)
         return 2
     cmd, wd, job = argv
     if cmd == "submit":
         return cmd_submit(wd, job, stdin, stdout, daemon)
     if cmd == "status":
         return cmd_status(wd, job, stdout, stdin if not getattr(stdin, "isatty", lambda: True)() else None)
-    return dict(status=cmd_status, export=cmd_export, cleanup=cmd_cleanup)[cmd](wd, job, stdout)
+    return dict(status=cmd_status, export=cmd_export, cleanup=cmd_cleanup, info=cmd_info)[cmd](wd, job, stdout)
 
 
 if __name__ == "__main__":

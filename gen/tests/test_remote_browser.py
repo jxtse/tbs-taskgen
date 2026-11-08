@@ -83,7 +83,9 @@ class FakeSSH:
 def mk_remote(tmp_path, routes, **ft):
     rdir = tmp_path / "remote-host"
     cfg = mkcfg(tmp_path, egress_check=dict(EC), elsevier={"enabled": True}, wiley={"enabled": True},
-                remote={"enabled": True, "host": "fake", "python": "/opt/py", "workdir": str(rdir)}, **ft)
+                remote={"enabled": True, "host": "fake", "python": "/opt/py", "workdir": str(rdir),
+                        # the test checkout itself may be dirty; the clean-tree preflight has its own tests
+                        "require_clean_tree": False, **(ft.pop("remote", None) or {})}, **ft)
     clock = FakeClock(time.time())
     led = DownloadLedger(cfg["fulltext"]["ledger_path"], cfg["fulltext"]["limits"], cfg["fulltext"]["global_limits"],
                          cfg["fulltext"]["host_caps"])
@@ -120,7 +122,7 @@ def test_remote_runs_http_channels_remotely_and_imports(tmp_path):
     ssh = FakeSSH(rdir, net)
     st = drain(f, ssh)
     assert st["ok"] == 3 and local_net.calls == []                 # nothing fetched locally
-    assert ssh.calls == ["submit", "status", "export", "cleanup"]
+    assert ssh.calls == ["info", "submit", "status", "export", "cleanup"]     # preflight `info` first
     # texts are in the LOCAL write cache with provenance naming the remote job
     w = Path(f.cfg["fulltext"]["write_cache_dir"])
     provs = [json.loads(p.read_text()) for p in w.glob("*.json")]
@@ -153,7 +155,7 @@ def test_remote_secrets_only_on_stdin_never_on_disk_or_argv(tmp_path):
         drain(f, ssh)
     finally:
         remote.work = orig_work
-    sub_stdin = ssh.stdin_seen[0].decode()
+    sub_stdin = ssh.stdin_seen[ssh.calls.index("submit")].decode()
     assert "k-els-test" in sub_stdin.splitlines()[1] and "k-els-test" not in sub_stdin.splitlines()[0]
     assert seen_files and not any(b"k-els-test" in b or b"t-wiley-test" in b for b in seen_files)
     assert all("k-els-test" not in c for c in ssh.calls)
@@ -198,6 +200,23 @@ def test_remote_worker_egress_outside_range_downloads_nothing(tmp_path):
 def test_remote_code_fingerprint_mismatch_is_refused(tmp_path, monkeypatch):
     f, net, _, led, rdir, _ = mk_remote(tmp_path, {"api.elsevier.com": ELS_XML})
     queue(f, ELS)
+    # the remote host runs another revision: its `info` answers with another fingerprint
+    monkeypatch.setattr(remote, "cmd_info", lambda wd, job, stdout: print(json.dumps(dict(
+        fingerprint="other-revision", head="0" * 40, dirty=[], jobs=[])), file=stdout) or 0)
+    ssh = FakeSSH(rdir, net)
+    st = drain(f, ssh)
+    # refused by the preflight, before anything is leased or submitted
+    assert "fingerprint mismatch" in st["remote_error"] and "tbsgen remote deploy" in st["remote_error"]
+    assert ssh.calls == ["info"] and net.calls == []
+    assert sqlite3.connect(led.path).execute("select count(*) from attempts").fetchone()[0] == 0
+    [e] = fulltext.read_queue(fulltext.queue_path(f.cfg))
+    assert not e.get("tries") and not e.get("next_try") and not e.get("chan_backoff")     # still due, not charged
+
+
+def test_remote_submit_refusal_is_an_error_and_does_not_back_off(tmp_path, monkeypatch):
+    """The remote side refuses at submit (fingerprint changed after the preflight): remote_error, no backoff."""
+    f, net, _, led, rdir, _ = mk_remote(tmp_path, {"api.elsevier.com": ELS_XML}, remote={"preflight": False})
+    queue(f, ELS)
     real = remote.code_fingerprint
     calls = {"n": 0}
 
@@ -207,7 +226,10 @@ def test_remote_code_fingerprint_mismatch_is_refused(tmp_path, monkeypatch):
     monkeypatch.setattr(remote, "code_fingerprint", fp)
     st = drain(f, FakeSSH(rdir, net))
     assert st["remote"]["jobs"][0]["stage"] == "dropped" and "fingerprint" in st["remote"]["jobs"][0]["error"]
+    assert "fingerprint" in st["remote_error"] and st["failed"] == 0 and st["not_tried"] == 1
     assert net.calls == []
+    [e] = fulltext.read_queue(fulltext.queue_path(f.cfg))
+    assert not e.get("tries") and not e.get("next_try") and not e.get("chan_backoff")
 
 
 def test_remote_seed_makes_remote_respect_local_usage(tmp_path):
@@ -282,6 +304,54 @@ def test_remote_ssh_drop_after_submit_resumes_without_loss_or_duplicates(tmp_pat
     assert fulltext.read_queue(fulltext.queue_path(f.cfg)) == []
 
 
+def test_remote_reclaimed_narrow_job_does_not_postpone_untried_oa(tmp_path, monkeypatch):
+    """An older `--channels elsevier` job is collected by a later default `fetch`: elsevier's failure is recorded,
+    but OA (never tried) is not pushed back 6 h -- the next round tries it at once (Codex r7)."""
+    p = dict(doi="10.1016/j.r.1", title=TITLE, oa_url="https://repo.example/r1.pdf")
+    f, net, _, led, rdir, _ = mk_remote(tmp_path, {"api.elsevier.com": Resp(500, {}, b"", "u"),
+                                                    "repo.example": FAKE_PDF})
+    queue(f, p)
+    real_collect = remote.collect
+    monkeypatch.setattr(remote, "collect", lambda fetcher, job, run, **kw: dict(job=job, stage="submitted",
+                                                                               note="still running"))
+    drain(f, FakeSSH(rdir, net), channels=["elsevier"])               # submitted, not collected this round
+    monkeypatch.setattr(remote, "collect", real_collect)
+    [job] = remote.outstanding_jobs(f.cfg)
+    assert job["channels"] == ["elsevier"]
+    st = drain(f, FakeSSH(rdir, net))                                  # default round reclaims the narrow job
+    assert st["ok"] == 0 and not any("repo.example" in u for u, _ in net.calls)
+    [e] = fulltext.read_queue(fulltext.queue_path(f.cfg))
+    assert e["chan_backoff"]["elsevier"]["tries"] == 1 and "oa" not in e["chan_backoff"]
+    assert float(e.get("next_try") or 0) <= time.time()               # still due for oa
+    assert drain(f, FakeSSH(rdir, net))["ok"] == 1                     # oa is tried at once
+
+
+def test_remote_result_skipped_for_a_since_expired_backoff_keeps_the_entry_due(tmp_path, monkeypatch):
+    """A full remote job skipped elsevier for its backoff; collected after that backoff ran out: no request was
+    made, so the entry must stay due -- not be backed off 6 h as a paper (Codex PR-A r9)."""
+    f, net, _, led, rdir, _ = mk_remote(tmp_path, {"api.elsevier.com": ELS_XML})
+    queue(f, ELS)
+    qp = fulltext.queue_path(f.cfg)
+    [e] = fulltext.read_queue(qp)
+    e["chan_backoff"] = {"elsevier": dict(tries=1, next_try=time.time() + 30)}
+    fulltext.write_queue(qp, [e])
+    real_collect = remote.collect
+    monkeypatch.setattr(remote, "collect", lambda fetcher, job, run, **kw: dict(job=job, stage="submitted",
+                                                                               note="still running"))
+    real_run = remote.run_job
+    drain(f, FakeSSH(rdir, net))                     # submitted while elsevier backs off (entry itself is due)
+    monkeypatch.setattr(remote, "collect", real_collect)
+    [e] = fulltext.read_queue(qp)
+    e["chan_backoff"]["elsevier"]["next_try"] = time.time() - 1         # the backoff runs out meanwhile
+    fulltext.write_queue(qp, [e])
+    assert remote.run_job is real_run
+    st = drain(f, FakeSSH(rdir, net))
+    assert st["ok"] == 0 and not any("elsevier" in u for u, _ in net.calls)
+    [e] = fulltext.read_queue(qp)
+    assert float(e.get("next_try") or 0) <= time.time() and not e.get("paper_tries")
+    assert drain(f, FakeSSH(rdir, net))["ok"] == 1
+
+
 def test_remote_dead_worker_partial_results_are_kept_and_rest_stays_queued(tmp_path):
     f, net, _, led, rdir, _ = mk_remote(tmp_path, {"api.elsevier.com": ELS_XML, "api.wiley.com": FAKE_PDF})
     queue(f, ELS, WIL)
@@ -333,8 +403,8 @@ def test_remote_one_job_at_a_time(tmp_path):
 
 def test_lease_holds_quota_past_pending_ttl(tmp_path):
     from tbsgen.dlledger import PENDING_TTL_S, LimitReached
-    # base at local noon: the fake clock's +TTL never crosses midnight (a day rollover frees the quota)
-    clock = FakeClock(time.mktime(time.localtime()[:3] + (12, 0, 0, 0, 0, 0)))
+    noon = time.mktime(time.localtime()[:3] + (12, 0, 0, 0, 0, -1))   # TTL must not cross local midnight
+    clock = FakeClock(noon)
     led = DownloadLedger(tmp_path / "l.sqlite", global_limits={"daily_ok": 1}, clock=clock, sleep=clock.sleep)
     remote.lease_and_snapshot(led, "j", 1)
     clock.t += PENDING_TTL_S + 60

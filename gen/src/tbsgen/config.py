@@ -108,7 +108,10 @@ DEFAULTS: dict[str, Any] = {
         "keep_raw": True,                   # also keep the raw PDF/XML under <write_cache_dir>/raw/
         "ledger_path": None,                # download ledger (sqlite); None -> <run.root>/fulltext_ledger.sqlite
         "queue_path": None,                 # browser queue (jsonl); None -> <run.root>/fulltext_queue.jsonl
-        "queue_backoff_s": 21600,           # a failed queue entry waits this long (doubling, max 8x) before retry
+        # a queue entry whose channels made a request and got nothing waits this long (doubling, max 8x).  Papers
+        # only refused by the ledger (caps, cooldowns, breakers) or the egress check are not backed off: they are
+        # due again when the earliest refusal lifts (see fulltext.classify).
+        "queue_backoff_s": 21600,
         "min_chars": 8000,
         "title_match_min": 0.6,
         "max_pdf_mb": 40,
@@ -215,7 +218,20 @@ DEFAULTS: dict[str, Any] = {
             # Command printing a JSON object of secrets on stdout; it gets the wanted names (JSON list) on stdin.
             # None -> read them from this process's environment.  Secrets go to the remote worker on ssh stdin.
             "secrets_cmd": None,
+            # Deployment (`tbsgen remote deploy` / `status`): the remote git checkout of this repository and the
+            # dependency sync run in its gen/ directory after the checkout.
+            "code_dir": None,               # e.g. "~/tbsgen/code"
+            "deploy_sync": "uv sync -q --no-dev",
+            "scp": ["scp", "-q", "-o", "BatchMode=yes"],
+            # `tbsgen fetch` refuses to start a remote job (before anything is leased or sent) when the local
+            # package has uncommitted changes or the remote code fingerprint differs; fix with `remote deploy`.
+            "require_clean_tree": True,
+            "preflight": True,
         },
+        # A TDM API (elsevier / wiley) answering 200 with too little text (metadata / abstract only: the
+        # institution does not subscribe to that volume): that (channel, DOI) is never asked again.
+        # ttl_days: forget such records after this many days (None: never).
+        "not_entitled": {"enabled": True, "channels": ["elsevier", "wiley"], "ttl_days": None},
         "pdftotext": None,                  # pdftotext binary; None -> "pdftotext" on PATH
         "ca_file": None,                    # CA bundle for HTTPS; None -> Python default, else a system bundle
         # Caps / pacing (dlledger.DEFAULT_LIMITS etc.); dicts merge per channel / host.
@@ -260,7 +276,12 @@ DEFAULTS: dict[str, Any] = {
         "l4b_minutes": 20,                  # cheap-agent inversion (待定, disabled)
         "max_repair_rounds": 2,
         "blocking": ["oracle", "hidden_shift", "leak", "isolation", "infeasible", "determinism", "truth_isolation",
-                     "cli_contract"],
+                     "cli_contract", "tdm_verbatim"],
+        # TDM terms (Elsevier: quotes <= 200 chars; Wiley: no redistribution): longest verbatim overlap between
+        # a TDM full text and the public task files (whitespace-normalised).  See tdmgate.py.
+        "tdm_verbatim_max_chars": 200,
+        "tdm_verbatim_channels": ["elsevier", "wiley"],
+        "tdm_verbatim_unknown": False,      # True: a full text of unknown channel is checked too
     },
     "sandbox": {
         "backend": "docker",                # only docker is supported
