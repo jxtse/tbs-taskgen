@@ -810,7 +810,8 @@ _SECRET_PATTERNS = (
                r"api[_-]?key|access[_-]?token|refresh[_-]?token|id[_-]?token|token|secret|client[_-]?secret|"
                r"password|passwd|pwd|session(?:id)?|sid|credentials?)(?:[\\\"'\s]|%2[27]|%5c|%20)*(?:[:=]|%3a|%3d)).*$"),
     re.compile(r"(?i)\b((?:bearer|basic)\s+).*$", re.M),
-    re.compile(r"(?i)(\w+://)[^/\s:@]+:[^/\s@]+@"),
+    # URL userinfo, whole (user, :password, user:password - either part may be empty; round 13)
+    re.compile(r"(?i)(\b[a-z][a-z0-9+.-]*://)[^/\s@?#\"<>]*@"),
     # every URL loses its query and fragment (OAuth / SAML / API callbacks: code, signature, ticket, key ...);
     # ' and ` are legal URL characters, so only whitespace, " and <> end it (round 12)
     re.compile(r"(?i)(\b[a-z][a-z0-9+.-]*://[^\s?#\"<>]*)[?#][^\s\"<>]*"),

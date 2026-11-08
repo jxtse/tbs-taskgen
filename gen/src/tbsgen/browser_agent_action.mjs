@@ -229,6 +229,9 @@ function credScan() {
       try { if (el.matches(":autofill") || el.matches(":-webkit-autofill")) { fields = true; strong = true; } } catch (e) {}
       if (MFA.test(meta) || /one-time-code/i.test(ac)) mfa = true;
     }
+    // an SSO hand-back page (SAML / WS-Federation / OIDC form_post): it carries an authentication assertion -
+    // a login page, handed to the user (round 13)
+    if (doc.querySelector('input[name="SAMLResponse" i], input[name="SAMLRequest" i], input[name="wresult" i], input[name="id_token" i], input[name="code" i][type="hidden" i]')) sem = true;
     // a select whose name / label is an account / user name (an account chooser) is a login field too
     for (const el of doc.querySelectorAll("select")) {
       if (!shown(el)) continue;
@@ -520,6 +523,16 @@ function domAct(walkSrc, k, allow, kind, expectUrl, scanSrc, infoSrc, chSrc) {
   // (round 12: every click inside any <label> is refused - a label can also activate a submit / reset button
   // of a form elsewhere, around every form check)
   if (el.closest && el.closest("label")) return { refused: "labels are not clicked by this tool (they activate form controls)" };
+  // NARROWED (round 13): only NATIVE links (<a href>), buttons, input buttons, <summary> and frames are
+  // clicked - no [role=...] element (it can be slotted into a shadow-root <label> and activate a control),
+  // and NO form is ever submitted or reset by this tool: a button / input button that belongs to any form
+  // (also by form="...") is refused (e.g. SAML POST "Continue" pages carry an authentication assertion).
+  // Links inside a page-wide wrapper form are still followed (a link submits nothing).
+  const nativeOk = (tag0 === "a" && el.hasAttribute("href")) || tag0 === "button" || tag0 === "summary" || tag0 === "iframe"
+    || (tag0 === "input" && ["submit", "button", "reset", "image"].includes((el.getAttribute("type") || "").toLowerCase()));
+  if (!nativeOk) return { refused: "only native links, buttons and frames are clicked by this tool" };
+  if ((tag0 === "button" || tag0 === "input") && (el.form || el.hasAttribute("form") || (el.closest && el.closest("form"))))
+    return { refused: "forms are not submitted by this tool (report login_required, or the page is handed to the user)" };
   const editable = (f) => !!f && fElems(f).some((x) => {
     const xt = x.tagName;
     if (xt === "TEXTAREA" || xt === "SELECT") return true;

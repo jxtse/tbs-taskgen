@@ -7,6 +7,7 @@ takeOverTaskSpace standing in for the user finishing and releasing control.
 """
 import http.server
 import json
+import re
 import shutil
 import subprocess
 import tempfile
@@ -233,6 +234,14 @@ def _pages(port, port2):
                                        b'<label for="s"><span role="button">Download now</span></label></body></html>'),
         "/btn-value": ("text/html", b'<html><head><title>Article</title></head><body><button name="access_token" '
                                     b'value="SECRETBTN" aria-label="Download PDF"></button></body></html>'),
+        # round 13: a role=button span slotted into a shadow-root <label> of a checkbox; a SAML POST hand-back page
+        "/slot-label": ("text/html", b'<html><head><title>Article</title></head><body><input id="c" type="checkbox">'
+                                     b'<div id="h"><span slot="x" role="button" id="sb">Download</span></div><script>'
+                                     b'const r=document.getElementById("h").attachShadow({mode:"closed"});'
+                                     b'r.innerHTML=\'<label for="c"><slot name="x"></slot></label>\';</script></body></html>'),
+        "/saml-post": ("text/html", b'<html><head><title>POST data</title></head><body><form method="post" action="/logged">'
+                                    b'<input type="hidden" name="SAMLResponse" value="PHNhbWw+"><button>Continue</button>'
+                                    b'</form></body></html>'),
         "/wayf-form": ("text/html", b'<html><head><title>Find your institution</title></head><body><form method="post" '
                                     b'action="/logged"><input type="search" name="q" aria-label="Search for your institution">'
                                     b'<button>Find</button></form></body></html>'),
@@ -483,17 +492,18 @@ def test_wayf_pages_go_to_the_user(origins):
         _finish(sp)
 
 
-def test_button_only_form_is_submitted_but_not_one_with_fields(origins):
+def test_no_form_is_submitted(origins):
     sp = "tbsgen-test-r11-forms"
     try:
         assert _run(sp, "open", origins[0] + "/chk-form", handoff=False)["status"] == "ok"
         r = _run(sp, "look", handoff=False)
         r2 = _run(sp, "click", str(_item(r, "Get PDF")["i"]), look_key=r["look_key"], handoff=False)
-        assert r2["status"] == "refused" and "input field" in r2["error"], r2
+        assert r2["status"] == "refused" and re.search("input field|forms are not submitted", r2["error"]), r2
         assert _run(sp, "open", origins[0] + "/btn-form", handoff=False)["status"] == "ok"
         r = _run(sp, "look", handoff=False)
         r2 = _run(sp, "click", str(_item(r, "Get PDF")["i"]), look_key=r["look_key"], handoff=False)
-        assert r2["status"] == "ok" and r2["page"]["url"].endswith("/logged"), r2
+        assert r2["status"] == "refused" and "forms are not submitted" in r2["error"], r2    # round 13: no form
+        assert not _run(sp, "look", handoff=False)["page"]["url"].endswith("/logged")
     finally:
         _finish(sp)
 
@@ -652,7 +662,7 @@ def test_round3_guards(origins):
         assert _run(sp, "open", origins[0] + "/offsite-form", handoff=False)["status"] == "ok"
         r = _run(sp, "look", handoff=False)
         r = _run(sp, "click", str(_item(r, "Download")["i"]), look_key=r["look_key"], handoff=False)
-        assert r["status"] == "refused" and "outside the allowed" in r["error"], r
+        assert r["status"] == "refused" and re.search("outside the allowed|forms are not submitted|only native", r["error"]), r
         # a login form in a shadow root: no interaction with the page
         assert _run(sp, "open", origins[0] + "/shadow-login", handoff=False)["status"] == "ok"
         r = _run(sp, "look", handoff=False)
@@ -681,7 +691,7 @@ def test_round4_guards(origins):
         assert _run(sp, "open", origins[0] + "/form-span", handoff=False)["status"] == "ok"
         r = _run(sp, "look", handoff=False)
         r = _run(sp, "click", str(_item(r, "Get PDF")["i"]), look_key=r["look_key"], handoff=False)
-        assert r["status"] == "refused" and "outside the allowed" in r["error"], r
+        assert r["status"] == "refused" and re.search("outside the allowed|forms are not submitted|only native", r["error"]), r
         # a stand-alone verification-code field (name="code"): no interaction
         assert _run(sp, "open", origins[0] + "/code-only", handoff=False)["status"] == "ok"
         r = _run(sp, "look", handoff=False)
@@ -732,7 +742,7 @@ def test_round5_guards(origins):
         r = _run(sp, "look", handoff=False)
         span = next(it for it in r["page"]["items"] if it["text"] == "Get PDF" and it["kind"] == "button")
         r = _run(sp, "click", str(span["i"]), look_key=r["look_key"], handoff=False)
-        assert r["status"] == "refused" and "outside the allowed" in r["error"], r
+        assert r["status"] == "refused" and re.search("outside the allowed|forms are not submitted|only native", r["error"]), r
         # userinfo in a long URL never comes back, cut or not
         assert _run(sp, "open", origins[0] + "/long-link", handoff=False)["status"] == "ok"
         r = _run(sp, "look", handoff=False)
@@ -924,7 +934,7 @@ def test_round10_selects(origins):
         r2 = _run(sp, "click", str(k), look_key=r["look_key"], handoff=False)
         assert r2["status"] == "refused" and "form fields" in r2["error"], r2
         r2 = _run(sp, "click", str(go), look_key=r["look_key"], handoff=False)
-        assert r2["status"] == "refused" and "input field" in r2["error"], r2
+        assert r2["status"] == "refused" and re.search("input field|forms are not submitted", r2["error"]), r2
         r = _run(sp, "look", handoff=False)
         assert not r["page"]["url"].endswith("/logged"), r
     finally:
@@ -961,5 +971,26 @@ def test_round12_label_of_a_submit_button_and_button_value(origins):
         assert _run(sp, "open", origins[0] + "/btn-value", handoff=False)["status"] == "ok"
         r = _run(sp, "look", handoff=False)
         assert _item(r, "Download PDF") and "SECRETBTN" not in json.dumps(r), r
+    finally:
+        _finish(sp)
+
+
+def test_round13_role_elements_and_saml_post(origins):
+    sp = "tbsgen-test-r13"
+    try:
+        assert _run(sp, "open", origins[0] + "/slot-label", handoff=False)["status"] == "ok"
+        r = _run(sp, "look", handoff=False)
+        it = _item(r, "Download")
+        if it:                                      # listed (role=button): never clicked
+            r2 = _run(sp, "click", str(it["i"]), look_key=r["look_key"], handoff=False)
+            assert r2["status"] == "refused", r2
+        r = _run(sp, "open", origins[0] + "/saml-post")
+        assert r["status"] == "handoff", r          # an SSO hand-back page goes to the user
+        assert _take_over(sp, origins[0] + "/saml-post")
+        r = _run(sp, "look", handoff=False)
+        assert r["page"]["login_form"] is True, r
+        r2 = _run(sp, "click", str(_item(r, "Continue")["i"]), look_key=r["look_key"], handoff=False)
+        assert r2["status"] == "refused", r2
+        assert not _run(sp, "look", handoff=False)["page"]["url"].endswith("/logged")
     finally:
         _finish(sp)

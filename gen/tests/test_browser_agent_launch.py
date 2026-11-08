@@ -701,3 +701,11 @@ def test_redaction_drops_url_query_and_fragment():
     for s in ("SECRETQ", "SECRETF", "SECRETC", "SECRETS"):
         assert s not in r, r
     assert "https://provider.example/v1" in r and "https://pub.example/cb" in r
+
+
+def test_redaction_drops_any_url_userinfo():
+    """Round 13: userinfo with an empty user or an empty password is masked too"""
+    for u in ("https://:SECRETU1@host.example/p", "https://SECRETU2@host.example/p", "ftp://a:SECRETU3@h.example/",
+              "https://SECRETU4:@host.example"):
+        r = browser_agent.redact(f"fetch {u} failed\n")
+        assert "SECRETU" not in r and ("host.example" in r or "h.example" in r), r

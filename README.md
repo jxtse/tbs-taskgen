@@ -344,9 +344,9 @@ uv run tbsgen fetch --run runs/R --config config.toml --browser --wait-for-egres
     institution / WAYF domains) are opened or clicked (link and browser-resolved form targets are checked
     before the click; nothing inside a frame is acted on - `click` on a frame opens its checked URL as the page;
     a page found outside the domains is reset before the next action);
-  - no form field is ever changed: a field item (text box, select, checkbox ...) cannot be clicked, and a form
-    with any editable control is never submitted - only forms made of buttons and hidden inputs (a "Download
-    PDF" form) are;
+  - no form field is ever changed and no form is ever submitted: only native links, buttons outside any form,
+    `<summary>` and frame items are clicked (no field, no `<label>`, no `[role=...]` element, no button of a form
+    - SAML / OIDC "POST data / Continue" pages carry an authentication assertion and count as login pages);
   - field values are never read: `look` lists field types and labels only, and the browser's page snapshot (which
     carries field values) is never taken;
   - login pages are detected conservatively (top document, same-origin frames, open shadow roots): any rendered
@@ -410,7 +410,8 @@ uv run tbsgen fetch --run runs/R --config config.toml --browser --wait-for-egres
   only build their items on hover (not present in the DOM before) and download forms with any option (a
   checkbox, a format select) are not reachable by the agent; a PDF viewer embedded in an iframe is reached by
   clicking the frame item (it opens the viewer's URL as the page). Unchanged: a download link or dropdown item
-  (also hidden), a button-only download form, a PDF viewer page, a new-tab PDF.
+  (also hidden), a PDF viewer page, a new-tab PDF. Download buttons that are form submissions (POST "Get PDF"
+  forms) and script widgets built from `[role=button]` elements are not clicked by the agent (round 13).
 - Institution sign-in is always done by you. The automatic `sso_login` (one check-and-press of the
   browser-autofilled login form) was removed in review round 9: the page's own handlers can submit a form to
   another target after any check the tool can make inside the page, so no tool-side check guarantees where the
@@ -561,8 +562,8 @@ Research code under active development.
   sites they have not been run end to end yet. Institution selection (WAYF) and sign-in are always done by you
   (hand-off); the agent only navigates and clicks. A cross-domain navigation the page starts by itself (script
   or redirect) is reset only after it lands. A click handler on an allowed page can still do things after the
-  checks (e.g. post data through `fetch`); the agent only clicks buttons / links of forms without any editable
-  field.
+  checks (e.g. post data through `fetch`); the agent never submits a form and never clicks a label, field or
+  `[role=...]` element.
 - Automatic S9 job submission needs your own Harbor launch scripts (`calib.*_launcher`).
 
 ## Repository layout

@@ -27,7 +27,8 @@ Use your terminal tool to run exactly one of these commands per call (nothing el
 - `tbsgen-browser N click I` — click item I of the last `look` list (run `look` first; the numbering changes when
   the page changes). Links to allowed hosts only. Cookie / consent banners may be clicked ("Accept" / "Reject").
   Dropdown menu items (e.g. under a "Download" button) are already in the `look` list (hidden): click them
-  directly. There is no hover, typing or choosing of options: form fields cannot be changed.
+  directly. There is no hover, typing or choosing of options: form fields cannot be changed, and no form is
+  submitted (only links, buttons outside forms and frame items can be clicked).
 - `tbsgen-browser N tabs` — list the pages of the paper's browser workspace (a publisher may have opened a PDF
   in a new tab; `allowed` shows whether its host is usable).
 - `tbsgen-browser N switch LABEL` — make page LABEL (from `tabs`) the current page.
