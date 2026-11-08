@@ -70,8 +70,10 @@ def metric_family(name: str) -> str:
 # baseline, so "reference worse than naive" does not mean the metric fails to measure the method (e2e-prod-20261109:
 # 2/2 specs had a hidden runtime metric, ref 0.58 s vs naive 0.40 s, and the item was dropped after 2 S8 rounds that
 # could not make the reference faster than the shortcut).  Name-based; a spec may also mark {"kind": "resource"}.
-RESOURCE_METRIC = re.compile(r"(?:^|_)(?:runtime|wall_?time|walltime|time_s|time_sec|sec|secs|seconds|elapsed|latency"
-                             r"|duration|memory|mem|peak_mem|rss|mb|gb|bytes)(?:_|$)", re.I)
+# Unambiguous tokens only: "rss" (residual sum of squares), "mb"/"gb", "mem" and bare "sec" are left out on purpose
+# (a quality metric misread as a resource metric would lose this check); use kind=resource for anything else.
+RESOURCE_METRIC = re.compile(r"(?:^|_)(?:runtime|wall_?time|walltime|elapsed|elapsed_s|latency|seconds|time_sec|time_s"
+                             r"|runtime_sec|memory|peak_memory|peak_rss|max_rss|peak_mem)(?:_|$)", re.I)
 
 
 def is_resource_metric(m: dict) -> bool:

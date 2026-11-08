@@ -208,18 +208,21 @@ def test_resource_metric_slower_than_naive_is_not_ref_worse():
     spec = {"metrics": [{"name": "hidden_frac_correct", "direction": ">="},
                         {"name": "hidden_mae", "direction": "<="},
                         {"name": "hidden_runtime_sec", "direction": "<="},
-                        {"name": "peak_rss", "direction": "<=", "kind": "resource"}]}
-    meas = {"ref": {"0": {"hidden_frac_correct": 0.96, "hidden_mae": 0.20, "hidden_runtime_sec": 0.58, "peak_rss": 900}},
-            "mid": {"0": {"hidden_frac_correct": 0.79, "hidden_mae": 1.35, "hidden_runtime_sec": 0.66, "peak_rss": 800}},
+                        {"name": "working_set_kib", "direction": "<=", "kind": "resource"}]}
+    meas = {"ref": {"0": {"hidden_frac_correct": 0.96, "hidden_mae": 0.20, "hidden_runtime_sec": 0.58, "working_set_kib": 900}},
+            "mid": {"0": {"hidden_frac_correct": 0.79, "hidden_mae": 1.35, "hidden_runtime_sec": 0.66, "working_set_kib": 800}},
             "naive": {"0": {"hidden_frac_correct": 0.82, "hidden_mae": 1.17, "hidden_runtime_sec": 0.40,
-                            "peak_rss": 100}}}
+                            "working_set_kib": 100}}}
     th = set_thresholds(spec, meas, cfg)
     assert th["ref_worse_than_naive"] == [] and th["status"] != "ref_worse_than_naive", th
     meas["ref"]["0"]["hidden_mae"] = 1.50                                       # a quality metric still counts
     assert set_thresholds(spec, meas, cfg)["ref_worse_than_naive"] == ["hidden_mae"]
+    spec["metrics"][3].pop("kind")                                             # kind is what exempts it
+    assert set_thresholds(spec, meas, cfg)["ref_worse_than_naive"] == ["hidden_mae", "working_set_kib"]
     assert [is_resource_metric({"name": n}) for n in
-            ("hidden_runtime_per_spectrum", "wall_time", "elapsed_s", "peak_mem_mb", "membrane_err", "second_moment",
-             "hidden_rmse", "runtime")] == [True, True, True, True, False, False, False, True]
+            ("hidden_runtime_per_spectrum", "wall_time", "elapsed_s", "peak_mem_mb", "peak_rss", "runtime",
+             "membrane_err", "second_moment", "hidden_rmse", "hidden_rss", "rss", "size_mb", "sec_moment")] == \
+        [True] * 6 + [False] * 7
 
 
 @pytest.mark.parametrize("d,ref,naive", [("<=", 1.04, 1.15), (">=", 0.96, 0.85)])
