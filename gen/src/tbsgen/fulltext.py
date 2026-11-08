@@ -713,14 +713,19 @@ class Fetcher:
                                note[:300], reservation=rid)
         return txt
 
-    def _meta(self, url: str, rec: dict | None = None) -> dict | None:
+    def _meta(self, url: str, rec: dict | None = None, channel: str = "oa") -> dict | None:
         """Metadata lookup (Unpaywall / Europe PMC search): paced and capped, never counted as a download.  A
-        redirect into a host in cooldown is booked in rec["limited"] (the paper waits for it, not a failure)."""
+        redirect into a host in cooldown is booked in rec["limited"] for `channel` (the paper waits for it, not a
+        failure)."""
         host = urllib.parse.urlsplit(url).hostname or ""
         if self.ledger is not None:
             self.ledger.acquire_meta(host)
         self._tl.hop = None
-        r = self._get(url, {"User-Agent": self._ua(), "Accept": "application/json"}, rec if rec is not None else {})
+        rec = rec if rec is not None else {}
+        n0 = len(rec.get("limited") or [])
+        r = self._get(url, {"User-Agent": self._ua(), "Accept": "application/json"}, rec)
+        for x in (rec.get("limited") or [])[n0:]:
+            x["channel"] = x.get("channel") or channel
         if self.ledger is not None and (cool := block_signal(r.status, r.body)):
             self.ledger.block(host, f"block signal HTTP {r.status} on metadata", seconds=cool)
         if r.status != 200:
@@ -1270,14 +1275,15 @@ def classify(out: Outcome, now: float | None = None) -> tuple[str, float | None,
 
 
 def _requeue(e: dict, now: float, backoff: float, was_limited: bool, until: float | None, failed_ch: set[str],
-             same_version: bool, backoff_only: bool = False) -> None:
+             same_version: bool, backoff_only: bool = False, untried_due: bool = False) -> None:
     """Update a queue entry after an attempt without text (see drain_queue).
 
     One rule: the entry is due again at the earliest time any of its channels could do something new -- a channel
     that failed retries after its own backoff (`chan_backoff`, doubling per channel from `queue_backoff_s`); a
     channel that was refused retries when the refusal lifts (`until`; unknown -> LIMIT_RECHECK_S).  Only when no
     channel holds any such state (no channel applies at all) does the paper itself back off.  `tries` counts the
-    rounds in which a request was really sent and failed (informational)."""
+    rounds in which a request was really sent and failed (informational).  `untried_due`: a channel whose backoff
+    has run out was not part of this round (`--channels`): it may try now."""
     if not same_version:
         # updated meanwhile (a new link / subscriber; enqueue reset the channel backoff): stay due, and do not
         # bring an old link's backoff back
@@ -1293,6 +1299,8 @@ def _requeue(e: dict, now: float, backoff: float, was_limited: bool, until: floa
         e["failed_channels"] = sorted(set(e.get("failed_channels") or []) | failed_ch)
         e.update(tries=int(e.get("tries") or 0) + 1, last_try=now)
     cands = [float(v["next_try"]) for v in cb.values() if float(v.get("next_try") or 0) > now]
+    if untried_due:
+        cands.append(now)
     if was_limited and not backoff_only:
         cands.append(until if until is not None else now + LIMIT_RECHECK_S)
         e.update(limited_until=min(cands), last_limited=now)
@@ -1492,8 +1500,14 @@ def _drain_locked(fetcher, qp, now, max_papers, channels, browser, dry_run, on_s
                     e["next_try"] = 0
                     e.pop("chan_backoff", None)
                 else:
+                    round_ch = set(channels or fetcher.ft.get("cascade") or CHANNELS)
+                    untried = any(ch not in round_ch and ch not in (chan_failed.get(k) or set())
+                                  and float(v.get("next_try") or 0) <= now
+                                  and fetcher.channel_applies(ch, e.get("doi") or "")
+                                  for ch, v in (e.get("chan_backoff") or {}).items())
                     _requeue(e, now, backoff, k in limited, limited.get(k), chan_failed.get(k) or set(),
-                             same_version=int(e.get("ver") or 0) == vers.get(k, 0), backoff_only=k in backoff_only)
+                             same_version=int(e.get("ver") or 0) == vers.get(k, 0), backoff_only=k in backoff_only,
+                             untried_due=untried)
             keep.append(e)
         write_queue(qp, keep)
         stats["remaining"] = len(keep)

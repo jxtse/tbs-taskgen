@@ -134,6 +134,34 @@ def test_oa_metadata_redirect_into_cooldown_is_a_refusal(tmp_path):
     assert not e.get("tries") and e["next_try"] == pytest.approx(clock.t + 3000, abs=2)
 
 
+def test_oa_metadata_refusal_keeps_oa_out_of_backoff(tmp_path):
+    """Metadata redirect into a cooldown + another OA URL 404 in the same round: oa was refused, so it must not get
+    the 6 h failure backoff; due when the cooldown lifts (Codex r5)."""
+    f, net, led, clock = mkfetcher(tmp_path, {"rest/search": Resp(302, {"Location": "https://cool.example/s"}, b"", "u"),
+                                              "repo.example": Resp(404, {}, b"", "u")},
+                                   SECRETS, oa={"enabled": True, "europepmc": True})
+    led.block("cool.example", "test", seconds=1800)
+    qp = q(f, dict(doi="10.9999/r.2", title=TITLE, oa_url="https://repo.example/r2.pdf"))
+    drain(f, clock)
+    e = entry(qp, "10.9999/r.2")
+    assert "oa" not in (e.get("chan_backoff") or {}) and e["next_try"] == pytest.approx(clock.t + 1800, abs=2)
+
+
+def test_channel_not_in_this_round_keeps_entry_due(tmp_path):
+    """`--channels oa` while elsevier's backoff has already run out: the entry stays due for elsevier instead of
+    being pushed back by oa's failure (Codex r5)."""
+    f, net, led, clock = mkfetcher(tmp_path, {"api.elsevier.com": ELS_XML, "repo.example": Resp(404, {}, b"", "u")},
+                                   SECRETS)
+    qp = q(f, dict(doi="10.1016/j.k.1", title=TITLE, oa_url="https://repo.example/k.pdf"))
+    e = entry(qp, "10.1016/j.k.1")
+    e["chan_backoff"] = {"elsevier": dict(tries=1, next_try=clock.t - 1), "oa": dict(tries=1, next_try=clock.t - 1)}
+    fulltext.write_queue(qp, [e])
+    drain(f, clock, channels=["cache", "oa"])
+    e = entry(qp, "10.1016/j.k.1")
+    assert e["chan_backoff"]["oa"]["tries"] == 2 and e["next_try"] == pytest.approx(clock.t)
+    assert drain(f, clock)["ok"] == 1                                  # elsevier is tried at once
+
+
 def test_real_failure_still_backs_off(tmp_path):
     f, net, led, clock = mkfetcher(tmp_path, {"api.elsevier.com": Resp(500, {}, b"err", "u")}, SECRETS,
                                    oa={"enabled": False})
