@@ -81,6 +81,13 @@ def is_resource_metric(m: dict) -> bool:
     return m.get("kind") == "resource" or bool(RESOURCE_METRIC.search(m.get("name", "")))
 
 
+def _noise(a: float, b: float, floor_abs: float) -> bool:
+    """Both values below the absolute floating-point noise floor (thresholds.noise_floor_abs): their difference is
+    rounding, not a difference in method.  This drops ref/mid separation whenever both sit below the floor, even if
+    naive is above it -- a metric whose natural scale is that small needs noise_floor_abs = 0 (or smaller)."""
+    return abs(a) < floor_abs and abs(b) < floor_abs
+
+
 def _worse(direction: str, a: float, b: float) -> bool:
     """is a worse than b"""
     return a > b if direction == "<=" else a < b
@@ -98,6 +105,7 @@ def _round_sig(x: float, sig: int, direction: str, toward_loose: bool) -> float:
 def set_thresholds(spec: dict, measure: dict, cfg: dict) -> dict:
     """measure = {"ref": {seed: {metric: value}}, "mid": {...}, "naive": {...}} -> thresholds report"""
     tc = cfg["thresholds"]
+    floor_abs = float(tc.get("noise_floor_abs", 1e-9))
     out, sep = {}, []
     resource = {m["name"] for m in spec["metrics"] if is_resource_metric(m)}
     for m in spec["metrics"]:
@@ -124,7 +132,7 @@ def set_thresholds(spec: dict, measure: dict, cfg: dict) -> dict:
         naive_capped = False
         n_best = None
         separating = m_best is not None and _worse(d, m_best, r) and \
-            abs(m_best - r) > margin * max(abs(r), 1e-12)
+            abs(m_best - r) > margin * max(abs(r), 1e-12) and not _noise(r, m_best, floor_abs)
         if separating:
             if r > 0 and m_best > 0:
                 thr = math.exp(math.log(r) + tc["frac"] * (math.log(m_best) - math.log(r)))
@@ -154,8 +162,19 @@ def set_thresholds(spec: dict, measure: dict, cfg: dict) -> dict:
                     mid_n = floor
                 if _worse(d, thr, mid_n):
                     thr, naive_capped = mid_n, True
+        # raw values (None / inf / nan included): a missing or non-finite value is not "at the floor"
+        all_vals = r_vals + m_vals + [v.get(name) for v in measure.get("naive", {}).values()]
+        if not separating and d == "<=" and all(x is not None and math.isfinite(x) and 0 <= x < floor_abs
+                                                 for x in all_vals):
+            # every measured solution (ref, mid, naive) sits at the floating-point noise floor of an error metric
+            # (e2e-prod-20261109: ref 4.3e-11, mid 2.7e-11, naive 4.3e-11): the metric separates nothing, and ref x1.5
+            # would fail a correct implementation that merely rounds differently
+            thr, naive_capped = floor_abs, False
+            at_floor = True
+        else:
+            at_floor = False
         exact = thr
-        thr = _round_sig(exact, tc["sig_digits"], d, toward_loose=True)
+        thr = exact if at_floor else _round_sig(exact, tc["sig_digits"], d, toward_loose=True)   # floor: kept exact
         if separating and not _worse(d, m_best, thr):   # rounding must not let the mid baseline pass
             thr = _round_sig(exact, tc["sig_digits"] + 2, d, toward_loose=False)
         if naive_capped and not _worse(d, n_best, thr):  # nor the naive baseline (review #9)
@@ -189,7 +208,8 @@ def set_thresholds(spec: dict, measure: dict, cfg: dict) -> dict:
         if nv:
             n_best = min(nv) if t["direction"] == "<=" else max(nv)
             if _worse(t["direction"], t["ref_worst"], n_best) and \
-                    abs(t["ref_worst"] - n_best) > tc["min_ref_margin"] * max(abs(n_best), 1e-12):
+                    abs(t["ref_worst"] - n_best) > tc["min_ref_margin"] * max(abs(n_best), 1e-12) and \
+                    not _noise(t["ref_worst"], n_best, floor_abs):     # both at the noise floor: not "worse"
                 ref_worse.append(name)
     lo, hi = tc["min_mid_fail"], tc["max_mid_fail"]
     status = "ok"
