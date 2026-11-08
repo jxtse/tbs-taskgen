@@ -487,7 +487,8 @@ class Fetcher:
                 txt = p.read_text(errors="replace")
                 if len(txt) >= self.ft["min_chars"]:
                     return txt, dict(source="cache", path=str(p), cached_channel=prov.get("channel"),
-                                     cached_licence=prov.get("licence") or licence_of(prov.get("channel")))
+                                     cached_licence=prov.get("licence") or licence_of(prov.get("channel")),
+                                     cached_fetched_at=prov.get("fetched_at"))
         return None
 
     def _ua(self) -> str:
@@ -990,7 +991,10 @@ def _text_channel(prov: dict) -> str | None:
 
 
 def _fetched_day(prov: dict, fallback: Path) -> str:
-    d = str(prov.get("fetched_at") or "")[:10]
+    """Day the text was downloaded: a provenance record's fetched_at, or an item's S3 record (fresh download:
+    provenance.fetched_at; cache hit: cached_fetched_at), else the file's mtime."""
+    d = str(prov.get("fetched_at") or (prov.get("provenance") or {}).get("fetched_at")
+            or prov.get("cached_fetched_at") or "")[:10]
     if re.fullmatch(r"\d{4}-\d{2}-\d{2}", d):
         return d
     return time.strftime("%Y-%m-%d", time.localtime(fallback.stat().st_mtime)) if fallback.exists() else ""
@@ -1288,7 +1292,11 @@ def _requeue(e: dict, now: float, backoff: float, was_limited: bool, until: floa
         e.update(next_try=max(now, nxt), limited_until=nxt, last_limited=now)
     else:                                              # a real failure: back off
         n_try = int(e.get("tries") or 0) + 1
-        e.update(tries=n_try, last_try=now, next_try=now + backoff * min(8, 2 ** (n_try - 1)))
+        nxt = now + backoff * min(8, 2 ** (n_try - 1))
+        # a channel backing off from an earlier failure may retry sooner: due then (the others stay skipped)
+        ends = [float(v["next_try"]) for ch, v in (e.get("chan_backoff") or {}).items()
+                if ch not in failed_ch and float(v.get("next_try") or 0) > now]
+        e.update(tries=n_try, last_try=now, next_try=min([nxt, *ends]))
 
 
 def _chan_skip(e: dict, now: float) -> list[str]:

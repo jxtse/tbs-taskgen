@@ -254,7 +254,9 @@ class DownloadLedger:
             raise LimitReached(msg, "cooldown", until=self.cooling_until(f"channel:{channel}"))
         if (msg := self.cooling(host, *related, *group)):
             raise LimitReached(msg, "cooldown", "host", until=self.cooling_until(host, *related, *group))
-        if (msg := self.breaker(channel)) or (day != self.today() and (msg := self.breaker(channel, day))):
+        if (msg := self.breaker(channel)):                  # today's breaker resets at today's midnight
+            raise LimitReached(msg, "breaker", until=next_midnight(now))
+        if day != self.today() and (msg := self.breaker(channel, day)):
             raise LimitReached(msg, "breaker", until=mid)
         if self._ok_or_pending("1", (), day=day) >= self.g["daily_ok"]:
             raise LimitReached(f"global daily cap {self.g['daily_ok']} reached", until=mid)

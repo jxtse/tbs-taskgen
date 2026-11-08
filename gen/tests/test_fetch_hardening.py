@@ -76,6 +76,39 @@ def test_breaker_skip_waits_until_midnight_not_backoff(tmp_path):
     assert not e.get("tries") and e["next_try"] == pytest.approx(next_midnight(clock.t))
 
 
+def test_todays_breaker_lifts_at_todays_midnight_even_for_a_slot_tomorrow(tmp_path):
+    """A breaker open today, checked for a slot that falls after midnight, lifts at today's midnight (Codex r3)."""
+    import time as _t
+    from tbsgen.dlledger import DownloadLedger, LimitReached, next_midnight
+    lt = _t.localtime(1_800_000_000)
+    late = _t.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, 23, 59, 0, 0, 0, -1))
+    clock = FakeClock(late)
+    led = DownloadLedger(tmp_path / "l.sqlite", clock=clock, sleep=clock.sleep)
+    for i in range(8):
+        led.record("elsevier", "api.elsevier.com", f"x{i}", "fail", 500, 0, "HTTP 500")
+    with pytest.raises(LimitReached) as ei:
+        led.check("elsevier", "api.elsevier.com", slot=late + 120)
+    assert ei.value.kind == "breaker" and ei.value.until == pytest.approx(next_midnight(late))
+
+
+def test_failure_keeps_earlier_retry_of_another_backed_off_channel(tmp_path):
+    """elsevier backs off 6 h; an hour later oa fails: the entry stays due at elsevier's retry, not 6 h after
+    the oa failure (Codex r3)."""
+    f, net, led, clock = mkfetcher(tmp_path, {"api.elsevier.com": Resp(500, {}, b"", "u"),
+                                              "repo.example": Resp(404, {}, b"", "u")}, SECRETS)
+    qp = q(f, dict(doi="10.1016/j.v.1", title=TITLE))
+    drain(f, clock)
+    t_els = entry(qp, "10.1016/j.v.1")["chan_backoff"]["elsevier"]["next_try"]
+    clock.t += 3600
+    fulltext.enqueue(qp, fulltext.queue_entry(dict(doi="10.1016/j.v.1", title=TITLE), subscribers=[["r", "late"]]))
+    e = entry(qp, "10.1016/j.v.1")
+    e["oa_url"] = "https://repo.example/v.pdf"
+    fulltext.write_queue(qp, [e])
+    drain(f, clock)
+    e = entry(qp, "10.1016/j.v.1")
+    assert e["chan_backoff"]["oa"]["tries"] == 1 and e["next_try"] == pytest.approx(t_els)
+
+
 def test_real_failure_still_backs_off(tmp_path):
     f, net, led, clock = mkfetcher(tmp_path, {"api.elsevier.com": Resp(500, {}, b"err", "u")}, SECRETS,
                                    oa={"enabled": False})
@@ -483,6 +516,27 @@ def test_purge_raw_match_is_exact_stem(tmp_path):
     (w / "raw" / "10.1016_a.b.pdf").write_bytes(FAKE_PDF)          # another paper's raw file, same prefix
     out = fulltext.purge(f.cfg, ["elsevier"])
     assert out["raw"] == 1 and (w / "raw" / "10.1016_a.b.pdf").exists() and not (w / "raw" / "10.1016_a.xml").exists()
+
+
+def test_purge_before_uses_original_download_day_for_item_copies(tmp_path):
+    """An item that got an old text from the cache: --before uses the cached text's download day, not the copy's
+    mtime (Codex r3)."""
+    f, led = _fetch_three(tmp_path)
+    w = Path(f.cfg["fulltext"]["write_cache_dir"])
+    pj = next(p for p in w.glob("*.json") if json.loads(p.read_text())["channel"] == "elsevier")
+    prov = json.loads(pj.read_text())
+    prov["fetched_at"] = "2026-01-02T00:00:00+0800"
+    pj.write_text(json.dumps(prov))
+    hit = f.cached(dict(doi="10.1016/j.p.1", title=TITLE))
+    assert hit[1]["cached_fetched_at"].startswith("2026-01-02")
+    run = tmp_path / "run"
+    d = run / "items" / "it"
+    d.mkdir(parents=True)
+    (d / "fulltext.txt").write_text(hit[0])
+    (d / "S3_fulltext.json").write_text(json.dumps(hit[1]))
+    (d / "state.json").write_text(json.dumps(dict(stage="S10", status="done")))
+    out = fulltext.purge(f.cfg, ["elsevier"], before="2026-02-01", runs=[run])
+    assert out["texts"] == 1 and out["items"] == 1 and not (d / "fulltext.txt").exists()
 
 
 def test_purge_before_date_and_bad_args(tmp_path):
