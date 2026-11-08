@@ -15,6 +15,7 @@ can be solved before the error).
 from __future__ import annotations
 
 import json
+import os
 import re
 import time
 from pathlib import Path
@@ -178,15 +179,20 @@ def launch(cfg: dict, rec: dict, ledger, save) -> dict:
         # those of the record, which ingest() checks the result against) and re-check it
         try:
             conf = json.loads(Path(rec["config"]).read_text())
-        except (OSError, ValueError):
-            conf = job_config(cfg, Path(rec["task"]), rec["who"], rec["job_name"])
+        except (OSError, ValueError) as e:
+            # never rebuild from the current settings: model / job dir could differ from the record
+            rec["blocked"] = f"job config {rec['config']} unreadable ({type(e).__name__}); run prepare again"
+            save(rec)
+            return rec
         hosts = [str(h) for h in c.get("agent_allowed_hosts") or []]
         for a in conf.get("agents") or []:
             if hosts:
                 a["extra_allowed_hosts"] = hosts
             else:
                 a.pop("extra_allowed_hosts", None)
-        Path(rec["config"]).write_text(json.dumps(conf, indent=1))
+        tmp = Path(rec["config"] + ".tmp")
+        tmp.write_text(json.dumps(conf, indent=1))
+        os.replace(tmp, rec["config"])                     # atomic: an interrupted write leaves the old config
         why = network_problem(cfg, Path(rec["task"]), conf)
         if why:
             rec["blocked"] = why

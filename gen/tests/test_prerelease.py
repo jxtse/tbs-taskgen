@@ -77,6 +77,19 @@ def test_vendored_copy_shipped_to_the_agent_is_blocking(tmp_path):
     assert r["findings"][0]["kind"] == "public_code"
 
 
+@pytest.mark.parametrize("name", ["DecayFit.tar.gz", "decayfit-1.2.0.tar.gz", "DecayFit-main.zip",
+                                  "decayfit-1.2-py3-none-any.whl", "decayfit_v2/core.py"])
+def test_shipped_archives_and_versioned_copies_are_blocking(tmp_path, name):
+    t = mk_task(tmp_path, extra={f"environment/data/{name}": "x"})
+    r = prerelease.readymade_check(t, CAND, SPEC)
+    assert not r["ok"] and r["findings"][0]["kind"] == "public_code", name
+
+
+def test_data_files_named_like_the_method_are_not_code(tmp_path):
+    t = mk_task(tmp_path, extra={"environment/data/decayfit_traces.csv": "t,y\n"})
+    assert prerelease.readymade_check(t, CAND, SPEC)["ok"]
+
+
 def test_generated_public_output_is_checked_too(tmp_path):
     """At S7 the public files are the generator's output (runs/s7-N/detA/environment), not task/environment."""
     t = mk_task(tmp_path)
@@ -230,6 +243,19 @@ def test_an_intent_saved_with_submit_off_is_rechecked_and_rewritten_at_launch(tm
     conf = json.loads(Path(rec["config"]).read_text())
     assert conf["agents"][0]["extra_allowed_hosts"] == ["models.example.com"]
     assert out["state"] == "launch_failed" and "not launched" not in out["error"]   # got past the check (no tmux)
+
+
+def test_resumed_intent_with_an_unreadable_config_is_blocked_not_rebuilt(tmp_path):
+    item = tmp_path / "items" / "i1"
+    _pkg_task(item)
+    base = {"harbor_root": str(tmp_path), "student_launcher": "x.sh", "jobs_dir": str(tmp_path / "jobs"),
+            "tmux_bin": "/nonexistent-tmux", "agent_allowed_hosts": ["m.example.com"]}
+    rec = calib.prepare(load_config(overrides={"calib": base}), item, "glm", 1)
+    Path(rec["config"]).write_text("{truncated")
+    out = calib.launch(load_config(overrides={"calib": dict(base, allow_submit=True)}), dict(rec), None,
+                       lambda r: None)
+    assert out["state"] == "intent" and "unreadable" in out["blocked"]
+    assert Path(rec["config"]).read_text() == "{truncated"
 
 
 def test_resumed_intent_keeps_its_identity(tmp_path):

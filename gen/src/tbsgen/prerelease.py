@@ -1,18 +1,12 @@
 """Pre-release checks of a packaged task: network policy of the agent phase, and ready-made implementations.
 
 Network (`package.network`): an agent solving a packaged task must not reach the open internet, or it can
-`pip install` the paper's own library or fetch a finished implementation from GitHub.  Harbor (0.23+) supports
-per-task network policies in task.toml:
-
-    [environment] network_mode = "public" | "no-network" | "allowlist", allowed_hosts = [...]
-
-and run-time host merges (`harbor run --allow-agent-host HOST`, `agent.extra_allowed_hosts` in a job config)
-that apply to the agent phase only.  `allowlist` is enforced by Harbor's Docker environment (an egress sidecar,
-needs a Linux kernel with nftables fib) and by its E2B-based sandboxes; a provider that cannot enforce it
-refuses to start the trial instead of running open.  Installed agents (Claude Code, Codex) set up during agent
-setup, before the agent phase, under the [environment] baseline: an install step that downloads needs its hosts
-in the baseline allowlist (`package.network.install_hosts`), while the model endpoint is added per run by the
-launcher (`--allow-agent-host`; calib.agent_allowed_hosts).
+`pip install` the paper's own library or fetch a finished implementation from GitHub.  Harbor (checked against
+0.23.0) supports per-phase network policies in task.toml -- [environment] network_mode = "public" | "no-network" |
+"allowlist" with allowed_hosts is the baseline, [agent] / [verifier] override it for those phases -- and run-time
+host merges for the agent phase only (`harbor run --allow-agent-host HOST`, agents[].extra_allowed_hosts in a job
+config).  Installed agents (Claude Code, Codex) are set up under the baseline before the agent-phase policy is
+applied; the model endpoint is added per run by the launcher (calib.agent_allowed_hosts).
 
 Modes written by `package` (`package.network.mode`):
   "agent-allowlist" (default)  [environment] network_mode = "public" (agent setup installs the agent CLI),
@@ -237,6 +231,11 @@ def _match(name: str, sig: dict[str, str]) -> str | None:
     return None
 
 
+# source / package files (compound archive suffixes first)
+_CODE_FILE = re.compile(r"\.(tar\.gz|tar\.bz2|tar\.xz|tgz|zip|whl|tar|gz|egg|py|pyx|r|jl|m|c|cc|cpp|h|f90|f|ipynb)$",
+                        re.I)
+
+
 def readymade_check(task: Path, candidate: dict, spec: dict | None, public_env: Path | None = None) -> dict:
     """Rule check: does the task image install, or does the reference / a baseline import, the paper's own
     implementation?  Any third-party import of the reference or baselines outside the pinned stack is reported
@@ -261,11 +260,12 @@ def readymade_check(task: Path, candidate: dict, spec: dict | None, public_env: 
     # the generator's public output (`public_env`, e.g. runs/s7-N/detA/environment at S7)
     shipped = [task / "environment"] + ([public_env] if public_env else [])
     for env, p in [(e, p) for e in shipped if e.exists() for p in sorted(e.rglob("*"))]:
-        if p.is_file() and p.suffix.lower() in (".py", ".r", ".jl", ".m", ".c", ".cpp", ".f90", ".ipynb", ".whl",
-                                                ".tar", ".gz", ".zip"):
+        if p.is_file() and _CODE_FILE.search(p.name):
             for part in p.relative_to(env).parts:
-                name = re.sub(r"\.(py|r|jl|m|c|cpp|f90|ipynb|whl|tar|gz|zip)$", "", part, flags=re.I)
-                if (why := _match(name.split("-")[0], sg["names"]) or _match(name, sg["names"])):
+                stem = _CODE_FILE.sub("", part)
+                # DecayFit-1.2.0 / decayfit_v2 / decayfit-main: also the part before a version / branch suffix
+                base = re.split(r"[-_.]v?\d|[-_](?:main|master|src|dist)$", stem, maxsplit=1)[0]
+                if (why := _match(stem, sg["names"]) or _match(base, sg["names"])):
                     findings.append(dict(kind="public_code", name=part, file=str(p.relative_to(env.parent)),
                                          matches=why))
                     break
