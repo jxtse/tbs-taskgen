@@ -176,19 +176,42 @@ function itemList(src) {
 }
 // ego snapshot lines: `  anchor [ref=4, url=...]` / `  iframe [ref=6]` / `    text "Download"`.  Only items
 // below an iframe that domWalk could not enter (cross-origin) are kept; field items never carry a text.
-function snapItems(snap, dom) {
+// the page's frame tree in document order: { kids: [{ cross, kids }] } (same-origin frames are entered)
+function frameTree() {
+  const walk = (doc) => [...doc.querySelectorAll("iframe, frame")].map((f) => {
+    let d = null; try { d = f.contentDocument; } catch (e) { d = null; }
+    return d ? { cross: false, kids: walk(d) } : { cross: true, kids: [] };
+  });
+  return { kids: walk(document) };
+}
+function snapItems(snap, dom, tree) {
   const lines = String(snap || "").split("\n");
   const res = [];
   const stack = [];
   const domKeys = new Set(dom.map((x) => x.kind + "|" + (x.href || "") + "|" + (x.itext || x.text || "")));
+  const rootNode = { kids: (tree && tree.kids) || [], next: 0 };
   for (let i = 0; i < lines.length; i++) {
     const ln = lines[i];
     if (!ln.trim()) continue;
     const ind = ln.length - ln.trimStart().length;
     while (stack.length && stack[stack.length - 1].ind >= ind) stack.pop();
-    if (/^\s*iframe \[ref=\d+/.test(ln)) { stack.push({ ind: ind, iframe: true }); continue; }
+    if (/^\s*iframe \[ref=\d+/.test(ln)) {
+      // only frames domWalk could not enter (cross-origin) give snapshot items; a same-origin frame's items are
+      // DOM items (checked by domAct).  Frames are matched to the DOM's frame tree by document order; inside a
+      // cross-origin frame everything is cross-origin; an unmatched frame counts as same-origin (skipped)
+      const parent = [...stack].reverse().find((s) => s.iframe);
+      let node;
+      if (parent && parent.cross) node = { cross: true, kids: [], next: 0 };
+      else {
+        const pn = parent ? parent.node : rootNode;
+        const k = pn && pn.kids ? pn.kids[pn.next++] : null;
+        node = k ? { cross: !!k.cross, kids: k.kids || [], next: 0 } : { cross: false, kids: [], next: 0 };
+      }
+      stack.push({ ind: ind, iframe: true, cross: node.cross, node: node });
+      continue;
+    }
     const m = /^\s*(button|anchor|link|combobox|textbox|searchbox|menuitem|tab|option) (?:"[^"]*" )?\[ref=(\d+)(?:[^\]]*?url=(\S+?))?\]/.exec(ln);
-    if (!m || !stack.some((s) => s.iframe)) continue;
+    if (!m || !stack.some((s) => s.iframe) || !stack.every((s) => !s.iframe || s.cross)) continue;
     const field = ["textbox", "searchbox", "combobox"].includes(m[1]);
     const t = field ? null : /^\s*text "(.*)"$/.exec(lines[i + 1] || "");
     const nm = /^\s*\w+ "([^"]*)"/.exec(ln);
@@ -213,7 +236,8 @@ async function items(page, scope) {
   if (!dom.some((d) => d.kind === "frame") && !scope) return dom;
   const opts = scope === "full" ? { scope: "full_page" } : (scope && scope.startsWith("@") ? { scope: "subtree", root: scope } : undefined);
   const snap = (await safeSnapshot(page, opts)) || "";
-  return dom.concat(snapItems(snap, dom));
+  const tree = await page.evaluate((src) => (new Function("return (" + src + ")")())(), frameTree.toString()).catch(() => null);
+  return dom.concat(tree ? snapItems(snap, dom, tree) : []);
 }
 
 // ---------- page state --------------------------------------------------------------------------
@@ -543,7 +567,8 @@ async function look(task, page) {
   if (all.some((d) => d.kind === "frame") || scope) {
     const opts = scope === "full" ? { scope: "full_page" } : (scope.startsWith("@") ? { scope: "subtree", root: scope } : undefined);
     const snap = (await safeSnapshot(page, opts)) || "";
-    all = all.concat(snapItems(snap, all));
+    const tree = await page.evaluate((src) => (new Function("return (" + src + ")")())(), frameTree.toString()).catch(() => null);
+    all = all.concat(tree ? snapItems(snap, all, tree) : []);
     if (snapLogin(snap)) i.login_form = true;
   }
   out.look_scope = scope;
@@ -993,7 +1018,12 @@ try {
             }
             break;
           }
-          // a label forwards the click to its control: check the control instead
+          // a label forwards the click to its control: the hit element (its link) AND the control are checked
+          const hit = el;
+          {
+            const ha = hit.closest && hit.closest("a[href]");
+            if (ha) { const h = ha.getAttribute("href") || ""; if (!/^\s*javascript:/i.test(h) && !ok(ha.href)) return { refused: "link target is outside the allowed domains" }; }
+          }
           const lb = el.closest && el.closest("label");
           if (lb && lb.control) el = lb.control;
           if (el.tagName === "INPUT" && (el.getAttribute("type") || "").toLowerCase() === "password") return { refused: "password field: do not interact" };
@@ -1017,7 +1047,9 @@ try {
           const a = el.closest("a[href]");
           if (a) { const h = a.getAttribute("href") || ""; if (!/^\s*javascript:/i.test(h) && !ok(a.href)) return { refused: "link target is outside the allowed domains" }; }
           if (form && !ok((fa && fa.hasAttribute("formaction") ? fa.formAction : "") || fAction(form) || location.href)) return { refused: "form target is outside the allowed domains" };
-          if (W.test(((el.innerText || "") + " " + (el.getAttribute("aria-label") || "")).slice(0, 200))) return { refused: "verification widget: do not interact" };
+          const vis = (v) => ((v.innerText || "") + " " + (v.tagName === "INPUT" && ["submit", "button", "reset"].includes((v.getAttribute("type") || "").toLowerCase()) ? (v.value || "") : "")
+                               + " " + (v.getAttribute("aria-label") || "") + " " + (v.title || "")).slice(0, 200);
+          if (W.test(vis(el)) || (hit !== el && W.test(vis(hit)))) return { refused: "verification widget: do not interact" };
           return { ok: true };
         }, [parts[0], parts[1], INPUT.allow, CHALLENGE.source]).catch(() => null);
         if (!pre) { out.status = "refused"; out.error = "the point could not be checked; use click on a look item"; }
@@ -1085,7 +1117,8 @@ try {
           const add = (root, inFrame) => {
             const st = document.createElement("style"); st.className = "__tbsgen_mask"; st.textContent = css;
             (root.documentElement || root).appendChild(st);
-            const n = [...root.querySelectorAll(TXT)].filter((x) => x.getClientRects().length > 0).length;   // rendered only
+            const n = [...root.querySelectorAll(TXT)].filter((x) => x.getClientRects().length > 0
+              && getComputedStyle(x).visibility !== "hidden" && getComputedStyle(x).display !== "none").length;   // shown only
             if (inFrame) res.frames += n; else res.top += n;
             for (const h of root.querySelectorAll("*")) if (h.shadowRoot) add(h.shadowRoot, inFrame);
             for (const fr of root.querySelectorAll("iframe, frame")) {
@@ -1100,8 +1133,10 @@ try {
         // unreachable (cross-origin) frame, or more fields than the masked documents hold (closed shadow roots)
         // (a field in a cross-origin frame can never be masked: any frame field while such a frame exists refuses
         // - other frames' fields are never counted against it)
+        // every field the snapshot shows must be one the mask reached: the counts per area must be EQUAL (a field
+        // the mask cannot see - closed shadow root, cross-origin frame - makes them differ and refuses)
         const uncovered = !snap || !cov || (cov.unreachable > 0 && frameFields > 0)
-          || topFields > cov.top || frameFields > cov.frames;
+          || topFields !== cov.top || frameFields !== cov.frames;
         const masked = uncovered ? -1 : 1, snapFields = 0;
         if (masked < 0 || snapFields > masked) {
           await page.evaluate(() => { const rm = (r) => { try { r.querySelectorAll(".__tbsgen_mask").forEach((x) => x.remove());

@@ -630,6 +630,12 @@ def _paper_call(bd: Path, st: dict, n: str, action: str, arg: str, say) -> int:
             if sso_ok:                       # reserved BEFORE the script runs; returned only if nothing was submitted
                 s_["submissions"] = int(s_.get("submissions") or 0) + 1
                 s_["pending"] = n
+        # a hand-off reservation this paper left behind (its wrapper was killed after the script may have handed
+        # the page over): the hand-off is unknown - the publisher's budget is used, never re-opened
+        if (state.get("handoff_inflight") or {}).get(pkey) == n:
+            state["handoff_inflight"].pop(pkey, None)
+            state.setdefault("handoff", {})[pkey] = True
+            state.setdefault("handoff_unknown", {})[pkey] = n
         handoff_free = (bool(st.get("handoff_enabled")) and not ps.get("handoff")
                         and not (state.get("handoff") or {}).get(pkey)
                         and not (state.get("handoff_inflight") or {}).get(pkey))
@@ -651,7 +657,7 @@ def _paper_call(bd: Path, st: dict, n: str, action: str, arg: str, say) -> int:
     finally:
         with _locked(slock):
             state = _read_state(bd)
-            if (state.get("handoff_inflight") or {}).get(pkey) == n:
+            if handoff_free and (state.get("handoff_inflight") or {}).get(pkey) == n:   # only our own reservation
                 state["handoff_inflight"].pop(pkey, None)
                 if not returned:
                     # the wrapper itself failed while it held the publisher's hand-off budget: the hand-off

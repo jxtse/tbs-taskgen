@@ -264,6 +264,20 @@ def _pages(port, port2):
                                     b'<iframe src="/verify-inner" style="position:absolute;left:0;top:0;width:400px;height:200px;border:0"></iframe></body></html>'),
         "/xform-frame": ("text/html", f'<html><head><title>Article</title></head><body><iframe src="http://127.0.0.1:{port2}/xform" '
                                       f'width="300" height="80"></iframe></body></html>'.encode()),
+        # round 16: a visibility:hidden field next to a closed-shadow e-mail field (screenshot refused); a link
+        # inside a label of a checkbox (click_xy keeps the link check); an input button "Verify you are human";
+        # a same-origin verification frame whose link has a different aria-label
+        "/shot-closed": ("text/html", b'<html><head><title>Article</title></head><body><input type="text" style="visibility:hidden">'
+                                      b'<div id="h"></div><script>const r=document.getElementById("h").attachShadow({mode:"closed"});'
+                                      b'r.innerHTML=\'<input type="email" value="SECRETCLOSED@x.org">\';</script></body></html>'),
+        "/label-link-xy": ("text/html", b'<html><head><title>Article</title></head><body style="margin:0"><input id="c" type="checkbox">'
+                                        b'<label for="c" style="position:absolute;left:0;top:100px;display:block;width:200px;height:40px">'
+                                        b'<a href="https://denied.example/pdf" style="display:block;width:200px;height:40px">Download</a></label></body></html>'),
+        "/verify-input-xy": ("text/html", b'<html><head><title>Article</title></head><body style="margin:0">'
+                                          b'<input type="button" value="Verify you are human" style="position:absolute;left:0;top:0;width:200px;height:40px"></body></html>'),
+        "/verify-aria-inner": ("text/html", b'<html><head><title>Verify you are human</title></head><body>'
+                                            b'<a href="/logged" aria-label="Continue">Go on</a></body></html>'),
+        "/verify-aria": ("text/html", b'<html><head><title>Article</title></head><body><iframe src="/verify-aria-inner" width="400" height="200"></iframe></body></html>'),
         "/wayf-form": ("text/html", b'<html><head><title>Find your institution</title></head><body><form method="post" '
                                     b'action="/logged"><input type="search" name="q" aria-label="Search for your institution">'
                                     b'<button>Find</button></form></body></html>'),
@@ -1153,5 +1167,30 @@ def test_round15_screenshot_label_xy_verify_xy_and_frame_form(origins):
         assert r2["status"] == "refused" and "frame item" in r2["error"], r2
         time.sleep(1)
         assert "/collect" not in XHITS
+    finally:
+        _finish(sp)
+
+
+def test_round16_guards(origins):
+    sp = "tbsgen-test-r16"
+    try:
+        assert _run(sp, "open", origins[0] + "/shot-closed", handoff=False)["status"] == "ok"
+        r = _run(sp, "screenshot", handoff=False)
+        assert r["status"] == "refused" and not r.get("shot"), r
+        assert _run(sp, "open", origins[0] + "/label-link-xy", handoff=False)["status"] == "ok"
+        r = _run(sp, "click_xy", "50 120", handoff=False)
+        assert r["status"] == "refused" and "outside the allowed" in r["error"], r
+        assert _run(sp, "open", origins[0] + "/verify-input-xy", handoff=False)["status"] == "ok"
+        r = _run(sp, "click_xy", "50 20", handoff=False)
+        assert r["status"] == "refused" and "verification" in r["error"], r
+        assert _run(sp, "open", origins[0] + "/verify-aria", handoff=False)["status"] == "ok"
+        r = _run(sp, "look", "full", handoff=False)
+        assert not any(x.get("in_frame") for x in r["page"]["items"]), r["page"]["items"]   # same-origin: DOM items
+        for it in r["page"]["items"]:
+            if it["kind"] == "frame":
+                continue
+            r2 = _run(sp, "click", str(it["i"]), look_key=r["look_key"], handoff=False)
+            assert r2["status"] == "refused", (it, r2)
+        assert not _run(sp, "look", handoff=False)["page"]["url"].endswith("/logged")
     finally:
         _finish(sp)

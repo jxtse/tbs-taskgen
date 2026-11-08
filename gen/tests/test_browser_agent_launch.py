@@ -791,3 +791,17 @@ def test_sso_page_goes_to_the_user_once_automatic_logins_are_over(tmp_path, monk
     _call(bd, "2", "open", "https://sso.example/login").communicate(timeout=60)
     inp = json.loads((tmp_path / "inp.json").read_text())
     assert inp["sso"]["enabled"] is False and inp["sso"]["login"] is False, inp
+
+
+def test_leftover_handoff_reservation_counts_as_used(tmp_path, monkeypatch):
+    """Round 16: a hand-off reservation a killed wrapper left behind is booked as used (never re-opened)"""
+    bd, led = _batch(tmp_path, monkeypatch, ["10.1080/a.1", "10.1080/b.2"], handoff_enabled=True)
+    from tbsgen.fulltext import publisher_of
+    pkey = "pub:" + publisher_of("10.1080/a.1")[0]
+    (bd / "state.json").write_text(json.dumps({"handoff_inflight": {pkey: "1"}}))
+    _call(bd, "1", "look").communicate(timeout=60)
+    state = json.loads((bd / "state.json").read_text())
+    assert state.get("handoff", {}).get(pkey) is True and not state.get("handoff_inflight", {}).get(pkey), state
+    _call(bd, "2", "open", "https://pub.example/b", env={"FAKE_EGO_MODE": "handoff"}).communicate(timeout=60)
+    log = [json.loads(x) for x in (tmp_path / "ego.log").read_text().splitlines()]
+    assert all(not e["handoff"] for e in log), log           # paper 2 gets no hand-off budget
