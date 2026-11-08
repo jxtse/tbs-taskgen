@@ -201,6 +201,16 @@ def test_skipped_only_for_a_backoff_that_has_run_out_stays_due():
     assert e["next_try"] == now and not e.get("paper_tries") and e["chan_backoff"]["elsevier"]["tries"] == 1
 
 
+def test_round_skipping_a_since_expired_backoff_is_due_at_the_earliest_channel():
+    """Old remote result: elsevier (expired by now) and wiley (still backing off) were both skipped for their
+    backoff: the entry is due now for elsevier, not at wiley's retry (Codex PR-A r9)."""
+    now = 1000.0
+    e = dict(ver=1, chan_backoff={"elsevier": dict(tries=1, next_try=995.0), "wiley": dict(tries=1, next_try=5000.0)})
+    fulltext._requeue(e, now, 21600, True, None, set(), same_version=True, backoff_only=True,
+                      skipped_backoff={"elsevier", "wiley"})
+    assert e["next_try"] == now and not e.get("paper_tries")
+
+
 def test_real_failure_still_backs_off(tmp_path):
     f, net, led, clock = mkfetcher(tmp_path, {"api.elsevier.com": Resp(500, {}, b"err", "u")}, SECRETS,
                                    oa={"enabled": False})

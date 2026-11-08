@@ -326,6 +326,32 @@ def test_remote_reclaimed_narrow_job_does_not_postpone_untried_oa(tmp_path, monk
     assert drain(f, FakeSSH(rdir, net))["ok"] == 1                     # oa is tried at once
 
 
+def test_remote_result_skipped_for_a_since_expired_backoff_keeps_the_entry_due(tmp_path, monkeypatch):
+    """A full remote job skipped elsevier for its backoff; collected after that backoff ran out: no request was
+    made, so the entry must stay due -- not be backed off 6 h as a paper (Codex PR-A r9)."""
+    f, net, _, led, rdir, _ = mk_remote(tmp_path, {"api.elsevier.com": ELS_XML})
+    queue(f, ELS)
+    qp = fulltext.queue_path(f.cfg)
+    [e] = fulltext.read_queue(qp)
+    e["chan_backoff"] = {"elsevier": dict(tries=1, next_try=time.time() + 30)}
+    fulltext.write_queue(qp, [e])
+    real_collect = remote.collect
+    monkeypatch.setattr(remote, "collect", lambda fetcher, job, run, **kw: dict(job=job, stage="submitted",
+                                                                               note="still running"))
+    real_run = remote.run_job
+    drain(f, FakeSSH(rdir, net))                     # submitted while elsevier backs off (entry itself is due)
+    monkeypatch.setattr(remote, "collect", real_collect)
+    [e] = fulltext.read_queue(qp)
+    e["chan_backoff"]["elsevier"]["next_try"] = time.time() - 1         # the backoff runs out meanwhile
+    fulltext.write_queue(qp, [e])
+    assert remote.run_job is real_run
+    st = drain(f, FakeSSH(rdir, net))
+    assert st["ok"] == 0 and not any("elsevier" in u for u, _ in net.calls)
+    [e] = fulltext.read_queue(qp)
+    assert float(e.get("next_try") or 0) <= time.time() and not e.get("paper_tries")
+    assert drain(f, FakeSSH(rdir, net))["ok"] == 1
+
+
 def test_remote_dead_worker_partial_results_are_kept_and_rest_stays_queued(tmp_path):
     f, net, _, led, rdir, _ = mk_remote(tmp_path, {"api.elsevier.com": ELS_XML, "api.wiley.com": FAKE_PDF})
     queue(f, ELS, WIL)
