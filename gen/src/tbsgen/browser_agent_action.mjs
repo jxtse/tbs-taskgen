@@ -10,8 +10,8 @@
 // Actions (one Page - INPUT.page_label, default the first - of the paper's TaskSpace):
 //   look [OFFSET]                 page summary: URL, title, PDF?, challenge?, login form?, text excerpt and a
 //                                 numbered list of links / buttons / fields of the page's own DOM (hidden
-//                                 dropdown items and same-origin iframes included; a cross-origin iframe is
-//                                 one `frame` item - clicking it opens the frame's checked URL as the page);
+//                                 dropdown items included; every iframe is one `frame` item - clicking it
+//                                 opens the frame's checked URL as the page);
 //                                 OFFSET paginates the item list
 //   open URL                      navigate (URL host must be in INPUT.allow); downloads and new tabs are saved /
 //                                 reported
@@ -25,18 +25,15 @@
 //   switch LABEL                  make page LABEL the current page (never a page opened by the user)
 //   wait_for url SUBSTR|sel CSS [S]   wait until the URL contains SUBSTR / a CSS selector matches (<= 60 s)
 //   save_pdf                      the current page is a PDF document: save it
-//   sso_login                     on a configured institution SSO login domain (INPUT.sso.domains): submit the
-//                                 browser-autofilled login form.  The values of credential fields are never
-//                                 read, never returned and never logged; no retry after a failure; any
-//                 captcha / slider / SMS / MFA code or missing autofill hands the page to the user instead.
 //   handoff_status                poll a running hand-off (the tool handed the page to the user)
 //   finish                        close the TaskSpace
 // Rules enforced here: nothing is typed except whitelisted institution names into checked plain text fields,
 // no interaction with verification pages / widgets, no reading of input values, storage or the browser's
-// page snapshot (it carries field values), no screenshots, no native mouse / wheel input at all (sso_login presses its
-// checked Login button inside the checking evaluation, with a CDP user gesture), no click / hover / select / type at all on a page with ANY login signal (credScan, checked in
+// page snapshot (it carries field values), no screenshots, no native mouse / wheel input at all, no click / hover / select / type at all on a page with ANY login signal (credScan, checked in
 // the same page evaluation that acts, together with the looked-at URL and the allowed domains), login forms
-// are never submitted except by `sso_login` with browser autofill, navigation targets are checked before and the
+// are never submitted (every login page - the institution's SSO login too - is handed to the user, whose
+// browser autofills it), no action inside any iframe (a frame is one item whose `click` opens its checked URL
+// as the page), navigation targets are checked before and the
 // landed URL is checked after (a page that ends up outside INPUT.allow is reset to about:blank), files are
 // only written under INPUT.files_dir, and verification / login pages are handed to the user (task.handOff)
 // instead of being solved.
@@ -49,16 +46,6 @@ const hostOk = (u) => {
   let h;
   try { const x = new URL(u); if (!/^https?:$/.test(x.protocol)) return false; h = x.hostname.toLowerCase(); } catch (e) { return false; }
   return INPUT.allow.some((d) => h === d || h.endsWith("." + d));
-};
-const hostIn = (u, domains) => {
-  let h, pr;
-  try { const x = new URL(u); pr = x.protocol; h = x.hostname.toLowerCase(); } catch (e) { return false; }
-  // HTTPS only, except loopback hosts and *.localhost (local tests); real SSO login domains are never local
-  // HTTPS only.  INPUT.sso.local_test (set only by the local test suite, never by the batch wrapper) admits
-  // exact loopback names; "127.0.0.1.example.org" is a public host either way
-  const local = h === "127.0.0.1" || h === "localhost" || h.endsWith(".localhost");
-  if (pr !== "https:" && !(local && INPUT.sso && INPUT.sso.local_test === true)) return false;
-  return domains.some((d) => h === d || h.endsWith("." + d));
 };
 
 // Everything printed goes through emit(): every URL - a whole value or a URL inside a longer string (error
@@ -106,11 +93,11 @@ function domWalk() {
   const walk = (doc, frame) => {
     if (pairs.length >= 240) return;
     for (const el of doc.querySelectorAll(SEL)) { pairs.push([el, frame]); if (pairs.length >= 240) return; }
+    // NARROWED (round 9): every iframe - same-origin too - is ONE `frame` item (its URL); nothing inside a
+    // frame is listed or acted on (`click` on the item opens the frame's checked URL as the page, where every
+    // check runs on the top document)
     for (const f of doc.querySelectorAll("iframe")) {
-      let inner = null;
-      try { inner = f.contentDocument; } catch (e) { inner = null; }
-      if (inner) walk(inner, frame + 1);
-      else if (f.src && pairs.length < 240) pairs.push([f, frame]);   // cross-origin: one `frame` item (its URL)
+      if (f.src && /^https?:/i.test(f.src) && pairs.length < 240) pairs.push([f, frame]);
     }
   };
   walk(document, 0);
@@ -180,7 +167,7 @@ async function info(page) {
   }
 }
 // ONE conservative login / MFA scan, used by every guard (interaction refusal - inside the same evaluation that
-// acts -, the hand-off decision, sso_login, the hand-off poll): runs in the page (source serialized).  Walks the
+// acts -, the hand-off decision, the hand-off poll): runs in the page (source serialized).  Walks the
 // top document, open shadow roots and same-origin iframes.  NARROWED (round 7): no judgement about what a form
 // is "for" - any login signal makes the page a login page, and a false positive only hands the page to the user:
 //   fields: a rendered input of type password / email / tel, an autocomplete token username / email /
@@ -198,7 +185,7 @@ function credScan() {
   const NAME = /pass|pwd|user|login|account|otp|one-time|code|sms|\bpin\b|verif|captcha|e-?mail|phone|mobile|密码|账号|帐号|用户名|学号|工号|验证码|动态码|短信|手机|邮箱/i;
   const MFA = /otp|one-time|code|sms|verif|验证码|动态码|短信/i;
   const AC = /\b(?:username|email|current-password|new-password|one-time-code|tel|webauthn)\b/i;
-  const WORDS = /\b(?:sign|log)[\s_-]?(?:in|on)\b|\blogin\b|\bsignin\b|continue with|登录|登入|登陆|统一身份认证/i;
+  const WORDS = /\b(?:sign|log)[\s_-]?(?:in|on)\b|\blogin\b|\bsignin\b|continue with|(?:choose|select|switch|pick) (?:an |your )?account|登录|登入|登陆|统一身份认证|选择账[号户]/i;
   const URLW = /log[\s_-]?in|sign[\s_-]?in|log[\s_-]?on|sign[\s_-]?on|登录/i;
   const IDP = /login|signin|sign-in|\/auth\b|oauth|\bsso\b|passport|account|\bidp\b|shibboleth|wayf|\bcas\b/i;
   const TXT = /验证码|短信|动态码|一次性|二次验证|安全验证|身份验证|one[- ]time|verification code|security code|two[- ]factor|2fa|authenticator/i;
@@ -223,6 +210,13 @@ function credScan() {
           || /pass|pwd|user|login|account|otp|one-time|密码|账号|帐号|用户名|学号|工号|验证码|动态码/i.test(meta)) strong = true;
       try { if (el.matches(":autofill") || el.matches(":-webkit-autofill")) { fields = true; strong = true; } } catch (e) {}
       if (MFA.test(meta) || /one-time-code/i.test(ac)) mfa = true;
+    }
+    // a select whose name / label is an account / user name (an account chooser) is a login field too
+    for (const el of doc.querySelectorAll("select")) {
+      if (!shown(el)) continue;
+      const ac = el.getAttribute("autocomplete") || "";
+      const meta = [el.id, el.getAttribute("name"), ac, el.getAttribute("aria-label"), el.getAttribute("title")].join(" ");
+      if (AC.test(ac) || NAME.test(meta)) { fields = true; strong = true; }
     }
     for (const b of doc.querySelectorAll("button, input[type=submit], input[type=button], input[type=image], [role=button]")) {
       if (!shown(b)) continue;
@@ -363,7 +357,7 @@ async function after(page) {
   return i;
 }
 
-// a challenge or (non-SSO) login page: hand the paper's space to the user instead of solving it.  The result
+// a challenge or login page: hand the paper's space to the user instead of solving it.  The result
 // line is printed FIRST (ego drops this process's output once control is with the user).
 // `kind`: challenge | login | mfa.  Without a hand-off budget (INPUT.handoff.enabled false) nothing is handed
 // over: a challenge is reported as blocked (the wrapper cools the publisher), a login as login_required.
@@ -390,11 +384,11 @@ async function postCheck(task, page, i, opts) {
     return i;
   }
   // the shared credential / MFA scan (password, user-name, e-mail sign-in, verification-code fields; frames,
-  // shadow roots): such a page outside the SSO domains goes to the user
+  // shadow roots): such a page goes to the user
   // (`cred` - any login signal - is reported and refuses interaction; `login` hands the page to the user)
   const sc = i.login_form ? { cred: true, login: true, mfa: false } : await scan(page);
   if (sc.cred) i.login_form = true;
-  if (sc.login && !hostIn(i.url, (INPUT.sso && INPUT.sso.domains) || []) && !(opts && opts.no_login_handoff)) {
+  if (sc.login && !(opts && opts.no_login_handoff)) {
     if (INPUT.handoff && INPUT.handoff.enabled) return handoff(task, page, sc.mfa ? "verification code" : "login form", h, sc.mfa ? "mfa" : "login", i.title);
     out.login_form = true;                       // reported; the agent books `login_required`
   }
@@ -447,7 +441,7 @@ async function look(task, page) {
                text: i.text, items: pageItems, more: offset + LIMIT < all.length, next_offset: offset + LIMIT < all.length ? offset + LIMIT : undefined };
   out.look_key = await urlKey(i.url);   // the wrapper's page-change check: a hash, never the URL (it can carry tokens)
   out.status = "ok";
-  await postCheck(task, page, i);       // a challenge or (non-SSO) login page is handed to the user here
+  await postCheck(task, page, i);       // a challenge or login page is handed to the user here
   if (out.status === "handoff") return;
   out.status = "ok";
 }
@@ -480,11 +474,11 @@ function domAct(walkSrc, k, allow, kind, value, expectUrl, scanSrc, infoSrc, chS
   const actv = (el.closest && el.closest("button, input")) || el;
   const form = actv.form || el.form || (el.closest ? el.closest("form") : null);
   const pwdForm = ((f) => !!f && ([...(f.elements || [])].some((x) => (x.type || "").toLowerCase() === "password") || !!f.querySelector("input[type=password]")));
-  // nothing inside (or submitting) a form with a password field (also one associated by form="..."): only
-  // sso_login submits login forms
+  // nothing inside (or submitting) a form with a password field (also one associated by form="..."): login
+  // forms are only ever submitted by the user
   if (pwdForm(form)) return { refused: "login form: credentials are not entered by this tool" };
   // a form holding a user-identifier field (e-mail / user name / account) is never submitted or changed by this
-  // tool, whatever the page calls it (identifier-first logins: only sso_login or the user)
+  // tool, whatever the page calls it (identifier-first logins: only the user)
   // NARROWED (round 6): no heuristics about what a form is for - a form with ANY free-text field (text, e-mail,
   // tel, number, textarea, ...) is only submitted / changed when every such field was filled by this tool's
   // `type` (a whitelisted institution name; marked below).  Anything else may hold an autofilled identifier.
@@ -500,7 +494,7 @@ function domAct(walkSrc, k, allow, kind, value, expectUrl, scanSrc, infoSrc, chS
   if (kind === "click" && W.test(text)) return { refused: "verification widget: do not interact" };
   const tag = el.tagName.toLowerCase();
   if (tag === "iframe") {
-    // a cross-origin frame: never acted on inside; `click` opens its (checked) URL as this page
+    // a frame (any origin): never acted on inside; `click` opens its (checked) URL as this page
     if (kind !== "click") return { refused: "frame items can only be clicked (opens the frame's page)" };
     if (!ok(el.src)) return { refused: "frame URL is outside the allowed domains" };
     return { open: el.src, text: text };
@@ -581,10 +575,10 @@ async function act(task, page, kind, k, value) {
   const it = all[k];
   if (isChallenge(ip)) { out.status = "refused"; out.error = "verification page: do not interact"; await postCheck(task, page, ip); return; }
   // a page with credential / MFA fields (anywhere: frames, shadow roots, identity-provider frames) is never
-  // interacted with: sso_login (configured SSO domains) or the hand-off only
+  // interacted with: the hand-off only
   if (ip.login_form || await credPage(page)) {
     out.status = "refused";
-    out.error = "login / verification-code page: no click, hover, select or type here (sso_login on the SSO domain, otherwise report login_required)";
+    out.error = "login / verification-code page: no click, hover, select or type here (it is handed to the user, otherwise report login_required)";
     return;
   }
   if (it.widget || WIDGET.test(it.text || "")) { out.status = "refused"; out.error = "verification widget: do not interact"; return; }
@@ -644,135 +638,6 @@ async function act(task, page, kind, k, value) {
   }
 }
 
-// in-page (serialized; run with a CDP user gesture): check and submit the SSO login form in one go.  Every
-// refusal is returned with stage "pre" (nothing was clicked).  Field values are never read (the browser's
-// :autofill state only; in the local test mode a non-empty stand-in value counts).
-function ssoSubmit(args) {
-  const [domains, lt, scanSrc, infoSrc, chSrc] = args;
-  const pre = (why) => ({ refused: why, stage: "pre" });
-  const inDom = (u) => { try { const x = new URL(u); const hh = x.hostname.toLowerCase();
-    const local = hh === "127.0.0.1" || hh === "localhost" || hh.endsWith(".localhost");
-    if (x.protocol !== "https:" && !(local && lt)) return false;
-    return domains.some((d) => hh === d || hh.endsWith("." + d)); } catch (e) { return false; } };
-  if (!inDom(location.href)) return pre("the page left the SSO login domain");
-  // the same verification-page test as everywhere else (title rules, challenge forms, captcha widgets)
-  if ((new Function("return (" + infoSrc + ")")())(chSrc).challenge_page) return pre("verification page on the SSO login page");
-  if ((new Function("return (" + scanSrc + ")")())().mfa
-      || document.querySelector("iframe[src*='captcha'], .g-recaptcha, .h-captcha, .cf-turnstile")) return pre("MFA / captcha on the login page");
-  const af = (el) => { try { return el.matches(":autofill") || el.matches(":-webkit-autofill"); } catch (e) { return false; } };
-  const filled = (el) => af(el) || (lt && el.value.length > 0);
-  const pwd = document.querySelector("form input[type=password]") || document.querySelector("input[type=password]");
-  const form = pwd && (pwd.form || pwd.closest("form"));
-  if (!form) return pre("no login form");
-  const user = form.querySelector("input[autocomplete=username], input[type=text], input[type=email], input:not([type])");
-  if (!user || !filled(pwd) || !filled(user)) return pre("the login form is not autofilled");
-  const b = [...form.elements].find((x) => (x.type || "").toLowerCase() === "submit" && !x.disabled)
-    || [...form.querySelectorAll("button")].find((x) => /log ?in|sign ?in|登录|登陆|submit/i.test((x.innerText || "")));
-  if (!b) return pre("no submit button on the login form");
-  const target = (b.hasAttribute("formaction") ? b.formAction : "") || form.action || location.href;
-  const method = ((b.hasAttribute("formmethod") ? b.formMethod : "") || form.method || "get").toLowerCase();
-  if (method !== "post") return pre("the login form does not use POST");
-  if (!inDom(target)) return pre("the login form posts outside the SSO login domains");
-  const r = b.getBoundingClientRect();
-  if (r.width < 1 || r.height < 1) return pre("the login button is not visible");
-  b.click();
-  // the page's own click / submit handlers ran synchronously inside b.click(): if they changed the form's
-  // method or target, the submission (a navigation not yet started) is cancelled here, before any request.
-  // (A script of the SSO page that reads the autofilled values itself is outside what any tool can prevent:
-  // the configured SSO domain is trusted, as when the user logs in by hand.)
-  const t2 = (b.hasAttribute("formaction") ? b.formAction : "") || form.action || location.href;
-  const m2 = ((b.hasAttribute("formmethod") ? b.formMethod : "") || form.method || "get").toLowerCase();
-  if (m2 !== "post" || !inDom(t2) || !inDom(location.href)) {
-    window.stop();
-    return { submitted: true, aborted: "the login form changed while it was submitted; stopped" };
-  }
-  return { submitted: true };
-}
-
-async function ssoLogin(task, page) {
-  const sso = INPUT.sso || {};
-  const localTest = sso.local_test === true;          // only the local test suite sets this; never the wrapper
-  // sso_stage "pre": nothing was submitted (the wrapper may return the reserved submission).  It switches to
-  // "submit" BEFORE the login button is pressed, so any error or navigation from then on counts as submitted.
-  out.sso_submitted = false;
-  out.sso_stage = "pre";
-  if (!sso.login || !(sso.domains || []).length) { out.status = "refused"; out.error = "sso_login is not enabled for this batch (or its budget is used up); report login_required"; return; }
-  const i = await info(page);
-  if (!hostIn(i.url, sso.domains)) { out.status = "refused"; out.error = "sso_login is only allowed on the configured institution SSO login domains (HTTPS)"; return; }
-  const h = (() => { try { return new URL(i.url).hostname; } catch (e) { return ""; } })();
-  out.sso_host = h;
-  // Autofill is detected with the browser's own :autofill state of the two fields (no value is read).  Only
-  // in the local test mode a non-empty field (a page-provided stand-in) also counts.
-  const read = () => page.evaluate(([lt, scanSrc]) => {
-    const af = (el) => { try { return el.matches(":autofill") || el.matches(":-webkit-autofill"); } catch (e) { return false; } };
-    // MFA / verification step: the same scan as every other guard (credScan), plus captcha widgets
-    const mfa = (new Function("return (" + scanSrc + ")")())().mfa
-      || !!document.querySelector("iframe[src*='captcha'], .g-recaptcha, .h-captcha, .cf-turnstile");
-    const pwd = document.querySelector("form input[type=password]") || document.querySelector("input[type=password]");
-    if (!pwd) return { hasPwd: false, mfa: mfa };
-    const form = pwd.form || pwd.closest("form") || document;
-    const user = form.querySelector("input[autocomplete=username], input[type=text], input[type=email], input:not([type])");
-    const filled = (el) => af(el) || (lt && el.value.length > 0);
-    return { hasPwd: true, hasUser: !!user, mfa: mfa, pwFilled: filled(pwd), userFilled: !!user && filled(user) };
-  }, [localTest, credScan.toString()]).catch(() => ({ hasPwd: false }));
-  let st = await read();
-  if (st.mfa) return handoff(task, page, "MFA / verification code on the SSO login page", h, "mfa", i.title);
-  if (!st.hasPwd || !st.hasUser) return handoff(task, page, "not a recognizable SSO login form", h, "login", i.title);
-  if (!st.pwFilled || !st.userFilled) {
-    // the page may still be loading: look once more (no click - a click could submit), then hand over
-    await sleep(2000);
-    st = await read();
-    if (st.mfa) return handoff(task, page, "MFA / verification code on the SSO login page", h, "mfa", i.title);
-    if (!st.pwFilled || !st.userFilled) return handoff(task, page, "the browser did not autofill the login form", h, "login", i.title);
-  }
-  // ONE evaluation checks and submits (no later, separate click): it runs through CDP with a user gesture (the
-  // browser releases autofilled values to the page on a user activation), re-checks that the page is still an
-  // HTTPS configured SSO host, both fields are still autofilled, there is no MFA / captcha, the form posts
-  // (POST only - never GET, which would put the credentials into a URL) to a browser-resolved target
-  // (form.action / button.formAction; <base href> included) on such a host - and only then clicks the button
-  // (button.click(): the page's own click / submit handlers run as for a real click).
-  const expr = "(" + ssoSubmit.toString() + ")(" + JSON.stringify([sso.domains, localTest, credScan.toString(),
-                                                                    pageInfo.toString(), CHALLENGE.source]) + ")";
-  out.sso_stage = "submit";
-  out.sso_submitted = true;                          // from here on the outcome counts as a submission
-  let chk = null;
-  await withDownload(task, page, async () => {
-    const r = await page.cdp("Runtime.evaluate", { expression: expr, returnByValue: true, userGesture: true, awaitPromise: false },
-                             { timeout: 15000 });
-    chk = (r && r.result && r.result.value) || { refused: "the login form could not be checked" + (r && r.exceptionDetails ? " (exception)" : "") };
-  }).catch((e) => { chk = { refused: "the login form could not be checked: " + String(e).slice(0, 80), unknown: true }; });
-  if (!chk || !chk.submitted) {
-    if (chk && chk.refused && !chk.unknown && chk.stage === "pre") { out.sso_stage = "pre"; out.sso_submitted = false; }
-    out.status = "refused"; out.error = (chk && chk.refused) || "not submitted"; return;
-  }
-  if (chk.aborted) {                                 // counted as a (failed) submission: no more logins this batch
-    out.sso = "fail"; out.note = chk.aborted; out.status = "ok";
-    out.page = { url: bareUrl(i.url), title: i.title, login_form: true };
-    return;
-  }
-  // wait for the login page to go away (never resubmit; a failure ends the logins of this batch)
-  const t0 = Date.now();
-  for (;;) {
-    await sleep(1500);
-    const i2 = await info(page);
-    if (isChallenge(i2)) { out.sso = "handoff"; return handoff(task, page, "challenge after the SSO login", h, "challenge", i2.title); }
-    const st2 = await read();
-    if (st2.mfa) { out.sso = "handoff"; return handoff(task, page, "MFA / verification code after the SSO login", h, "mfa", i2.title); }
-    if (!st2.hasPwd && hostIn(i2.url, sso.domains) && await loginPage(page)) {
-      // still on the login server with other credential fields (a second step): the user finishes it
-      out.sso = "handoff"; return handoff(task, page, "a further login step on the SSO server", h, "mfa", i2.title);
-    }
-    if (!st2.hasPwd) {
-      const i3 = await after(page);                  // the landed page must be an allowed / SSO host
-      if (out.left_allowed) { out.sso = "fail"; out.status = "ok"; return; }
-      out.sso = "ok"; out.page = { url: bareUrl(i3.url), title: i3.title, pdf: /pdf/i.test(i3.ctype) }; out.status = "ok"; return;
-    }
-    if (Date.now() - t0 > (sso.wait_ms || 35000)) break;
-  }
-  out.sso = "fail";                                   // still on the login page: failed, never retried
-  out.page = { url: bareUrl(i.url), title: i.title, login_form: true };
-  out.status = "ok";
-}
 
 try {
   let task;
@@ -798,8 +663,7 @@ try {
     if (!["handoff_status", "tabs", "switch"].includes(INPUT.action)) {
       const i0 = await info(page);
       // (only web pages count: about:, chrome:// new-tab and error pages are the browser's own)
-      const allowedHere = !/^https?:/i.test(i0.url || "") || hostOk(i0.url)
-        || hostIn(i0.url, (INPUT.sso && INPUT.sso.domains) || []);
+      const allowedHere = !/^https?:/i.test(i0.url || "") || hostOk(i0.url);
       if (!allowedHere) {
         let hh = ""; try { hh = new URL(i0.url).hostname; } catch (e) {}
         await page.goto("about:blank", { timeout: 5000 }).catch(() => {});
@@ -891,8 +755,6 @@ try {
         else if (r.ok) out.files.push(f);
         out.status = "ok";
       }
-    } else if (INPUT.action === "sso_login") {
-      await ssoLogin(task, page);
     } else if (INPUT.action === "handoff_status") {
       const hs = INPUT.handoff_state || {};
       if (!hs.active) { out.handoff_check = "none"; out.status = "ok"; }

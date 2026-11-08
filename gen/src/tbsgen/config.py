@@ -170,19 +170,12 @@ DEFAULTS: dict[str, Any] = {
                 "notify": True,             # macOS notification when the control is handed to the user
                 "bark_cmd": [],             # optional local notification command; off by default, never group chats
             },
-            # Institution / WAYF domains every paper may navigate to (they are added to allowed_domains); the
-            # agent may type ONLY the institution names in agent.institution_names there.
+            # Institution / WAYF / institution-login domains every paper may navigate to (they are added to
+            # allowed_domains), e.g. add "authserver.nju.edu.cn".  The agent may type ONLY the institution names
+            # in agent.institution_names there; any login page (the institution's own SSO login too) is handed
+            # to the user (handoff.enabled), whose browser autofills it - the agent never submits a login.
             "sso": {
                 "domains": ["carsi.edu.cn", "openathens.net", "shibboleth.net"],
-            },
-            # Browser-autofill login on the institution's own SSO domains: `tbsgen-browser N sso_login` checks
-            # that Chromium autofilled the form (lengths only - values are never read, returned or logged) and
-            # clicks Login.  No typing, no retry after a failure, at most max_submissions per batch; a captcha
-            # / slider / SMS / MFA code or missing autofill hands the page to the user instead.
-            "sso_login": {
-                "enabled": False,           # repo default off; enable on the machine with the logged-in profile
-                "domains": [],              # e.g. ["authserver.nju.edu.cn"]; HTTPS only
-                "max_submissions": 2,       # per batch; after one failed login no more attempts this batch
             },
             "agent": {
                 "enabled": False,
@@ -198,7 +191,7 @@ DEFAULTS: dict[str, Any] = {
                 "gate_max_wait_s": 150,     # the per-paper gate waits at most this long for the publisher's slot
                 "prompt_template": None,    # None -> packaged browser_agent_prompt.md
                 "max_calls_per_paper": 25,  # ego-browser calls the agent may make per paper
-                "max_navigations_per_paper": 12,   # page loads per paper (open / click / select / type / hover / sso_login / save_pdf)
+                "max_navigations_per_paper": 12,   # page loads per paper (open / click / select / type / hover / save_pdf)
                 "nav_gap_s": 2.5,           # min seconds between two page loads of the same publisher
                 "institution_names": [],    # the ONLY strings `type` may type, e.g. ["Nanjing University", "南京大学"]
                 "call_timeout_s": 150,      # one ego-browser call of the agent

@@ -252,7 +252,7 @@ _PAPER_ACTIONS = "|".join((
     # the pattern never starts with '#' (a shell comment) and has no glob / quote characters
     r"wait_for url [A-Za-z0-9/._%=:-]{1,200}( \d{1,3})?",
     r"wait_for sel [A-Za-z][A-Za-z0-9_.#:-]{0,100}( \d{1,3})?",
-    "save_pdf", "sso_login", "handoff_status",
+    "save_pdf", "handoff_status",
 ))
 _TOOL_CMD = re.compile(rf"^tbsgen-browser (finish|[1-9]\d? ({_PAPER_ACTIONS}))$")
 _SLEEP_CMD = re.compile(r"^sleep ([1-9]\d?|[12]\d\d|300)$")
@@ -260,7 +260,7 @@ DENY_TEXT = re.compile(r"sci-?hub|libgen|z-lib|annas-archive", re.I)
 # actions that can load a page of the publisher (paced per publisher and capped per paper)
 # (select / type / hover can trigger a navigation from the page's handlers: reserved and paced like one)
 # actions that may load a page or request a file: navigation budget, per-publisher lock and pacing
-NAV_ACTIONS = frozenset({"open", "click", "sso_login", "select", "type", "hover", "save_pdf"})
+NAV_ACTIONS = frozenset({"open", "click", "select", "type", "hover", "save_pdf"})
 
 
 def shell_allowed(cmd) -> str | None:
@@ -305,8 +305,7 @@ def _cool_publisher(led, ps: dict, doi: str, why: str, secs: float):
 
 
 def _read_state(bd: Path) -> dict:
-    """Batch-shared wrapper state: navigation pacing per publisher, one hand-off per publisher, SSO budget,
-    and the TaskSpaces the batch created (one per paper, closed by `finish`)."""
+    """Batch-shared wrapper state: navigation pacing per publisher, one hand-off per publisher, and the TaskSpaces the batch created (one per paper, closed by `finish`)."""
     try:
         return json.loads((bd / "state.json").read_text())
     except (OSError, ValueError):
@@ -498,7 +497,7 @@ def wrapper_main(batch_dir: str, argv: list[str]) -> int:
         return say(f"tbsgen: TaskSpaces closed ({', '.join(done)})", 0)
     usage = ("usage: tbsgen-browser N look [OFFSET]|open URL|click I|hover I|"
              "select I VALUE|type I TEXT|tabs|switch LABEL|"
-             "wait_for url SUB|sel CSS [S]|save_pdf|sso_login|handoff_status  |  tbsgen-browser finish")
+             "wait_for url SUB|sel CSS [S]|save_pdf|handoff_status  |  tbsgen-browser finish")
     if len(argv) < 2 or argv[0] not in st["papers"] or not _TOOL_CMD.match("tbsgen-browser " + " ".join(argv)):
         return say(usage, 2)
     n = argv[0]
@@ -581,7 +580,7 @@ def _paper_call(bd: Path, st: dict, n: str, action: str, arg: str, say) -> int:
             _atomic(sp, json.dumps(ps))
             return say(f"tbsgen: paper {n}: only the configured institution names may be typed", 2)
     # budgets shared by the batch's concurrent calls are reserved under one lock: navigation pacing per
-    # publisher, the publisher's single hand-off and the SSO submission budget
+    # publisher and the publisher's single hand-off
     with _locked(slock):
         state = _read_state(bd)
         if action in NAV_ACTIONS:
@@ -594,15 +593,6 @@ def _paper_call(bd: Path, st: dict, n: str, action: str, arg: str, say) -> int:
                         and not (state.get("handoff_inflight") or {}).get(pkey))
         if handoff_free:
             state.setdefault("handoff_inflight", {})[pkey] = n
-        sso_ok = False
-        if action == "sso_login":
-            s = state.setdefault("sso", {})
-            sso_ok = (bool(st.get("sso_login_enabled")) and bool(st.get("sso_domains"))
-                      and int(s.get("submissions") or 0) < int(st.get("sso_max_submissions", 2))
-                      and not s.get("failed") and not s.get("logged_in") and not s.get("pending"))
-            if sso_ok:                       # reserved before the script runs; released only if nothing was submitted
-                s["submissions"] = int(s.get("submissions") or 0) + 1
-                s["pending"] = n
         _write_state(bd, state)
     _atomic(sp, json.dumps(ps))
     # page loads of one publisher run one at a time (a lock held over the wait AND the action), at least
@@ -612,7 +602,7 @@ def _paper_call(bd: Path, st: dict, n: str, action: str, arg: str, say) -> int:
     returned = False
     try:
         with nav_lock:
-            rc = _paced_run(bd, st, n, p, ps, action, arg, say, led, pkey, space, handoff_free, sso_ok, slock,
+            rc = _paced_run(bd, st, n, p, ps, action, arg, say, led, pkey, space, handoff_free, slock,
                             COOLDOWN_429_S, aliases, web_hosts, sp)
         returned = True
         return rc
@@ -629,37 +619,29 @@ def _paper_call(bd: Path, st: dict, n: str, action: str, arg: str, say) -> int:
                 _write_state(bd, state)
 
 
-def _paced_run(bd, st, n, p, ps, action, arg, say, led, pkey, space, handoff_free, sso_ok, slock, COOLDOWN_429_S,
+def _paced_run(bd, st, n, p, ps, action, arg, say, led, pkey, space, handoff_free, slock, COOLDOWN_429_S,
                aliases, web_hosts, sp) -> int:
-    def refund_sso():
-        if sso_ok:
-            _sso_finalize(bd, slock, n, {"sso_submitted": False, "sso_stage": "pre"})
     try:
         if action in NAV_ACTIONS:
             last = float((_read_state(bd).get("nav") or {}).get(pkey) or 0)
             nav_at = last + float(st["nav_gap_s"])
             if nav_at > float(st["deadline"]):
-                refund_sso()
                 return say("tbsgen: the batch deadline comes before the next navigation; end now.", 3)
             # cancellable wait, then re-check everything that may have changed meanwhile
             while (wait := nav_at - time.time()) > 0:
                 if (bd / "STOP").exists():
-                    refund_sso()
                     return say("tbsgen: STOP - the batch was stopped (egress changed or deadline). End now.", 3)
                 time.sleep(min(0.5, wait))
         if (bd / "STOP").exists():
-            refund_sso()
             return say("tbsgen: STOP - the batch was stopped (egress changed or deadline). End now.", 3)
         if time.time() >= float(st["deadline"]):
-            refund_sso()
             return say("tbsgen: the batch deadline has passed; end now.", 3)
         if (msg := led.cooling(ps["lkey"], *aliases, *web_hosts)):
-            refund_sso()
             ps = json.loads(sp.read_text())
             ps["closed"] = "publisher in cooldown"
             _atomic(sp, json.dumps(ps))
             return say(f"tbsgen: paper {n}: {msg[:120]}; move on", 2)
-        return _paper_run(bd, st, n, p, ps, action, arg, say, led, pkey, space, handoff_free, sso_ok, slock,
+        return _paper_run(bd, st, n, p, ps, action, arg, say, led, pkey, space, handoff_free, slock,
                           COOLDOWN_429_S)
     finally:
         if action in NAV_ACTIONS:
@@ -669,32 +651,10 @@ def _paced_run(bd, st, n, p, ps, action, arg, say, led, pkey, space, handoff_fre
                 _write_state(bd, state)
 
 
-def _sso_finalize(bd: Path, slock: Path, n: str, res: dict) -> str | None:
-    """Book the result of a reserved SSO submission.  Only an explicit `sso_submitted: false` (refused before
-    anything was submitted) returns the reservation; anything uncertain (timeout, error, hand-off after the
-    submit) counts as a submission and ends the automatic logins of this batch."""
-    with _locked(slock):
-        state = _read_state(bd)
-        s = state.get("sso") or {}
-        if s.get("pending") != n:
-            return None
-        s.pop("pending", None)
-        # "sso_stage": "pre" is set by the script only on paths that end before the login button is touched
-        if res and res.get("sso_submitted") is False and res.get("sso_stage") == "pre":
-            s["submissions"] = max(0, int(s.get("submissions") or 0) - 1)
-            result = None
-        else:
-            result = res.get("sso") if res.get("sso") in ("ok", "fail", "handoff") else "unknown"
-            s["logged_in" if result == "ok" else "failed"] = True
-        state["sso"] = s
-        _write_state(bd, state)
-    return result
-
-
 _VALID_STATUS = ("ok", "refused", "error", "handoff", "paused")
 
 
-def _paper_run(bd, st, n, p, ps, action, arg, say, led, pkey, space, handoff_free, sso_ok, slock,
+def _paper_run(bd, st, n, p, ps, action, arg, say, led, pkey, space, handoff_free, slock,
                COOLDOWN_429_S) -> int:
     sp = bd / "papers" / f"{n}.json"
     files = (bd / "files" / n).resolve()
@@ -704,7 +664,7 @@ def _paper_run(bd, st, n, p, ps, action, arg, say, led, pkey, space, handoff_fre
                page_label=ps.get("page_label") or "",
                nav_timeout_ms=45000, download_timeout_ms=120000, download_wait_ms=6000,
                challenge_wait_ms=int(st.get("challenge_wait_ms", 40000)),
-               handoff={"enabled": handoff_free}, sso={"login": sso_ok, "domains": st.get("sso_domains") or []},
+               handoff={"enabled": handoff_free},
                type_allow=st.get("type_allow") or [],
                handoff_state={"active": bool(ps.get("handoff")),
                               "deadline_ms": int(float(ps.get("handoff_deadline") or 0) * 1000),
@@ -716,7 +676,6 @@ def _paper_run(bd, st, n, p, ps, action, arg, say, led, pkey, space, handoff_fre
         res, err = {}, f"wrapper error {type(e).__name__}"
     if not (isinstance(res, dict) and res.get("status") in _VALID_STATUS):
         res = {}                                   # no valid result line: treated exactly like no output
-    sso_result = _sso_finalize(bd, slock, n, res) if sso_ok else None
     if not res and err != "not-started" and handoff_free:
         # ANY call that started and gave no valid result (timeout, STOP, a normal or an error exit without a
         # result line, an unparseable one) may have handed the space to the user before its output was lost:
@@ -742,18 +701,6 @@ def _paper_run(bd, st, n, p, ps, action, arg, say, led, pkey, space, handoff_fre
         cur.update(kw)
         _atomic(sp, json.dumps(cur))
         return cur
-    if sso_result is not None:
-        host = str(res.get("sso_host") or "")[:80]
-        if not host:
-            with contextlib.suppress(ValueError):
-                host = urlparse((res.get("page") or {}).get("url") or "").hostname or ""
-        note = f"sso_login host={host} result={sso_result} at={time.strftime('%H:%M:%S')}"
-        if sso_result in ("ok", "handoff"):
-            save_ps(sso_note=note)
-        else:
-            save_ps(sso_note=note, closed="login_failed (sso, not retried)")
-            if sso_result == "fail":
-                return say(f"tbsgen: paper {n}: SSO login failed - no retry; report `login_required` and move on.", 2)
     if not res:
         return say("tbsgen: stopped (egress changed, deadline or call timeout). End now.", 3)
     if res.get("status") == "paused":
@@ -826,7 +773,7 @@ def _paper_run(bd, st, n, p, ps, action, arg, say, led, pkey, space, handoff_fre
     show = dict(status=res.get("status"), error=res.get("error"), files_saved=len(res.get("files") or []),
                 page=res.get("page"), note=res.get("note"), left_allowed=res.get("left_allowed") or res.get("reset_foreign"),
                 login_required=res.get("login_required"),
-                tabs=res.get("tabs"), acted=res.get("acted"), sso=res.get("sso"),
+                tabs=res.get("tabs"), acted=res.get("acted"),
                 waited=res.get("waited"), page_label=res.get("page_label"),
                 handoff_check=res.get("handoff_check"), handoff_left_s=res.get("handoff_left_s"))
     return say(json.dumps({k: v for k, v in show.items() if v is not None}, ensure_ascii=False)[:9000],
@@ -892,6 +839,7 @@ class _Redactor:
         self.sensitive = False             # the current record has a credential-like field
         self.dropping = False              # the current record is being discarded
         self.val = ""                      # text of the sensitive value(s) so far (for the balance check)
+        self.unbounded = False             # a sensitive key with an empty value: its end cannot be known
         self.hold = False                  # set after an over-long line with / inside a sensitive value: drop the rest
 
     def _push(self, s: str):
@@ -904,8 +852,9 @@ class _Redactor:
 
     def _open(self) -> bool:
         v = self.val
+        if self.unbounded:
+            return True
         if not v.strip():
-            # a sensitive key with nothing after it: its value may be on the next line (round 8) - open
             return self.sensitive
         esc = re.sub(r"\\.", "", v)
         if any(x.count(q) % 2 for x in (v, esc) for q in ('"', "'")):
@@ -946,15 +895,28 @@ class _Redactor:
         body = line[:-1] if nl else line
         if self.hold:
             return                           # after an unknown-length sensitive value: nothing more is kept
+        if self.unbounded:
+            # the line after a sensitive key with an empty value: it may be the value, and so may any line
+            # after it - the rest of the stderr is dropped
+            if not self.dropping and self.rec_lines > 1:
+                self._drop_record()
+            self._push(self.SINK)
+            self.hold = True
+            return
         still_open = self.sensitive and self._open()
         new = (self.rec_start is None or not still_open) and (
             not body.strip() or (body[:1] not in " \t" and body[:1] not in self._CLOSERS))
         if new:
             self.rec_start, self.rec_lines, self.sensitive, self.dropping, self.val = (
                 self.base + len(self.out), 0, False, False, "")
+            self.unbounded = False
         self.rec_lines += 1
         m = _SECRET_PATTERNS[0].search(body) or _SECRET_PATTERNS[1].search(body)
         if m:
+            if not self.sensitive and not body[m.end(1):].strip():
+                # nothing after the key: the value (if any) follows on lines whose end no delimiter marks -
+                # everything after it is dropped (round 9), no guess at where a new record starts
+                self.unbounded = True
             self.val = (self.val + "\n" + body) if self.sensitive else body[m.end(1):]
             self.sensitive = True
         elif self.sensitive:
@@ -1577,10 +1539,10 @@ def _agent_phase(fetcher, todo: list[dict], deadline: float, bd: Path, wd: Watch
     ag = b.get("agent") or {}
     ho = b.get("handoff") or {}
     sso = b.get("sso") or {}
-    sso_login = b.get("sso_login") or {}
     led = fetcher.ledger
     papers = {}
-    sso_domains = [str(x).lower() for x in [*(sso.get("domains") or []), *(sso_login.get("domains") or [])]]
+    # institution / WAYF domains (the login itself is always handed to the user; the browser autofills it)
+    sso_domains = [str(x).lower() for x in sso.get("domains") or []]
     for i, e in enumerate(todo, 1):
         papers[str(i)] = dict(doi=e["doi"], title=e.get("title") or "", ident=paper_ident(e),
                               allow=allowed_domains(e["doi"], e.get("_landing"),
@@ -1599,9 +1561,6 @@ def _agent_phase(fetcher, todo: list[dict], deadline: float, bd: Path, wd: Watch
               nav_gap_s=float(ag.get("nav_gap_s", 2.5)),
               handoff_enabled=bool(ho.get("enabled")), handoff_wait_s=float(ho.get("wait_s", 120)),
               handoff_notify=bool(ho.get("notify", True)), bark_cmd=[list(x) for x in ho.get("bark_cmd") or []],
-              sso_login_enabled=bool(sso_login.get("enabled")) and bool(sso_login.get("domains")),
-              sso_domains=[str(x).lower() for x in sso_login.get("domains") or []],
-              sso_max_submissions=int(sso_login.get("max_submissions", 2)),
               type_allow=[str(x) for x in ag.get("institution_names") or []])
     (bd / "papers").mkdir(exist_ok=True)
     (bd / "files").mkdir(exist_ok=True)
@@ -1733,9 +1692,9 @@ def _agent_phase(fetcher, todo: list[dict], deadline: float, bd: Path, wd: Watch
             why = f"challenge: {ps['challenge']} (publisher cooled down)"
         ok = txt is not None
         interrupted = not ok and (lost or cut) and not ps.get("challenge")
-        # every hand-off and SSO login of the paper is noted in the ledger row (time, host, result; never
-        # credentials - the action script never reads the values of credential fields)
-        extras = "; ".join(x for x in (ps.get("handoff_note"), ps.get("sso_note")) if x)
+        # every hand-off of the paper is noted in the ledger row (time, host, kind; never credentials - the
+        # action script never reads the values of credential fields)
+        extras = "; ".join(x for x in (ps.get("handoff_note"),) if x)
         note = "" if ok else ("cancelled: batch stopped" if interrupted else fetcher._r(f"agent: {why}")[:300])
         if extras:
             note = (note + "; " if note else "") + extras

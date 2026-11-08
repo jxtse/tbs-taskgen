@@ -1,4 +1,4 @@
-"""Offline tests for the browser agent's expanded exploration actions, hand-off and SSO login.
+"""Offline tests for the browser agent's expanded exploration actions and hand-off.
 
 The action script itself (browser_agent_action.mjs) runs against a real ego-browser and local pages in
 test_browser_actions_live.py; here the wrapper (browser_agent.py) is exercised with the fake `ego-browser`
@@ -74,7 +74,7 @@ def test_shell_allowed_new_actions():
         "tbsgen-browser 1 tabs", "tbsgen-browser 1 switch p2",
         "tbsgen-browser 1 wait_for url /pdf 20",
         "tbsgen-browser 1 wait_for sel a.pdf-link", "tbsgen-browser 1 wait_for sel div#pdf", "tbsgen-browser 1 save_pdf",
-        "tbsgen-browser 1 sso_login", "tbsgen-browser 1 handoff_status", "tbsgen-browser finish",
+        "tbsgen-browser 1 handoff_status", "tbsgen-browser finish",
         "sleep 30",
     ]
     for c in ok:
@@ -82,6 +82,7 @@ def test_shell_allowed_new_actions():
     bad = [
         "tbsgen-browser 1 scroll down", "tbsgen-browser 1 scroll up 800",   # removed (round 7)
         "tbsgen-browser 1 back",                                             # removed (round 8)
+        "tbsgen-browser 1 sso_login",                                        # removed (round 9)
         "tbsgen-browser 1 open https://x.example/a;rm -rf /",     # shell metachar
         "tbsgen-browser 1 open https://x.example/a && echo hi",
         "tbsgen-browser 1 open \"https://x.example/a\"",
@@ -208,33 +209,18 @@ def test_no_handoff_when_disabled(tmp_path, monkeypatch):
     assert led.cooling("chrome:10.1080")
 
 
-# --------------------------------------------------------------------------- SSO login
+# --------------------------------------------------------------------------- SSO login (removed)
 
-def test_sso_login_budget_and_no_retry_after_failure(tmp_path, monkeypatch):
-    f, led, pr, _ = mk_agent(tmp_path, monkeypatch, hermes_mode="sso", ego_mode="sso_fail",
-                             queue={"10.1080": 2}, agent={"keep_batch_dir": True},
-                             sso_login={"enabled": True, "domains": ["sso.example"], "max_submissions": 2})
-    st = _run(f, pr)
-    log = _ego_log(tmp_path)
-    # the first paper submits and fails; the second paper's sso_login runs with the budget closed
-    ssos = [e for e in log if e["action"] == "sso_login"]
-    assert len(ssos) == 2 and ssos[0]["sso_login"] is True and ssos[1]["sso_login"] is False
-    assert all(p["status"] == "failed" for p in st["papers"])
-    notes = _notes(led)
-    assert "sso_login host=sso.example result=fail" in notes["10.1080/paper.1"][1]
-
-
-def test_sso_login_success_marks_batch_logged_in(tmp_path, monkeypatch):
+def test_sso_login_is_not_an_action_any_more(tmp_path, monkeypatch):
+    """Round 9: every login - the institution's SSO login too - is the user's (hand-off); the hook blocks
+    `sso_login` before it runs, and an old `sso_login` config section has no effect."""
     f, led, pr, _ = mk_agent(tmp_path, monkeypatch, hermes_mode="sso", ego_mode="sso_ok",
-                             queue={"10.1080": 2}, agent={"keep_batch_dir": True},
+                             queue={"10.1080": 1}, agent={"keep_batch_dir": True},
                              sso_login={"enabled": True, "domains": ["sso.example"]})
     st = _run(f, pr)
-    log = _ego_log(tmp_path)
-    ssos = [e for e in log if e["action"] == "sso_login"]
-    # one successful login signs the whole batch in: the second paper's sso_login is disabled
-    assert ssos[0]["sso_login"] is True and ssos[1]["sso_login"] is False
-    notes = _notes(led)
-    assert "sso_login host=pub.example result=ok" in notes["10.1080/paper.1"][1]
+    assert not [e for e in _ego_log(tmp_path) if e["action"] == "sso_login"]
+    assert any("sso_login" in v for v in st["agent"]["usage"]["violations"])
+    assert "sso_login_enabled" not in json.loads((_bd(f) / "batch.json").read_text())
 
 
 # --------------------------------------------------------------------------- screenshots / domains
@@ -251,17 +237,17 @@ def test_screenshot_is_not_an_action_any_more(tmp_path, monkeypatch):
 def test_allowed_domains_cover_sso_and_prompt_lists_actions(tmp_path, monkeypatch):
     f, led, pr, _ = mk_agent(tmp_path, monkeypatch, agent={"keep_batch_dir": True},
                              sso={"domains": ["nju.edu.cn", "carsi.edu.cn"]},
-                             handoff={"enabled": True}, sso_login={"enabled": True, "domains": ["authserver.nju.edu.cn"]})
+                             handoff={"enabled": True})
     _run(f, pr)
     st = json.loads((_bd(f) / "batch.json").read_text())
     for d in ("nju.edu.cn", "carsi.edu.cn"):
         assert any(d in p["allow"] for p in st["papers"].values())
-    assert st["handoff_enabled"] and st["sso_login_enabled"] and st["sso_domains"] == ["authserver.nju.edu.cn"]
+    assert st["handoff_enabled"] and "sso_login_enabled" not in st
     prompt = (_bd(f) / "prompt.md").read_text()
-    for s in ("hover", "tabs", "switch LABEL", "wait_for", "sso_login",
+    for s in ("hover", "tabs", "switch LABEL", "wait_for",
               "handoff_status", "25 tool calls", "12 page loads"):
         assert s in prompt, s
-    for s in ("click_xy", "screenshot", "vision", "look [full]", "@REF"):
+    for s in ("click_xy", "screenshot", "vision", "look [full]", "@REF", "sso_login", "scroll", " back"):
         assert s not in prompt, s
 
 

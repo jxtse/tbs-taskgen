@@ -7,7 +7,7 @@
    stderr is kept in the batch directory and shown in the `agent_end` log event.
 2. Action scripts (~40 KB) used to be written to the child's stdin by the first `communicate(input,
    timeout=0.5)` call only; a child slower than that to drain the pipe never saw EOF and the call hung
-   until its timeout (the intermittent failures of the hand-off / SSO tests under load).
+   until its timeout (the intermittent failures of the hand-off tests under load).
 """
 import json
 import os
@@ -165,29 +165,16 @@ def test_script_channel_does_not_stall_on_a_slow_child(tmp_path):
 
 # ------------------------------------------------------------------ wrapper: budgets shared by concurrent calls
 
-FAKE_EGO_SLOW_SSO = r"""#!{py}
+FAKE_EGO = r"""#!{py}
 import json, os, re, sys, time
 code = sys.argv[2] if len(sys.argv) > 2 else sys.stdin.read()
 inp = json.loads(re.match(r"const INPUT = (\{.*?\});\n", code).group(1))
 log = "{log}"
 open(log, "a").write(json.dumps({"action": inp.get("action"), "space": inp.get("space"),
-                                 "sso_login": (inp.get("sso") or {}).get("login"),
                                  "handoff": (inp.get("handoff") or {}).get("enabled")}) + "\n")
 mode = open("{mode}").read().strip() if os.path.exists("{mode}") else ""
 out = {"status": "ok", "files": []}
-if inp.get("action") == "sso_login":
-    time.sleep(1.0)
-    if not (inp.get("sso") or {}).get("login"):
-        out = {"status": "refused", "error": "not enabled", "sso_submitted": False}
-    elif mode == "sso_crash":
-        print("crashed before the result line"); sys.exit(0)
-    elif mode == "sso_click_error":       # the click navigated and the evaluation died: unknown, not refundable
-        out = {"status": "error", "error": "context destroyed", "sso_submitted": True, "sso_stage": "submit"}
-    elif mode == "sso_pre_refused":       # refused before anything was clicked: refundable
-        out = {"status": "refused", "error": "no login form", "sso_submitted": False, "sso_stage": "pre"}
-    else:
-        out = {"status": "ok", "sso": "fail", "sso_submitted": True, "sso_host": "sso.example"}
-elif inp.get("action") == "open" and mode == "handoff":
+if inp.get("action") == "open" and mode == "handoff":
     if (inp.get("handoff") or {}).get("enabled"):
         out = {"status": "handoff", "handoff": {"reason": "challenge: x", "host": "pub.example", "kind": "challenge"}}
     else:
@@ -205,7 +192,7 @@ def _batch(tmp_path, monkeypatch, papers, **st_over):
     led = DownloadLedger(ft["ledger_path"], ft["limits"], ft["global_limits"], ft["host_caps"])
     ego = tmp_path / "ego"
     # the wrapper runs ego with a filtered environment: the log and mode paths are written into the script
-    ego.write_text(FAKE_EGO_SLOW_SSO.replace("{py}", sys.executable).replace("{log}", str(tmp_path / "ego.log"))
+    ego.write_text(FAKE_EGO.replace("{py}", sys.executable).replace("{log}", str(tmp_path / "ego.log"))
                    .replace("{mode}", str(tmp_path / "ego.mode")))
     ego.chmod(0o755)
     bd = tmp_path / "batch"
@@ -217,7 +204,7 @@ def _batch(tmp_path, monkeypatch, papers, **st_over):
               host_caps=led.host_caps, ego_binary=str(ego), gate_max_wait_s=150, max_calls_per_paper=25,
               call_timeout_s=20, challenge_cooldown_s=3600, challenge_wait_ms=1000, max_navigations_per_paper=12,
               nav_gap_s=0.0, handoff_enabled=False, handoff_wait_s=120, handoff_notify=False, bark_cmd=[],
-              sso_login_enabled=True, sso_domains=["sso.example"], sso_max_submissions=2, type_allow=[])
+              type_allow=[])
     st.update(st_over)
     (bd / "batch.json").write_text(json.dumps(st))
     return bd, led
@@ -239,34 +226,9 @@ def _ego_actions(tmp_path):
     return [json.loads(x) for x in (tmp_path / "ego.log").read_text().splitlines()]
 
 
-def test_concurrent_sso_logins_cannot_exceed_the_budget(tmp_path, monkeypatch):
-    bd, _ = _batch(tmp_path, monkeypatch, ["10.1080/a.1", "10.1093/b.2", "10.1287/c.3"], sso_max_submissions=1)
-    procs = [_call(bd, str(k), "sso_login") for k in ("1", "2", "3")]          # concurrent
-    for p in procs:
-        p.communicate(timeout=60)
-    enabled = [e for e in _ego_actions(tmp_path) if e["action"] == "sso_login" and e["sso_login"]]
-    assert len(enabled) == 1                                   # one reservation; the others ran disabled
-    s = json.loads((bd / "state.json").read_text())["sso"]
-    assert s["submissions"] == 1 and s["failed"] and "pending" not in s
-
-
-def test_sso_without_a_result_still_counts_as_a_submission(tmp_path, monkeypatch):
-    bd, _ = _batch(tmp_path, monkeypatch, ["10.1080/a.1", "10.1093/b.2"])
-    p = _call(bd, "1", "sso_login", env={"FAKE_EGO_MODE": "sso_crash"})
-    p.communicate(timeout=60)
-    p = _call(bd, "2", "sso_login")
-    p.communicate(timeout=60)
-    ssos = [e for e in _ego_actions(tmp_path) if e["action"] == "sso_login"]
-    # the first submission's outcome is unknown: no second automatic login in this batch
-    assert ssos[0]["sso_login"] is True and ssos[1]["sso_login"] is False
-    s = json.loads((bd / "state.json").read_text())["sso"]
-    assert s["submissions"] == 1 and s["failed"]
-
-
 def test_handoff_budget_is_per_publisher_not_per_doi_prefix(tmp_path, monkeypatch):
     # 10.1016 and 10.1006 are both Elsevier: one hand-off for the publisher per batch
-    bd, _ = _batch(tmp_path, monkeypatch, ["10.1016/j.a.1", "10.1006/b.2"], handoff_enabled=True,
-                   sso_login_enabled=False)
+    bd, _ = _batch(tmp_path, monkeypatch, ["10.1016/j.a.1", "10.1006/b.2"], handoff_enabled=True)
     env = {"FAKE_EGO_MODE": "handoff"}
     _call(bd, "1", "open", "https://pub.example/a", env=env).communicate(timeout=60)
     _call(bd, "2", "open", "https://pub.example/b", env=env).communicate(timeout=60)
@@ -275,8 +237,7 @@ def test_handoff_budget_is_per_publisher_not_per_doi_prefix(tmp_path, monkeypatc
 
 
 def test_unpolled_handoff_is_expired_and_cools_the_publisher(tmp_path, monkeypatch):
-    bd, led = _batch(tmp_path, monkeypatch, ["10.1080/a.1", "10.1093/b.2"], handoff_enabled=True,
-                     sso_login_enabled=False, handoff_wait_s=0.5)
+    bd, led = _batch(tmp_path, monkeypatch, ["10.1080/a.1", "10.1093/b.2"], handoff_enabled=True, handoff_wait_s=0.5)
     _call(bd, "1", "open", "https://pub.example/a", env={"FAKE_EGO_MODE": "handoff"}).communicate(timeout=60)
     assert json.loads((bd / "papers" / "1.json").read_text())["handoff"]
     time.sleep(1.0)
@@ -288,7 +249,7 @@ def test_unpolled_handoff_is_expired_and_cools_the_publisher(tmp_path, monkeypat
 
 
 def test_end_of_batch_sweep_closes_open_handoffs(tmp_path, monkeypatch):
-    bd, led = _batch(tmp_path, monkeypatch, ["10.1080/a.1"], handoff_enabled=True, sso_login_enabled=False)
+    bd, led = _batch(tmp_path, monkeypatch, ["10.1080/a.1"], handoff_enabled=True)
     _call(bd, "1", "open", "https://pub.example/a", env={"FAKE_EGO_MODE": "handoff"}).communicate(timeout=60)
     st = json.loads((bd / "batch.json").read_text())
     browser_agent._sweep_handoffs(bd, st, led, force=True)
@@ -335,21 +296,8 @@ def test_allowed_commands_reach_the_wrapper_unchanged_through_a_real_shell(tmp_p
         assert browser_agent.shell_allowed(c), c
 
 
-def test_sso_click_that_errors_counts_and_only_pre_submit_refusals_refund(tmp_path, monkeypatch):
-    bd, _ = _batch(tmp_path, monkeypatch, ["10.1080/a.1", "10.1093/b.2", "10.1287/c.3"])
-    _call(bd, "1", "sso_login", env={"FAKE_EGO_MODE": "sso_pre_refused"}).communicate(timeout=60)
-    s = json.loads((bd / "state.json").read_text())["sso"]
-    assert s["submissions"] == 0 and not s.get("failed")          # nothing was submitted: refunded
-    _call(bd, "2", "sso_login", env={"FAKE_EGO_MODE": "sso_click_error"}).communicate(timeout=60)
-    _call(bd, "3", "sso_login").communicate(timeout=60)
-    ssos = [e for e in _ego_actions(tmp_path) if e["action"] == "sso_login"]
-    assert [e["sso_login"] for e in ssos] == [True, True, False]
-    s = json.loads((bd / "state.json").read_text())["sso"]
-    assert s["submissions"] == 1 and s["failed"]
-
-
 def test_hover_is_reserved_as_a_navigation(tmp_path, monkeypatch):
-    bd, _ = _batch(tmp_path, monkeypatch, ["10.1080/a.1"], max_navigations_per_paper=1, sso_login_enabled=False)
+    bd, _ = _batch(tmp_path, monkeypatch, ["10.1080/a.1"], max_navigations_per_paper=1)
     _call(bd, "1", "hover", "3").communicate(timeout=60)
     out, _ = _call(bd, "1", "hover", "3").communicate(timeout=60)
     assert "navigation limit" in out
@@ -357,7 +305,7 @@ def test_hover_is_reserved_as_a_navigation(tmp_path, monkeypatch):
 
 
 def test_challenge_handoff_expiry_cools_even_with_earlier_files(tmp_path, monkeypatch):
-    bd, led = _batch(tmp_path, monkeypatch, ["10.1080/a.1"], handoff_enabled=True, sso_login_enabled=False)
+    bd, led = _batch(tmp_path, monkeypatch, ["10.1080/a.1"], handoff_enabled=True)
     _call(bd, "1", "open", "https://pub.example/a", env={"FAKE_EGO_MODE": "handoff"}).communicate(timeout=60)
     sp = bd / "papers" / "1.json"
     ps = json.loads(sp.read_text())
@@ -368,7 +316,7 @@ def test_challenge_handoff_expiry_cools_even_with_earlier_files(tmp_path, monkey
 
 
 def test_stop_during_the_navigation_wait_cancels_the_call(tmp_path, monkeypatch):
-    bd, _ = _batch(tmp_path, monkeypatch, ["10.1080/a.1", "10.1080/b.2"], nav_gap_s=30.0, sso_login_enabled=False)
+    bd, _ = _batch(tmp_path, monkeypatch, ["10.1080/a.1", "10.1080/b.2"], nav_gap_s=30.0)
     _call(bd, "1", "open", "https://pub.example/a").communicate(timeout=60)
     p = _call(bd, "2", "open", "https://pub.example/b")             # waits ~30 s for the publisher's slot
     time.sleep(1.5)
@@ -410,19 +358,6 @@ def test_agent_runner_crash_still_cleans_up(tmp_path, monkeypatch):
     assert (_bd(f) / "STOP").exists()
 
 
-CAPTURE_EGO = r"""#!{py}
-import json, re, sys
-open("{out}", "w").write(re.match(r"const INPUT = (\{.*?\});\n", sys.argv[2]).group(1))
-print("TBSGEN_RESULT " + json.dumps({"status": "ok", "sso_submitted": False, "sso_stage": "pre"}))
-"""
-
-
-def test_wrapper_never_enables_the_local_sso_test_mode(tmp_path, monkeypatch):
-    bd, _ = _batch(tmp_path, monkeypatch, ["10.1080/a.1"])
-    (tmp_path / "ego").write_text(CAPTURE_EGO.replace("{py}", sys.executable).replace("{out}", str(tmp_path / "inp.json")))
-    _call(bd, "1", "sso_login").communicate(timeout=60)
-    inp = json.loads((tmp_path / "inp.json").read_text())
-    assert inp["sso"]["login"] is True and "local_test" not in inp["sso"]
 
 
 def test_long_stderr_line_never_leaks_its_tail():
@@ -448,8 +383,7 @@ def test_redaction_ignores_quote_tricks():
 
 
 def test_navigations_of_one_publisher_never_overlap(tmp_path, monkeypatch):
-    bd, _ = _batch(tmp_path, monkeypatch, ["10.1080/a.1", "10.1080/b.2", "10.1080/c.3"], nav_gap_s=0.3,
-                   sso_login_enabled=False)
+    bd, _ = _batch(tmp_path, monkeypatch, ["10.1080/a.1", "10.1080/b.2", "10.1080/c.3"], nav_gap_s=0.3)
     slow = tmp_path / "ego"
     slow.write_text(f"#!{sys.executable}\nimport json, time\nt0 = time.time()\ntime.sleep(0.8)\n"
                     f"open({str(tmp_path / 'spans.log')!r}, 'a').write(json.dumps([t0, time.time()]) + chr(10))\n"
@@ -464,7 +398,7 @@ def test_navigations_of_one_publisher_never_overlap(tmp_path, monkeypatch):
 
 
 def test_poll_that_ends_after_the_deadline_is_not_a_clear(tmp_path, monkeypatch):
-    bd, led = _batch(tmp_path, monkeypatch, ["10.1080/a.1"], handoff_enabled=True, sso_login_enabled=False,
+    bd, led = _batch(tmp_path, monkeypatch, ["10.1080/a.1"], handoff_enabled=True,
                      handoff_wait_s=1.5)
     _call(bd, "1", "open", "https://pub.example/a", env={"FAKE_EGO_MODE": "handoff"}).communicate(timeout=60)
     late = tmp_path / "ego"
@@ -504,8 +438,7 @@ time.sleep(60)
 
 
 def test_handoff_result_printed_before_a_timeout_is_still_booked(tmp_path, monkeypatch):
-    bd, led = _batch(tmp_path, monkeypatch, ["10.1080/a.1", "10.1080/b.2"], handoff_enabled=True,
-                     sso_login_enabled=False, call_timeout_s=3)
+    bd, led = _batch(tmp_path, monkeypatch, ["10.1080/a.1", "10.1080/b.2"], handoff_enabled=True, call_timeout_s=3)
     (tmp_path / "ego").write_text(HANG_AFTER_HANDOFF_EGO.replace("{py}", sys.executable))
     out, _ = _call(bd, "1", "open", "https://pub.example/a").communicate(timeout=60)
     assert "handed the page to the user" in out, out
@@ -515,8 +448,7 @@ def test_handoff_result_printed_before_a_timeout_is_still_booked(tmp_path, monke
 
 
 def test_silent_timeout_with_a_handoff_budget_closes_the_paper_and_cools(tmp_path, monkeypatch):
-    bd, led = _batch(tmp_path, monkeypatch, ["10.1080/a.1", "10.1080/b.2"], handoff_enabled=True,
-                     sso_login_enabled=False, call_timeout_s=3)
+    bd, led = _batch(tmp_path, monkeypatch, ["10.1080/a.1", "10.1080/b.2"], handoff_enabled=True, call_timeout_s=3)
     (tmp_path / "ego").write_text(SILENT_HANG_EGO.replace("{py}", sys.executable))
     out, _ = _call(bd, "1", "open", "https://pub.example/a").communicate(timeout=60)
     assert "gave no result" in out, out
@@ -528,8 +460,7 @@ def test_silent_timeout_with_a_handoff_budget_closes_the_paper_and_cools(tmp_pat
 
 
 def test_stop_during_a_call_with_a_handoff_budget_closes_the_paper_and_cools(tmp_path, monkeypatch):
-    bd, led = _batch(tmp_path, monkeypatch, ["10.1080/a.1", "10.1080/b.2"], handoff_enabled=True,
-                     sso_login_enabled=False, call_timeout_s=30)
+    bd, led = _batch(tmp_path, monkeypatch, ["10.1080/a.1", "10.1080/b.2"], handoff_enabled=True, call_timeout_s=30)
     (tmp_path / "ego").write_text(SILENT_HANG_EGO.replace("{py}", sys.executable))
     pr = _call(bd, "1", "open", "https://pub.example/a")
     time.sleep(2.0)
@@ -550,7 +481,7 @@ print("TBSGEN_RESULT " + json.dumps({"status": "handoff", "handoff": {"reason": 
 
 
 def test_handoff_window_counts_from_the_handover_not_the_return(tmp_path, monkeypatch):
-    bd, led = _batch(tmp_path, monkeypatch, ["10.1080/a.1"], handoff_enabled=True, sso_login_enabled=False,
+    bd, led = _batch(tmp_path, monkeypatch, ["10.1080/a.1"], handoff_enabled=True,
                      handoff_wait_s=120)
     (tmp_path / "ego").write_text(LATE_HANDOFF_EGO.replace("{py}", sys.executable))
     out, _ = _call(bd, "1", "open", "https://pub.example/a").communicate(timeout=60)
@@ -562,7 +493,7 @@ def test_handoff_window_counts_from_the_handover_not_the_return(tmp_path, monkey
 
 def test_final_sweep_books_an_interrupted_handoff_call(tmp_path, monkeypatch):
     from tbsgen.dlledger import DownloadLedger
-    bd, led = _batch(tmp_path, monkeypatch, ["10.1080/a.1"], handoff_enabled=True, sso_login_enabled=False)
+    bd, led = _batch(tmp_path, monkeypatch, ["10.1080/a.1"], handoff_enabled=True)
     st = json.loads((bd / "batch.json").read_text())
     pk = "pub:" + _pub("10.1080/a.1")
     rid = led.acquire("browser", "chrome:10.1080", "10.1080/a.1")
@@ -582,8 +513,7 @@ def test_final_sweep_books_an_interrupted_handoff_call(tmp_path, monkeypatch):
                                   "print('TBSGEN_RESULT {\"files\": []}')\n", "print('TBSGEN_RESULT {broken')\n",
                                   "import os, sys\nsys.stdout.flush()\nos.kill(os.getpid(), 9)\n"])
 def test_started_call_without_a_result_books_an_unknown_handoff(tmp_path, monkeypatch, body):
-    bd, led = _batch(tmp_path, monkeypatch, ["10.1080/a.1", "10.1080/b.2"], handoff_enabled=True,
-                     sso_login_enabled=False)
+    bd, led = _batch(tmp_path, monkeypatch, ["10.1080/a.1", "10.1080/b.2"], handoff_enabled=True)
     (tmp_path / "ego").write_text("#!" + sys.executable + "\n" + body)
     out, _ = _call(bd, "1", "open", "https://pub.example/a").communicate(timeout=60)
     assert "gave no result" in out, out
@@ -615,7 +545,7 @@ def test_redaction_drops_a_multi_line_record_whole():
         # an open value is not closed by a blank line
         ('password: "SECRET\n\nSECRET2"\nnext\n', "SECRET"),
         # an empty value after the key: the value may be on the next line (round 8)
-        ("password:\nSECRET\nnext\n", "SECRET"), ("token =\n  SECRET\nnext\n", "SECRET"),
+
     ]
     for txt, gone in cases:
         for r in (browser_agent.redact(txt), browser_agent._StderrTail(io.BytesIO(txt.encode()), keep=4096).text()):
@@ -637,8 +567,7 @@ def test_redaction_drop_survives_the_tail_cut():
 def test_wrapper_exception_after_start_never_reopens_the_handoff(tmp_path, monkeypatch):
     """Round 7: a Python exception after the script started (e.g. while decoding its output) is booked as
     an unknown hand-off: the paper closes, the publisher cools, the hand-off budget stays used."""
-    bd, led = _batch(tmp_path, monkeypatch, ["10.1080/a.1", "10.1080/b.2"], handoff_enabled=True,
-                     sso_login_enabled=False)
+    bd, led = _batch(tmp_path, monkeypatch, ["10.1080/a.1", "10.1080/b.2"], handoff_enabled=True)
     # output cut in the middle of a UTF-8 character, then a hang: killed at the call timeout
     (tmp_path / "ego").write_text("#!" + sys.executable + "\nimport sys, time\nsys.stdout.buffer.write(b'x\\xe4\\xb8')\n"
                                   "sys.stdout.flush()\ntime.sleep(60)\n")
@@ -654,8 +583,7 @@ def test_wrapper_exception_after_start_never_reopens_the_handoff(tmp_path, monke
 
 
 def test_wrapper_crash_while_holding_the_handoff_budget_books_it(tmp_path, monkeypatch):
-    bd, led = _batch(tmp_path, monkeypatch, ["10.1080/a.1", "10.1080/b.2"], handoff_enabled=True,
-                     sso_login_enabled=False)
+    bd, led = _batch(tmp_path, monkeypatch, ["10.1080/a.1", "10.1080/b.2"], handoff_enabled=True)
     st = json.loads((bd / "batch.json").read_text())
 
     def boom(*a, **k):
@@ -674,3 +602,25 @@ def test_wrapper_crash_while_holding_the_handoff_budget_books_it(tmp_path, monke
     assert json.loads((bd / "papers" / "1.json").read_text())["closed"]
     assert led.cooling("chrome:10.1080")
     assert not json.loads((bd / "state.json").read_text()).get("handoff_unknown")
+
+
+def test_wrapper_never_passes_a_login_mode_to_the_script(tmp_path, monkeypatch):
+    """Round 9: no sso / local-test input reaches the action script, whatever the old config said."""
+    bd, _ = _batch(tmp_path, monkeypatch, ["10.1080/a.1"], sso_login_enabled=True, sso_domains=["sso.example"])
+    cap = tmp_path / "inp.json"
+    (tmp_path / "ego").write_text("#!" + sys.executable + "\nimport json, re, sys\n"
+                                  f"open({str(cap)!r}, 'w').write(re.match(r'const INPUT = (\\{{.*?\\}});\\n', sys.argv[2]).group(1))\n"
+                                  "print('TBSGEN_RESULT ' + json.dumps({'status': 'ok'}))\n")
+    _call(bd, "1", "look").communicate(timeout=60)
+    inp = json.loads(cap.read_text())
+    assert "sso" not in inp and "local_test" not in json.dumps(inp), inp
+    out, _ = _call(bd, "1", "sso_login").communicate(timeout=60)
+    assert "usage" in out, out                                  # not an action of the wrapper either
+
+
+def test_redaction_after_an_empty_sensitive_value_drops_the_rest():
+    import io
+    # round 9: the value after an empty key may span any number of lines: everything after it is dropped
+    for txt in ("password:\nSECRET1\nSECRET2\nnext\n", "a\ntoken =\n  SECRET1\n  SECRET2\nnext\n"):
+        for r in (browser_agent.redact(txt), browser_agent._StderrTail(io.BytesIO(txt.encode()), keep=4096).text()):
+            assert "SECRET" not in r and "next" not in r and "rest of stderr dropped" in r, (txt, r)
