@@ -1,7 +1,7 @@
 [project]
 name = "tbsretr"
 version = "0.1.0"
-description = "TB-Science retrieval layer v2 (OpenAlex, S2, Exa, Tavily, Crossref, arXiv, Europe PMC)"
+description = "TB-Science retrieval layer v2 (OpenAlex, S2, Exa, Crossref, arXiv, Europe PMC)"
 requires-python = ">=3.12"
 license = "MIT"
 dependencies = []

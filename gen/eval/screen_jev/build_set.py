@@ -8,7 +8,7 @@ Sources (paths come from the environment; nothing machine-specific is hard-coded
   * retrieval/eval/raw/*.json or $TBS_RETR_RAW (+ $TBS_EVAL_BASELINE/review and retrieval/eval/labels_new.json) - every paper the
     retrieval eval saw for 10 targets, with human topic-relevance labels (0/1/2) for the judged top-20.
     Relevance to a target is NOT suitability for a computational task.
-  * $TBS_OLD_PIPE/literature/methodlit/cands/*.jsonl - candidates scored by the earlier pipeline's LLM abstract
+  * --old-pipe DIR: <DIR>/literature/methodlit/cands/*.jsonl - candidates scored by the earlier pipeline's LLM abstract
     screen (exclude flag, 0-10 sub-scores).  Model labels, not human.
   * $TBS_E2E_ITEMS (optional) - the e2e-iter1 items (S1_candidate.json + fulltext.txt).
 
@@ -51,8 +51,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", required=True)
     ap.add_argument("--corpus-out", default=None)
+    ap.add_argument("--old-pipe", required=True, help="earlier pipeline's data directory (not in this repo)")
     a = ap.parse_args()
-    old = Path(os.environ["TBS_OLD_PIPE"])
+    old = Path(a.old_pipe)
     base = Path(os.environ["TBS_EVAL_BASELINE"])
     rng = random.Random(SEED)
     rows, seen = [], set()

@@ -56,7 +56,7 @@ def cfg(tmp_path):
 
 @pytest.fixture
 def keys(monkeypatch):
-    for k in ("OPENALEX_API_KEY", "SEMANTIC_SCHOLAR_API_KEY", "EXA_API_KEY_SECONDARY", "TAVILY_API_KEY_SECONDARY"):
+    for k in ("OPENALEX_API_KEY", "SEMANTIC_SCHOLAR_API_KEY", "EXA_API_KEY_SECONDARY"):
         monkeypatch.setenv(k, "SECRET-" + k + "-1234567890")
     return True
 

@@ -2,7 +2,10 @@
 
   eval/raw/<target>.json   : every ranked list (stage 1 + stage 2 pseudo + stage 2 seeded), enrichment records,
                              per-source status/errors/timings, pseudo/seeded outputs.
-  uv run python eval/run_eval.py [--only id,...]
+  uv run python eval/run_eval.py --selected <earlier pipeline>/literature/methodlit/selected.jsonl [--only id,...]
+
+Historical: the recorded run (eval/raw, REPORT.md) included the Tavily source, which has since been removed from
+the code; a rerun now covers the remaining sources only.
 
 Hard call caps for this evaluation (decision 2026-11-05) are enforced through the ledger: daily_max_calls for each
 source = (calls already booked today) + cap - (calls this eval already made), so a source stops itself when its
@@ -12,7 +15,6 @@ import argparse
 import json
 import time
 from dataclasses import asdict
-import os
 from pathlib import Path
 
 from tbsretr.config import load_config
@@ -21,13 +23,12 @@ from tbsretr.model import Target
 from tbsretr.pipeline import Retriever, to_json
 
 HERE = Path(__file__).resolve().parent
-SEL = Path(os.environ.get("TBS_OLD_PIPE") or "TBS_OLD_PIPE-not-set") / "literature/methodlit/selected.jsonl"   # earlier pipeline data, not in this repo
-CAPS = {"openalex": 300, "exa": 80, "tavily": 80, "crossref": 120, "arxiv": 60, "europepmc": 60, "s2": 150}
+CAPS = {"openalex": 300, "exa": 80, "crossref": 120, "arxiv": 60, "europepmc": 60, "s2": 150}
 
 
-def selected_by_target():
+def selected_by_target(sel: Path):
     out = {}
-    for line in SEL.read_text().splitlines():
+    for line in sel.read_text().splitlines():
         r = json.loads(line)
         out.setdefault(r["target"], []).append(r)
     for v in out.values():
@@ -49,11 +50,12 @@ def dump_lists(lists):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--only", default="")
+    ap.add_argument("--selected", required=True, help="selected.jsonl of the earlier pipeline (not in this repo)")
     a = ap.parse_args()
     targets = [Target.from_dict(d) for d in json.loads((HERE / "targets10.json").read_text())]
     if a.only:
         targets = [t for t in targets if t.id in set(a.only.split(","))]
-    sel = selected_by_target()
+    sel = selected_by_target(Path(a.selected))
     cfg = load_config()
     led = Ledger(cfg["state_dir"])
     run = "eval10-" + time.strftime("%Y%m%dT%H%M%S")
@@ -68,7 +70,6 @@ def main():
     for n, cap in CAPS.items():
         cfg["sources"][n]["daily_max_calls"] = already[n] + max(0, cap - prior_eval[n])
     cfg["sources"]["exa"]["daily_budget_usd"] = 2.0
-    cfg["sources"]["tavily"]["daily_max_credits"] = 10_000
     print("caps this run:", {n: cfg["sources"][n]["daily_max_calls"] - already[n] for n in CAPS})
     (HERE / "raw").mkdir(exist_ok=True)
     rt = Retriever(cfg, run=run)

@@ -327,32 +327,6 @@ def test_ledger_persists_across_restarts(tmp_path):
     assert led.cooling("www.mdpi.com")
 
 
-def test_shares_legacy_ledger_schema(tmp_path):
-    """An earlier pipeline's ledger file (attempts/cooldown/hosts) is used as is; its rows count."""
-    p = tmp_path / "legacy.sqlite"
-    db = sqlite3.connect(p)
-    db.executescript("""
-        CREATE TABLE attempts(ts real, day text, channel text, host text, doi text,
-                              status text, http int, bytes int, note text);
-        CREATE TABLE cooldown(host text primary key, until real, reason text);
-        CREATE INDEX a_day on attempts(day, channel);
-        CREATE TABLE hosts(host text primary key, next_ts real);""")
-    clock = FakeClock()
-    day = time.strftime("%Y-%m-%d", time.localtime(clock.t))
-    db.executemany("insert into attempts values(?,?,?,?,?,?,?,?,?)",
-                   [(clock.t - 7200, day, "wiley", "api.wiley.com", f"d{i}", "ok", 200, 1, "") for i in range(2)])
-    db.execute("insert into cooldown values('chrome:10.1093', ?, 'challenge')", (clock.t + 3600,))
-    db.commit()
-    db.close()
-    led = DownloadLedger(p, {"wiley": {"daily_ok": 2}}, clock=clock, sleep=clock.sleep)
-    with pytest.raises(LimitReached, match="wiley daily success cap"):
-        led.acquire("wiley", "api.wiley.com", "x")
-    assert led.cooling("chrome:10.1093")
-    cols = [r[1] for r in sqlite3.connect(p).execute("pragma table_info(attempts)")]
-    assert cols == ["ts", "day", "channel", "host", "doi", "status", "http", "bytes", "note"]
-
-
-# ------------------------------------------------------------------ network hygiene
 def test_default_transport_ignores_env_proxy(monkeypatch):
     import urllib.request
     seen = {}

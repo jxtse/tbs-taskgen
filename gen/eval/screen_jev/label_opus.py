@@ -1,11 +1,11 @@
 """Reference labels for the S2 set from the teacher model (Opus), following RUBRIC.md.
 
-Uses tbsgen's own OpusClient + budget ledger.  The ledger lives next to the output file and enforces a whole-run
+Uses tbsgen's own TeacherClient + budget ledger.  The ledger lives next to the output file and enforces a whole-run
 USD cap (`--usd-cap`, priced at models.prices placeholders); the script stops when a reservation would exceed it.
 Papers are sent in batches (one call labels `--batch` papers) to keep the cost down; resumable (labels already in
 the output file are skipped).
 
-    TBS_OPUS_URL=... uv run python eval/screen_jev/label_opus.py --set <set.jsonl> --out <labels.jsonl>
+    TBS_TEACHER_URL=... uv run python eval/screen_jev/label_opus.py --set <set.jsonl> --out <labels.jsonl>
 """
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ from pathlib import Path
 
 from tbsgen.budget import BudgetStop, Ledger
 from tbsgen.config import load_config
-from tbsgen.models import ModelError, OpusClient, extract_json
+from tbsgen.models import ModelError, TeacherClient, extract_json
 
 HERE = Path(__file__).resolve().parent
 
@@ -46,9 +46,9 @@ def main():
     todo = [r for r in rows if r["key"] not in done]
     cfg = load_config(overrides={"budget": {"daily_usd_total": a.usd_cap, "run_usd_total": a.usd_cap,
                                             "est_usd_per_call": 0.4, "max_calls_per_item": None},
-                                 "models": {"opus": {"effort": a.effort, "max_tokens": 16000}}})
+                                 "models": {"teacher": {"effort": a.effort, "max_tokens": 16000}}})
     led = Ledger(out.with_suffix(".ledger.sqlite"), cfg)
-    cli = OpusClient(led, cfg)
+    cli = TeacherClient(led, cfg)
     rubric = (HERE / "RUBRIC.md").read_text()
     system = ("You label scientific papers for a dataset-construction pipeline. Follow the rubric exactly. Judge "
               "only from the record given. Answer with one JSON array and nothing else.\n\n" + rubric)

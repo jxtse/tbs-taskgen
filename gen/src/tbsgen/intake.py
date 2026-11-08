@@ -4,8 +4,8 @@ S1  intake: candidates come from the retrieval layer (tbsretr) output JSON (`out
     hand-written candidates JSONL.  The generation side never calls search APIs.
 S2  screen: `models.roles.screen` = "rules" (this file) or "jev" (screen_jev.py; rules are its fallback).
     Rules score abstract cues (method / data / code / computational words, negative cues for reviews / purely
-    clinical / qualitative work).  rules-v2 (default) counts each cue stem once and only treats "survey" as a
-    negative cue when it means a literature survey; rules-v1 is kept for comparison (screen.rules_version).
+    clinical / qualitative work), rules-v2: each cue stem counts once and "survey" is a negative cue only when it
+    means a literature survey.  Rules are the screen without a Jev key and Jev's fallback.
 S3  full text: the configurable cascade in fulltext.py (cache -> OA -> Elsevier / Wiley TDM -> institution IP
     -> browser), behind the download ledger in dlledger.py.  Papers no channel could fetch are parked
     (`fulltext_unavailable`) and queued; `tbsgen fetch` drains the queue (incl. the ego-browser channel) and
@@ -30,9 +30,7 @@ POS = re.compile(r"\b(algorithm|estimat|simulat|inversion|solver|numerical|optim
                  r"deconvol|iterative|phantom|least[- ]squares|fitting|denois|unwrap|retriev|kalman|assimilat|"
                  r"quantif|extrapolat|interpolat|decompos|inference|correction)\w*",
                  re.I)
-NEG = re.compile(r"\b(review|survey|perspective|editorial|commentary|qualitative|interview|questionnaire|"
-                 r"case report|randomi[sz]ed controlled|patients were recruited)\b", re.I)
-# rules-v2: "survey" alone is often a sample survey (household / living-conditions survey data); count it only in
+# "survey" alone is often a sample survey (household / living-conditions survey data); count it only in
 # literature-survey phrasings.
 NEG2 = re.compile(r"\b(review|perspective|editorial|commentary|qualitative|interview|questionnaire|"
                   r"case report|randomi[sz]ed controlled|patients were recruited|"
@@ -82,26 +80,19 @@ def screen(c: dict, cfg: dict, fulltext_head: str | None = None) -> dict:
     first chars of the full text (e2e-iter1: a nanoindentation drift-correction method paper with no abstract
     in the retrieval record scored -1 and was dropped).
 
-    rules-v1: distinct matched words (estimating / estimation / estimator count 3 times), "survey" negative.
     rules-v2: distinct cue stems (each POS alternative once), "survey" negative only as literature survey."""
-    ver = str(cfg["screen"].get("rules_version", "v2"))
-    method = f"rules-{ver}"
+    method = "rules-v2"
     if not c.get("abstract") and fulltext_head is None:
         return dict(score=None, pos=[], neg=[], keep=True, deferred=True, form_hint=None, method=method,
                     reason=None)
     abstract = c.get("abstract") or (fulltext_head or "")[:4000]
     text = f"{c.get('title', '')}\n{abstract}"
-    if ver == "v1":
-        pos = sorted({m.group(0).lower() for m in POS.finditer(text)})
-        neg = sorted({m.group(0).lower() for m in NEG.finditer(text)})
-    else:
-        pos = sorted({_stem(m.group(1)) for m in POS.finditer(text)})
-        neg = sorted({m.group(1).lower() for m in NEG2.finditer(text)})
+    pos = sorted({_stem(m.group(1)) for m in POS.finditer(text)})
+    neg = sorted({m.group(1).lower() for m in NEG2.finditer(text)})
     score = len(pos) - 2 * len(neg) + (1 if c.get("code_links") or c.get("code_urls") else 0) + \
         (1 if c.get("data_links") or c.get("data_urls") else 0)
     form_hint = "INTERACT" if BLACKBOX.search(text) else None
-    min_score = cfg["screen"].get("min_score_v1", 2) if ver == "v1" else cfg["screen"]["min_score"]
-    keep = score >= min_score
+    keep = score >= cfg["screen"]["min_score"]
     return dict(score=score, pos=pos, neg=neg, keep=keep, form_hint=form_hint, method=method,
                 reason=None if keep else "low_screen_score", deferred=False)
 
@@ -112,24 +103,9 @@ from .fulltext import Fetcher, title_match  # noqa: E402,F401
 from .fulltext import pdf_to_text as _pdf_to_text  # noqa: E402,F401
 
 
-def _legacy_transport(fn):
-    """Wrap an old-style fetcher (url -> bytes) as a fulltext transport (tests / dry runs)."""
-    from .fulltext import Resp
-
-    def transport(url, headers, timeout, max_bytes):
-        try:
-            return Resp(200, {}, fn(url), url)
-        except Exception as e:  # noqa: BLE001
-            return Resp(0, {}, b"", url, f"{type(e).__name__}: {str(e)[:120]}")
-    return transport
-
-
-def fetch_fulltext(c: dict, cfg: dict, fetcher=None) -> tuple[str | None, dict]:
-    """S3 for one candidate.  `fetcher`: a fulltext.Fetcher, an old-style callable (url -> bytes), or None
-    (a Fetcher built from cfg)."""
-    if not isinstance(fetcher, Fetcher):
-        fetcher = Fetcher(cfg, transport=_legacy_transport(fetcher) if callable(fetcher) else None)
-    out = fetcher.fetch(c)
+def fetch_fulltext(c: dict, cfg: dict, fetcher: Fetcher | None = None) -> tuple[str | None, dict]:
+    """S3 for one candidate with `fetcher` (a fulltext.Fetcher; None -> one built from cfg)."""
+    out = (fetcher or Fetcher(cfg)).fetch(c)
     return out.text, out.rec
 
 
@@ -184,7 +160,7 @@ class TBSIndex:
 def probe(c: dict, fulltext: str, screen_rec: dict, cfg: dict, tbs: TBSIndex | None) -> dict:
     pc = cfg["probe"]
     hits = sorted({m.group(0).lower() for m in POS.finditer(fulltext[:200000])})
-    rec = dict(method="rules-v1 (cheap sandbox agent 待定)", fulltext_chars=len(fulltext), method_hits=len(hits))
+    rec = dict(method="rules (cheap sandbox agent 待定)", fulltext_chars=len(fulltext), method_hits=len(hits))
     reasons = []
     if len(hits) < pc["min_method_hits"]:
         reasons.append("no_compute_core")

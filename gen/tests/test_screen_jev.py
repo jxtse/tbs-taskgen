@@ -287,34 +287,14 @@ def test_deferred_no_abstract_then_s4_asks_jev_on_fulltext(tmp_path, key):
     assert P.ledger.summary()["rows"][0]["stage"] == "S4"
 
 
-def test_legacy_s2_record_still_read(tmp_path, key):
-    """An S2_screen.json written by rules-v1 (old run dir) keeps working: s4 reads only keep/deferred/form_hint."""
-    from tbsgen import intake
-    legacy = {"score": 5, "pos": ["estimat"], "neg": [], "keep": True, "form_hint": "INTERACT", "method": "rules-v1",
-              "reason": None}
-    r = intake.probe(FAY, "We propose an estimation algorithm. " * 400, legacy, load_config(), None)
-    assert "interact_form_banned_until_isolation" in r["reasons"]
-    P = mkp(tmp_path, [(500, {}, b"must not be called")])
-    (i,) = P.ingest([NOABS])
-    it = P.store.item(i)
-    write_json(it.p("S2_screen.json"), legacy)          # not deferred -> S4 must not re-screen
-    it.state.update(stage="S4", status="active")
-    it.save()
-    it.p("fulltext.txt").write_text("We propose an estimation algorithm with simulation. " * 400)
-    from tbsgen import stages_a
-    stages_a.s4(P, it)
-    assert P.jev_transport.calls == []
-
-
 # ------------------------------------------------------------------ rules-v2 fixes
 def test_rules_v2_counts_stems_once_and_survey_is_not_a_review():
-    v1, v2 = load_config(overrides={"screen": {"rules_version": "v1"}}), load_config()
+    v2 = load_config()
     t = dict(title="x", abstract="estimating estimation estimator estimators")
-    assert screen(t, v1)["score"] == 4 and screen(t, v2)["score"] == 1
-    r1, r2 = screen(FAY, v1), screen(FAY, v2)
-    assert "survey" in r1["neg"] and not r2["neg"]
-    assert len(r2["pos"]) < len(r1["pos"])          # variants (estimating / estimators ...) counted once
-    assert r1["method"] == "rules-v1" and r2["method"] == "rules-v2"
+    assert screen(t, v2)["score"] == 1                  # variants (estimating / estimators ...) counted once
+    r2 = screen(FAY, v2)
+    assert not r2["neg"] and r2["method"] == "rules-v2"   # a sample survey is not a literature review
+    assert "rules_version" not in v2["screen"] and "min_score_v1" not in v2["screen"]
     lit = dict(title="Methods for X", abstract="This survey of the literature covers estimation methods.")
     assert screen(lit, v2)["neg"]
     assert not screen(REVIEW, v2)["keep"]

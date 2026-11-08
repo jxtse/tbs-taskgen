@@ -102,7 +102,7 @@ class Target:
         return exact_terms(self.queries + [self.name], self.libs)
 
     def topic_phrase(self) -> str:
-        """Short English phrase naming the method/task (for Exa/Tavily resource queries)."""
+        """Short English phrase naming the method/task (for Exa resource queries)."""
         if self.topic:
             return self.topic
         if self.name:

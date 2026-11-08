@@ -66,16 +66,6 @@ def test_exa_paper_entities(cfg, keys):
     assert led.usage("exa")["usd"] == pytest.approx(0.007)   # costDollars from the response
 
 
-def test_tavily_code_channel(cfg, keys):
-    S, led, _ = make_sources(cfg, Replay())
-    rl = S["tavily"].channel("code", T)
-    kinds = {r.kind for r in rl.resources}
-    assert "code" in kinds
-    keys_ = {resource_key(r.url) for r in rl.resources}
-    assert "github.com/broadinstitute/cellbender" in keys_
-    assert led.usage("tavily")["credits"] == 1
-
-
 def test_crossref_arxiv_epmc(cfg, keys):
     S, _, _ = make_sources(cfg, Replay())
     cr = S["crossref"].search("SoupX ambient RNA", T)
@@ -93,9 +83,8 @@ def test_no_secret_in_ledger_cache_or_fixtures(cfg, keys, tmp_path):
     S, led, _ = make_sources(cfg, Replay())
     S["openalex"].search(T.queries[0], T)
     S["exa"].channel("paper", T)
-    S["tavily"].channel("code", T)
     blob = (led.path.read_bytes() + led.cache_path.read_bytes()).decode("latin1")
-    for k in ("OPENALEX_API_KEY", "EXA_API_KEY_SECONDARY", "TAVILY_API_KEY_SECONDARY"):
+    for k in ("OPENALEX_API_KEY", "EXA_API_KEY_SECONDARY"):
         assert os.environ[k] not in blob
     assert "api_key" not in blob
     for fx in load_fixtures():
@@ -133,11 +122,14 @@ def test_budget_stops_source(cfg, keys):
 
 
 def test_monthly_credit_cap(cfg, keys):
-    cfg["sources"]["tavily"]["monthly_max_credits"] = 1
-    S, _, _ = make_sources(cfg, Replay())
-    S["tavily"].channel("code", T)
+    """Credit-billed sources: the monthly credit cap stops the source (ledger-level; no such source is enabled now)."""
+    from tbsretr.ledger import Ledger
+    led = Ledger(cfg["state_dir"], run="t")
+    scfg = {"monthly_max_credits": 1}
+    led.check_budget("x", scfg, next_credits=1)
+    led.book("x", "code", "https://example.org/s", 200, 0.1, credits=1)
     with pytest.raises(BudgetExceeded):
-        S["tavily"].channel("data", T)
+        led.check_budget("x", scfg, next_credits=1)
 
 
 def test_429_cooldown_persists(cfg, keys):
@@ -265,9 +257,9 @@ def test_resources_fuse_and_classify():
     assert resource_key("https://github.com/Foo/Bar/issues/3") == "github.com/foo/bar"
     from tbsretr.model import Resource
     l1 = RankedList("exa.code", "q", resources=[Resource("https://github.com/Foo/Bar", "code")])
-    l2 = RankedList("tavily.code", "q", resources=[Resource("https://github.com/foo/bar/blob/main/x.py", "code")])
+    l2 = RankedList("exa.docs", "q", resources=[Resource("https://github.com/foo/bar/blob/main/x.py", "code")])
     res = fuse_resources([l1, l2], [{"code_links": ["github.com/foo/bar"], "fused_rank": 1, "doi": "10.1/x"}])
-    assert len(res) == 1 and set(res[0]["found_by"]) == {"exa.code", "tavily.code"} and res[0]["from_papers"]
+    assert len(res) == 1 and set(res[0]["found_by"]) == {"exa.code", "exa.docs"} and res[0]["from_papers"]
 
 
 def test_resource_leak_filter():
@@ -305,7 +297,6 @@ def test_crossref_exact_queries(cfg):
 def test_retrieve_end_to_end_offline(cfg, keys):
     """Full pipeline on fixtures: unknown requests return 599 -> recorded as errors, never crash."""
     cfg["sources"]["exa"]["channels"] = ["paper"]
-    cfg["sources"]["tavily"]["channels"] = ["code"]
     cfg["sources"]["openalex"]["retries"] = 0
     cfg["sources"]["s2"]["retries"] = 0
     for s in cfg["sources"].values():
@@ -368,11 +359,11 @@ def test_exa_pool_backend_same_parse_as_direct(cfg, monkeypatch):
 def test_exa_pool_rejects_other_provider_and_env_url(cfg, monkeypatch):
     monkeypatch.setenv("TBS_SEARCH_POOL_URL", "http://127.0.0.1:9/")
     cfg["sources"]["exa"]["backend"] = "pool"
-    tr, seen, _ = _pool_replay(provider="tavily")
+    tr, seen, _ = _pool_replay(provider="other-engine")
     S, led, _ = make_sources(cfg, tr)
     assert S["exa"]._safe(S["exa"].channel, "code", T) is None
     assert seen[0][1] == "http://127.0.0.1:9/v1/search"
-    assert "provider='tavily'" in S["exa"].errors[0]
+    assert "provider='other-engine'" in S["exa"].errors[0]
     u = led.usage("exa")
     assert u["calls"] == 1 and u["usd"] == pytest.approx(0.007)        # real cost kept ...
     # ... but the bad 200 is not cached: once the pool is fixed, the same query is fetched again
@@ -423,13 +414,24 @@ def test_no_machine_specific_defaults(monkeypatch):
     """Default pool URL and leak-refs path are unset unless the environment provides them."""
     import importlib
     import tbsretr.config as rc
-    for k in ("TBS_SEARCH_POOL_URL", "TBS_LEAK_REFS", "TBS_OLD_PIPE"):
+    for k in ("TBS_SEARCH_POOL_URL",):
         monkeypatch.delenv(k, raising=False)
     c = importlib.reload(rc).load_config(path="/nonexistent.toml")
     assert c["sources"]["exa"]["pool_url"] is None and c["leak_refs"] is None
-    monkeypatch.setenv("TBS_OLD_PIPE", "/data/old")
-    assert importlib.reload(rc).load_config(path="/nonexistent.toml")["leak_refs"] == "/data/old/literature/tbs_task_refs.json"
-    monkeypatch.setenv("TBS_LEAK_REFS", "/x/refs.json")
-    assert importlib.reload(rc).load_config(path="/nonexistent.toml")["leak_refs"] == "/x/refs.json"
+    # leak refs come from the config file only (no environment variable)
+    for k in ("TBS_LEAK_REFS", "TBS_OLD_PIPE"):
+        monkeypatch.setenv(k, "/data/old")
+    assert importlib.reload(rc).load_config(path="/nonexistent.toml")["leak_refs"] is None
+    assert rc.load_config(overrides={"leak_refs": "/x/refs.json"})["leak_refs"] == "/x/refs.json"
     monkeypatch.undo()
     importlib.reload(rc)
+
+
+def test_recorded_web_search_titles_still_yield_to_bibliographic_titles():
+    """eval/raw holds lists from the removed Tavily source; re-fusing them must keep the old title rule."""
+    from tbsretr.fusion import _merge_into
+    from tbsretr.model import Paper
+    for web in ("exa", "tavily"):
+        a = Paper(title="Page title - a review site", origin=web, doi="10.1/x")
+        _merge_into(a, Paper(title="Estimating X", origin="openalex", doi="10.1/x"))
+        assert a.title == "Estimating X"

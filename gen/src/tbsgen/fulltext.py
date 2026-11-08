@@ -1174,9 +1174,6 @@ def enqueue(path: Path, entry: dict) -> bool:
     entry.pop("key", None)
     if not entry["ident"]:
         return False
-    if "item_ids" in entry:
-        entry["subscribers"] = _subs(entry)
-        entry.pop("item_ids")
     with queue_lock(path):
         q = read_queue(path)
         for e in q:
@@ -1186,7 +1183,6 @@ def enqueue(path: Path, entry: dict) -> bool:
                 subs = old_subs + [list(s) for s in _subs(entry) if list(s) not in old_subs]
                 if subs != old_subs:
                     e["subscribers"] = subs
-                    e.pop("item_ids", None)
                     changed = True
                 new_link = False
                 for k in QUEUE_FIELDS:
@@ -1224,10 +1220,8 @@ def reconcile(store, path: Path) -> int:
 
 
 def _subs(e: dict) -> list[list[str]]:
-    """[(run, item_id)] waiting for this paper (older entries: item_ids + run)."""
-    if e.get("subscribers"):
-        return [list(s) for s in e["subscribers"]]
-    return [[e.get("run") or "", i] for i in e.get("item_ids") or []]
+    """[(run, item_id)] waiting for this paper."""
+    return [list(s) for s in e.get("subscribers") or []]
 
 
 # ------------------------------------------------------------------------------------------- queue drain

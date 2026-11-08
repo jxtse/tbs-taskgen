@@ -29,12 +29,11 @@ t = Target(id="task:ambient-rna-correction", queries=["ambient RNA removal dropl
            description="Remove ambient RNA (soup) contamination from droplet scRNA-seq count matrices using empty droplets.",
            name="ambient RNA correction", libs=["SoupX"])
 S = rt.src
-which = sys.argv[1:] or ["openalex", "s2", "exa", "tavily", "crossref", "arxiv", "europepmc"]
+which = sys.argv[1:] or ["openalex", "s2", "exa", "crossref", "arxiv", "europepmc"]
 if "openalex" in which: S["openalex"].search(t.queries[0], t)
 if "s2" in which:
     l = S["s2"].search(t.queries[0], t); S["s2"].recommend(l.papers[:2], t); S["s2"].recommend(l.papers[:1], t)
 if "exa" in which: S["exa"].channel("paper", t)
-if "tavily" in which: S["tavily"].channel("code", t)
 if "crossref" in which:
     S["crossref"].search("SoupX ambient RNA", t); S["crossref"].by_dois(["10.1093/gigascience/giaa151"], t.id)
 if "arxiv" in which: S["arxiv"].search("neural quantum states stochastic reconfiguration", t, ["quant-ph", "cond-mat"])
@@ -42,7 +41,7 @@ if "europepmc" in which: S["europepmc"].search(t.queries[0], t)
 for r in rec:
     name = r["url"].split("//")[1].split("/")[0].split(".")[-2] + "_" + str(len(list(FX.glob("*.json")))) \
         + ("_" + str(r["status"]) if r["status"] != 200 else "")
-    for k in ("OPENALEX_API_KEY","SEMANTIC_SCHOLAR_API_KEY","EXA_API_KEY_SECONDARY","TAVILY_API_KEY_SECONDARY"):
+    for k in ("OPENALEX_API_KEY","SEMANTIC_SCHOLAR_API_KEY","EXA_API_KEY_SECONDARY"):
         import os; v = os.environ.get(k)
         assert not v or v not in json.dumps(r), "secret leaked into fixture"
     (FX / f"{name}.json").write_text(json.dumps(r, ensure_ascii=False, indent=1))
