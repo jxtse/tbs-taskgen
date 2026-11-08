@@ -191,6 +191,12 @@ downloading and probing. Two modes, chosen with `models.roles.screen`:
 In both modes, papers without an abstract are passed on and re-screened at S4 on the first 4000 characters of the
 full text. Evaluation: [`gen/eval/screen_jev/`](gen/eval/screen_jev/).
 
+Before either mode, S2 drops papers whose full text the S3 channels have never been able to obtain
+(`screen.blocklist`, matched on DOI prefix and optionally publication year): Elsevier before 2000, SAGE, the
+American Meteorological Society, Powder Diffraction, ASCE and SPIE. Such papers get `method = "blocklist"` and
+`reason = "blocklist:<rule>"` in `S2_screen.json` and cost no screen call. Set `screen.blocklist = []` to disable,
+or edit the list to add or remove publishers.
+
 ```toml
 [models.roles]
 screen = "jev"

@@ -72,6 +72,17 @@ DEFAULTS: dict[str, Any] = {
         # the same text; 1 was picked on the dev half of the S2 reference set (gen/eval/screen_jev/).
         "min_score": 1,
         "min_score_v1": 2,                  # rules-v1 threshold (unchanged)
+        # Papers whose full text we cannot obtain (S3 history: 0 successes, every channel), dropped at S2 before
+        # any screen call.  Match = DOI prefix [+ published before `before_year`].  Set to [] to disable.
+        "blocklist": [
+            {"name": "elsevier-pre2000", "doi_prefix": "10.1016", "before_year": 2000,
+             "why": "Elsevier TDM returns metadata only for pre-2000 volumes (0/11)"},
+            {"name": "sage", "doi_prefix": "10.1177", "why": "no TDM/OA route; 0/3"},
+            {"name": "ams-meteorology", "doi_prefix": "10.1175", "why": "American Meteorological Society; 0/3"},
+            {"name": "powder-diffraction", "doi_prefix": "10.1154", "why": "Powder Diffraction (Cambridge/ICDD); 0/3"},
+            {"name": "asce", "doi_prefix": "10.1061", "why": "Cloudflare-walled, no TDM; 1/4"},
+            {"name": "spie", "doi_prefix": "10.1117", "why": "mostly proceedings, no TDM/OA; 1/4"},
+        ],
         "jev": {
             "model": "jev-1.14.0",          # pinned version (thresholds were set on it); "jev-latest" = alias
             "url": "https://api.typesafe.ai/v1/systemone",
