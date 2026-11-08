@@ -168,10 +168,13 @@ def _spec_name(tok: str) -> list[str]:
     url = re.sub(r"^[a-z]+\+", "", tok)
     if re.match(r"(https?|ssh|file)://", url) or re.match(r"[\w.-]+\.[a-z]{2,}/", url):
         out += [r["name"] for r in repo_names([url])]
-        if not out:
-            # direct archive / file URL: last path segment without query / fragment (#sha256=...) and version
-            path = re.split(r"[#?]", url, maxsplit=1)[0].rstrip("/")
-            out.append(_archive_dist(path.rsplit("/", 1)[-1]))
+        # always also the last path segment (any host): a direct archive (`.../DecayFit-1.2.tar.gz`, version and
+        # #sha256= fragment removed) or a VCS repo (`.../DecayFit.git@v1` -> DecayFit)
+        last = re.split(r"[#?]", url, maxsplit=1)[0].rstrip("/").rsplit("/", 1)[-1]
+        last = re.sub(r"@[^/]*$", "", last)
+        last = re.sub(r"\.git$", "", last)
+        if last and (name := _archive_dist(last)) not in out:
+            out.append(name)
         return out
     if tok.startswith((".", "/", "~")) or "/" in tok:      # a local path (a distribution name has no "/")
         return [_archive_dist(Path(re.split(r"[#?]", tok)[0].rstrip("/")).name)]

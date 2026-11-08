@@ -102,6 +102,8 @@ def test_shipped_compiled_modules_are_blocking(tmp_path, name):
     "-e vendor/DecayFit\n",
     "https://files.example.org/dist/DecayFit_1.2.tar.gz\n",
     "py_decay_fit==1.2\n",
+    "https://github.com/lab/wheels/releases/download/v1/DecayFit-1.2.tar.gz\n",
+    "git+https://git.example.org/lab/DecayFit.git@v1\n",
 ])
 def test_direct_archive_urls_resolve_to_the_distribution_name(tmp_path, req):
     r = prerelease.readymade_check(mk_task(tmp_path, req=req), CAND, SPEC)
