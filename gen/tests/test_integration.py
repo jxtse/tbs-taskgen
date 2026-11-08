@@ -59,6 +59,90 @@ def test_happy_path_to_harbor_package_and_calibration(tmp_path):
     assert len(fake.log) == n
 
 
+NET_PROBE = r"""#!/bin/bash
+set -uo pipefail
+mkdir -p /logs/agent
+{
+python - <<'PY'
+import urllib.request
+for u in ("https://pypi.org/simple/six/", "https://github.com/"):
+    try:
+        urllib.request.urlopen(u, timeout=10); print("OPEN", u)
+    except Exception as e:
+        print("BLOCKED", u, type(e).__name__)
+PY
+if timeout 60 pip download --no-deps -q -d /tmp/x six >/dev/null 2>&1; then echo "PIP_OK"; else echo "PIP_FAILED"; fi
+} > /logs/agent/net_probe.txt 2>&1
+python /solution/solve.py
+"""
+
+
+def _packaged_toy(tmp_path):
+    P, _ = mk(tmp_path)
+    [iid] = P.ingest([make_toy_candidate(tmp_path)])
+    P.run()
+    it = P.store.item(iid)
+    assert it.state["stage"] == "S9", it.state
+    return P, it
+
+
+def test_packaged_image_builds_and_reference_runs_offline(tmp_path):
+    """The packaged Dockerfile builds, and the reference solution plus the verifier pass inside the image with the
+    network off (docker --network none); pip install fails there."""
+    import subprocess
+    P, it = _packaged_toy(tmp_path)
+    pkg = it.p("pkg")
+    tag = f"tbsgen-pkgtest-{it.item_id}".lower()
+    b = subprocess.run(["docker", "build", "-q", "-t", tag, str(pkg / "environment")], capture_output=True, text=True,
+                       timeout=1200)
+    assert b.returncode == 0, b.stderr[-2000:]
+    try:
+        cmd = ("bash /solution/solve.sh && bash /tests/test.sh && cat /logs/verifier/reward.txt && "
+               "(pip install --no-cache-dir -q six >/dev/null 2>&1 && echo PIP_OK || echo PIP_FAILED)")
+        r = subprocess.run(["docker", "run", "--rm", "--network", "none", "-v", f"{pkg / 'solution'}:/solution:ro",
+                            "-v", f"{pkg / 'tests'}:/tests:ro", tag, "bash", "-c", cmd],
+                           capture_output=True, text=True, timeout=1200)
+        out = r.stdout.split()
+        assert r.returncode == 0 and "1" in out and out[-1] == "PIP_FAILED", (r.stdout[-1000:], r.stderr[-2000:])
+    finally:
+        subprocess.run(["docker", "image", "rm", "-f", tag], capture_output=True)
+
+
+def test_harbor_agent_phase_allowlist_blocks_internet(tmp_path):
+    """Real Harbor (local Docker environment) on the packaged toy task, default network policy: during the agent
+    phase pypi.org / github.com are unreachable and pip fails; --allow-agent-host opens exactly that host; the
+    oracle still passes.  Needs a `harbor` binary (TBS_HARBOR_BIN or calib.harbor_root); skipped otherwise."""
+    import shutil
+    import subprocess
+    from tbsgen import harbor_local
+    harbor = harbor_local.find_harbor(load_config(overrides={"calib": {"harbor_root": __import__("os").environ.get(
+        "TBS_HARBOR_ROOT")}}))
+    if not harbor:
+        pytest.skip("harbor binary not available")
+    P, it = _packaged_toy(tmp_path)
+    task = tmp_path / "h" / "tasks" / "net"
+    shutil.copytree(it.p("pkg"), task)
+    from tbsgen.package import DOCKERFILE_LOCAL
+    (task / "environment" / "Dockerfile").write_text(DOCKERFILE_LOCAL.format(image=IMAGE, offline=""))
+    (task / "solution" / "solve.sh").write_text(NET_PROBE)
+    env = {k: v for k, v in __import__("os").environ.items() if k not in ("PYTHONPATH", "VIRTUAL_ENV", "DOCKER_CONFIG")}
+
+    def run(job, *extra):
+        p = subprocess.run([harbor, "run", "-p", str(task), "-a", "oracle", "-o", str(tmp_path / "h" / "jobs"),
+                            "--job-name", job, "-n", "1", "-q", "--yes", *extra], capture_output=True, text=True,
+                           timeout=1800, env=env)
+        assert p.returncode == 0, p.stderr[-2000:]
+        jd = tmp_path / "h" / "jobs" / job
+        probe = next(jd.rglob("net_probe.txt")).read_text()
+        res = json.loads(next(x for x in jd.glob("*/result.json")).read_text())
+        return probe, ((res.get("verifier_result") or {}).get("rewards") or {}).get("reward")
+    probe, reward = run("allow")
+    assert "BLOCKED https://pypi.org" in probe and "BLOCKED https://github.com" in probe and "PIP_FAILED" in probe
+    assert reward == 1.0
+    probe, reward = run("allowhost", "--allow-agent-host", "pypi.org")
+    assert "OPEN https://pypi.org" in probe and "BLOCKED https://github.com" in probe and reward == 1.0
+
+
 def test_resume_after_crash_mid_stage(tmp_path):
     """Kill-like interruption: run stops after S6A_run; a new Pipeline object continues from state.json."""
     P, fake = mk(tmp_path)

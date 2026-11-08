@@ -30,7 +30,7 @@ def _merge_into(a: Paper, b: Paper):
             setattr(a, f, getattr(b, f))
     if len(b.abstract or "") > len(a.abstract or ""):
         a.abstract = b.abstract
-    if len(b.title or "") > 0 and (not a.title or (a.origin in ("exa", "tavily") and b.origin not in ("exa", "tavily"))):
+    if len(b.title or "") > 0 and (not a.title or (a.origin == "exa" and b.origin != "exa")):
         a.title = b.title
     if b.oa_url and (not a.oa_url or (a.oa_url and not a.oa_url.lower().endswith(".pdf") and b.oa_url.lower().endswith(".pdf"))):
         a.oa_url = b.oa_url

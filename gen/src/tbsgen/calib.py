@@ -85,6 +85,9 @@ def job_config(cfg: dict, pkg: Path, who: str, job_name: str) -> dict:
         agent = {**_ref(c.get("teacher_agent"), "name", c["harness"]), "model_name": c["teacher_model"],
                  "kwargs": {"version": c["cc_version"], "reasoning_effort": "max", "thinking_display": "summarized"},
                  "env": dict(AGENT_ENV)}
+    hosts = [str(h) for h in c.get("agent_allowed_hosts") or []]
+    if hosts:
+        agent["extra_allowed_hosts"] = hosts            # the model endpoint during the agent phase only
     return {"job_name": job_name, "jobs_dir": c["jobs_dir"], "n_attempts": 1, "n_concurrent_trials": 1,
             "timeout_multiplier": 1.0, "agent_timeout_multiplier": 1.0,
             "retry": {"max_retries": 2, "include_exceptions": ["AgentSetupTimeoutError", "EnvironmentStartTimeoutError",
@@ -120,6 +123,17 @@ def prepare(cfg: dict, item_dir: Path, who: str, n: int) -> dict:
         # remote sandbox backends cannot build a Dockerfile: a missing prepared template means the run would die
         # at environment start (e2e-iter1: FileUploadException, no model use) -> do not launch
         rec["blocked"] = "no prepared sandbox template for this item"
+    net = (cfg["package"].get("network") or {}).get("mode", "agent-allowlist")
+    why = None
+    if net == "agent-allowlist" and not c.get("agent_allowed_hosts") and \
+            not (cfg["package"].get("network") or {}).get("agent_hosts"):
+        why = ("the task allows no host in the agent phase (package.network.mode = agent-allowlist): set "
+               "calib.agent_allowed_hosts to the model endpoint host(s), or add --allow-agent-host to the command")
+    elif net == "no-network":
+        why = "package.network.mode = no-network: an agent that calls a model cannot run"
+    if why:
+        # an automatic launch would only burn a sandbox; a printed command is for a human, who can add the host
+        rec["blocked" if c.get("allow_submit") else "warning"] = why
     if c.get("allow_submit") and not (launcher and c.get("harbor_root")):
         rec["blocked"] = (f"calib.allow_submit needs calib.harbor_root and calib.{'student' if who == 'glm' else 'teacher'}"
                           "_launcher (or set allow_submit=false and run the printed command yourself)")
@@ -187,14 +201,6 @@ def launcher_failed(rec: dict) -> str | None:
 def actual_spend(ledger) -> float:
     with ledger._db() as db:
         return db.execute("SELECT COALESCE(SUM(usd),0) FROM calls WHERE real=1 AND status!='reserved'").fetchone()[0]
-
-
-def submit(cfg: dict, item_dir: Path, who: str, n: int, ledger=None) -> dict:
-    """Back-compat helper (tests / config-only use): prepare + launch without persistence."""
-    rec = prepare(cfg, item_dir, who, n)
-    if rec.get("blocked") or not cfg["calib"].get("allow_submit"):
-        return rec
-    return launch(cfg, rec, ledger, lambda r: None)
 
 
 def _api_status(trial: Path) -> tuple[int | None, str | None]:

@@ -18,8 +18,8 @@ from .ledger import BudgetExceeded, Http, Ledger, SourceCooling
 from .model import Paper, RankedList, Target, informative_words
 from .sources import ALL, STOP_EXC
 
-PAPER_SOURCES = ("openalex", "s2", "crossref", "arxiv", "europepmc", "exa", "tavily")
-NEW4 = {"openalex", "s2", "exa", "tavily"}
+PAPER_SOURCES = ("openalex", "s2", "crossref", "arxiv", "europepmc", "exa")
+NEW4 = {"openalex", "s2", "exa"}
 OLD3 = {"crossref", "arxiv", "europepmc"}
 
 
@@ -104,7 +104,7 @@ class Retriever:
             if t.routed_biomed():
                 for q in t.queries[: sc["max_queries"]]:
                     out.append(self._run(name, s.search, q, t))
-        elif name in ("exa", "tavily"):
+        elif name == "exa":
             for ch in sc.get("channels", []):
                 if ch == "tool":
                     ex = t.exact()

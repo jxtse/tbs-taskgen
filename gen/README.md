@@ -8,10 +8,10 @@
 src/tbsgen/
   config.py        全部配置与默认值（待定项都在这里）；config.toml 可覆盖
   budget.py        sqlite 预算账本：按 模型×阶段×条目 记 token/美元/次数；日预算、调用上限、单条目上限；熔断
-  models.py        模型调用层：OpusClient（Anthropic 兼容端点）/ FakeClient（脚本化）/ RecordingClient（录制）
+  models.py        模型调用层：TeacherClient（Anthropic 兼容端点）/ FakeClient（脚本化）/ RecordingClient（录制）
   state.py         每条目一个状态目录 + state.json 状态机；events.jsonl
   pipeline.py      编排：逐条推进、断点续跑、预算/熔断暂停、resume
-  intake.py        S1 读检索层输出；S2 规则筛选（rules-v1/v2）；S3 全文（调 fulltext.py）；S4 可行性（规则部分 + 官方题去重）
+  intake.py        S1 读检索层输出；S2 规则筛选（rules-v2）；S3 全文（调 fulltext.py）；S4 可行性（规则部分 + 官方题去重）
   blocklist.py     S2 前置黑名单：按 DOI 前缀（可加发表年份）直接丢弃拿不到全文的论文，配置 screen.blocklist
   fulltext.py      S3 下载级联（cache/oa/elsevier/wiley/inst/browser）、校验、写入缓存、全文队列
   dlledger.py      S3 下载账本：每日/每小时上限、同站点间隔、冷却、熔断
@@ -26,7 +26,8 @@ src/tbsgen/
   gates.py         S7 机械门
   leaves.py, leakgate.py, leakcheck.py, introspect_probe.py   4 层泄漏门（L1–L4a）
   repair.py        S8 局部修复的保工审查（机械 diff）
-  package.py       PKG：打包为 Harbor 任务 + 结构校验
+  package.py       PKG：打包为 Harbor 任务 + 结构校验（含网络策略）
+  prerelease.py    上线前检查：现成实现检查（S7 `readymade` 门）+ 打包任务网络策略说明
   calib.py         S9：GLM 顺序校准 + Opus 教师分支的调度规则、Harbor 作业配置、结果收集
   report.py        日报（Markdown）
   stages_a.py, stages_b.py   各阶段处理函数
@@ -130,7 +131,7 @@ daily_calls_per_model = { "claude-opus-5-5" = 40 }
 allow_submit = false
 ```
 
-凭据：出题阶段的 Opus 走 Anthropic 兼容端点（`models.opus.url` 或环境变量 `TBS_OPUS_URL`，没有默认值；未设置时模型阶段以 `model:config` 暂停）。不设 `key_env` 时本进程不发送 key（适用于持有凭据的本机网关）。如果改走需要 key 的端点，设置 `models.opus.key_env`，再用 `uv run tbsgen ...` 注入；key 只放在请求头里，不写日志或文件，错误信息会先脱敏。
+凭据：出题阶段的 teacher 模型走 Anthropic 兼容端点（`models.teacher.url` 或环境变量 `TBS_TEACHER_URL`，没有默认值；未设置时模型阶段以 `model:config` 暂停）。不设 `key_env` 时本进程不发送 key（适用于持有凭据的本机网关）。如果改走需要 key 的端点，设置 `models.teacher.key_env`，再用 `uv run tbsgen ...` 注入；key 只放在请求头里，不写日志或文件，错误信息会先脱敏。
 
 ## 4. 配置项与待定项默认值
 
@@ -144,7 +145,7 @@ allow_submit = false
 | `budget.est_usd_per_call` | 1.5 | 调用前按此金额预占，用于判断是否会超预算 |
 | `models.prices` | Opus $5/$25 每百万 token | **占位**，需按实际价格替换 |
 | `models.cheap` / `roles.screen/probe/review/invert` | None / rules | `roles.screen = "jev"` 启用 Jev 筛选；其余廉价模型角色**待定**，S4/S8 审查用规则，L4b 跳过 |
-| `screen.rules_version / min_score` | v2 / 1 | 规则筛选：v2 每个词干只计一次、“survey”只在文献综述语境扣分；v1（`min_score_v1`=2）保留作对照 |
+| `screen.min_score` | 1 | 规则筛选（rules-v2）：每个词干只计一次、“survey”只在文献综述语境扣分。无 Jev key 时的默认、Jev 不可用时的回退 |
 | `screen.jev.model` | jev-1.14.0 | 固定版本；响应里的 `model` 不一致时报错并熔断（`jev-latest` 不检查） |
 | `screen.jev.key_env` | TYPESAFE_API_KEY | 存放密钥的环境变量名 |
 | `screen.jev.uncertain` | keep | 不确定时放行并标记 `uncertain=true`；`drop` 则丢弃 |
@@ -159,6 +160,10 @@ allow_submit = false
 | `gen.s6a_max_tokens / s6c_max_tokens / continue_calls` | 64000 / 48000 / 1 | 多文件输出上限；被截断时最多 1 次续写，只要缺的文件 |
 | `gen.mid_rework_max` | 1 | mid 不可区分时先由 S6M 只重写 `baselines/mid.py`，再不行才回 S5 |
 | `gates.max_repair_rounds` | 2 | S8 修复轮数上限 |
+| `gates.blocking` 中的 `readymade` | 阻塞 | 现成实现检查：任务镜像声明的依赖（requirements、Dockerfile 里的 pip install）、参考解/基线的 import、`environment/` 下随题分发的代码，与论文 `code_links`/`data_links` 的仓库名/包名、S5 规格的 `method_names` 匹配即阻塞，进 S8（去掉依赖、自己实现或改题）。已知配套仓库写入 `provenance.json` 的 `companion_code`。纯规则，不调模型 |
+| `package.network.mode` | agent-allowlist | 打包任务的网络策略：`[agent]` 阶段 allowlist（`agent_hosts` + 启动时 `--allow-agent-host` 给的模型端点），`[verifier]` 断网，`[environment]` 公网只用于 agent 安装；`no-network` 全程断网（只适合 oracle）；`public` 旧行为，仅作对照 |
+| `package.network.disable_index` | False | True 时镜像构建完成后去掉 pip/uv/conda 索引并设 `PIP_NO_INDEX=1` 等（减速带，不是屏障；默认关，避免 agent 安装自身运行时失败） |
+| `calib.agent_allowed_hosts` | 空 | 校准作业里给 agent 阶段放行的模型端点主机（写成 `agents[].extra_allowed_hosts`）。allowlist 模式下为空且 `allow_submit=true` 时 S9 拒绝提交 |
 | `gates.tdm_verbatim_max_chars / tdm_verbatim_channels` | 200 / elsevier, wiley | TDM 全文与公开文件的最长逐字重合上限（阻塞级） |
 | `fulltext.not_entitled` | 开；elsevier, wiley；不过期 | TDM API 只给元数据/摘要（`short text N`）时记账本，该通道永不再请求该 DOI |
 | `fulltext.remote.require_clean_tree / preflight` | True / True | 远程模式：本地包有未提交改动或远端指纹不一致时，在租约和提交之前拒绝（退出码 3） |

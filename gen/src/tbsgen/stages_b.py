@@ -108,6 +108,11 @@ def _slim(g):
             out["fix_hint"] = ("tests/measure.py must execute /app/output/solution_cli.py ONLY via "
                                "`from _metrics import run_solution, hidden_sets` (one call per hidden set dir); "
                                "never subprocess it directly: run_solution drops privileges and locks /tests/truth.")
+        if "readymade" in out.get("blocking", []):
+            out["details"]["readymade"] = det.get("readymade")
+            out["fix_hint"] = ("the task depends on the paper's own published implementation (see details.readymade): "
+                               "remove that dependency / import / vendored code and implement the method in the "
+                               "reference solution, so the agent has to do the work the task tests.")
         if "leak" in det:
             out["details"]["leak"] = dict(classes=det["leak"].get("classes"), findings=det["leak"].get("findings", [])[:8])
         if "seeds" in det:
@@ -122,12 +127,20 @@ def pkg(P, it):
     last = sorted(it.p("gates").glob("attempt-*.json"))[-1]
     gate = read_json(last)
     gen0 = it.p("runs", f"s7-{gate['attempt']}", "detA")
+    from . import prerelease
+    cand = read_json(it.p("S1_candidate.json"), {})
     prov = dict(read_json(it.p("_spec", "provenance.json"), {}), item_id=it.item_id,
+                companion_code=prerelease.signals(cand, spec)["repos"],     # for calibration / human review
+                network=P.cfg["package"].get("network"),
                 spec_sha=_sha_file(it.p("_spec", "spec.json")), gates=gate["gates"],
                 thresholds=read_json(it.p("thresholds.json"))["thresholds"],
                 model_cost=P.item_cost(it.item_id), packaged=time.time())
     out = package.package(P.cfg, it.dir, gen0, spec, prov)
     v = package.validate_pkg(out)
+    # the packaged image (Dockerfile written here, not by the model) gets the same ready-made check
+    rm = prerelease.readymade_check(out, cand, spec)
+    if not rm["ok"]:
+        v = dict(v, ok=False, errors=list(v.get("errors") or []) + [f"readymade: {rm['findings'][:3]}"])
     write_json(it.p("PKG_check.json"), v)
     if not v["ok"]:
         return it.finish("parked", "package_invalid")

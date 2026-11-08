@@ -1,4 +1,7 @@
-"""Offline analysis of eval/raw/*.json -> eval/metrics.json + eval/tables.md (+ eval/to_label.jsonl for any paper
+"""Historical evaluation: it reads the recorded raw lists of the 2026-11-05 run, which include the Tavily
+source (since removed from the code); the Tavily rows below describe that run only.
+
+Offline analysis of eval/raw/*.json -> eval/metrics.json + eval/tables.md (+ eval/to_label.jsonl for any paper
 or resource in the judged sets that has no label yet).
 
 Relevance labels (subjective, single annotator reading title + abstract; scale identical to the earlier

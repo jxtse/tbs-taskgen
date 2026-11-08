@@ -1,18 +1,17 @@
-"""Build eval/targets10.json from $TBS_EVAL_BASELINE/targets_sample.json (same 10 targets, same 4 queries as the
-earlier OpenAlex/Crossref/arXiv benchmark) + read-only metadata from $TBS_OLD_PIPE/literature/methodlit/targets.json
-(libs, method text).  Neither input is part of this repository.
+"""Build eval/targets10.json from <baseline>/targets_sample.json (same 10 targets, same 4 queries as the earlier
+OpenAlex/Crossref/arXiv benchmark) + read-only metadata from <earlier pipeline>/literature/methodlit/targets.json
+(libs, method text).  Neither input is part of this repository:
 
-`topic` (short English phrase for Exa/Tavily resource channels) is hand-written here for the 5 task targets because
+    uv run python eval/build_targets.py --sample <baseline>/targets_sample.json --methodlit <...>/targets.json
+
+`topic` (short English phrase for the Exa resource channels) is hand-written here for the 5 task targets because
 task ids are terse; in production this phrase comes from the upstream query writer together with the queries.
 """
 import ast
 import json
-import os
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-SAMPLE = Path(os.environ.get("TBS_EVAL_BASELINE") or "TBS_EVAL_BASELINE-not-set") / "targets_sample.json"
-ML = Path(os.environ.get("TBS_OLD_PIPE") or "TBS_OLD_PIPE-not-set") / "literature/methodlit/targets.json"   # earlier pipeline data, not in this repo
 
 TOPIC = {
     "task:ambient-rna-correction": "ambient RNA contamination removal for droplet single-cell RNA-seq",
@@ -24,8 +23,13 @@ TOPIC = {
 
 
 def main():
-    sample = json.loads(SAMPLE.read_text())["targets"]
-    ml = {t["id"]: t for t in json.loads(ML.read_text())}
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--sample", required=True)
+    ap.add_argument("--methodlit", required=True)
+    a = ap.parse_args()
+    sample = json.loads(Path(a.sample).read_text())["targets"]
+    ml = {t["id"]: t for t in json.loads(Path(a.methodlit).read_text())}
     out = []
     for s in sample:
         m = ml.get(s["id"], {})

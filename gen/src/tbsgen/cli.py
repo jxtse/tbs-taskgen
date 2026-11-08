@@ -8,7 +8,7 @@
   tbsgen ledger  --run DIR                                       spend summary (all days)
   tbsgen breaker --run DIR --model M --reset
   tbsgen calib-ingest --run DIR --item ID --job-dir JOBDIR      attach Harbor results to the pending S9 run
-  tbsgen ping    --run DIR --calls N                             real Opus connectivity check (needs budget set)
+  tbsgen ping    --run DIR --calls N                             real teacher-model connectivity check (needs budget)
   tbsgen harbor-local --run DIR [--item ID]                       local Harbor oracle+nop on packaged items
   tbsgen reset   --run DIR --item ID --stage S5 [--regen]        re-activate an item at a stage (after a pipeline fix);
                                                                  --regen also forces S6A/S6C to regenerate files
@@ -43,7 +43,7 @@ from pathlib import Path
 from . import calib
 from .budget import BudgetStop
 from .config import load_config
-from .models import ModelError, OpusClient
+from .models import ModelError, TeacherClient
 from .pipeline import Pipeline
 from .report import daily_report
 from .state import read_json, write_json
@@ -239,13 +239,14 @@ def _remote(P: Pipeline, a) -> int:
 
 
 def _ping(a):
-    """Minimal real Opus call(s) through the new client + ledger.  Budget must be given explicitly."""
+    """Minimal real teacher-model call(s) through the client + ledger.  Budget must be given explicitly."""
+    model = load_config(a.config)["models"]["teacher"]["model"]
     cfg = load_config(a.config, {"run": {"root": a.run},
                                  "budget": {"daily_usd_total": a.budget_usd,
-                                            "daily_calls_per_model": {"claude-opus-5-5": a.calls},
+                                            "daily_calls_per_model": {model: a.calls},
                                             "est_usd_per_call": 0.05}})
     P = Pipeline(cfg)
-    c = OpusClient(P.ledger, cfg)
+    c = TeacherClient(P.ledger, cfg)
     out = []
     for i in range(a.calls):
         try:

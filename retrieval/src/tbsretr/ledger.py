@@ -3,8 +3,8 @@
 Guarantees
   * Every outbound request is booked in `calls` with source, endpoint kind, status, latency, cost, cache flag.
   * Daily budgets (UTC calendar day: OpenAlex resets at midnight UTC) are checked *before* a request: calls,
-    USD (OpenAlex/Exa) or credits (Tavily). Exceeding a budget raises BudgetExceeded and the source stops for the run.
-  * Monthly caps (Exa USD, Tavily credits) are checked the same way.
+    USD (OpenAlex/Exa) or credits (any credit-billed source). Exceeding a budget raises BudgetExceeded and the source stops for the run.
+  * Monthly caps (USD or credits) are checked the same way.
   * 429 -> per-source cooldown persisted in sqlite (other processes respect it). 5xx / network -> exponential backoff.
   * Pacing: min interval between requests of the same source, shared across threads *and* processes via sqlite.
   * Cache key and stored URL never contain secrets: auth goes in headers, except OpenAlex where `api_key` is a query

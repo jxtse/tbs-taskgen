@@ -763,7 +763,6 @@ def _update_queue(fetcher, plan, results):
                 if not rest:
                     continue
                 e["subscribers"] = rest
-                e.pop("item_ids", None)
                 e["next_try"] = 0
             elif r and r["status"] == "failed":
                 if int(e.get("ver") or 0) == vers.get(k, 0):

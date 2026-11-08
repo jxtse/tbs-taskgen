@@ -252,19 +252,6 @@ def test_failure_of_old_link_does_not_restore_backoff_after_new_link(tmp_path):
     assert drain(f, clock)["ok"] == 1
 
 
-def test_old_queue_format_item_ids_still_delivered(tmp_path):
-    """Queue entries written before `subscribers` (run + item_ids) keep notifying their items."""
-    f, net, led, clock = mkfetcher(tmp_path, {"api.elsevier.com": ELS_XML}, SECRETS, oa={"enabled": False})
-    qp = fulltext.queue_path(f.cfg)
-    qp.parent.mkdir(parents=True, exist_ok=True)
-    qp.write_text(json.dumps(dict(doi="10.1016/j.l.1", title=TITLE, ident="doi:10.1016/j.l.1", run="/runs/A",
-                                  item_ids=["i1", "i2"])) + "\n")
-    got = []
-    fulltext.drain_queue(f, browser=False, on_success=lambda e, o, s: got.append(s) or True, log=lambda s: None,
-                         now=clock.t)
-    assert got == [["/runs/A", "i1"], ["/runs/A", "i2"]] and fulltext.read_queue(qp) == []
-
-
 # ------------------------------------------------------------------ A3: not entitled
 def test_elsevier_short_text_zero_is_not_entitled_and_never_asked_again(tmp_path):
     f, net, led, clock = mkfetcher(tmp_path, {"api.elsevier.com": ELS_ABSTRACT_ONLY}, SECRETS, oa={"enabled": False})
