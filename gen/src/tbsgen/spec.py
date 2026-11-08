@@ -99,6 +99,7 @@ def set_thresholds(spec: dict, measure: dict, cfg: dict) -> dict:
     """measure = {"ref": {seed: {metric: value}}, "mid": {...}, "naive": {...}} -> thresholds report"""
     tc = cfg["thresholds"]
     out, sep = {}, []
+    resource = {m["name"] for m in spec["metrics"] if is_resource_metric(m)}
     for m in spec["metrics"]:
         name, d = m["name"], m["direction"]
         r_vals = [v.get(name) for v in measure["ref"].values()]
@@ -131,7 +132,10 @@ def set_thresholds(spec: dict, measure: dict, cfg: dict) -> dict:
                 thr = r + tc["frac"] * (m_best - r)
             sep.append(name)
         else:
-            thr = r * (1 + tc["loose_margin"]) if (d == "<=") == (r >= 0) else r * (1 - tc["loose_margin"])
+            # resource metrics (wall time / memory) are noisy run to run (e2e-prod-20261109: reference 0.58 s in S6A,
+            # 0.93 s when S7 re-measured it -> threshold ref x1.5 = 0.88 failed the oracle gate): wider margin
+            lm = tc.get("resource_loose_margin", 2.0) if name in resource else tc["loose_margin"]
+            thr = r * (1 + lm) if (d == "<=") == (r >= 0) else r * (1 - lm)
             if r == 0:
                 thr = 1e-9 if d == "<=" else -1e-9
             # v2.1: a non-separating metric must still reject the naive baseline when the naive is clearly worse
@@ -144,7 +148,8 @@ def set_thresholds(spec: dict, measure: dict, cfg: dict) -> dict:
             if n_best is not None and _worse(d, n_best, r):
                 mid_n = math.exp(math.log(r) + tc["frac"] * (math.log(n_best) - math.log(r))) \
                     if r > 0 and n_best > 0 else r + tc["frac"] * (n_best - r)
-                floor = r * (1 + margin) if (d == "<=") == (r >= 0) else r * (1 - margin)
+                fm = tc.get("resource_loose_margin", 2.0) if name in resource else margin
+                floor = r * (1 + fm) if (d == "<=") == (r >= 0) else r * (1 - fm)
                 if _worse(d, floor, mid_n):          # midpoint tighter than the reference margin allows
                     mid_n = floor
                 if _worse(d, thr, mid_n):
@@ -176,7 +181,6 @@ def set_thresholds(spec: dict, measure: dict, cfg: dict) -> dict:
     # does not measure the method (e2e-iter1 IEnKS: on the hidden regime the reference diverged, filter RMSE 4.19
     # vs naive 3.39-3.52, and the loose rule still produced thresholds that both passed)
     ref_worse = []
-    resource = {m["name"] for m in spec["metrics"] if is_resource_metric(m)}
     for name, t in out.items():
         if t.get("threshold") is None or name in resource:
             continue

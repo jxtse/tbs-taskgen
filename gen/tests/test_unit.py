@@ -237,7 +237,7 @@ def test_resource_metric_exempt_item_passes_with_its_threshold_unchanged():
     th = set_thresholds(spec, meas, cfg)
     assert th["status"] == "ok" and th["ref_worse_than_naive"] == [], th
     rt = th["thresholds"]["hidden_runtime_sec"]
-    assert rt["threshold"] == pytest.approx(0.87) and rt["ref_passes"] and not rt["separating"]
+    assert rt["threshold"] == pytest.approx(1.8) and rt["ref_passes"] and not rt["separating"]   # ref x3, rounded
     spec["metrics"][2]["name"] = "hidden_delay_mae_seconds"                     # quality metric in seconds: not exempt
     meas = {w: {"0": {("hidden_delay_mae_seconds" if k == "hidden_runtime_sec" else k): v for k, v in d["0"].items()}}
             for w, d in meas.items()}
@@ -749,3 +749,33 @@ def test_teacher_corrupt_sse_is_a_billed_stream_error_not_a_retry(tmp_path, monk
     with pytest.raises(ModelError) as e:
         c.chat("sys", "user", stage="S6A", item="i1", max_tokens=64000)
     assert e.value.cls == "stream" and len(sent) == 1 and _calls(led)[0][2] > 0
+
+
+def test_resource_metric_threshold_tolerates_timing_noise():
+    """e2e-prod-20261109: ref runtime 0.58 s in S6A, 0.93 s re-measured in S7; threshold ref x1.5 = 0.88 -> oracle gate
+    failed -> 2 repair rounds -> dropped.  Non-separating resource metrics get ref x(1+resource_loose_margin)."""
+    cfg = load_config()
+    spec = {"metrics": [{"name": "hidden_mae", "direction": "<="}, {"name": "hidden_runtime_sec", "direction": "<="}]}
+    meas = {"ref": {"0": {"hidden_mae": 0.2, "hidden_runtime_sec": 0.58}},
+            "mid": {"0": {"hidden_mae": 1.3, "hidden_runtime_sec": 0.60}},
+            "naive": {"0": {"hidden_mae": 1.9, "hidden_runtime_sec": 0.40}}}
+    th = set_thresholds(spec, meas, cfg)["thresholds"]
+    assert th["hidden_runtime_sec"]["threshold"] >= 0.58 * 3 - 1e-9 > 0.93
+    # a much slower naive: the naive cap never goes below ref x3 (here the loose rule is already tighter)
+    meas["naive"]["0"]["hidden_runtime_sec"] = 2.0
+    t2 = set_thresholds(spec, meas, cfg)["thresholds"]["hidden_runtime_sec"]
+    assert t2["threshold"] >= 0.58 * 3 - 1e-9 and t2["threshold"] < 2.0
+    # quality metrics unchanged (ref x1.5 loose rule)
+    spec2 = {"metrics": [{"name": "hidden_mae", "direction": "<="}, {"name": "hidden_err2", "direction": "<="}]}
+    m2 = {w: {"0": {"hidden_mae": v["0"]["hidden_mae"], "hidden_err2": 0.58 if w == "ref" else 0.6 if w == "mid" else 0.4}}
+          for w, v in meas.items()}
+    assert set_thresholds(spec2, m2, cfg)["thresholds"]["hidden_err2"]["threshold"] == pytest.approx(0.87)
+
+
+def test_resource_loose_margin_is_configurable():
+    cfg = load_config(None, {"thresholds": {"resource_loose_margin": 0.8}})
+    spec = {"metrics": [{"name": "hidden_mae", "direction": "<="}, {"name": "hidden_runtime_sec", "direction": "<="}]}
+    meas = {"ref": {"0": {"hidden_mae": 0.2, "hidden_runtime_sec": 0.58}},
+            "mid": {"0": {"hidden_mae": 1.3, "hidden_runtime_sec": 0.60}},
+            "naive": {"0": {"hidden_mae": 1.9, "hidden_runtime_sec": 2.0}}}
+    assert set_thresholds(spec, meas, cfg)["thresholds"]["hidden_runtime_sec"]["threshold"] == pytest.approx(1.1)
