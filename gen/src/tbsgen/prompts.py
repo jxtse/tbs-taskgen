@@ -56,7 +56,9 @@ Write the task specification as ONE JSON object with keys:
    "difficulty_knobs": {{"derive_nodes": int, "chain_len": int, "files_crossed": int, "nonstd_tool": bool}}}},
 - "metrics": [{{"name", "direction": "<=" or ">=", "on": "public|hidden", "desc"}}]  (3-8 metrics, no thresholds yet),
 - "public_files": [..], "hidden_files": [..], "truth_files": [..],
-- "hidden_shift": str (PROG only), "why_naive_fails": str, "mid_missing_step": str.
+- "hidden_shift": str (PROG only), "why_naive_fails": str, "mid_missing_step": str,
+- "method_names": [names of the paper's method and of its published software/package, if any] (used to check that
+  the task does not install or import that implementation).
 Thresholds are NOT chosen now; they are set from measured reference vs mid results.  Keep the JSON compact
 (short descs): code is written in a later step."""
 

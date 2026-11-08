@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import statistics
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -93,8 +94,30 @@ def confusion(pred: list[bool], gold: list[bool]) -> dict:
                 accuracy=round((tp + tn) / n, 3) if n else None)
 
 
+# rules-v1 was removed from tbsgen; this frozen copy only reproduces the recorded comparison (README.md).
+_NEG_V1 = re.compile(r"\b(review|survey|perspective|editorial|commentary|qualitative|interview|questionnaire|"
+                     r"case report|randomi[sz]ed controlled|patients were recruited)\b", re.I)
+
+
+def _screen_v1(c: dict, fulltext_head: str | None = None, min_score: int = 2) -> dict:
+    if not c.get("abstract") and fulltext_head is None:
+        return dict(score=None, keep=True, deferred=True, form_hint=None, method="rules-v1")
+    text = f"{c.get('title', '')}\n{c.get('abstract') or (fulltext_head or '')[:4000]}"
+    pos = {m.group(0).lower() for m in intake.POS.finditer(text)}
+    neg = {m.group(0).lower() for m in _NEG_V1.finditer(text)}
+    score = len(pos) - 2 * len(neg) + (1 if c.get("code_links") or c.get("code_urls") else 0) + \
+        (1 if c.get("data_links") or c.get("data_urls") else 0)
+    return dict(score=score, keep=score >= min_score, deferred=False, method="rules-v1",
+                form_hint="INTERACT" if intake.BLACKBOX.search(text) else None)
+
+
 def decide_rules(r: dict, ver: str, min_score: int | None = None) -> dict:
-    cfg = load_config(overrides={"screen": {"rules_version": ver, **({"min_score": min_score} if min_score else {})}})
+    if ver == "v1":
+        rec = _screen_v1(cand(r), min_score=min_score or 2)
+        if rec.get("deferred"):
+            rec = _screen_v1(cand(r), r.get("fulltext_head") or "", min_score=min_score or 2)
+        return rec
+    cfg = load_config(overrides={"screen": {"min_score": min_score}} if min_score else None)
     rec = intake.screen(cand(r), cfg)
     if rec.get("deferred"):           # S4 re-screen on the full-text opening (as the pipeline does)
         rec = intake.screen(cand(r), cfg, fulltext_head=r.get("fulltext_head") or "")

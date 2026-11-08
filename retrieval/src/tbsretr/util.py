@@ -161,8 +161,7 @@ def resource_key(url: str) -> str:
 
 # ------------------------------------------------------------------ secrets
 SECRET_PARAMS = {"api_key", "apikey", "key", "token", "access_token", "x-api-key"}
-_KEY_ENV_NAMES = ("OPENALEX_API_KEY", "SEMANTIC_SCHOLAR_API_KEY", "EXA_API_KEY", "EXA_API_KEY_SECONDARY",
-                  "TAVILY_API_KEY", "TAVILY_API_KEY_SECONDARY")
+_KEY_ENV_NAMES = ("OPENALEX_API_KEY", "SEMANTIC_SCHOLAR_API_KEY", "EXA_API_KEY", "EXA_API_KEY_SECONDARY")
 
 
 def strip_secret_params(url: str) -> str:

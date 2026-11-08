@@ -1,12 +1,12 @@
 """Pluggable model-call layer.
 
-    client = get_client(alias, cfg, ledger)     # alias: "opus" | "fake:<script.json>" | FakeClient instance
+    client = get_client(alias, cfg, ledger)     # alias: "teacher" | "fake:<script.json>" | FakeClient instance
     r = client.chat(system, user, stage="S5", item="doi-...", max_tokens=...)
     r.text, r.usage, r.usd, r.model
 
-* OpusClient: Anthropic /v1/messages request to an Anthropic-compatible endpoint (by default a local gateway;
+* TeacherClient: Anthropic /v1/messages request to an Anthropic-compatible endpoint (by default a local gateway;
   model claude-opus-5-5, adaptive thinking, effort medium, SSE for long outputs).  No key in this process: the
-  gateway holds the credentials.  If cfg.models.opus.key_env is set, the key is read from that env var
+  gateway holds the credentials.  If cfg.models.teacher.key_env is set, the key is read from that env var
   (injected by your secret manager) and only placed in a request header; never logged.
 * FakeClient: scripted responses for tests / dry runs.  A script is a list of rules
   {"stage": "S5", "match": "<substring of user prompt>"?, "text": "...", "usage": {...}?, "error": "quota"?}
@@ -113,7 +113,7 @@ class _Base:
         raise NotImplementedError
 
 
-# ---------------------------------------------------------------------------------------------- Opus
+# ---------------------------------------------------------------------------------------------- teacher
 def _read_sse(r):
     text, model, usage, stop = [], None, {}, None
     for raw in r:
@@ -143,15 +143,15 @@ def _read_sse(r):
     return "".join(text), model, usage, stop
 
 
-class OpusClient(_Base):
+class TeacherClient(_Base):
     real = True
 
-    def __init__(self, ledger: Ledger, cfg: dict, alias: str = "opus"):
+    def __init__(self, ledger: Ledger, cfg: dict, alias: str = "teacher"):
         super().__init__(ledger, cfg)
         self.m = cfg["models"][alias]
         self.name = self.m["model"]
         if not self.m.get("url"):
-            raise ModelError("config", f"models.{alias}.url is not set (set TBS_OPUS_URL or models.{alias}.url)")
+            raise ModelError("config", f"models.{alias}.url is not set (set models.{alias}.url or TBS_TEACHER_URL)")
 
     def _call(self, system, user, *, stage, max_tokens):
         m = self.m
@@ -249,7 +249,7 @@ def get_client(alias, cfg: dict, ledger: Ledger, fake_script=None):
     if alias.startswith("fake"):
         return FakeClient(ledger, cfg, fake_script if fake_script is not None else alias.split(":", 1)[1])
     if alias in cfg["models"] and isinstance(cfg["models"][alias], dict) and "url" in cfg["models"][alias]:
-        return OpusClient(ledger, cfg, alias)
+        return TeacherClient(ledger, cfg, alias)
     raise ValueError(f"unknown model alias {alias!r}")
 
 

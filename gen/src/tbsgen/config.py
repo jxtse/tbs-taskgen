@@ -16,10 +16,8 @@ from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[3]          # repo root (gen/ and retrieval/ live here)
 # Optional external locations.  No machine-specific defaults: unset -> the feature that needs them is off
-# (no full-text cache, no TB-Science dedup, no launcher-based calibration submit).  Set the env vars or the
-# corresponding config.toml keys.
-_OLD_PIPE = os.environ.get("TBS_OLD_PIPE") or None          # earlier pipeline data: literature/txt, tasks_text
-OLD_PIPE = Path(_OLD_PIPE) if _OLD_PIPE else None
+# (no full-text cache, no TB-Science dedup, no launcher-based calibration submit).  Set them in config.toml
+# (fulltext.cache_dirs, probe.tbs_tasks_root, calib.harbor_root; TBS_HARBOR_ROOT also works for the last).
 HARBOR_ROOT = os.environ.get("TBS_HARBOR_ROOT") or None     # directory holding your Harbor launcher scripts
 
 DEFAULTS: dict[str, Any] = {
@@ -43,10 +41,9 @@ DEFAULTS: dict[str, Any] = {
     },
     # ---------------------------------------------------------------- models
     "models": {
-        "teacher": "opus",                  # decision 2026-11-05: Opus
         "cheap": None,                      # 待定: cheap-model role; None -> rules-only fallbacks
         "roles": {                          # stage role -> model alias ("teacher"/"cheap"/"rules"/explicit)
-            "screen": "rules",              # S2: "rules" (screen.rules_version) | "jev" (TypeSafe Jev, see screen.jev)
+            "screen": "rules",              # S2: "rules" (rules-v2, intake.screen) | "jev" (TypeSafe Jev, screen.jev)
             "probe": "rules",               # S4 (待定 cheap agent; sandbox repro not implemented in MVP)
             "spec": "teacher",              # S5
             "gen": "teacher",               # S6A
@@ -55,8 +52,9 @@ DEFAULTS: dict[str, Any] = {
             "review": "rules",              # S8 preservation review (mechanical diff; cheap model 待定)
             "invert": None,                 # S7 L4b cheap-agent inversion attack (待定; disabled)
         },
-        # url: Anthropic-compatible /v1/messages endpoint.  No default: set TBS_OPUS_URL or models.opus.url.
-        "opus": {"model": "claude-opus-5-5", "url": os.environ.get("TBS_OPUS_URL") or None,
+        # The teacher model (S5 / S6 / S8): an Anthropic-compatible /v1/messages endpoint.  No default URL: set
+        # models.teacher.url or TBS_TEACHER_URL.
+        "teacher": {"model": "claude-opus-5-5", "url": os.environ.get("TBS_TEACHER_URL") or None,
                  "effort": "medium", "max_tokens": 32000, "timeout": 1800, "retries": 2},
         # USD per million tokens.  PLACEHOLDERS: set real prices for your model.
         "prices": {"claude-opus-5-5": {"in": 5.0, "out": 25.0, "cache_read": 0.5},
@@ -67,11 +65,9 @@ DEFAULTS: dict[str, Any] = {
     },
     # ---------------------------------------------------------------- stages
     "screen": {
-        "rules_version": "v2",              # v2: each cue stem once, "survey" negative only as literature survey
-        # rules keep threshold.  rules-v2 counts each cue stem once, so its scores are lower than rules-v1's for
-        # the same text; 1 was picked on the dev half of the S2 reference set (gen/eval/screen_jev/).
+        # rules (rules-v2): each cue stem counts once, "survey" is negative only as a literature survey.  Keep
+        # threshold picked on the dev half of the S2 reference set (gen/eval/screen_jev/).
         "min_score": 1,
-        "min_score_v1": 2,                  # rules-v1 threshold (unchanged)
         # Papers whose full text S3 has rarely or never obtained (history per rule below), dropped at S2 before
         # any screen call.  Match = DOI prefix [+ published before `before_year`].  Set to [] to disable.
         "blocklist": [
@@ -103,7 +99,7 @@ DEFAULTS: dict[str, Any] = {
         # Cascade (first success wins).  Every network channel has its own switch; only cache + oa are on by
         # default.  See fulltext.py and README (S3).
         "cascade": ["cache", "oa", "elsevier", "wiley", "inst", "browser"],
-        "cache_dirs": [str(OLD_PIPE / "literature" / "txt")] if OLD_PIPE else [],   # read-only caches
+        "cache_dirs": [],                   # read-only full-text caches (<key>.txt), e.g. an earlier pipeline's
         "write_cache_dir": None,            # downloaded texts + provenance json; None -> <run.root>/fulltext_cache
         "keep_raw": True,                   # also keep the raw PDF/XML under <write_cache_dir>/raw/
         "ledger_path": None,                # download ledger (sqlite); None -> <run.root>/fulltext_ledger.sqlite
@@ -240,7 +236,7 @@ DEFAULTS: dict[str, Any] = {
         "host_caps": {},
     },
     "probe": {
-        "tbs_tasks_root": str(OLD_PIPE / "tasks_text") if OLD_PIPE else None,   # None -> no TBS dedup
+        "tbs_tasks_root": None,             # TB-Science task texts (<task>/instruction.md ...); None -> no dedup
         "decontam_cos_max": 0.30,
         "min_method_hits": 2,
     },
@@ -276,7 +272,9 @@ DEFAULTS: dict[str, Any] = {
         "l4b_minutes": 20,                  # cheap-agent inversion (待定, disabled)
         "max_repair_rounds": 2,
         "blocking": ["oracle", "hidden_shift", "leak", "isolation", "infeasible", "determinism", "truth_isolation",
-                     "cli_contract", "tdm_verbatim"],
+                     "cli_contract", "tdm_verbatim", "readymade"],
+        # readymade (prerelease.readymade_check): the task image installs, or the reference / a baseline imports,
+        # the paper's own implementation (code_links repo names, method_names of the S5 spec).  Rules only.
         # TDM terms (Elsevier: quotes <= 200 chars; Wiley: no redistribution): longest verbatim overlap between
         # a TDM full text and the public task files (whitespace-normalised).  See tdmgate.py.
         "tdm_verbatim_max_chars": 200,
@@ -308,6 +306,11 @@ DEFAULTS: dict[str, Any] = {
         "est_usd_per_run": 20.0,            # ledger reservation per Harbor run; settled with the job's cost_usd
         "teacher_available": True,          # False: GLM#1 fail -> parked:teacher_unavailable (no teacher run)
         "prepared_tasks_dir": None,         # sandbox-prepared task copies (docker_image set), one dir per item
+        # Hosts the agent may reach while it works when the task's agent phase is an allowlist
+        # (package.network.mode = "agent-allowlist"): the model endpoint(s).  Written to the job config as
+        # agents[].extra_allowed_hosts (= harbor run --allow-agent-host).  Empty with an allowlisted task: S9 does
+        # not submit (the agent could not reach its model).
+        "agent_allowed_hosts": [],
         "glm_runs_on_first_fail": 1,        # first GLM fail -> teacher (no 2nd GLM run)
         "teacher_runs_max": 2,
         "quick_pass_minutes": None,         # 待定: 1st-pass shortcut to "easy" (e.g. 30); None=off
@@ -319,6 +322,13 @@ DEFAULTS: dict[str, Any] = {
         "dockerfile_mode": "selfcontained",  # "selfcontained" (pip in Dockerfile, portable) | "local_base"
         "agent_hours": 2,
         "verifier_timeout": 900,
+        # Network of the packaged task (prerelease.py).  "agent-allowlist": no internet while the agent works
+        # except `agent_hosts` + the model endpoint added per run (calib.agent_allowed_hosts / --allow-agent-host);
+        # agent setup runs before that with network (installs the agent CLI); the verifier is offline.
+        # "no-network": offline throughout (oracle-only checks).  "public": old behaviour, comparison runs only.
+        # disable_index: also strip pip/uv/conda indexes from the image (off: agent setups that pip-install their
+        # own runtime would break; the allowlist already blocks package downloads).
+        "network": {"mode": "agent-allowlist", "agent_hosts": [], "disable_index": False},
     },
 }
 
@@ -345,8 +355,8 @@ def load_config(path: str | Path | None = None, overrides: dict | None = None) -
 
 
 def resolve_role(cfg: dict, role: str) -> str | None:
-    """role -> model alias: 'rules' / None / 'fake:*' / 'opus' / ..."""
+    """role -> model alias: 'rules' / None / 'fake:*' / 'jev' / 'teacher' / another models.<name> client table."""
     v = cfg["models"]["roles"].get(role, "rules")
-    if v in ("teacher", "cheap"):
-        v = cfg["models"][v]
+    if v == "cheap":
+        v = cfg["models"]["cheap"]
     return v

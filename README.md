@@ -31,7 +31,7 @@ retrieval/ (tbsretr)                       gen/ (tbsgen)
 ────────────────────                       ──────────────────────────────────────────────────────────
 OpenAlex · Semantic Scholar · Exa          S1 ingest → S2 screen → S3 full text → S4 feasibility + dedup
 Crossref · arXiv · Europe PMC              → S5 spec (teacher) → S6 generate files (teacher), set thresholds
-(Tavily adapter, off by default)             from measured reference / mid / naive scores
+                                             from measured reference / mid / naive scores
   → dedup → RRF fusion → rule prefilter    → S7 mechanical gates, incl. 4-layer leak check
   → ranked candidate papers  ──────────▶   → S8 bounded local repair → PKG Harbor package
                                            → S9 difficulty calibration → S10 release manifest
@@ -41,7 +41,7 @@ Crossref · arXiv · Europe PMC              → S5 spec (teacher) → S6 genera
    are normalised, deduplicated across DOI / arXiv / OpenAlex / S2 IDs / title, fused with
    reciprocal-rank fusion and rule-prefiltered. URLs of the TB-Science benchmark itself are dropped by
    default, and papers that TB-Science tasks were built from are dropped when you provide that
-   list (`TBS_LEAK_REFS`). This layer calls no LLM.
+   list (`leak_refs` in the retrieval config). This layer calls no LLM.
 2. **Teacher-model task authoring** (`gen/`, S5–S6). A teacher model writes a spec with an explicit
    information-dependency graph, then the generator, reference solution, baselines, tests and
    statement. Pass thresholds are set from the *measured* scores of the reference and the mid
@@ -54,14 +54,18 @@ Crossref · arXiv · Europe PMC              → S5 spec (teacher) → S6 genera
 4. **Reference and empty-submission checks** (S7). Same seed gives the same output; the reference
    passes every seed with margin; an empty submission (`nop`) fails; the naive baseline fails at
    least two criteria and the mid baseline one or two; scripted exploit attempts fail; `PROG`
-   tasks are graded on hidden, distribution-shifted inputs. Blocking failures go to a local repair
+   tasks are graded on hidden, distribution-shifted inputs. Pre-release checks: the task image, the
+   reference and the baselines must not use the paper's own published implementation, and public
+   task files must not copy long passages of a TDM full text. Blocking failures go to a local repair
    loop (S8, at most two rounds).
 5. **Difficulty calibration** (S9). A student agent runs the packaged task in Harbor; if it fails, a
    teacher agent tries. A task is kept if it is *unstable* (the student passes one of two runs) or
    *hard* (the student fails and the teacher passes). By default S9 only writes job configs and
    launch commands; submitting jobs must be enabled explicitly.
-6. **Packaging** (PKG, S10). Harbor task layout with a self-contained Dockerfile; kept tasks are
-   appended to `release/manifest.jsonl`.
+6. **Packaging** (PKG, S10). Harbor task layout with a self-contained Dockerfile and a network
+   policy that keeps the agent off the internet while it works (see
+   [Network of packaged tasks](#network-of-packaged-tasks)); kept tasks are appended to
+   `release/manifest.jsonl`.
 
 Every real model call goes through a sqlite budget ledger with daily and per-run caps and a
 circuit breaker. Real calls are refused until a daily budget is configured. Items resume from
@@ -163,7 +167,7 @@ compatible endpoint and pick the model yourself:
 daily_usd_total = 5.0                                  # required: real model calls are refused while this is unset
 daily_calls_per_model = { "my-teacher-model" = 10 }
 
-[models.opus]                                          # historical alias name; any compatible model works
+[models.teacher]                                       # any Anthropic-compatible model
 url     = "https://your-endpoint.example.com/v1/messages"
 model   = "my-teacher-model"
 key_env = "MY_TEACHER_API_KEY"                         # name of the environment variable holding your key
@@ -181,7 +185,7 @@ credentials). The built-in price table is a placeholder; set prices for your mod
 S2 decides from the bibliographic record (title, abstract, venue, year, code/data links) whether a paper is worth
 downloading and probing. Two modes, chosen with `models.roles.screen`:
 
-- `"rules"` (default): keyword cues in title and abstract (`screen.rules_version = "v2"`, keep at
+- `"rules"` (default): keyword cues in title and abstract, each cue stem counted once (`rules-v2`; keep at
   `screen.min_score`). No network, no cost.
 - `"jev"`: one request per paper to TypeSafe Jev (`https://api.typesafe.ai/v1/systemone`). Ten narrow questions are
   answered in parallel (paper type, whether there is a re-implementable computational method, whether it runs on one
@@ -472,24 +476,74 @@ concurrency = 2
 daily_ok = 100                 # tighten any cap per channel
 ```
 
+### Network of packaged tasks
+
+An agent that can reach the internet while it solves a task can `pip install` the paper's own library or
+download a finished implementation, which defeats the task. Harbor (checked against 0.23.0: `harbor.models.task.config`,
+`harbor.environments`, `harbor run --help`; [github.com/laude-institute/harbor](https://github.com/laude-institute/harbor))
+lets a task set a network policy per phase in `task.toml`: `network_mode = "public" | "no-network" | "allowlist"` with `allowed_hosts`, in
+`[environment]` (the default) and in `[agent]` / `[verifier]` (overrides for those phases), and the launcher can
+add hosts for the agent phase only (`harbor run --allow-agent-host HOST`, or `extra_allowed_hosts` of an agent in
+a job config). Installed agents such as Claude Code or Codex run inside the task container and must reach their
+model API, so plain `no-network` would stop them.
+
+`package.network.mode` (default `"agent-allowlist"`) writes:
+
+```toml
+[verifier]
+network_mode = "no-network"
+[agent]
+network_mode = "allowlist"       # while the agent works: only package.network.agent_hosts ...
+allowed_hosts = []               # ... plus the model endpoint the launcher adds per run
+[environment]
+network_mode = "public"          # agent setup (installing the agent CLI) only
+```
+
+Dependencies are installed when the image is built. S9 adds `calib.agent_allowed_hosts` (your model endpoint's
+host) to the job config; with `calib.allow_submit = true` and no host configured, S9 refuses to launch rather than
+start an agent that cannot reach its model. `"no-network"` (offline throughout; oracle checks only) and `"public"`
+(the old behaviour, for comparison) are also available. `package.network.disable_index = true` additionally strips
+pip / uv / conda index settings from the image after the build (off by default because some agent setups
+pip-install their own runtime; it is a speed bump, the allowlist is the barrier).
+
+Enforcement depends on the Harbor environment. In Harbor 0.23.0 the local `docker` environment enforces
+allowlists and per-phase changes with an egress-control sidecar (tested here on Docker Desktop for macOS: during the
+agent phase PyPI and GitHub were unreachable and `pip download` failed; with `--allow-agent-host pypi.org` only
+PyPI opened); the E2B, Novita, Beam and Runta environments declare the same capability, others only static
+allowlists or none. Before a trial starts, Harbor refuses a policy the environment cannot enforce. A custom
+environment (`calib.environment`) must declare and honour these capabilities itself.
+
+A separate gate, `readymade` (S7, blocking), checks that the task does not hand the agent the paper's own
+implementation: the task image's declared dependencies (requirements files, `pip install` lines in a
+Dockerfile), imports of the reference solution and the baselines, and code shipped under `environment/` are
+matched against the repository and package names in the paper's `code_links` / `data_links` and the method
+names of the S5 spec. A hit goes to S8 repair (drop the dependency, implement the method, or change the task).
+Known companion repositories are written to the task's `provenance.json` (`companion_code`) for calibration and
+human review.
+
+Scope and known limits: `readymade` is a name-based rule check. It recognises requirement specifiers (`name==v`,
+`name @ url`, `-e`, `#egg=`), VCS and direct archive URLs/files (version and `#sha256=` fragments removed),
+GitHub/Bitbucket/Codeberg/Hugging Face `owner/repo`, GitLab `group/subgroup/.../repo`, PyPI `/project/<name>`,
+CRAN `package=<name>` and `/web/packages/<name>`, and shipped source, archive and compiled files (`.so`, `.pyd`,
+`.pyc`, ...) whose name matches, ignoring case, `-`/`_`/`.`, version or branch suffixes and `py` prefixes or
+suffixes. It does not promise to find an implementation that was renamed, vendored under another name,
+obfuscated, or fetched at run time some other way; calibration and human review cover those.
+
 ### Environment variables
 
 | Variable | Used by | Purpose |
 |---|---|---|
-| `TBS_OPUS_URL` | gen | Teacher endpoint URL (Anthropic-compatible `/v1/messages`). No default: set it here or with `models.opus.url`; real model stages pause with `model:config` until it is set. |
-| *your `key_env`* | gen | Teacher API key, if `models.opus.key_env` is set. |
+| `TBS_TEACHER_URL` | gen | Teacher endpoint URL (Anthropic-compatible `/v1/messages`). No default: set it here or with `models.teacher.url`; real model stages pause with `model:config` until it is set. |
+| *your `key_env`* | gen | Teacher API key, if `models.teacher.key_env` is set. |
 | `TYPESAFE_API_KEY` | gen (S2) | TypeSafe key for the Jev screen (`models.roles.screen = "jev"`). The variable name is `screen.jev.key_env`. Unset: S2 falls back to the rules screen (or parks, see `screen.jev.on_unavailable`). |
 | `ELSEVIER_API_KEY`, `ELSEVIER_INSTTOKEN` | gen (S3) | Elsevier TDM channel (`fulltext.elsevier.key_env` / `insttoken_env`). Unset: the channel is skipped. |
 | `WILEY_TDM_TOKEN` | gen (S3) | Wiley TDM channel (`fulltext.wiley.token_env`). Unset: the channel is skipped. |
-| `TBS_OLD_PIPE` | gen, retrieval | Data from an earlier pipeline: a full-text cache (`literature/txt`) and TB-Science task texts used for deduplication (`tasks_text`). Unset: no full-text cache and no deduplication. |
-| `TBS_LEAK_REFS` | retrieval | JSON file of papers that TB-Science tasks were built from; these are excluded from retrieval. Defaults to `$TBS_OLD_PIPE/literature/tbs_task_refs.json` when `TBS_OLD_PIPE` is set; otherwise no exclusion list. |
 | `TBS_HARBOR_ROOT` | gen (S9) | Directory with your Harbor job launch scripts for calibration (`calib.harbor_root`). Unset: S9 prints a plain `harbor run --config ...` command. |
 | `TBS_HARBOR_BIN` | gen | Path to the `harbor` binary for `tbsgen harbor-local` (otherwise looked up on `PATH`). |
 | `TBS_SEARCH_POOL_URL` | retrieval | Search-pool service for Exa (`sources.exa.backend = "pool"`, the default). No default: unset means Exa is skipped. Or set `backend = "direct"` and use `EXA_API_KEY_SECONDARY`. |
 | `OPENALEX_API_KEY` | retrieval | Optional; OpenAlex also works without a key, at lower rate limits. |
 | `SEMANTIC_SCHOLAR_API_KEY` | retrieval | Required for Semantic Scholar; the source is skipped without it. |
 | `EXA_API_KEY_SECONDARY` | retrieval | Exa key, used with `sources.exa.backend = "direct"`. |
-| `TAVILY_API_KEY_SECONDARY` | retrieval | Tavily key; the Tavily source is disabled by default. |
 | `TBSGEN_METRICS`, `TBSGEN_ENTRY`, `TBSGEN_HIDDEN` | generated tests | Set by the local test runner inside the sandbox; you do not set these. |
 
 Crossref, arXiv and Europe PMC need no key. `uv run tbsretr status` lists which sources are usable;
@@ -499,7 +553,9 @@ it shows whether a key is present, never its value.
 
 There are no machine-specific defaults. Unset settings switch the corresponding feature off:
 the teacher URL (real model stages pause until it is set), the Exa search pool (Exa skipped),
-`TBS_OLD_PIPE` (no full-text cache, no deduplication against TB-Science tasks), and the S9 launcher
+`fulltext.cache_dirs` (read-only full-text caches; none by default), `probe.tbs_tasks_root` (TB-Science task
+texts for deduplication; none: no deduplication), `leak_refs` in the retrieval config (papers TB-Science tasks
+were built from, excluded from retrieval; none: no exclusion), and the S9 launcher
 settings under `[calib]` (`harbor_root`, `student_launcher`, `teacher_launcher`). Without launchers,
 S9 writes the job config and prints a plain `harbor run --config <file> --yes` command, and
 `allow_submit = true` refuses to launch. Calibration jobs use Harbor's built-in `claude-code` agent
@@ -540,7 +596,8 @@ Research code under active development.
   abstracts with reference labels from a teacher model (not human labels), and on a larger set of papers whose
   downstream outcome in an earlier pipeline is known.
 - Retrieval evaluation on 10 targets ([`retrieval/eval/REPORT.md`](retrieval/eval/REPORT.md)).
-  Relevance labels come from a single annotator and are subjective.
+  Relevance labels come from a single annotator and are subjective. Historical evaluation: it includes the
+  Tavily source, which has since been removed from the code.
 - End-to-end runs on 6 real papers: 3 became packaged
   Harbor tasks where the reference solution scores 1 and an empty submission scores 0; 2 were
   dropped because the mid baseline could not be separated from the reference; 1 was still in
@@ -549,9 +606,13 @@ Research code under active development.
 
 **Known limitations**
 
-- Packaged tasks currently use `network_mode = "public"`, so an agent could install an existing
-  implementation of the paper's method. Offline-by-default and a check for ready-made
-  implementations are planned, not implemented.
+- Packaged tasks keep the agent off the internet with Harbor's per-phase network policy; this needs a Harbor
+  environment that can enforce it (Docker with Harbor's egress sidecar, or Harbor's E2B-based sandboxes).
+  Other environments refuse the trial instead of running it open. The model endpoint the agent needs stays
+  reachable, as does anything else on the allow list. Agent setup (installing the agent CLI) runs with network.
+- The ready-made-implementation check is rule-based: it matches the paper's code/data links, method names and
+  declared dependencies. A package or repository with an unrelated name, or code fetched through an allowed host,
+  is not detected.
 - The teacher-agent branch of calibration has not been run on real tasks.
 - The L4b inversion attack, the cheap-model roles other than the S2 screen, harder-variant generation (S9b) and the
   file-format and interactive task forms are not implemented.

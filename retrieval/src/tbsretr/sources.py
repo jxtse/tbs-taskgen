@@ -217,7 +217,7 @@ EXA_CHANNEL = {
 
 class Exa(Source):
     """Exa search.  backend="pool" (default) goes through a local search-pool service (POST {pool_url}/v1/search,
-    engine=exa, no Tavily fallback) that holds the Exa keys; backend="direct" calls api.exa.ai with key_env."""
+    engine=exa, no other engine as fallback) that holds the Exa keys; backend="direct" calls api.exa.ai with key_env."""
     name = "exa"
 
     def __init__(self, cfg: dict, http: Http):
@@ -290,44 +290,6 @@ class Exa(Source):
         q = query or tmpl.format(topic=target.topic_phrase(), desc=(target.description or " ".join(target.queries[:2]))[:600])
         d = self._search(ch, q, extra, target)
         return _web_list(f"exa.{ch}", q, d.get("results") or [], text_key="highlights", origin="exa",
-                         paper_channel=(ch == "paper"))
-
-
-# ====================================================================== Tavily
-TAVILY_CHANNEL = {
-    "code": ("{topic} source code github", {"include_domains": ["github.com", "gitlab.com"]}),
-    "data": ("{topic} public dataset download", {}),
-    "docs": ("{topic} software documentation tutorial", {}),
-    "paper": ("{q0} paper", {"include_domains": ["arxiv.org", "nature.com", "sciencedirect.com", "springer.com",
-                                                  "wiley.com", "iop.org", "aps.org", "oup.com", "biorxiv.org",
-                                                  "ncbi.nlm.nih.gov", "plos.org", "pnas.org", "aanda.org",
-                                                  "tandfonline.com", "informs.org", "ametsoc.org", "doi.org",
-                                                  "semanticscholar.org", "openreview.net", "ieee.org", "acm.org"]}),
-}
-
-
-class Tavily(Source):
-    name = "tavily"
-
-    def channel(self, ch: str, target: Target, query: str | None = None) -> RankedList:
-        tmpl, extra = TAVILY_CHANNEL[ch]
-        q = query or tmpl.format(topic=target.topic_phrase(), q0=target.queries[0] if target.queries else target.id)
-        depth = self.scfg.get("search_depth", "basic")
-        credits = 2.0 if depth == "advanced" else 1.0
-        body = {"query": q[:400], "search_depth": depth, "max_results": self.scfg["max_results"],
-                "include_usage": True, **extra}
-
-        def cost(st, hd, b):
-            try:
-                u = json.loads(b).get("usage") or {}
-                return 0.0, float(u.get("credits", credits))
-            except Exception:  # noqa: BLE001
-                return 0.0, credits
-        r = self.http.request(self.name, ch, "https://api.tavily.com/search", method="POST",
-                              headers={"Authorization": f"Bearer {self.key or ''}"}, body=body, credits=credits,
-                              target=target.id, cost_from_response=cost)
-        d = r.json() if r.status == 200 else {}
-        return _web_list(f"tavily.{ch}", q, d.get("results") or [], text_key="content", origin="tavily",
                          paper_channel=(ch == "paper"))
 
 
@@ -464,4 +426,4 @@ class EuropePMC(Source):
         return RankedList("europepmc.search", q, papers=papers)
 
 
-ALL = {c.name: c for c in (OpenAlex, SemanticScholar, Exa, Tavily, Crossref, Arxiv, EuropePMC)}
+ALL = {c.name: c for c in (OpenAlex, SemanticScholar, Exa, Crossref, Arxiv, EuropePMC)}

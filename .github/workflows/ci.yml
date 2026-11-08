@@ -20,14 +20,13 @@ env:
   OPENALEX_API_KEY: ""
   SEMANTIC_SCHOLAR_API_KEY: ""
   EXA_API_KEY_SECONDARY: ""
-  TAVILY_API_KEY_SECONDARY: ""
   ANTHROPIC_API_KEY: ""
   TYPESAFE_API_KEY: ""
   ELSEVIER_API_KEY: ""
   ELSEVIER_INSTTOKEN: ""
   WILEY_TDM_TOKEN: ""
   TBS_SEARCH_POOL_URL: ""
-  TBS_OPUS_URL: "http://127.0.0.1:9/unused"
+  TBS_TEACHER_URL: "http://127.0.0.1:9/unused"
 
 jobs:
   retrieval:
@@ -77,6 +76,11 @@ jobs:
       - name: Sync
         working-directory: gen
         run: uv sync --locked
+      - name: Harbor (packaged-task network test)
+        # not a tbsgen dependency; the version whose network policy semantics the package targets
+        run: |
+          uv tool install harbor==0.23.0
+          echo "TBS_HARBOR_BIN=$(uv tool dir --bin)/harbor" >> "$GITHUB_ENV"
       - name: Integration tests (must not be skipped)
         working-directory: gen
         # test_integration.py skips itself when Docker or the image is missing; fail instead.

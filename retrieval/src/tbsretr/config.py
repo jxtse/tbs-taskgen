@@ -20,13 +20,11 @@ DEFAULTS: dict = {
     "cache_ttl_days": 30,
     "parallel_sources": True,                      # one thread per source inside a target (each source keeps its own pacing)
     "timeout_s": 60,
-    # TBS task-source papers (the data a TBS task was built from) must never be proposed. Read-only.
-    # Unset -> no exclusion list (TBS_LEAK_REFS, or <TBS_OLD_PIPE>/literature/tbs_task_refs.json if TBS_OLD_PIPE is set).
-    "leak_refs": os.environ.get("TBS_LEAK_REFS") or (
-        os.path.join(os.environ["TBS_OLD_PIPE"], "literature", "tbs_task_refs.json") if os.environ.get("TBS_OLD_PIPE")
-        else None),
+    # TBS task-source papers (the data a TBS task was built from) must never be proposed: a JSON file of those
+    # papers (read-only).  None -> no exclusion list.  Set it in config.toml.
+    "leak_refs": None,
     # Resources (code/data/docs) whose URL contains any of these substrings are dropped: the TBS benchmark itself
-    # leaks task statements/solutions (both Exa and Tavily returned it on 3/10 targets in the 2026-11-05 eval).
+    # leaks task statements/solutions (web search returned it on 3/10 targets in the 2026-11-05 eval).
     "leak_url_substrings": ["harbor-framework/terminal-bench-science", "terminal-bench-science", "tbench.ai"],
     "fusion": {
         "rrf_k": 60,
@@ -35,9 +33,9 @@ DEFAULTS: dict = {
         "weights": {                               # per ranked-list weight in RRF (subjective defaults)
             "openalex.search": 1.0, "openalex.snowball": 1.0, "openalex.semantic": 0.6,
             "s2.search": 1.0, "s2.recommend": 0.8,
-            "exa.paper": 0.8, "tavily.paper": 0.5,
+            "exa.paper": 0.8,
             # papers that show up in the code/data/docs channels count, but weakly
-            "exa.code": 0.3, "exa.data": 0.3, "exa.docs": 0.3, "tavily.code": 0.3, "tavily.data": 0.3, "tavily.docs": 0.3,
+            "exa.code": 0.3, "exa.data": 0.3, "exa.docs": 0.3,
             "crossref.search": 0.7, "arxiv.search": 0.7, "europepmc.search": 0.5,
         },
     },
@@ -78,7 +76,7 @@ DEFAULTS: dict = {
         },
         "exa": {
             # backend "pool": local search-pool service that holds the Exa keys (POST {pool_url}/v1/search, engine=exa,
-            # no Tavily fallback; env TBS_SEARCH_POOL_URL overrides pool_url; unset -> Exa is skipped).
+            # no fallback engine; env TBS_SEARCH_POOL_URL overrides pool_url; unset -> Exa is skipped).
             # backend "direct": api.exa.ai + key_env.
             "backend": "pool", "pool_url": None,
             "enabled": True, "key_env": "EXA_API_KEY_SECONDARY", "require_key": True,
@@ -89,16 +87,6 @@ DEFAULTS: dict = {
             "highlights_chars": 400,
             "est_cost_usd": 0.012,                 # used only when the response lacks costDollars
             "daily_max_calls": 80, "daily_budget_usd": 0.60, "monthly_budget_usd": 9.0,   # 4 calls/target -> 20 targets/day
-            "retries": 3, "cooldown_429_s": 3600,
-        },
-        "tavily": {
-            # 2026-11-05 decision: Tavily removed from the default pipeline (low yield vs Exa); adapter kept for reruns.
-            "enabled": False, "key_env": "TAVILY_API_KEY_SECONDARY", "require_key": True,
-            "min_interval_s": 1.0, "max_results": 10, "search_depth": "basic",
-            # 2026-11-05 eval: Tavily found 35 target-usable resources vs Exa 137 (13 Tavily-only), 41 aggregator/
-            # forum URLs; paper channel added 0 papers that no other source had -> backup code channel only.
-            "channels": ["code"],
-            "daily_max_calls": 30, "daily_max_credits": 30, "monthly_max_credits": 900,   # free tier = 1000/month
             "retries": 3, "cooldown_429_s": 3600,
         },
         "crossref": {

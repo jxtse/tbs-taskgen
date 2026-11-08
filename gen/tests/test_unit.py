@@ -389,6 +389,7 @@ def _s9_env(tmp_path, monkeypatch=None, launcher_rc=0, make_job=True, **calib_kw
     (hr / "launch.sh").write_text("#!/bin/bash\n%s\nexit %d\n" % (mk, launcher_rc))
     (hr / "launch.sh").chmod(0o755)
     cal = dict(allow_submit=True, harbor_root=str(hr), jobs_dir=str(jobs), student_launcher="launch.sh",
+               agent_allowed_hosts=["models.example.com"],
                tmux_bin=str(tmux), est_usd_per_run=10.0)
     cal.update(calib_kw)
     cfg = load_config(None, {"run": {"root": str(tmp_path / "run")}, "calib": cal,
@@ -519,24 +520,32 @@ def test_prepare_without_launcher_prints_plain_harbor_command(tmp_path):
     assert rec["command"].startswith("cd /h && ./run.sh run ")
 
 
-def test_opus_url_unset_is_a_config_error(tmp_path):
-    from tbsgen.models import OpusClient
-    cfg = load_config(None, {"models": {"opus": {"url": None}}, "budget": {"daily_usd_total": 1.0}})
+def test_teacher_url_unset_is_a_config_error(tmp_path):
+    from tbsgen.models import TeacherClient
+    cfg = load_config(None, {"models": {"teacher": {"url": None}}, "budget": {"daily_usd_total": 1.0}})
     led = Ledger(tmp_path / "l.sqlite", cfg)
     with pytest.raises(ModelError) as e:
-        OpusClient(led, cfg)
-    assert e.value.cls == "config" and "TBS_OPUS_URL" in str(e.value)
+        TeacherClient(led, cfg)
+    assert e.value.cls == "config" and "models.teacher.url" in str(e.value)
 
 
-def test_no_old_pipe_means_no_cache_dirs_and_no_dedup(monkeypatch):
+def test_teacher_role_resolves_to_the_teacher_client(tmp_path):
+    from tbsgen.config import resolve_role
+    from tbsgen.models import TeacherClient, get_client
+    cfg = load_config(None, {"models": {"teacher": {"url": "http://127.0.0.1:9/v1/messages"}},
+                             "budget": {"daily_usd_total": 1.0}})
+    assert resolve_role(cfg, "spec") == "teacher"
+    assert isinstance(get_client("teacher", cfg, Ledger(tmp_path / "l.sqlite", cfg)), TeacherClient)
+    assert "opus" not in cfg["models"]
+
+
+def test_external_locations_come_from_config_only(monkeypatch):
+    """No environment variable points at an earlier pipeline: cache dirs and the TBS dedup root are config keys."""
     import importlib
     import tbsgen.config as gc
-    monkeypatch.delenv("TBS_OLD_PIPE", raising=False)
+    monkeypatch.setenv("TBS_OLD_PIPE", "/data/old")
     monkeypatch.delenv("TBS_HARBOR_ROOT", raising=False)
     c = importlib.reload(gc).load_config()
     assert c["fulltext"]["cache_dirs"] == [] and c["probe"]["tbs_tasks_root"] is None and c["calib"]["harbor_root"] is None
-    monkeypatch.setenv("TBS_OLD_PIPE", "/data/old")
-    c = importlib.reload(gc).load_config()
-    assert c["fulltext"]["cache_dirs"] == ["/data/old/literature/txt"] and c["probe"]["tbs_tasks_root"] == "/data/old/tasks_text"
     monkeypatch.undo()
     importlib.reload(gc)

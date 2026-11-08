@@ -4,7 +4,8 @@
 
 Copies items/<id>/pkg to <run>/harbor-local/tasks/<id> with the "local_base" Dockerfile (FROM the sandbox
 image, so no pip download), runs `harbor run -a oracle` and `-a nop`, and records rewards in
-items/<id>/harbor_local.json.  Expected: oracle reward 1, nop reward 0.
+items/<id>/harbor_local.json.  Expected: oracle reward 1, nop reward 0.  The task's network policy is kept
+(oracle and nop need no network; the agent phase allowlist is enforced by Harbor's Docker egress sidecar).
 """
 from __future__ import annotations
 
@@ -15,7 +16,7 @@ import subprocess
 import time
 from pathlib import Path
 
-from .package import DOCKERFILE_LOCAL
+from .package import dockerfile
 
 
 def find_harbor(cfg: dict) -> str | None:
@@ -46,7 +47,7 @@ def check(cfg: dict, run_root: Path, item_dir: Path, harbor: str | None = None, 
     if tdir.exists():
         shutil.rmtree(tdir)
     shutil.copytree(item_dir / "pkg", tdir)
-    (tdir / "environment" / "Dockerfile").write_text(DOCKERFILE_LOCAL.format(image=cfg["sandbox"]["image"]))
+    (tdir / "environment" / "Dockerfile").write_text(dockerfile(cfg, "local_base"))
     res = dict(item=item_dir.name, task=str(tdir), ts=time.time())
     for agent in ("oracle", "nop"):
         job = f"{item_dir.name}-{agent}-{time.strftime('%Y%m%d%H%M%S')}"

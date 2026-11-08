@@ -195,7 +195,7 @@ def combine(p: dict, th: dict | None = None) -> dict:
 
 
 def score_of(p: dict) -> float | None:
-    """Single number for S2_screen.json `score` (back-compat): P(method) * P(single machine) * P(some data)."""
+    """Single number for S2_screen.json `score` (shared with the rules screen): P(method) * P(single machine) * P(some data)."""
     try:
         return round(p["computational_method"] * p["single_machine"] * max(p["data_public"], p["data_simulatable"]), 4)
     except (KeyError, TypeError):

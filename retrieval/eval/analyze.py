@@ -1,4 +1,7 @@
-"""Offline analysis of eval/raw/*.json -> eval/metrics.json + eval/tables.md (+ eval/to_label.jsonl for any paper
+"""Historical evaluation: it reads the recorded raw lists of the 2026-11-05 run, which include the Tavily
+source (since removed from the code); the Tavily rows below describe that run only.
+
+Offline analysis of eval/raw/*.json -> eval/metrics.json + eval/tables.md (+ eval/to_label.jsonl for any paper
 or resource in the judged sets that has no label yet).
 
 Relevance labels (subjective, single annotator reading title + abstract; scale identical to the earlier
@@ -135,8 +138,14 @@ def recall(sel, items):
     return sum(1 for s in sel if all_keys(s) & keys)
 
 
+# fusion weights of the recorded run (2026-11-05): the Tavily lists it contains keep their weights, although the
+# source has since been removed from the code and from config.py
+HISTORICAL_WEIGHTS = {"tavily.paper": 0.5, "tavily.code": 0.3, "tavily.data": 0.3, "tavily.docs": 0.3}
+
+
 def main():
     cfg = load_config()
+    cfg["fusion"]["weights"] = {**cfg["fusion"]["weights"], **HISTORICAL_WEIGHTS}
     leak = load_leak(cfg["leak_refs"])
     lab = load_labels()
     recs = [json.loads(p.read_text()) for p in sorted((HERE / "raw").glob("*.json"))]

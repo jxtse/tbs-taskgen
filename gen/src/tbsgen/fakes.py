@@ -35,7 +35,8 @@ SPEC = {
                 {"name": "rate_p90_rel_error", "direction": "<=", "on": "public"},
                 {"name": "coverage", "direction": ">=", "on": "public"}],
     "public_files": ["series.csv"], "hidden_files": [], "truth_files": ["params.csv"],
-    "why_naive_fails": "unweighted log fit + spikes", "mid_missing_step": "C1 weighting"}
+    "why_naive_fails": "unweighted log fit + spikes", "mid_missing_step": "C1 weighting",
+    "method_names": ["spike-robust weighted log-linear fit"]}
 
 
 def _files(fx: Path, rels) -> str:
