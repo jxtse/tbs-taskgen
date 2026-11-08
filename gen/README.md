@@ -75,7 +75,7 @@ items/<item_id>/
 | S9 | `pkg/` | `calib/*.json` 作业配置 + 启动命令；`runs.json` | 不调用（只调度） | 见 §5 |
 | S10 | 标签为 hard/unstable 的题 | `release/manifest.jsonl` | 无 | — |
 
-**S7 机械门**：determinism（同种子两次哈希一致）；oracle（参考解在每个种子上都通过）；oracle_margin（参考解至少留出一半余量）；nop（空交付不过）；naive（每个种子至少 2 项不过）；mid（1–2 项不过，且全部判据都被评估）；exploit（作弊尝试全不过）；hidden_shift（只对 PROG）；thresholds_stated（每个阈值都在题面中出现）；leak；isolation（`environment/` 下没有 tests/truth/generator）。
+**S7 机械门**：determinism（同种子两次哈希一致）；oracle（参考解在每个种子上都通过）；oracle_margin（参考解至少留出一半余量）；nop（空交付不过）；naive（每个种子至少 2 项不过）；mid（1–2 项不过，且全部判据都被评估）；exploit（作弊尝试全不过）；hidden_shift（只对 PROG）；thresholds_stated（每个阈值都在题面中出现）；leak；isolation（`environment/` 下没有 tests/truth/generator）；tdm_verbatim（全文来自 Elsevier/Wiley TDM 的论文：题面和 `environment/data` 下的文本文件与全文的最长逐字重合，空白规范化后不超过 200 字符，见 `tdmgate.py`）。
 
 **泄漏门（`leakcheck.py`）**：
 
@@ -105,6 +105,12 @@ uv run tbsgen resume --run runs/R --config config.toml              # 恢复因�
 uv run tbsgen breaker --run runs/R --model claude-opus-5-5 --reset  # 人工解除熔断
 uv run tbsgen fetch --run runs/R --config config.toml [--max N] [--channels oa,browser] [--no-browser] [--dry-run]
                                                                     # 清全文队列（含 ego-browser 通道），取到全文后交给等待的条目并推进到 S4
+                                                                    # 只有真正发出请求并失败才退避；被限额/冷却/熔断跳过的不计次数，到最早恢复时间再到期
+uv run tbsgen fetch --run runs/R --only 10.1016/j.x.1,arxiv:2101.00001  # 只处理指定条目（不论是否到期）
+uv run tbsgen remote deploy --run runs/R --config config.toml [--dry-run]  # 把本地 HEAD 部署到 fulltext.remote.code_dir 并核对两端指纹
+uv run tbsgen remote status --run runs/R --config config.toml       # 两端 HEAD、指纹、远端作业
+uv run tbsgen fulltext purge --run runs/R --channel elsevier,wiley [--before YYYY-MM-DD] [--dry-run]
+                                                                    # 删除这些通道的全文与 raw PDF/XML（保留账本与 provenance）
 uv run tbsgen fetch --run runs/R --status                          # 今日下载用量、冷却、熔断
 uv run tbsgen fetch --run runs/R --finish-browser                  # 关闭本工具的 ego TaskSpace
 uv run tbsgen fetch --run runs/R --browser --wait-for-egress         # 等出口进入 allow_cidrs 后跑一个浏览器批次
@@ -153,6 +159,10 @@ allow_submit = false
 | `gen.s6a_max_tokens / s6c_max_tokens / continue_calls` | 64000 / 48000 / 1 | 多文件输出上限；被截断时最多 1 次续写，只要缺的文件 |
 | `gen.mid_rework_max` | 1 | mid 不可区分时先由 S6M 只重写 `baselines/mid.py`，再不行才回 S5 |
 | `gates.max_repair_rounds` | 2 | S8 修复轮数上限 |
+| `gates.tdm_verbatim_max_chars / tdm_verbatim_channels` | 200 / elsevier, wiley | TDM 全文与公开文件的最长逐字重合上限（阻塞级） |
+| `fulltext.not_entitled` | 开；elsevier, wiley；不过期 | TDM API 只给元数据/摘要（`short text N`）时记账本，该通道永不再请求该 DOI |
+| `fulltext.remote.require_clean_tree / preflight` | True / True | 远程模式：本地包有未提交改动或远端指纹不一致时，在租约和提交之前拒绝（退出码 3） |
+| `fulltext.remote.code_dir / deploy_sync` | None / `uv sync -q --no-dev` | `tbsgen remote deploy` 的远端仓库目录与依赖同步命令 |
 | `calib.quick_pass_minutes` | None | GLM 首次通过且用时短时直接记 easy（**待定**，默认关） |
 | `calib.keep_labels` | hard, unstable | 保留的难度标签 |
 | `calib.variant_depth` | 0 | S9b 更难变体（**待定**，MVP 关闭） |

@@ -120,6 +120,27 @@ def test_injected_leak_blocked_then_repaired(tmp_path):
     assert it.state["status"] == "waiting" and read_json(it.p("gates", "attempt-2.json"))["ok"]
 
 
+def test_tdm_verbatim_copy_blocked_then_repaired(tmp_path):
+    """A full text from Elsevier's TDM API; S6C pastes 300 chars of it into instruction.md: S7 blocks
+    (tdm_verbatim), S8 removes the passage, the second S7 passes."""
+    from tbsgen.dryrun import TOY_TEXT
+    passage = TOY_TEXT[:300]
+    P, _ = mk(tmp_path, fake_kw={"copy_source": passage})
+    cand = make_toy_candidate(tmp_path)
+    prov = tmp_path / "fulltext_cache" / "10.0000_tbsgen.toy.decay.json"
+    prov.write_text(json.dumps(dict(doi=cand["doi"], channel="elsevier", licence="elsevier_tdm")))
+    [iid] = P.ingest([cand])
+    P.run()
+    it = P.store.item(iid)
+    assert read_json(it.p("S3_fulltext.json"))["cached_channel"] == "elsevier"
+    g1 = read_json(it.p("gates", "attempt-1.json"))
+    assert "tdm_verbatim" in g1["blocking"] and g1["details"]["tdm_verbatim"]["findings"][0]["chars"] >= 290
+    g2 = read_json(it.p("gates", "attempt-2.json"))
+    assert g2["ok"] and g2["gates"]["tdm_verbatim"], g2["gates"]
+    assert passage[:80] not in it.p("pkg", "instruction.md").read_text()
+    assert it.state["status"] == "waiting"
+
+
 def test_unrepairable_is_dropped_after_two_rounds(tmp_path):
     P, _ = mk(tmp_path, fake_kw={"leak_in_public": True, "repair_fixes": False})
     [iid] = P.ingest([make_toy_candidate(tmp_path)])

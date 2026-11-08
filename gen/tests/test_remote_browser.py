@@ -83,7 +83,9 @@ class FakeSSH:
 def mk_remote(tmp_path, routes, **ft):
     rdir = tmp_path / "remote-host"
     cfg = mkcfg(tmp_path, egress_check=dict(EC), elsevier={"enabled": True}, wiley={"enabled": True},
-                remote={"enabled": True, "host": "fake", "python": "/opt/py", "workdir": str(rdir)}, **ft)
+                remote={"enabled": True, "host": "fake", "python": "/opt/py", "workdir": str(rdir),
+                        # the test checkout itself may be dirty; the clean-tree preflight has its own tests
+                        "require_clean_tree": False, **(ft.pop("remote", None) or {})}, **ft)
     clock = FakeClock(time.time())
     led = DownloadLedger(cfg["fulltext"]["ledger_path"], cfg["fulltext"]["limits"], cfg["fulltext"]["global_limits"],
                          cfg["fulltext"]["host_caps"])
@@ -120,7 +122,7 @@ def test_remote_runs_http_channels_remotely_and_imports(tmp_path):
     ssh = FakeSSH(rdir, net)
     st = drain(f, ssh)
     assert st["ok"] == 3 and local_net.calls == []                 # nothing fetched locally
-    assert ssh.calls == ["submit", "status", "export", "cleanup"]
+    assert ssh.calls == ["info", "submit", "status", "export", "cleanup"]     # preflight `info` first
     # texts are in the LOCAL write cache with provenance naming the remote job
     w = Path(f.cfg["fulltext"]["write_cache_dir"])
     provs = [json.loads(p.read_text()) for p in w.glob("*.json")]
@@ -153,7 +155,7 @@ def test_remote_secrets_only_on_stdin_never_on_disk_or_argv(tmp_path):
         drain(f, ssh)
     finally:
         remote.work = orig_work
-    sub_stdin = ssh.stdin_seen[0].decode()
+    sub_stdin = ssh.stdin_seen[ssh.calls.index("submit")].decode()
     assert "k-els-test" in sub_stdin.splitlines()[1] and "k-els-test" not in sub_stdin.splitlines()[0]
     assert seen_files and not any(b"k-els-test" in b or b"t-wiley-test" in b for b in seen_files)
     assert all("k-els-test" not in c for c in ssh.calls)
@@ -198,6 +200,23 @@ def test_remote_worker_egress_outside_range_downloads_nothing(tmp_path):
 def test_remote_code_fingerprint_mismatch_is_refused(tmp_path, monkeypatch):
     f, net, _, led, rdir, _ = mk_remote(tmp_path, {"api.elsevier.com": ELS_XML})
     queue(f, ELS)
+    # the remote host runs another revision: its `info` answers with another fingerprint
+    monkeypatch.setattr(remote, "cmd_info", lambda wd, job, stdout: print(json.dumps(dict(
+        fingerprint="other-revision", head="0" * 40, dirty=[], jobs=[])), file=stdout) or 0)
+    ssh = FakeSSH(rdir, net)
+    st = drain(f, ssh)
+    # refused by the preflight, before anything is leased or submitted
+    assert "fingerprint mismatch" in st["remote_error"] and "tbsgen remote deploy" in st["remote_error"]
+    assert ssh.calls == ["info"] and net.calls == []
+    assert sqlite3.connect(led.path).execute("select count(*) from attempts").fetchone()[0] == 0
+    [e] = fulltext.read_queue(fulltext.queue_path(f.cfg))
+    assert not e.get("tries") and not e.get("next_try") and not e.get("chan_backoff")     # still due, not charged
+
+
+def test_remote_submit_refusal_is_an_error_and_does_not_back_off(tmp_path, monkeypatch):
+    """The remote side refuses at submit (fingerprint changed after the preflight): remote_error, no backoff."""
+    f, net, _, led, rdir, _ = mk_remote(tmp_path, {"api.elsevier.com": ELS_XML}, remote={"preflight": False})
+    queue(f, ELS)
     real = remote.code_fingerprint
     calls = {"n": 0}
 
@@ -207,7 +226,10 @@ def test_remote_code_fingerprint_mismatch_is_refused(tmp_path, monkeypatch):
     monkeypatch.setattr(remote, "code_fingerprint", fp)
     st = drain(f, FakeSSH(rdir, net))
     assert st["remote"]["jobs"][0]["stage"] == "dropped" and "fingerprint" in st["remote"]["jobs"][0]["error"]
+    assert "fingerprint" in st["remote_error"] and st["failed"] == 0 and st["not_tried"] == 1
     assert net.calls == []
+    [e] = fulltext.read_queue(fulltext.queue_path(f.cfg))
+    assert not e.get("tries") and not e.get("next_try") and not e.get("chan_backoff")
 
 
 def test_remote_seed_makes_remote_respect_local_usage(tmp_path):

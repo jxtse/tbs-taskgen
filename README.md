@@ -134,9 +134,12 @@ uv run --directory gen tbsgen status --run runs/R
 On a fresh machine both items may stop at S3 as `parked: fulltext_unavailable` (listed in
 `S3_queue.json` and in the run's full-text queue): the pipeline needs the paper's full text. S3 tries a
 configurable cascade (see [Full text (S3)](#full-text-s3)); by default only a local cache and open-access copies
-are used. `tbsgen fetch --run runs/R` retries the queue later (failed entries back off, doubling from
-`fulltext.queue_backoff_s`), hands the text to every waiting item (also items of other runs sharing the queue) and
-moves them on to S4; an entry leaves the queue only after that. Only one `tbsgen fetch` drains a queue at a time, and only one
+are used. `tbsgen fetch --run runs/R` retries the queue later, hands the text to every waiting item (also items of
+other runs sharing the queue) and moves them on to S4; an entry leaves the queue only after that. Only a paper whose
+channels actually sent a request and got nothing backs off (doubling from `fulltext.queue_backoff_s`, per channel);
+a paper that was only skipped because of a cap, cooldown or breaker (or the egress check) is not charged a try and
+becomes due again when the earliest of those limits lifts. `tbsgen fetch --only DOI[,DOI]` (DOIs, arXiv ids or queue
+idents) processes just those entries, due or not. Only one `tbsgen fetch` drains a queue at a time, and only one
 process at a time uses a browser TaskSpace (a second one skips the browser channel). With full text, a teacher endpoint and a
 budget in `my.toml` (see below), `tbsgen run` continues into the model stages. The other commands
 (`resume`, `reset`, `breaker`, `calib-ingest`, `harbor-local`, `ping`) are documented in
@@ -229,8 +232,13 @@ Checks: a download is accepted only if it is a PDF (or full-text XML / an HTML a
 headings), its text has at least `min_chars` characters, and at least `title_match_min` of the title words appear
 in its first 6,000 characters. HTML wrapper pages, abstract-only API answers and bot-wall pages are rejected.
 Accepted texts go to `fulltext.write_cache_dir` (default `<run>/fulltext_cache/`) as `<doi_key>.txt` with a
-`<doi_key>.json` provenance record (channel, URL without query string, time, bytes, SHA-256, title match).
-Read-only caches are never written.
+`<doi_key>.json` provenance record (channel, licence class `elsevier_tdm` / `wiley_tdm` / `oa` / `inst` /
+`browser`, URL without query string, time, bytes, SHA-256, title match). Read-only caches are never written.
+
+Not entitled: when the Elsevier or Wiley API answers with metadata or an abstract only (`short text N`: the
+institution does not subscribe to that volume), the (channel, DOI) pair is recorded in the ledger table
+`not_entitled` and that channel never asks for the DOI again (`fulltext.not_entitled`: `enabled`, `channels`,
+`ttl_days`, default no expiry). Such answers do not count towards the channel's failure breaker.
 
 Limits: every download is booked in a SQLite ledger (`fulltext.ledger_path`, default
 `<run>/fulltext_ledger.sqlite`) before it is sent. Per channel: successes and attempts per day, successes per hour,
@@ -266,10 +274,21 @@ through the browser. Use this when subscription access depends on the IP range.
 
 When the machine running the pipeline is not on the institution's network but another host you can reach with
 `ssh` is, set `fulltext.remote` (`enabled`, `host`, `python`, `workdir`). `tbsgen fetch` then sends the due papers
-as one job to that host, which runs the same tbsgen code (`python -m tbsgen.remote`; both sides compare a hash of
-the package sources and the job is refused on a mismatch) through the `oa` / `elsevier` / `wiley` / `inst`
-channels, and copies the texts back into the local `write_cache_dir`. The local side makes no publisher request.
+as one job to that host, which runs the same tbsgen code (`python -m tbsgen.remote`) through the `oa` / `elsevier` /
+`wiley` / `inst` channels, and copies the texts back into the local `write_cache_dir`. The local side makes no
+publisher request.
 
+- Same code on both sides: before leasing anything, `tbsgen fetch` refuses to start a job if the local package
+  (`gen/src/tbsgen`) has uncommitted changes (`remote.require_clean_tree`) or if the remote host's code
+  fingerprint (a hash of the package sources) differs (`remote.preflight`). It then exits with code 3, prints the
+  reason and points at `tbsgen remote deploy`; the papers stay due and are not charged a try. A job the remote side
+  refuses at submit is reported the same way (`remote_error` in the printed stats).
+- `tbsgen remote deploy [--dry-run]` bundles the local `HEAD` (`git bundle`), copies it with `scp` to
+  `remote.code_dir`, runs `git fetch` + `git checkout --detach <sha>` and `remote.deploy_sync` (default
+  `uv sync -q --no-dev`) there, then checks that the remote `HEAD` and fingerprint equal the local ones. It refuses
+  while the package has uncommitted changes or a remote job is not collected yet (`--force` overrides the latter).
+  `--dry-run` prints the plan and contacts nothing. `tbsgen remote status` prints both sides' `HEAD` and
+  fingerprint and the remote jobs (exit 2 when the code differs).
 - The remote host must have `egress_check` on with `allow_cidrs`; the job is refused otherwise.
 - Secrets (`ELSEVIER_API_KEY`, `WILEY_TDM_TOKEN`) are read locally (environment, or the command in
   `fulltext.remote.secrets_cmd`, which gets the wanted names on stdin and prints a JSON object) and sent on the
@@ -321,9 +340,29 @@ uv run tbsgen fetch --run runs/R --config config.toml --browser --wait-for-egres
   code; the agent's own report is not used. Papers cut by an egress change or the window's end stay queued
   without backoff. Model usage per run is appended to `<queue>.browser/usage.jsonl`.
 
-Terms: use only content your own subscriptions and API licences allow. The Elsevier and Wiley TDM licences are
-for non-commercial text mining by subscribers; do not redistribute full texts. This pipeline only uses the text
-to ground generated tasks and does not copy it into task files. No channel bypasses access control.
+Terms: use only content your own subscriptions and API licences allow. No channel bypasses access control.
+
+#### TDM compliance (Elsevier, Wiley)
+
+The [Elsevier TDM provisions](https://dev.elsevier.com/policy/TDM-provisions.pdf) and the
+[Wiley TDM terms](https://onlinelibrary.wiley.com/library-info/resources/text-and-datamining) allow non-commercial
+text mining by subscribers. Among their conditions: output may quote at most 200 characters of a mined article
+(Elsevier, with a DOI link); the content must not be redistributed or substantially reproduced; and the downloaded
+content must be deleted when the project or the agreement ends. How this pipeline follows them:
+
+- Full texts stay on the machine that runs the pipeline, as grounding input for the teacher model. They are never
+  part of a packaged task or of this repository (run directories are git-ignored).
+- Every text's provenance record names its channel and licence class (`elsevier_tdm`, `wiley_tdm`, `oa`, `inst`,
+  `browser`); items record it in `S3_fulltext.json` (a cache hit records the channel that filled the cache).
+- S7 gate `tdm_verbatim` (blocking): for a paper whose text came from a TDM channel
+  (`gates.tdm_verbatim_channels`), the longest verbatim overlap between the full text and the public task files
+  (`instruction.md` and the text files under `environment/data`), compared after whitespace normalisation, must not
+  exceed `gates.tdm_verbatim_max_chars` (200). A longer overlap goes to S8 repair like any other blocking gate.
+- `tbsgen fulltext purge --run DIR --channel elsevier,wiley [--before YYYY-MM-DD] [--dry-run]` deletes the texts
+  and raw PDF/XML files of those channels from the write cache, and the copies held by finished items of that run.
+  The ledger rows and provenance records stay (they hold no article text; the record gets `purged_at`). Items
+  still before S6 keep their copy and are listed; read-only caches are never written, matches there are counted
+  so their owner can delete them.
 
 ```toml
 [fulltext]

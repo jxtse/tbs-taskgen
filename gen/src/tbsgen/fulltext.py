@@ -11,13 +11,25 @@ Channels (order = `fulltext.cascade`; each one has its own `enabled` switch):
   browser   a logged-in local browser (ego-browser, see browser_ego.py); off by default and, even when on, not
             run inline in S3 unless `browser.inline` is true: S3 queues the paper and `tbsgen fetch` drains
             the queue
-A channel is skipped when it is disabled, its secret is missing, the DOI does not match its prefixes, or the
-ledger refuses (cap, cooldown, breaker).  Nothing here bypasses access control: every channel only fetches what
-the user's own subscriptions / API terms allow, and bot-wall pages are never clicked through.
+A channel is skipped when it is disabled, its secret is missing, the DOI does not match its prefixes, the
+channel answered for this DOI with metadata / abstract only before (`not_entitled`, see below), or the ledger
+refuses (cap, cooldown, breaker).  Nothing here bypasses access control: every channel only fetches what the
+user's own subscriptions / API terms allow, and bot-wall pages are never clicked through.
+
+Skipped is not failed: a paper whose channels were only refused by the ledger (rec["limited"], with the time
+the refusal lifts) or by the egress check made no request, so the queue keeps it due (until the earliest lift
+time) instead of backing it off.  Only a paper with at least one real request (rec["tried"]) and no refusal
+backs off.
+
+Not entitled: a TDM API (elsevier / wiley) that answers 200 with too little text for a full article is
+returning metadata / abstract only (volume not covered by the subscription).  That (channel, DOI) pair is booked
+in the ledger table `not_entitled` and the channel never asks for that DOI again (`fulltext.not_entitled`).
 
 Every download is booked in dlledger.DownloadLedger.  Successful texts go to the write cache as
-<doi_key>.txt plus <doi_key>.json (provenance: channel, url, time, bytes, sha256, title match); raw bytes go to
-<write_cache_dir>/raw/ when `keep_raw` is true.  Read-only caches are never written.
+<doi_key>.txt plus <doi_key>.json (provenance: channel, licence class, url, time, bytes, sha256, title match);
+raw bytes go to <write_cache_dir>/raw/ when `keep_raw` is true.  Read-only caches are never written.
+`licence` (LICENCES) records the terms a text was obtained under; `tbsgen fulltext purge` deletes the texts of
+given channels (TDM terms: delete at the end of the project).
 
 Network: urllib with ProxyHandler({}) (environment proxies ignored) unless `use_env_proxy = true`.  Optional
 egress self-check (`egress_check.enabled`): before the first download in a process, ask `egress_check.urls` for
@@ -46,6 +58,14 @@ from typing import Callable
 from .dlledger import COOLDOWN_429_S, DownloadLedger, LimitReached, block_signal, challenge_page
 
 CHANNELS = ("cache", "oa", "elsevier", "wiley", "inst", "browser")
+# licence class of a text, by the channel that fetched it (provenance `licence`)
+LICENCES = {"elsevier": "elsevier_tdm", "wiley": "wiley_tdm", "oa": "oa", "inst": "inst", "browser": "browser"}
+TDM_CHANNELS = ("elsevier", "wiley")
+LIMIT_RECHECK_S = 900          # a ledger refusal with no known end: look again after this
+
+
+def licence_of(channel: str | None) -> str | None:
+    return LICENCES.get(channel or "")
 UA_BROWSERISH = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) "
                  "Chrome/140.0 Safari/537.36")
 
@@ -466,7 +486,8 @@ class Fetcher:
                     continue
                 txt = p.read_text(errors="replace")
                 if len(txt) >= self.ft["min_chars"]:
-                    return txt, dict(source="cache", path=str(p), cached_channel=prov.get("channel"))
+                    return txt, dict(source="cache", path=str(p), cached_channel=prov.get("channel"),
+                                     cached_licence=prov.get("licence") or licence_of(prov.get("channel")))
         return None
 
     def _ua(self) -> str:
@@ -551,7 +572,8 @@ class Fetcher:
     def _save(self, c: dict, channel: str, url: str, body: bytes, txt: str, tm: float | None, kind: str,
               **extra) -> dict:
         key, ident, doi = paper_key(c), paper_ident(c), norm_doi(c.get("doi"))
-        prov = dict(doi=doi, ident=ident, channel=channel, url=self._r(safe_url(url)), kind=kind, bytes=len(body),
+        prov = dict(doi=doi, ident=ident, channel=channel, licence=licence_of(channel), url=self._r(safe_url(url)),
+                    kind=kind, bytes=len(body),
                     sha256=hashlib.sha256(body).hexdigest(), text_chars=len(txt),
                     title_match=None if tm is None else round(tm, 3), fetched_at=time.strftime("%Y-%m-%dT%H:%M:%S%z"),
                     **extra)
@@ -565,6 +587,7 @@ class Fetcher:
         """Write a text fetched elsewhere (remote mode) to the write cache, with the same collision-safe naming."""
         key, ident = paper_key(c), paper_ident(c)
         prov = dict(prov, ident=ident)
+        prov.setdefault("licence", licence_of(prov.get("channel")))
         if (w := self.write_dir()) and key:
             w.mkdir(parents=True, exist_ok=True)
             with _dir_lock(w):
@@ -614,12 +637,19 @@ class Fetcher:
             cur_host = urllib.parse.urlsplit(url).hostname or ""
             if self.ledger and sp.hostname and sp.hostname != cur_host:
                 hop = getattr(self._tl, "hop", None)
+                # a refused redirect target is our own limit, not the paper's failure: booked as "limited"
+                # (the queue keeps the paper due) and as a cancelled attempt (no breaker counts it)
                 try:
                     if hop:
                         self.ledger.acquire_hop(hop[0], sp.hostname, hop[1], related=self._related(sp.hostname))
                     elif (msg := self.ledger.cooling(sp.hostname, *self._related(sp.hostname))):
+                        rec.setdefault("limited", []).append(dict(
+                            channel=hop[0] if hop else None, kind="cooldown", scope="host",
+                            until=self.ledger.cooling_until(sp.hostname, *self._related(sp.hostname))))
                         return Resp(0, {}, b"", url, f"redirect target cooling: {msg}")
                 except LimitReached as e:
+                    rec.setdefault("limited", []).append(dict(channel=hop[0] if hop else None, kind=e.kind,
+                                                              scope=e.scope, until=e.until))
                     return Resp(0, {}, b"", url, f"redirect target refused: {e}")
             if sp[:2] != origin:
                 hdr = {k: v for k, v in hdr.items() if k.lower() not in CRED_HEADERS}
@@ -660,10 +690,19 @@ class Fetcher:
                 prov = self._save(self._cur, channel, r.url, r.body, txt, tm, kind, reservation=rid)
                 rec.update(source=channel, url=prov["url"], title_match=prov["title_match"], provenance=prov)
             else:
+                if r.status == 200 and not cool and why.startswith("short text") and self._ne_applies(channel):
+                    # metadata / abstract only: the subscription does not cover this paper
+                    why = f"not_entitled: {why}"
+                    self.ledger.mark_not_entitled(channel, doi or key, why)
+                    rec.setdefault("not_entitled", []).append(channel)
                 rec["errors"].append(self._r(f"{channel}: {why}"))
         finally:
             ok = rec.get("source") == channel
             note = "" if ok else (rec["errors"][-1] if rec["errors"] else self._r(r.error))
+            if not ok and note.startswith(f"{channel}: not_entitled"):
+                note = note[len(channel) + 2:]          # ledger note starts with "not_entitled" (breaker ignores it)
+            elif not ok and r.status == 0 and r.error.startswith("redirect target "):
+                note = "cancelled: " + note             # our own limit on the redirect target: no breaker count
             self.ledger.record(channel, host, doi or key, "ok" if ok else "fail", r.status, len(r.body),
                                note[:300], reservation=rid)
         return txt
@@ -684,12 +723,31 @@ class Fetcher:
         except json.JSONDecodeError:
             return None
 
+    def _ne_conf(self) -> dict:
+        return self.ft.get("not_entitled") or {}
+
+    def _ne_applies(self, channel: str) -> bool:
+        ne = self._ne_conf()
+        return bool(ne.get("enabled", True)) and channel in (ne.get("channels") or TDM_CHANNELS)
+
+    def not_entitled(self, channel: str, doi: str) -> str | None:
+        """Why `channel` must not ask for `doi` again (an earlier metadata-only answer), else None."""
+        if not doi or self.ledger is None or not self._ne_applies(channel):
+            return None
+        return self.ledger.not_entitled(channel, doi, self._ne_conf().get("ttl_days"))
+
     @staticmethod
-    def _host_scoped(e: LimitReached, rec: dict, ch: str) -> None:
+    def _limited(e: LimitReached, rec: dict, ch: str) -> None:
+        """Book a ledger refusal: nothing was sent, so it is not a failure (the queue keeps the paper due)."""
+        rec.setdefault("limited", []).append(dict(channel=ch, kind=e.kind, scope=e.scope, until=e.until))
+
+    @classmethod
+    def _host_scoped(cls, e: LimitReached, rec: dict, ch: str) -> None:
         """A host-level refusal skips that source only; channel-level ones stop the channel."""
         if e.scope != "host":
             raise e
         rec["skipped"].append(f"{ch}: {e}")
+        cls._limited(e, rec, ch)
 
     # ---------------------------------------------------------------- channels
     def ch_oa(self, c: dict, key: str, doi: str, title: str, rec: dict) -> str | None:
@@ -851,6 +909,7 @@ class Fetcher:
         title = c.get("title") or ""
         rec: dict = dict(doi=doi, key=paper_ident(c), tried=[], errors=[], skipped=[], source=None)
         order = [ch for ch in (channels or self.ft.get("cascade") or CHANNELS) if ch in CHANNELS]
+        skip_ch = set(c.get("skip_channels") or ())     # drain_queue: channels still backing off for this paper
         if browser is None:
             browser = bool((self.ft.get("browser") or {}).get("inline"))
         remote_used = False
@@ -862,6 +921,14 @@ class Fetcher:
                 continue
             if not self.channel_applies(ch, doi):
                 continue
+            if (why := self.not_entitled(ch, doi)):
+                rec["skipped"].append(self._r(why))
+                continue
+            if ch in skip_ch:
+                rec["skipped"].append(f"{ch}: backing off after a failed attempt")
+                rec.setdefault("backing_off", []).append(ch)
+                continue
+
             if ch == "browser" and not browser:
                 rec["skipped"].append("browser: queued (run `tbsgen fetch`)")
                 continue
@@ -875,8 +942,11 @@ class Fetcher:
                     continue
                 remote_used = True
                 rr = r.get("rec") or {}
-                for k in ("tried", "errors", "skipped"):
-                    rec[k].extend(rr.get(k) or [])
+                for k in ("tried", "errors", "skipped", "limited", "not_entitled"):
+                    if rr.get(k):
+                        rec.setdefault(k, []).extend(rr[k])
+                if rr.get("egress_refused"):
+                    rec["egress_refused"] = rr["egress_refused"]
                 rec["remote_job"] = rr.get("remote_job")
                 if r.get("ok") and r.get("text") is not None:
                     rec.update(source=rr.get("source"), url=rr.get("url"), title_match=rr.get("title_match"),
@@ -895,6 +965,7 @@ class Fetcher:
                 txt = fn(c, key, doi, title, rec, slot) if ch == "browser" else fn(c, key, doi, title, rec)
             except LimitReached as e:
                 rec["skipped"].append(self._r(f"{ch}: {e}"))
+                self._limited(e, rec, ch)
                 continue
             except EgressRefused as e:
                 rec["skipped"].append(self._r(f"{ch}: egress refused: {e}"))
@@ -903,6 +974,97 @@ class Fetcher:
             if txt is not None:
                 return Outcome(txt, rec)
         return Outcome(None, rec)
+
+
+# ------------------------------------------------------------------------------------------- purge (TDM terms)
+_EARLY_STAGES = ("S1", "S2", "S3", "S4", "S5")     # stages that still read items/<id>/fulltext.txt
+
+
+def _text_channel(prov: dict) -> str | None:
+    """Channel a text was obtained through (a cache hit names the channel that filled the cache)."""
+    if not isinstance(prov, dict):
+        return None
+    ch = prov.get("channel") or prov.get("source")
+    return prov.get("cached_channel") if ch == "cache" else ch
+
+
+def _fetched_day(prov: dict, fallback: Path) -> str:
+    d = str(prov.get("fetched_at") or "")[:10]
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", d):
+        return d
+    return time.strftime("%Y-%m-%d", time.localtime(fallback.stat().st_mtime)) if fallback.exists() else ""
+
+
+def purge(cfg: dict, channels: list[str], *, before: str | None = None, dry_run: bool = False,
+          runs: list[Path] | None = None) -> dict:
+    """`tbsgen fulltext purge`: delete the full texts obtained through `channels` (TDM terms: delete the corpus at
+    the end of the project) -- the text, the raw PDF/XML and the copies held by items of `runs` -- and keep the
+    ledger rows and the provenance json (it holds no article text; it is marked `purged_at`).
+
+    Only the write cache (`fulltext.write_cache_dir`) is purged.  Read-only caches (`fulltext.cache_dirs`) are
+    never written: matching texts there are reported (`readonly_matches`) for the owner to delete.  Item copies
+    of items still at S1..S5 (which read fulltext.txt) are not deleted unless the item is finished; they are
+    reported as `items_active`."""
+    from .state import read_json
+    bad = [c for c in channels if c not in LICENCES]
+    if not channels or bad:
+        return dict(error=f"unknown channel(s) {bad or channels}; choose from {sorted(LICENCES)}")
+    if before and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", before):
+        return dict(error="--before must be YYYY-MM-DD")
+    want = set(channels)
+    out = dict(channels=sorted(want), before=before, dry_run=dry_run, texts=0, raw=0, items=0, items_active=[],
+               readonly_matches=0, bytes=0)
+
+    def match(prov: dict, path: Path) -> bool:
+        return _text_channel(prov) in want and (not before or _fetched_day(prov, path) < before)
+
+    w = write_cache_dir(cfg)
+    if w and w.exists():
+        with _dir_lock(w):
+            for pj in sorted(w.glob("*.json")):
+                prov = None
+                with contextlib.suppress(OSError, ValueError):
+                    prov = json.loads(pj.read_text())
+                txt = pj.with_suffix(".txt")
+                if not isinstance(prov, dict) or not match(prov, txt) or prov.get("purged_at"):
+                    continue
+                raws = sorted((w / "raw").glob(pj.stem + ".*")) if (w / "raw").exists() else []
+                victims = [p for p in (txt, *raws) if p.exists()]
+                out["texts"] += txt.exists()
+                out["raw"] += len(raws)
+                out["bytes"] += sum(p.stat().st_size for p in victims)
+                if not dry_run:
+                    for v in victims:
+                        v.unlink()
+                    prov.update(purged_at=time.strftime("%Y-%m-%dT%H:%M:%S%z"))
+                    prov.pop("path", None)
+                    _atomic_write(pj, json.dumps(prov, indent=1))
+    for d in cfg["fulltext"].get("cache_dirs") or []:
+        for pj in Path(d).glob("*.json") if Path(d).exists() else []:
+            with contextlib.suppress(OSError, ValueError):
+                prov = json.loads(pj.read_text())
+                if isinstance(prov, dict) and match(prov, pj.with_suffix(".txt")) and pj.with_suffix(".txt").exists():
+                    out["readonly_matches"] += 1
+    for run in runs or []:
+        items = Path(run) / "items"
+        for idir in sorted(items.iterdir()) if items.exists() else []:
+            ft = idir / "fulltext.txt"
+            if not ft.exists():
+                continue
+            rec = read_json(idir / "S3_fulltext.json", {})
+            if not match(rec, ft):
+                continue
+            st = read_json(idir / "state.json", {})
+            if st.get("stage") in _EARLY_STAGES and st.get("status") not in ("dropped", "done"):
+                out["items_active"].append(idir.name)
+                continue
+            out["items"] += 1
+            out["bytes"] += ft.stat().st_size
+            if not dry_run:
+                ft.unlink()
+                (idir / "fulltext_purged.json").write_text(json.dumps(dict(
+                    channel=_text_channel(rec), purged_at=time.strftime("%Y-%m-%dT%H:%M:%S%z"))))
+    return out
 
 
 # ------------------------------------------------------------------------------------------- paths
@@ -995,9 +1157,6 @@ def enqueue(path: Path, entry: dict) -> bool:
     entry.pop("key", None)
     if not entry["ident"]:
         return False
-    if "item_ids" in entry:
-        entry["subscribers"] = _subs(entry)
-        entry.pop("item_ids")
     with queue_lock(path):
         q = read_queue(path)
         for e in q:
@@ -1007,7 +1166,6 @@ def enqueue(path: Path, entry: dict) -> bool:
                 subs = old_subs + [list(s) for s in _subs(entry) if list(s) not in old_subs]
                 if subs != old_subs:
                     e["subscribers"] = subs
-                    e.pop("item_ids", None)
                     changed = True
                 for k in QUEUE_FIELDS:
                     if entry.get(k) and entry[k] != e.get(k):
@@ -1041,20 +1199,95 @@ def reconcile(store, path: Path) -> int:
 
 
 def _subs(e: dict) -> list[list[str]]:
-    """[(run, item_id)] waiting for this paper (older entries: item_ids + run)."""
-    if e.get("subscribers"):
-        return [list(s) for s in e["subscribers"]]
-    return [[e.get("run") or "", i] for i in e.get("item_ids") or []]
+    """[(run, item_id)] waiting for this paper."""
+    return [list(s) for s in e.get("subscribers") or []]
 
 
 # ------------------------------------------------------------------------------------------- queue drain
+def match_only(e: dict, only: list[str]) -> bool:
+    """`tbsgen fetch --only`: does queue entry `e` match one of the identifiers (DOI with or without "doi:" /
+    https://doi.org/, arXiv id with or without "arxiv:", or the entry's ident)?"""
+    ident = _entry_key(e)
+    doi = norm_doi(e.get("doi"))
+    arx = str(e.get("arxiv") or "").lower().strip()
+    for x in only:
+        x = x.strip()
+        if not x:
+            continue
+        xl = x.lower()
+        if xl == ident or (doi and norm_doi(xl) == doi) or (arx and xl.removeprefix("arxiv:") == arx):
+            return True
+    return False
+
+
+def classify(out: Outcome) -> tuple[str, float | None, set[str], set[str]]:
+    """Queue verdict for an attempt that produced no text -> (verdict, until, failed_channels, limited_channels).
+
+    "limited": some channel was refused without sending anything (ledger cap / cooldown / breaker, egress
+    refused); the paper is not charged a try and becomes due again at `until`, the earliest time a refusal lifts
+    (None: unknown).  "failed": requests were made and nothing was refused, or no channel applies at all; the
+    entry backs off.  failed_channels: channels that made a request and got no text (and were not also refused);
+    they back off individually, so a paper waiting for a capped channel does not re-ask a failing one."""
+    rec = out.rec
+    limited = rec.get("limited") or []
+    lim_ch = {x.get("channel") for x in limited if x.get("channel")}
+    if rec.get("egress_refused"):
+        lim_ch |= {t.split(":", 1)[0] for t in rec.get("skipped") or [] if "egress refused" in t}
+    failed = {t.split(":", 1)[0] for t in rec.get("tried") or [] if not t.startswith("cache:")} - lim_ch
+    if limited or rec.get("egress_refused"):
+        ends = [float(x["until"]) for x in limited if x.get("until")]
+        return "limited", (min(ends) if ends else None), failed, lim_ch
+    if not rec.get("tried") and rec.get("backing_off"):
+        return "limited", None, failed, lim_ch          # every applicable channel is still backing off
+    return "failed", None, failed, lim_ch
+
+
+def _requeue(e: dict, now: float, backoff: float, was_limited: bool, until: float | None, failed_ch: set[str],
+             same_version: bool, backoff_only: bool = False) -> None:
+    """Update a queue entry after an attempt without text (see drain_queue)."""
+    if failed_ch:
+        # every channel that really failed backs off on its own (doubling per channel)
+        cb = dict(e.get("chan_backoff") or {})
+        for ch in sorted(failed_ch):
+            n_ch = int((cb.get(ch) or {}).get("tries") or 0) + 1
+            cb[ch] = dict(tries=n_ch, next_try=now + backoff * min(8, 2 ** (n_ch - 1)))
+        e["chan_backoff"] = cb
+        e["failed_channels"] = sorted(set(e.get("failed_channels") or []) | failed_ch)
+    if not same_version:                               # updated meanwhile (new link / subscriber): stay due
+        e.update(last_try=now, next_try=0)
+    elif was_limited:                                  # refused without a request: not a try, no backoff
+        ends = [float(v["next_try"]) for v in (e.get("chan_backoff") or {}).values()
+                if float(v.get("next_try") or 0) > now]
+        if until is not None:
+            nxt = until
+        elif backoff_only and ends:                    # nothing refused: only waiting for backed-off channels
+            nxt = min(ends)
+        else:
+            nxt = now + LIMIT_RECHECK_S
+        # due again when the refusal lifts or a backed-off channel may retry, whichever comes first
+        nxt = min([nxt, *ends])
+        e.update(next_try=max(now, nxt), limited_until=nxt, last_limited=now)
+    else:                                              # a real failure: back off
+        n_try = int(e.get("tries") or 0) + 1
+        e.update(tries=n_try, last_try=now, next_try=now + backoff * min(8, 2 ** (n_try - 1)))
+
+
+def _chan_skip(e: dict, now: float) -> list[str]:
+    """Channels of a queue entry that failed recently and are still backing off."""
+    return sorted(ch for ch, v in (e.get("chan_backoff") or {}).items() if float(v.get("next_try") or 0) > now)
+
+
 def drain_queue(fetcher: Fetcher, *, max_papers: int = 10, channels: list[str] | None = None,
                 browser: bool = True, dry_run: bool = False, on_success=None, log=print,
-                now: float | None = None) -> dict:
+                now: float | None = None, only: list[str] | None = None) -> dict:
     """`tbsgen fetch`: try queued papers again (cache first, then the cascade incl. the browser channel).
 
-    Order: entries whose `next_try` has passed, least recently tried first; a failed entry backs off
-    (`fulltext.queue_backoff_s`, doubling up to 8x), so permanently unreachable papers do not starve the rest.
+    Order: entries whose `next_try` has passed, least recently tried first.  Only a real failure (requests made,
+    no text) backs off (`fulltext.queue_backoff_s`, doubling up to 8x), so permanently unreachable papers do not
+    starve the rest.  A paper that was only refused by the ledger (caps, cooldowns, breakers) or by the egress
+    check is not counted as a try: it becomes due again when the earliest refusal lifts (`classify`).  A paper
+    the remote host did not process (job refused / not collected) stays due unchanged.
+    `only`: process just these papers (DOIs / arXiv ids / idents), whether due or not.
     Parallelism: browser jobs of different publishers run in parallel (up to browser.concurrency, one Page per
     worker); papers of one publisher are serialized (the ledger also paces them 60-120 s apart).  An entry leaves
     the queue only after `on_success(entry, outcome)` returned True for all of its subscribers (the CLI's
@@ -1076,21 +1309,31 @@ def drain_queue(fetcher: Fetcher, *, max_papers: int = 10, channels: list[str] |
         return dict(busy=True, note="another `tbsgen fetch` is draining this queue")
     try:
         return _drain_locked(fetcher, qp, now, max_papers, channels, browser, dry_run, on_success, log,
-                             defaultdict, browser_ego)
+                             defaultdict, browser_ego, only)
     finally:
         fcntl.flock(drain_fh, fcntl.LOCK_UN)
         drain_fh.close()
 
 
 def _drain_locked(fetcher, qp, now, max_papers, channels, browser, dry_run, on_success, log, defaultdict,
-                  browser_ego) -> dict:
+                  browser_ego, only=None) -> dict:
     with queue_lock(qp):
         queue = read_queue(qp)
-    due = sorted((e for e in queue if float(e.get("next_try") or 0) <= now),
-                 key=lambda e: (float(e.get("last_try") or 0), queue.index(e)))
+    if only:
+        due = [e for e in queue if match_only(e, only)]
+    else:
+        due = sorted((e for e in queue if float(e.get("next_try") or 0) <= now),
+                     key=lambda e: (max(float(e.get("last_try") or 0), float(e.get("last_limited") or 0)),
+                                    queue.index(e)))
     todo = due[:max_papers] if max_papers else due
     vers = {_entry_key(e): int(e.get("ver") or 0) for e in todo}
-    stats = dict(queued=len(queue), due=len(due), considered=len(todo), ok=0, failed=0, by_channel={}, errors=[])
+    # per-channel backoff travels with the work copy (also to the remote worker); never written back as such
+    todo = [dict(e, skip_channels=sk) if (sk := _chan_skip(e, now)) and not only else e for e in todo]
+    stats = dict(queued=len(queue), due=len(due), considered=len(todo), ok=0, failed=0, limited=0, deferred=0,
+                 by_channel={}, errors=[])
+    if only:
+        stats["only"] = list(only)
+        stats["only_unmatched"] = [x for x in only if x.strip() and not any(match_only(e, [x]) for e in queue)]
     if dry_run:
         stats["plan"] = [dict(ident=_entry_key(e), doi=e.get("doi"), publisher=publisher_of(e.get("doi") or "")[0],
                               channels=[ch for ch in (channels or fetcher.ft["cascade"])
@@ -1104,6 +1347,9 @@ def _drain_locked(fetcher, qp, now, max_papers, channels, browser, dry_run, on_s
     lock = threading.Lock()
     results: dict[str, tuple[bool, list]] = {}     # key -> (fetched, acknowledged subscribers)
     deferred: set[str] = set()                     # not tried (remote job not collected yet): stays due
+    limited: dict[str, float | None] = {}          # refused by the ledger / egress: due again at `until`
+    chan_failed: dict[str, set[str]] = {}          # channels that made a request and got nothing
+    backoff_only: set[str] = set()                 # nothing refused, every applicable channel still backing off
     if fetcher.remote_mode():
         # the HTTP channels of every due paper run as one job on the remote host; results feed the cascade
         from . import remote
@@ -1114,6 +1360,18 @@ def _drain_locked(fetcher, qp, now, max_papers, channels, browser, dry_run, on_s
         stats["remote"] = {k: v for k, v in rjob.items() if k != "results"}
         for j in stats["remote"].get("jobs") or []:
             j.pop("results", None)
+        # a job the remote side refused (code fingerprint, bad spec) or that could not be collected: report it
+        # loudly (the CLI exits non-zero); its papers were not tried and stay due
+        errs = [f"{j.get('job')}: {j['error']}" for j in stats["remote"].get("jobs") or [] if j.get("error")]
+        if rjob.get("refused"):
+            errs.insert(0, f"not submitted: {rjob['refused']}")
+        if errs:
+            stats["remote_error"] = "; ".join(errs)
+            # nothing was tried for the papers of a refused round: leave them untouched (no try, no backoff, no
+            # browser attempt that would charge them a try); only results already collected are delivered
+            keep = [e for e in todo if paper_ident(e) in fetcher.remote_results or fetcher.cached(e)]
+            stats["not_tried"] = len(todo) - len(keep)
+            todo = keep
 
     def one(e: dict, slot: int):
         k = _entry_key(e)
@@ -1140,13 +1398,22 @@ def _drain_locked(fetcher, qp, now, max_papers, channels, browser, dry_run, on_s
             if out.text is not None:
                 stats["ok"] += 1
                 stats["by_channel"][src] = stats["by_channel"].get(src, 0) + 1
+            elif not out.rec.get("tried") and any(" remote (run `tbsgen fetch`)" in x
+                                                  for x in out.rec.get("skipped") or []):
+                deferred.add(k)
+                stats["deferred"] += 1
             else:
-                stats["failed"] += 1
+                verdict, until, failed_ch, _ = classify(out)
+                chan_failed[k] = failed_ch
+                if verdict == "limited":
+                    limited[k] = until
+                    if not out.rec.get("limited") and not out.rec.get("egress_refused"):
+                        backoff_only.add(k)
+                    stats["limited"] += 1
+                else:
+                    stats["failed"] += 1
                 stats["errors"].append(dict(key=k, errors=out.rec.get("errors", [])[-3:],
                                             skipped=out.rec.get("skipped", [])[-3:]))
-            if out.text is None and not out.rec.get("tried") and any(
-                    " remote (run `tbsgen fetch`)" in x for x in out.rec.get("skipped") or []):
-                deferred.add(k)
             log(json.dumps(dict(key=k, ok=out.text is not None, source=src, seconds=dt,
                                 errors=out.rec.get("errors", [])[-2:], skipped=out.rec.get("skipped", [])[-2:]),
                            ensure_ascii=False))
@@ -1184,13 +1451,11 @@ def _drain_locked(fetcher, qp, now, max_papers, channels, browser, dry_run, on_s
                     continue                                   # all subscribers re-activated: done
                 if fetched:
                     e["subscribers"] = rest                    # new / unacknowledged subscribers stay
-                    e.pop("item_ids", None)
                     e["next_try"] = 0
-                elif int(e.get("ver") or 0) == vers.get(k, 0):   # unchanged since we read it: back off
-                    n_try = int(e.get("tries") or 0) + 1
-                    e.update(tries=n_try, last_try=now, next_try=now + backoff * min(8, 2 ** (n_try - 1)))
-                else:                                            # updated meanwhile (new link): stay due
-                    e.update(last_try=now, next_try=0)
+                    e.pop("chan_backoff", None)
+                else:
+                    _requeue(e, now, backoff, k in limited, limited.get(k), chan_failed.get(k) or set(),
+                             same_version=int(e.get("ver") or 0) == vers.get(k, 0), backoff_only=k in backoff_only)
             keep.append(e)
         write_queue(qp, keep)
         stats["remaining"] = len(keep)

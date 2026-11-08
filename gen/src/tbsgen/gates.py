@@ -129,6 +129,12 @@ def run_gates(cfg: dict, item_dir: Path, spec: dict, thresholds: dict, attempt: 
            if p.is_file() and re.search(r"(^|/)(tests|truth|generator)(/|$)", str(p.relative_to(gen0 / "environment")))]
     g["isolation"] = not bad
     det["isolation"] = bad
+    # TDM terms: public task files must not copy long passages of an Elsevier / Wiley TDM full text
+    from . import tdmgate
+    tv = tdmgate.check(cfg, item_dir, task, gen0 / "environment" / "data")
+    det["tdm_verbatim"] = tv
+    if tv["applies"]:
+        g["tdm_verbatim"] = tv["ok"]
     blocking = [k for k, v in g.items() if not v and k in _blocking(cfg)]
     nonblocking = [k for k, v in g.items() if not v and k not in _blocking(cfg)]
     return dict(attempt=attempt, gates=g, blocking=blocking, nonblocking=nonblocking, ok=all(g.values()),

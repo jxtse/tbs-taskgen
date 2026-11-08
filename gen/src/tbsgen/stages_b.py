@@ -100,6 +100,10 @@ def _slim(g):
     if isinstance(det, dict):
         out["details"] = {k: det[k] for k in ("determinism", "unstated", "isolation", "runs", "truth_isolation")
                           if k in det}
+        if "tdm_verbatim" in out.get("blocking", []):
+            out["details"]["tdm_verbatim"] = det.get("tdm_verbatim")
+            out["fix_hint"] = ("instruction.md / data files copy a passage of the paper's licensed full text verbatim "
+                               "(over the TDM quote limit): paraphrase it in your own words or remove it.")
         if "truth_isolation" in out.get("blocking", []):
             out["fix_hint"] = ("tests/measure.py must execute /app/output/solution_cli.py ONLY via "
                                "`from _metrics import run_solution, hidden_sets` (one call per hidden set dir); "

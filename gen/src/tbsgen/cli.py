@@ -13,13 +13,24 @@
   tbsgen reset   --run DIR --item ID --stage S5 [--regen]        re-activate an item at a stage (after a pipeline fix);
                                                                  --regen also forces S6A/S6C to regenerate files
   tbsgen fetch   --run DIR [--max N] [--channels a,b] [--no-browser] [--dry-run] [--status] [--finish-browser]
-                                                                 drain the S3 full-text queue (incl. the ego-browser
+                 [--only IDENT[,IDENT]]                          drain the S3 full-text queue (incl. the ego-browser
                                                                  channel; HTTP channels on fulltext.remote.host when
-                                                                 remote mode is on); fetched items go back to S3
+                                                                 remote mode is on); fetched items go back to S3.
+                                                                 --only: just these queue entries (DOI, arXiv id or
+                                                                 ident), due or not.  Exit 3: the remote host refused
+                                                                 the job (stats.remote_error; papers stay due)
   tbsgen fetch   --run DIR --browser [--wait-for-egress] [--max-wait S]
                                                                  one egress-gated, time-boxed browser batch (script,
                                                                  then a Hermes CLI agent); --wait-for-egress polls the
                                                                  browser egress and starts when it is allowed
+  tbsgen remote deploy --run DIR [--dry-run] [--force]          ship the local HEAD to fulltext.remote.code_dir (git
+                                                                 bundle + scp, fetch + checkout --detach, uv sync) and
+                                                                 check both code fingerprints
+  tbsgen remote status --run DIR                                 both sides' HEAD / fingerprint, remote jobs
+  tbsgen fulltext purge --run DIR --channel elsevier,wiley [--before YYYY-MM-DD] [--dry-run]
+                                                                 delete full texts (+ raw PDF/XML, + item copies in
+                                                                 this run) obtained via these channels; ledger rows
+                                                                 and provenance records are kept (TDM terms)
 Real model calls need budget.daily_usd_total in the config (or --budget-usd on ping).
 """
 from __future__ import annotations
@@ -49,7 +60,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser(prog="tbsgen")
     sub = ap.add_subparsers(dest="cmd", required=True)
     for name in ("ingest", "run", "resume", "status", "report", "ledger", "breaker", "calib-ingest", "ping", "reset",
-                 "harbor-local", "fetch"):
+                 "harbor-local", "fetch", "remote", "fulltext"):
         s = sub.add_parser(name)
         s.add_argument("--run", required=True)
         s.add_argument("--config", default=None)
@@ -73,7 +84,17 @@ def main(argv=None):
             s.add_argument("--item", required=True)
             s.add_argument("--stage", required=True)
             s.add_argument("--regen", action="store_true")
+        if name == "remote":
+            s.add_argument("action", choices=["deploy", "status"])
+            s.add_argument("--dry-run", action="store_true")
+            s.add_argument("--force", action="store_true", help="deploy even if a remote job is not collected")
+        if name == "fulltext":
+            s.add_argument("action", choices=["purge"])
+            s.add_argument("--channel", required=True, help="comma-separated, e.g. elsevier,wiley")
+            s.add_argument("--before", default=None, help="only texts fetched before this day (YYYY-MM-DD)")
+            s.add_argument("--dry-run", action="store_true")
         if name == "fetch":
+            s.add_argument("--only", default="", help="IDENT[,IDENT]: DOI, arXiv id or queue ident")
             s.add_argument("--max", type=int, default=10)
             s.add_argument("--channels", default="")
             s.add_argument("--no-browser", action="store_true")
@@ -93,6 +114,14 @@ def main(argv=None):
     P = _pipeline(a)
     if a.cmd == "fetch":
         return _fetch(P, a)
+    if a.cmd == "remote":
+        return _remote(P, a)
+    if a.cmd == "fulltext":
+        from . import fulltext
+        out = fulltext.purge(P.cfg, [x.strip() for x in a.channel.split(",") if x.strip()], before=a.before,
+                             dry_run=a.dry_run, runs=[Path(a.run)])
+        print(json.dumps(out, indent=1, ensure_ascii=False))
+        return 2 if out.get("error") else 0
     if a.cmd == "ingest":
         from .intake import load_candidates
         cs = load_candidates(__import__("pathlib").Path(a.candidates))
@@ -176,12 +205,33 @@ def _fetch(P: Pipeline, a) -> int:
         stats["requeued_from_items"] = readded
         print(json.dumps(stats, indent=1, ensure_ascii=False, default=str))
         return 2 if stats.get("refused") else 0
-    stats = fulltext.drain_queue(f, max_papers=a.max, channels=[x for x in a.channels.split(",") if x] or None,
+    only = [x.strip() for x in (getattr(a, "only", "") or "").split(",") if x.strip()] or None
+    stats = fulltext.drain_queue(f, max_papers=0 if only else a.max,
+                                 channels=[x for x in a.channels.split(",") if x] or None,
                                  browser=not a.no_browser, dry_run=a.dry_run, on_success=reactivate,
-                                 log=lambda s: print(s, file=sys.stderr))
+                                 log=lambda s: print(s, file=sys.stderr), only=only)
     stats["requeued_from_items"] = readded
     print(json.dumps(stats, indent=1, ensure_ascii=False))
+    if stats.get("remote_error"):
+        print(f"tbsgen fetch: remote job refused: {stats['remote_error']}", file=sys.stderr)
+        return 3
+    if only and stats.get("only_unmatched"):
+        print(f"tbsgen fetch: not in the queue: {', '.join(stats['only_unmatched'])}", file=sys.stderr)
+        return 4 if not stats.get("considered") else 0
     return 0
+
+
+def _remote(P: Pipeline, a) -> int:
+    from . import remote
+    f = P.fulltext_fetcher()
+    if a.action == "deploy":
+        out = remote.deploy(f, dry_run=a.dry_run, force=a.force, log=lambda s: print(s, file=sys.stderr))
+    else:
+        out = remote.status(f)
+    print(json.dumps(out, indent=1, ensure_ascii=False, default=str))
+    if a.action == "status":
+        return 0 if out.get("same_code") else 2
+    return 0 if out.get("ok") else 2
 
 
 def _ping(a):

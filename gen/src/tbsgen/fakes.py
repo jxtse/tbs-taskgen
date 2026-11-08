@@ -2,7 +2,9 @@
 (tests/fixtures/toy_task).  S6C reads the thresholds out of its prompt, the way a real model would, so the
 test file always matches S6B's measured thresholds.  Knobs let tests inject failures:
 
-    toy_script(fixture_dir, break_reference=False, leak_in_public=False, s6c_drop_exploit=False)
+    toy_script(fixture_dir, break_reference=False, leak_in_public=False, s6c_drop_exploit=False,
+               copy_source=None)
+copy_source: a passage S6C pastes into instruction.md (the TDM verbatim gate must block it; S8 removes it).
 """
 from __future__ import annotations
 
@@ -82,8 +84,11 @@ with open('/app/output/estimates.csv', 'w') as f:
 """
 
 
+COPY_MARK = "\n## Background (from the paper)\n"
+
+
 def toy_script(fx: Path, break_reference: bool = False, leak_in_public: bool = False,
-               s6c_drop_exploit: bool = False, repair_fixes: bool = True):
+               s6c_drop_exploit: bool = False, repair_fixes: bool = True, copy_source: str | None = None):
     fx = Path(fx)
     metrics_src = (fx / "metrics_src.py").read_text()
     state = {"s8": 0}
@@ -107,6 +112,8 @@ def toy_script(fx: Path, break_reference: bool = False, leak_in_public: bool = F
             m = re.search(r"Thresholds fixed from those measurements \(do not change them\): (\{.*?\})\n", user)
             thr = json.loads(m.group(1))
             files = {"tests/test_outputs.py": test_file(thr, metrics_src), "instruction.md": instruction(thr)}
+            if copy_source:
+                files["instruction.md"] += COPY_MARK + copy_source + "\n"
             if not s6c_drop_exploit:
                 files["baselines/exploit_first_point.py"] = EXPLOIT
             return "".join(f"=== FILE: {k} ===\n{v}" for k, v in files.items()) + "=== END ===\n"
@@ -114,6 +121,9 @@ def toy_script(fx: Path, break_reference: bool = False, leak_in_public: bool = F
             state["s8"] += 1
             if repair_fixes and "reference crashed" in user:
                 return "=== FILE: solution/solve.py ===\n" + (fx / "solution/solve.py").read_text() + "=== END ===\n"
+            if repair_fixes and "tdm_verbatim" in user:
+                m = re.search(r"=== FILE: instruction.md ===\n(.*?)(?==== FILE: |\Z)", user, re.S)
+                return "=== FILE: instruction.md ===\n" + m.group(1).split(COPY_MARK)[0] + "\n=== END ===\n"
             if repair_fixes and "meta.csv" in user:
                 g = (fx / "generator/generate.py").read_text()
                 return "=== FILE: generator/generate.py ===\n" + g + "=== END ===\n"
