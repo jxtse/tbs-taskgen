@@ -178,6 +178,20 @@ def test_partial_round_never_reschedules_a_refused_channel_away(tmp_path):
     assert drain(f, clock)["ok"] == 1                                  # oa is tried at once
 
 
+def test_explicit_channels_listing_every_http_channel_is_still_partial(tmp_path):
+    """`--channels cache,oa,elsevier,wiley,inst` leaves out browser: still a partial round, so elsevier's failure
+    records its backoff but does not push the entry back (a due browser channel keeps it due) (Codex r7)."""
+    f, net, led, clock = mkfetcher(tmp_path, {"api.elsevier.com": Resp(500, {}, b"", "u")}, SECRETS,
+                                   oa={"enabled": False})
+    qp = q(f, dict(doi="10.1016/j.p.1", title=TITLE))
+    drain(f, clock, channels=["cache", "oa", "elsevier", "wiley", "inst"])
+    e = entry(qp, "10.1016/j.p.1")
+    assert e["chan_backoff"]["elsevier"]["tries"] == 1 and float(e.get("next_try") or 0) <= clock.t
+    drain(f, clock)                                                    # a full round does reschedule
+    e = entry(qp, "10.1016/j.p.1")
+    assert e["chan_backoff"]["elsevier"]["tries"] == 1 and float(e["next_try"]) > clock.t
+
+
 def test_real_failure_still_backs_off(tmp_path):
     f, net, led, clock = mkfetcher(tmp_path, {"api.elsevier.com": Resp(500, {}, b"err", "u")}, SECRETS,
                                    oa={"enabled": False})

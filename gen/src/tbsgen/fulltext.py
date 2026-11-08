@@ -1284,8 +1284,10 @@ def _requeue(e: dict, now: float, backoff: float, was_limited: bool, until: floa
     channel holds any such state (no channel applies at all) does the paper itself back off.  `tries` counts the
     rounds in which a request was really sent and failed (informational).
 
-    `partial`: the round tried only some channels (`tbsgen fetch --channels`).  It records the backoff of the
-    channels it tried but never reschedules the entry: only a full round knows every channel's state."""
+    `partial`: the round did not cover every applicable channel (any explicit `tbsgen fetch --channels`, or a
+    collected remote result whose job scope was narrower than the entry's HTTP channels).  It records the backoff
+    of the channels it really tried but never reschedules the entry and never pushes back a channel it did not
+    try: only a full round knows every channel's state."""
     if not same_version:
         # updated meanwhile (a new link / subscriber; enqueue reset the channel backoff): stay due, and do not
         # bring an old link's backoff back
@@ -1394,8 +1396,22 @@ def _drain_locked(fetcher, qp, now, max_papers, channels, browser, dry_run, on_s
     limited: dict[str, float | None] = {}          # refused by the ledger / egress: due again at `until`
     chan_failed: dict[str, set[str]] = {}          # channels that made a request and got nothing
     backoff_only: set[str] = set()                 # nothing refused, every applicable channel still backing off
-    full = [ch for ch in (fetcher.ft.get("cascade") or CHANNELS) if ch in CHANNELS and ch != "browser"]
-    partial = bool(channels) and not set(full) <= set(channels)    # --channels left out a channel of the cascade
+    # A round is PARTIAL for an entry when it did not cover every channel that applies to it: any explicit
+    # `--channels`, or a remote result collected from a job whose channel scope was narrower than the entry's
+    # applicable HTTP channels (e.g. an older `--channels elsevier` job collected now; unknown scope counts as
+    # narrower).  A partial round records the backoff of the channels it really tried but never reschedules the
+    # entry or pushes back a channel it did not try (_requeue).
+    def is_partial(e: dict) -> bool:
+        if channels:
+            return True
+        r = fetcher.remote_results.get(paper_ident(e)) if fetcher.remote_mode() else None
+        if r is None:
+            return False
+        from .remote import HTTP_CHANNELS
+        doi = norm_doi(e.get("doi"))
+        need = {ch for ch in (fetcher.ft.get("cascade") or CHANNELS)
+                if ch in HTTP_CHANNELS and fetcher.channel_applies(ch, doi)}
+        return r.get("channels") is None or not need <= set(r["channels"])
     if fetcher.remote_mode():
         # the HTTP channels of every due paper run as one job on the remote host; results feed the cascade
         from . import remote
@@ -1491,6 +1507,7 @@ def _drain_locked(fetcher, qp, now, max_papers, channels, browser, dry_run, on_s
             fetcher._space_held = False
             fcntl.flock(space_fh, fcntl.LOCK_UN)
             space_fh.close()
+    partial = {_entry_key(e) for e in todo if is_partial(e)}
     with queue_lock(qp):
         q = read_queue(qp)
         keep = []
@@ -1508,7 +1525,7 @@ def _drain_locked(fetcher, qp, now, max_papers, channels, browser, dry_run, on_s
                 else:
                     _requeue(e, now, backoff, k in limited, limited.get(k), chan_failed.get(k) or set(),
                              same_version=int(e.get("ver") or 0) == vers.get(k, 0), backoff_only=k in backoff_only,
-                             partial=partial)
+                             partial=k in partial)
             keep.append(e)
         write_queue(qp, keep)
         stats["remaining"] = len(keep)

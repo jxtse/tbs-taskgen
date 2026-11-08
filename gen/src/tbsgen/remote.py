@@ -492,11 +492,12 @@ def _run_job_locked(fetcher, entries, channels, run, log, poll_s, sleep, max_pol
     now = led.clock()
     # the job file is written before the lease, so a crash right after leasing is still visible
     _atomic(_job_state(fetcher.cfg, job), json.dumps(dict(job=job, stage="leasing", created=now, n=len(entries),
+                                                          channels=channels,
                                                           idents=[paper_ident(e) for e in entries])))
     snap = lease_and_snapshot(led, job, lease_n, now)
     spec = remote_spec(fetcher, job, entries, channels, lease_n, snap, now)
     _atomic(_job_state(fetcher.cfg, job), json.dumps(dict(job=job, stage="leased", created=now, n=len(entries),
-                                                          lease_n=lease_n,
+                                                          lease_n=lease_n, channels=channels,
                                                           idents=[paper_ident(e) for e in entries])))
     names = secret_names(fetcher.ft, channels)
     secrets = load_secrets(fetcher, names)
@@ -572,7 +573,7 @@ def collect(fetcher, job: str, run, *, log=print, poll_s: float = 15.0, sleep=ti
     rc, so, se = run(_remote_cmd(rcfg, "export", rcfg["workdir"], job), b"", 600)
     if rc != 0:
         return dict(job=job, stage=js.get("stage"), error=f"export failed rc={rc}")
-    res = import_export(fetcher, job, so)
+    res = import_export(fetcher, job, so, channels=js.get("channels"))
     _set_stage(fetcher.cfg, job, "collected", merged=res["merged"], n_results=len(res["results"]))
     run(_remote_cmd(rcfg, "cleanup", rcfg["workdir"], job), b"", 60)
     log(json.dumps(dict(remote_job=job, collected=len(res["results"]), ok=sum(r["ok"] for r in res["results"].values()),
@@ -580,7 +581,7 @@ def collect(fetcher, job: str, run, *, log=print, poll_s: float = 15.0, sleep=ti
     return dict(job=job, stage="collected", results=res["results"], merged=res["merged"], status=status)
 
 
-def import_export(fetcher, job: str, blob: bytes) -> dict:
+def import_export(fetcher, job: str, blob: bytes, channels: list[str] | None = None) -> dict:
     """Unpack the export tar (only regular files under results/ and cache/, plus ledger.json), save texts to the
     local write cache, merge ledger rows.  Returns {results: {ident: dict(ok, text, rec)}, merged}."""
     files: dict[str, bytes] = {}
@@ -613,7 +614,9 @@ def import_export(fetcher, job: str, blob: bytes) -> dict:
             from .fulltext import norm_doi
             fetcher.ledger.mark_not_entitled(ch, norm_doi(doi), f"remote:{job}")
         results[r["ident"]] = dict(ok=text is not None, text=text, rec=rec,
-                                   entry_ver=int((r.get("entry") or {}).get("ver") or 0))
+                                   entry_ver=int((r.get("entry") or {}).get("ver") or 0),
+                                   # the job's channel scope (None: unknown, e.g. a job file of an older version)
+                                   channels=list(channels) if channels is not None else None)
     rows = json.loads(files.get("ledger.json", b"{}"))
     merged = merge_rows(fetcher.ledger, job, rows)
     return dict(results=results, merged=merged)
