@@ -79,12 +79,14 @@ def _exec(cfg: dict, inp: dict, timeout: float, cancel=None) -> dict:
     exe = binary(cfg)
     if not exe:
         return dict(status="unavailable", error="ego-browser binary not found (fulltext.browser.binary)")
-    p = subprocess.Popen([exe, "nodejs"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                         text=True, env=child_env())
+    # the script goes in as an argument: a stdin pipe is only written during the first communicate() call,
+    # so a script larger than the pipe buffer would hang a child that is slow to start reading
+    p = subprocess.Popen([exe, "nodejs", render(inp)], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                         stderr=subprocess.PIPE, text=True, env=child_env())
     t_end = time.monotonic() + timeout
     so = se = ""
     try:
-        so, se = p.communicate(render(inp), timeout=min(1.0, timeout))
+        so, se = p.communicate(timeout=min(1.0, timeout))
     except subprocess.TimeoutExpired:
         while True:
             if cancel is not None and cancel.is_set():

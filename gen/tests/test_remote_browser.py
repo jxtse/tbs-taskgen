@@ -658,22 +658,61 @@ def test_validation_failure_is_not_success(tmp_path, monkeypatch):
 # ---- agent phase with a fake `hermes` executable and a fake `ego-browser`
 FAKE_EGO = r"""#!{py}
 import json, os, re, sys, time
-code = sys.stdin.read()
+# the action scripts are passed as an argument (like `ego-browser nodejs <script>`)
+code = sys.argv[2] if len(sys.argv) > 2 else sys.stdin.read()
 m = re.match(r"const INPUT = (\{.*?\});\n", code)
 inp = json.loads(m.group(1)) if m else {}
 mode = "{ego_mode}"
 log = "{ego_log}"
 if log:
-    open(log, "a").write(json.dumps({"action": inp.get("action"), "arg": inp.get("arg"), "space": inp.get("space")}) + "\n")
+    open(log, "a").write(json.dumps({"action": inp.get("action"), "arg": inp.get("arg"),
+                                     "space": inp.get("space"), "ts": time.time(),
+                                     "handoff": (inp.get("handoff") or {}).get("enabled"),
+                                     "sso_login": (inp.get("sso") or {}).get("login")}) + "\n")
 out = {"status": "ok", "files": []}
-if inp.get("action") == "open":
+if inp.get("action") == "handoff_status":
+    n_status = sum(1 for l in open(log) if '"action": "handoff_status"' in l)
+    if mode == "handoff_wait":
+        # the user has not returned control yet; the second poll sees the page cleared
+        out = {"status": "ok", "handoff_check": "cleared" if n_status >= 2 else "waiting",
+               "handoff_left_s": 99, "page": {"url": "https://pub.example/a", "title": "A"}}
+    elif mode == "handoff_stuck":
+        # the user cannot clear it: the poll still sees the challenge and keeps waiting
+        out = {"status": "ok", "handoff_check": "waiting", "handoff_left_s": 99,
+               "page": {"url": "https://pub.example/a", "title": "Just a moment"}}
+    else:
+        out = {"status": "ok", "handoff_check": "none"}
+elif inp.get("action") == "sso_login":
+    if mode == "sso_ok":
+        out = {"status": "ok", "sso": "ok", "page": {"url": "https://pub.example/a"}}
+    elif mode == "sso_fail":
+        out = {"status": "ok", "sso": "fail", "page": {"url": "https://sso.example/login", "login_form": True}}
+    else:
+        out = {"status": "refused", "error": "sso_login is not enabled for this batch"}
+elif inp.get("action") == "screenshot" and mode == "shot":
+    f = os.path.join(inp["files_dir"], "shot-1-1.png")
+    open(f, "wb").write(b"\x89PNG fake")
+    out = {"status": "ok", "shot": f}
+elif inp.get("action") == "open":
+    n_status = sum(1 for l in open(log) if '"action": "handoff_status"' in l)
     if mode == "challenge":
         out["blocked"] = "verification page: Just a moment"
+    elif mode in ("handoff", "handoff_wait", "handoff_stuck"):
+        if mode == "handoff" and not (inp.get("handoff") or {}).get("enabled"):
+            out["blocked"] = "verification page: Just a moment"   # no hand-off budget: the old blocked path
+        elif mode == "handoff_stuck" and n_status >= 1:
+            out["blocked"] = "verification page: Just a moment"   # the user cannot clear it
+        elif n_status < 2:
+            out = {"status": "handoff", "handoff": {"reason": "challenge: Just a moment", "host": "pub.example"}}
+        else:                                                     # the user cleared the page
+            f = os.path.join(inp["files_dir"], "dl.bin")
+            open(f, "wb").write(b"%PDF-1.7 fake")
+            out["files"] = [f]
     elif mode == "slow":
         time.sleep(30)
     else:
         f = os.path.join(inp["files_dir"], "dl.bin")
-        open(f, "wb").write(b"%PDF-1.7 fake" if mode == "pdf" else b"<html>login</html>")
+        open(f, "wb").write(b"%PDF-1.7 fake" if mode in ("pdf", "handoff_wait", "handoff_stuck") else b"<html>login</html>")
         out["files"] = [f]
         if mode == "rejected":                   # a refused PDF whose deletion did not happen
             open(f, "wb").write(b"%PDF-1.7 fake")
@@ -704,6 +743,35 @@ if mode == "work":
     for n in (1, 2):
         tool(f"tbsgen-browser {n} open https://doi.org/10.1080/x")
     tool("tbsgen-browser finish")
+elif mode == "navs":                              # many navigations of one paper (nav cap / pacing)
+    for _ in range(4):
+        tool("tbsgen-browser 1 open https://doi.org/10.1080/x")
+    tool("tbsgen-browser finish")
+elif mode == "handoff":                           # a challenge is handed to the user, then cleared
+    for n in (1, 2):
+        tool(f"tbsgen-browser {n} open https://doi.org/10.1080/x")
+        tool(f"tbsgen-browser {n} handoff_status")
+        tool(f"tbsgen-browser {n} handoff_status")
+        tool(f"tbsgen-browser {n} open https://doi.org/10.1080/x")
+    tool("tbsgen-browser finish")
+elif mode == "type":                               # removed form-field actions: blocked by the hook
+    tool("tbsgen-browser 1 type 4 Nanjing University")
+    tool("tbsgen-browser 1 select 2 Nanjing University")
+    tool("tbsgen-browser 1 type 4 x;env")                 # blocked by the hook (shell metacharacter)
+    tool("tbsgen-browser 1 open https://doi.org/10.1080/x")
+    tool("tbsgen-browser finish")
+elif mode == "handoff_timeout":                   # the user never finishes
+    tool("tbsgen-browser 1 open https://doi.org/10.1080/x")
+    time.sleep(0.3)
+    tool("tbsgen-browser 1 handoff_status")
+    tool("tbsgen-browser finish")
+elif mode == "sso":                               # an SSO login per paper
+    for n in (1, 2):
+        tool(f"tbsgen-browser {n} sso_login")
+    tool("tbsgen-browser finish")
+elif mode == "shot":                              # a screenshot instead of a download
+    tool("tbsgen-browser 1 screenshot")
+    tool("tbsgen-browser finish")
 elif mode == "curl":
     tool("touch " + os.environ["FAKE_MARKER"])
     tool("curl -s https://sci-hub.example/10.1/x")
@@ -715,7 +783,8 @@ print(json.dumps({"type": "result", "exit_code": 0, "text": "1: saved\n2: saved"
 """
 
 
-def mk_agent(tmp_path, monkeypatch, hermes_mode="work", ego_mode="pdf", **bb):
+def mk_agent(tmp_path, monkeypatch, hermes_mode="work", ego_mode="pdf", queue=None, agent=None,
+             handoff=None, sso=None, sso_login=None, **bb):
     bin_dir = tmp_path / "fakebin"
     bin_dir.mkdir()
     ego = bin_dir / "ego-real"
@@ -732,17 +801,27 @@ def mk_agent(tmp_path, monkeypatch, hermes_mode="work", ego_mode="pdf", **bb):
     monkeypatch.setenv("ELSEVIER_API_KEY", "k-should-not-leak")
     monkeypatch.setattr(browser_agent.browser_ego, "ENV_ALLOW", browser_agent.browser_ego.ENV_ALLOW + (
         "FAKE_HERMES_MODE", "FAKE_HERMES_ARGS", "FAKE_MARKER", "FAKE_EGO_LOG"))
-    cfg = mkcfg(tmp_path, egress_check=dict(EC),
-                browser={"enabled": True, "batch_only": True, "binary": str(ego),
-                         "batch": dict({"window_s": 600, "margin_s": 60, "poll_s": 5, "recheck_s": 3600,
-                                        "probe_host_gap_s": 0, "require_http_first": False}, **bb),
-                         "agent": {"enabled": True, "hermes_bin": str(herm), "provider": "prov-x", "model": "model-y",
-                                   "provider_config": {"api": "http://127.0.0.1:9/v1", "api_key": "SECRET-K"},
-                                   "max_turns": 7, "run_budget_s": 30, "call_timeout_s": 20}})
+    browser = {"enabled": True, "batch_only": True, "binary": str(ego),
+               "batch": dict({"window_s": 600, "margin_s": 60, "poll_s": 5, "recheck_s": 3600,
+                              "probe_host_gap_s": 0, "require_http_first": False}, **bb),
+               "agent": dict({"enabled": True, "hermes_bin": str(herm), "provider": "prov-x", "model": "model-y",
+                              "provider_config": {"api": "http://127.0.0.1:9/v1", "api_key": "SECRET-K"},
+                              "max_turns": 7, "run_budget_s": 30, "call_timeout_s": 20},
+                             **(agent or {}))}
+    for k, v in (("handoff", handoff), ("sso", sso), ("sso_login", sso_login)):
+        if v is not None:
+            browser[k] = v
+    cfg = mkcfg(tmp_path, egress_check=dict(EC), browser=browser)
     led = DownloadLedger(cfg["fulltext"]["ledger_path"], cfg["fulltext"]["limits"], cfg["fulltext"]["global_limits"],
                          cfg["fulltext"]["host_caps"])
-    bqueue(cfg, {"10.1080": 1, "10.1093": 1})
-    run, calls = script_runner(tmp_path, results={"10.1080/paper.1": "html", "10.1093/paper.2": "html"})
+    dois = []
+    i = 0
+    for pre, n in (queue if queue is not None else {"10.1080": 1, "10.1093": 1}).items():
+        for _ in range(n):
+            i += 1
+            dois.append(f"{pre}/paper.{i}")
+    bqueue(cfg, queue if queue is not None else {"10.1080": 1, "10.1093": 1})
+    run, calls = script_runner(tmp_path, results={d: "html" for d in dois})   # the script fails them all
     f = Fetcher(cfg, ledger=led, transport=FakeNet({}), browser_runner=run)
     pr = browser_agent.Prober(f.ft, probe_fn=Seq(TRACE_OK), sleep=lambda s: None)
     return f, led, pr, calls
@@ -757,7 +836,7 @@ def test_agent_fallback_saves_validated_files(tmp_path, monkeypatch):
     args = got["argv"]
     assert args[:2] == ["chat", "--query-file"] and "--oneshot" in args and "--accept-hooks" in args
     assert args[args.index("--provider") + 1] == "prov-x" and args[args.index("-m") + 1] == "model-y"
-    assert args[args.index("--max-turns") + 1] == "7" and args[args.index("-t") + 1] == "terminal"
+    assert args[args.index("--max-turns") + 1] == "7" and args[args.index("-t") + 1] == "terminal,vision"
     assert int(args[args.index("--run-budget") + 1]) <= 30
     assert "ELSEVIER_API_KEY" not in got["env"]                # the agent's process gets no credentials
     assert got["home"] and "hermes-home" in got["home"]       # isolated Hermes home with the hook
@@ -770,7 +849,9 @@ def test_agent_fallback_saves_validated_files(tmp_path, monkeypatch):
     usage = (fulltext.queue_path(f.cfg).with_name(fulltext.queue_path(f.cfg).name + ".browser") / "usage.jsonl")
     assert json.loads(usage.read_text().splitlines()[-1])["model"] == "model-y"
     ego_log = [json.loads(x) for x in (tmp_path / "ego.log").read_text().splitlines()]
-    assert {e["space"] for e in ego_log} == {f.ft["browser"]["space"] + "-agent"}
+    base = f.ft["browser"]["space"] + "-agent"
+    # one TaskSpace per paper (a hand-off pauses one paper only) + the base space closed by `finish`
+    assert {e["space"] for e in ego_log} == {f"{base}-p1", f"{base}-p2", base}
 
 
 def test_agent_isolated_home_has_no_api_key(tmp_path, monkeypatch):

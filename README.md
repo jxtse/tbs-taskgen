@@ -331,18 +331,89 @@ uv run tbsgen fetch --run runs/R --config config.toml --browser --wait-for-egres
 - Each paper is first tried with the reviewed script. With `browser.agent.enabled`, the papers the script could
   not get go to one Hermes CLI run (`hermes chat --oneshot`, `agent.provider` / `model` / `max_turns` /
   `run_budget_s`) with a prompt generated from [`browser_agent_prompt.md`](gen/src/tbsgen/browser_agent_prompt.md).
-  The agent writes no browser code. Its only tool is `tbsgen-browser N look | open URL | click I | save_pdf` (and
-  `finish`), each call running the reviewed action script
-  [`browser_agent_action.mjs`](gen/src/tbsgen/browser_agent_action.mjs): the paper is booked in the ledger before
-  its first call; only the paper's publisher domains are opened or clicked; nothing is typed; verification pages,
-  verification widgets and login forms are never interacted with; a bot wall cools the publisher at once.
-  Known limit: URLs, links and form targets are checked before the request, but a cross-domain navigation that
-  the page itself starts (script or HTTP redirect) cannot be intercepted with the browser SDK; such a page is
-  reset to about:blank as soon as it lands and reported, and nothing from it is saved. The run
-  uses an isolated Hermes home (no user memory, rules, plugins or credentials) whose `pre_tool_call` hook blocks
-  every other command before it runs; repeated attempts end the run. Saved files are validated and booked by
-  code; the agent's own report is not used. Papers cut by an egress change or the window's end stay queued
-  without backoff. Model usage per run is appended to `<queue>.browser/usage.jsonl`.
+  The agent writes no browser code. Its only tool is `tbsgen-browser N <action>` (plus `vision_analyze` for the
+  batch's own screenshots), each call running the reviewed action script
+  [`browser_agent_action.mjs`](gen/src/tbsgen/browser_agent_action.mjs) in a TaskSpace of its own per paper.
+
+  | Action | What it does |
+  |---|---|
+  | `look [full] [@REF] [OFFSET]` | page summary: URL (no query), title, PDF? verification page? login form?, text excerpt, numbered links / buttons / fields of the page, same-origin iframes and (via the ego page snapshot) cross-origin iframes; `full` whole page, `@REF` one subtree |
+  | `open URL` | navigate (allowed domains only) |
+  | `click I` | click item I (also inside same-origin iframes and links inside cross-origin iframes; a button inside a cross-origin iframe after opening the frame item; `_blank` links by a native click, new tabs tracked) |
+  | `click_xy X Y` | native click at viewport coordinates (the element there is checked first) |
+  | `hover I` | native pointer onto item I (dropdown menus) |
+  | `scroll up\|down [PX]` | scroll (wheel fallback) |
+  | `select I VALUE` / `type I TEXT` | choose an option / type text (never into password, one-time-code, account or e-mail fields) |
+  | `screenshot` | PNG of the viewport with every field masked; the agent views it with `vision_analyze` |
+  | `tabs` / `switch LABEL` | list / select the paper's pages (never your own tabs) |
+  | `back` | one history step, same-origin and allowed host only |
+  | `wait_for url\|sel ...` | wait for a URL / selector (<= 60 s) |
+  | `save_pdf` | save the current PDF page |
+  | `sso_login` | on `browser.sso_login.domains`: press Login on the browser-autofilled form (values never read; at most `max_submissions` per batch, counted before the click, no retry after a failure) |
+  | `handoff_status` / `finish` | poll a hand-off / close the workspaces |
+
+  Hard rules, enforced in code:
+  - **credential values never reach the model, logs or anything outside the browser**: field values are never
+    read in the page; the ego page snapshot is reduced inside the action script before use (every field's text
+    is dropped); screenshots mask every field and are refused on login pages and on pages with fields the mask
+    cannot reach (cross-origin frames, closed shadow roots); `type` / `select` refuse credential fields; every
+    URL in the tool's output and in the agent's stderr loses its userinfo, query and fragment; stderr records
+    with credential-like keys are dropped;
+  - **no automatic CAPTCHA / Cloudflare / Turnstile solving**: verification pages and widgets are never clicked;
+    with `browser.handoff.enabled` they are handed to you (macOS notification, optional `handoff.bark_cmd`);
+  - **navigation stays inside the paper's `allowed_domains`** (publisher, `doi.org`, PDF CDNs,
+    `browser.sso.domains`, `browser.sso_login.domains`): `open`, link / form / frame targets, `back` and
+    downloads are checked before the request, and a page that ends up outside (redirect) is reset to
+    about:blank as soon as it lands;
+  - **files are validated and booked by code**, never by the agent's report; screenshots are never deliverables;
+  - budgets: at most `agent.max_calls_per_paper` (25) calls and `agent.max_navigations_per_paper` (12)
+    page-changing calls per paper, page loads of one publisher `agent.nav_gap_s` (2.5 s) apart; one hand-off per
+    paper and per publisher per batch; a hand-off that is not cleared in time (or whose call lost its result)
+    closes the paper and cools the publisher; budgets are reserved under a lock before the action script runs.
+  - On pages with a login signal (password / one-time-code / account fields, autofill, login wording, SAML
+    hand-back) `click`, `click_xy`, `hover`, `select` and `type` are refused; only `sso_login` (on the SSO
+    domain) or the hand-off act there.
+
+  The run uses an isolated Hermes home (no user memory, rules, plugins or credentials; only Hermes' own
+  dependency environments, `installs/`, are linked from your Hermes data root so the CLI can start, or from
+  `agent.hermes_installs_dir`) whose `pre_tool_call` hook blocks every other command before it runs; repeated
+  attempts end the run. The agent's stderr is kept (tail, credential-like strings masked; a multi-line record,
+  such as a traceback, a JSON object or a multi-line value, with a credential-like field is dropped whole, and
+  after a sensitive value whose end cannot be known the rest is dropped) in the batch directory
+  as `agent-stderr.log` and in the `agent_end` log event. Saved files are validated and booked by code; the
+  agent's own report is not used. Papers cut by an egress change or the window's end stay queued without
+  backoff. Model usage per run is appended to `<queue>.browser/usage.jsonl`.
+
+  Known limitations (residual risk of the full action set, accepted by design):
+  - a cross-domain navigation the page itself starts (script or HTTP redirect) cannot be intercepted with the
+    browser SDK; it is reset only after it lands (nothing from it is saved);
+  - `click_xy`, native clicks on `_blank` links and actions inside cross-origin iframes act through the browser's
+    hit-testing / snapshot refs: the element is checked right before, but a page can move content between the
+    check and the native event;
+  - a click / submit handler of an allowed page can still do anything after the checks (e.g. `fetch`, rewrite a
+    form); form submissions to allowed hosts are allowed;
+  - login detection is heuristic; a page it misses is still protected by the field rules (`type` refuses
+    credential fields, values are never read), not by the hand-off;
+  - `sso_login` presses the autofilled Login button after checking the form posts (POST) to an SSO login
+    domain; the page's own handlers could change the target after that check (it then counts as a failed
+    login and is not retried);
+  - the ego SDK returns the page snapshot (used for `look` items inside cross-origin frames and for the screenshot
+    field check) only as full text to the action script's Node process: it is reduced line by line inside one
+    function and never returned, printed or logged, but the raw text does exist briefly in that local process;
+  - not run end to end on real publisher or institution sites yet.
+
+```toml
+[fulltext.browser.handoff]
+enabled = true                 # hand verification / login pages to the person at this machine
+[fulltext.browser.sso]
+domains = ["carsi.edu.cn", "openathens.net", "shibboleth.net"]   # institution / WAYF
+[fulltext.browser.sso_login]
+enabled = true
+domains = ["login.example.edu"]   # the institution's own login host (HTTPS); autofill-only login
+max_submissions = 2
+[fulltext.browser.agent]
+enabled = true
+```
 
 Terms: use only content your own subscriptions and API licences allow. No channel bypasses access control.
 
@@ -486,10 +557,13 @@ Research code under active development.
 **Tests** (run by [GitHub Actions CI](.github/workflows/ci.yml) on every push to `main` and every pull request)
 
 - `retrieval/`: 47 offline unit tests that replay recorded API responses.
-- `gen/`: 156 tests: 140 unit tests (17 of them for the Jev screen and 70 for the S3 full-text channels, using
-  recorded and scripted responses; no network, no browser) and 16 integration tests that run task code in Docker. Locally
-  they are skipped when Docker or the sandbox image is missing; CI builds the image and fails if
-  any of them is skipped.
+- `gen/`: 269 tests: 238 offline unit tests (18 for the Jev screen, 6 for the S2 publisher blocklist and 161 for
+  the S3 full-text channels and browser batches, using recorded and scripted responses and fake `ego-browser` /
+  `hermes` executables; no network, no real browser or model), 16 integration tests that run task code in
+  Docker, and 15 live tests of the browser agent's action script against local pages in a real ego-browser
+  (no website is contacted; skipped where ego-browser is not installed, as in CI). Locally the integration
+  tests are skipped when Docker or the sandbox image is missing; CI builds the image and fails if any of them
+  is skipped.
 - Fake-model dry run: S1 → S10 on a synthetic toy task, including the mechanical gates and
   simulated calibration results.
 
@@ -525,7 +599,9 @@ Research code under active development.
   file-format and interactive task forms are not implemented.
 - The expert-time estimate in `task.toml` is the teacher model's own estimate.
 - The S3 publisher channels (TDM APIs, institution IP, browser) are off by default and need your own licences;
-  their tests use recorded or scripted responses only.
+  their offline tests use recorded or scripted responses only. The browser agent's exploration actions,
+  hand-off and institution sign-in are tested against local pages only; on real publisher and institution
+  sites they have not been run end to end yet; see "Known limitations" of the browser agent above.
 - Automatic S9 job submission needs your own Harbor launch scripts (`calib.*_launcher`).
 
 ## Repository layout

@@ -30,6 +30,7 @@ secure-access VPN client is paused for 10 minutes), a batch is sized to fit the 
 from __future__ import annotations
 
 import contextlib
+import inspect
 import json
 import os
 import re
@@ -43,6 +44,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import urlparse
 from typing import Callable
 
 from . import browser_ego
@@ -220,10 +222,11 @@ def allowed_domains(doi: str, landing: str | None, extra: list[str]) -> list[str
 
 # ------------------------------------------------------------------------------------------- agent tools
 # The agent never runs browser code of its own.  Its only browser tool is `tbsgen-browser` (a generated
-# executable first on PATH): `tbsgen-browser N look|open URL|click I|save_pdf` and `tbsgen-browser finish`.  Each
-# call runs the reviewed action script browser_agent_action.mjs with one injected INPUT line.  The Hermes run
-# itself uses an isolated Hermes home whose pre_tool_call hook (hook_main) allows only `tbsgen-browser ...` and
-# `sleep N` terminal commands *before* they run; anything else is blocked (and the stream watcher kills the run).
+# executable first on PATH): `tbsgen-browser N <action> [arg]` and `tbsgen-browser finish`.  Each call runs
+# the reviewed action script browser_agent_action.mjs with one injected INPUT line.  The Hermes run itself
+# uses an isolated Hermes home whose pre_tool_call hook (hook_main) allows only `tbsgen-browser ...` and
+# `sleep N` terminal commands *before* they run; anything else (every other tool too) is blocked (and the
+# stream watcher kills the run).
 ACTION = Path(__file__).with_name("browser_agent_action.mjs")
 TOOL = r"""#!{python}
 # tbsgen browser batch tool (generated; removed with the batch directory)
@@ -232,9 +235,37 @@ sys.path.insert(0, {pkg_parent!r})
 from tbsgen.browser_agent import {fn}
 sys.exit({fn}({batch_dir!r}, sys.argv[1:]))
 """
-_TOOL_CMD = re.compile(r"^tbsgen-browser (finish|[1-9]\d? (look|save_pdf|click \d{1,3}|open https?://[^\s'\"`$;&|<>\\]+))$")
+# One-token shapes (no quotes, shell metachars or newlines ever reach a shell: the hook matches the whole
+# command against these patterns and the wrapper re-parses argv).
+# (also no glob characters other than "?", which cannot match: a URL word contains "://")
+_SAFE_TOK = r"[^\s'\"`$;&|<>\\*\[\]{}!()]{1,200}"
+# type / select text: no quotes / parentheses / shell metacharacters (the shell must pass it as is)
+# (other characters, e.g. ' or &, are written percent-encoded - %27, %26 - and decoded by the wrapper)
+_SAFE_TXT = r"[A-Za-z0-9 ,.@+%\-_/:\u00c0-\u024f\u4e00-\u9fff]{1,80}"
+_PAPER_ACTIONS = "|".join((
+    r"look( full)?( @\d{1,5})?( \d{1,4})?",
+    r"open https?://" + _SAFE_TOK,
+    r"click \d{1,3}",
+    r"click_xy \d{1,4} \d{1,4}",
+    r"hover \d{1,3}",
+    r"scroll (up|down)( \d{1,4})?",
+    r"select \d{1,3} " + _SAFE_TXT,
+    r"type \d{1,3} " + _SAFE_TXT,
+    "screenshot", "tabs", "back",
+    r"switch [A-Za-z0-9_.-]{1,24}",
+    # the pattern never starts with '#' (a shell comment) and has no glob / quote characters
+    r"wait_for url [A-Za-z0-9/._%=:-]{1,200}( \d{1,3})?",
+    r"wait_for sel [A-Za-z][A-Za-z0-9_.#:-]{0,100}( \d{1,3})?",
+    "save_pdf", "sso_login", "handoff_status",
+))
+_TOOL_CMD = re.compile(rf"^tbsgen-browser (finish|[1-9]\d? ({_PAPER_ACTIONS}))$")
 _SLEEP_CMD = re.compile(r"^sleep ([1-9]\d?|[12]\d\d|300)$")
 DENY_TEXT = re.compile(r"sci-?hub|libgen|z-lib|annas-archive", re.I)
+# actions that may load a page or request a file: navigation budget, per-publisher lock and pacing
+# (hover / select / type / scroll can trigger a navigation from the page's handlers: paced like one)
+NAV_ACTIONS = frozenset({"open", "click", "click_xy", "hover", "scroll", "select", "type", "back", "sso_login",
+                         "save_pdf"})
+VISION_TOOL = "vision_analyze"
 
 
 def shell_allowed(cmd) -> str | None:
@@ -250,6 +281,22 @@ def shell_allowed(cmd) -> str | None:
     return None
 
 
+def _vision_allowed(batch_dir: str, inp: dict) -> str | None:
+    """None if a vision_analyze call may run: only screenshots this batch saved (shot-*.png in its files dir)."""
+    url = inp.get("image_url")
+    if not isinstance(url, str) or not url:
+        return "vision: image_url is required"
+    try:
+        root = (Path(batch_dir) / "files").resolve()
+        pth = Path(url).resolve()
+        pth.relative_to(root)
+    except (OSError, ValueError):
+        return "vision: only screenshots inside this batch's files directory may be viewed"
+    if not re.fullmatch(r"shot-[0-9-]{1,40}\.png", pth.name) or not pth.is_file():
+        return "vision: only screenshots saved by `screenshot` may be viewed"
+    return None
+
+
 def hook_main(batch_dir: str, argv: list[str]) -> int:
     """Hermes pre_tool_call hook: stdin {tool_name, tool_input}; prints a block decision unless allowed."""
     try:
@@ -257,7 +304,9 @@ def hook_main(batch_dir: str, argv: list[str]) -> int:
     except ValueError:
         d = {}
     name, inp = d.get("tool_name"), d.get("tool_input") or {}
-    if name != "terminal":
+    if name == VISION_TOOL:
+        why = _vision_allowed(batch_dir, inp)
+    elif name != "terminal":
         why = f"tool {name} is not available in this batch"
     elif inp.get("background") or inp.get("pty"):
         why = "background / pty terminals are not available"
@@ -278,10 +327,185 @@ def _cool_publisher(led, ps: dict, doi: str, why: str, secs: float):
         led.block(h, f"browser agent: {why}"[:200], seconds=secs, channel="browser" if h == ps["lkey"] else None)
 
 
+def _read_state(bd: Path) -> dict:
+    """Batch-shared wrapper state: navigation pacing per publisher, one hand-off per publisher, and the TaskSpaces the batch created (one per paper, closed by `finish`)."""
+    try:
+        return json.loads((bd / "state.json").read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def _write_state(bd: Path, state: dict):
+    _atomic(bd / "state.json", json.dumps(state))
+
+
+def _notify_user(st: dict, msg: str):
+    """A local macOS notification (and an optional local Bark command, off by default; never group chats)."""
+    if not st.get("handoff_notify", True):
+        return
+    with contextlib.suppress(Exception):
+        subprocess.run(["osascript", "-e",
+                        f'display notification {json.dumps(msg[:200], ensure_ascii=False)} with title '
+                        f'{json.dumps("tbsgen 浏览器批次", ensure_ascii=False)}'],
+                       timeout=10, check=False)
+    for cmd in st.get("bark_cmd") or []:
+        with contextlib.suppress(Exception):
+            subprocess.run(list(cmd) + [msg[:200]], timeout=10, check=False)
+
+
+def _run_script(st: dict, inp: dict, timeout: float, bd: Path, honor_stop: bool = True) -> tuple[dict, str]:
+    """Run the reviewed action script with one injected INPUT line; returns (result, stderr-tail).
+
+    The script (~40 KB) is passed as an argument, not on a stdin pipe: `communicate(input, timeout)` stops
+    writing stdin after its first TimeoutExpired, so a child slower than that first timeout to drain the
+    pipe never saw EOF and the call hung until its timeout (ego-browser also drops the output of a stdin
+    script whose TaskSpace is with the user)."""
+    script = "const INPUT = " + json.dumps(inp) + ";\n" + ACTION.read_text()
+    if honor_stop and (bd / "STOP").exists():
+        return {}, "not-started"
+    # bytes, decoded tolerantly below: a process killed in the middle of a UTF-8 character must not raise
+    proc = subprocess.Popen([st["ego_binary"], "nodejs", script], stdin=subprocess.DEVNULL,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=browser_ego.child_env())
+    t_end = time.time() + max(5.0, timeout)
+    so = se = b""
+    why = ""
+    while True:
+        try:
+            so, se = proc.communicate(timeout=0.5)
+            break
+        except subprocess.TimeoutExpired:
+            if (honor_stop and (bd / "STOP").exists()) or time.time() > t_end:
+                why = "timeout" if time.time() > t_end else "stopped"
+                proc.kill()
+                # what the script printed before it was killed still counts: a hand-off result is printed
+                # BEFORE the space is handed to the user, and must be booked even if the call then times out
+                so, se = proc.communicate()
+                break
+    so = (so or b"").decode("utf-8", "replace")
+    se = (se or b"").decode("utf-8", "replace")
+    res: dict = {}
+    for line in reversed((so + "\n" + se).splitlines()):
+        if line.startswith("TBSGEN_RESULT "):
+            with contextlib.suppress(ValueError):
+                res = json.loads(line[len("TBSGEN_RESULT "):])
+            break
+    if why:
+        return res, why
+    return res, (se or so)[-200:]
+
+
+def _finish_spaces(bd: Path, st: dict, spaces: list[str]) -> list[str]:
+    """Close the batch's TaskSpaces (the action script's `finish` takes the space back from the user first
+    when a hand-off is still open, then closes it)."""
+    done = []
+    for sp_name in spaces:
+        # the batch's STOP file must not cancel the clean-up itself (it is written before the spaces close);
+        # one space failing to close does not keep the others open
+        try:
+            r, _ = _run_script(st, dict(space=sp_name, action="finish", files_dir=str(bd / "files")), 90.0, bd,
+                               honor_stop=False)
+            done.append(f"{sp_name}:{r.get('status', 'error')}")
+        except Exception as e:                       # noqa: BLE001
+            done.append(f"{sp_name}:error {type(e).__name__}")
+    return done
+
+
+@contextlib.contextmanager
+def _locked(path: Path, blocking: bool = True):
+    """An exclusive flock on `path` (across the agent's concurrent `tbsgen-browser` processes).  Yields False when
+    `blocking` is off and the lock is held elsewhere."""
+    import fcntl
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
+        except BlockingIOError:
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
+def _handoff_start(ho: dict) -> float:
+    """When the script handed the page over (its own clock, never later than now)."""
+    try:
+        at = float(ho.get("at_ms")) / 1000.0
+    except (TypeError, ValueError):
+        return time.time()
+    return min(at, time.time()) if at > 0 else time.time()
+
+
+def _expire_handoff(st: dict, led, n: str, ps: dict, force: bool = False) -> str | None:
+    """Close paper `n` when its hand-off has run out (or, with `force`, at the end of the batch).  EVERY hand-off
+    that the user did not clear - challenge, login, MFA or institution selection, whatever the last poll saw -
+    closes the paper and cools the publisher (round 11).  Returns the closed reason, else None."""
+    if not ps.get("handoff") or (not force and time.time() <= float(ps.get("handoff_deadline") or 0)):
+        return None
+    ps.pop("handoff", None)
+    if ps.get("lkey"):
+        _cool_publisher(led, ps, st["papers"][n]["doi"], "hand-off not cleared", float(st["challenge_cooldown_s"]))
+    if (ps.get("handoff_kind") or "challenge") == "challenge":
+        ps["closed"] = "challenge (hand-off not cleared)"
+        ps["challenge"] = "hand-off not cleared"
+    else:
+        ps["closed"] = "login_required (hand-off not cleared)"
+    ps["handoff_note"] = (ps.get("handoff_note") or "handoff") + " (not cleared)"
+    return ps["closed"]
+
+
+def _sweep_handoffs(bd: Path, st: dict, led, skip: str | None = None, force: bool = False) -> None:
+    """Expire the hand-offs of other papers too (a paper the agent stops polling must still be closed and its
+    publisher cooled).  Papers busy in another call are skipped (their own next call expires them).  At the end
+    of the batch (`force`), a call that still holds a publisher's hand-off slot (its wrapper was killed: the
+    hand-off state is unknown) is booked as a hand-off that was not cleared."""
+    inflight = {}
+    with _locked(bd / ".state.lock"):
+        state = _read_state(bd)
+        # calls whose wrapper failed while holding a hand-off budget (booked as used in _paper_call)
+        unknown = {str(v): k for k, v in (state.get("handoff_unknown") or {}).items()}
+        if force:
+            inflight = {str(v): k for k, v in (state.get("handoff_inflight") or {}).items()}
+            if inflight:
+                state["handoff_inflight"] = {}
+                for pk in inflight.values():
+                    state.setdefault("handoff", {})[pk] = True
+                _write_state(bd, state)
+    inflight.update(unknown)
+    done_unknown = []
+    for k in st["papers"]:
+        if k == skip:
+            continue
+        sp = bd / "papers" / f"{k}.json"
+        if not sp.exists():
+            continue
+        with _locked(bd / "papers" / f".{k}.lock", blocking=force) as got:
+            if not got:
+                continue
+            with contextlib.suppress(OSError, ValueError):
+                ps = json.loads(sp.read_text())
+                if k in inflight and not ps.get("handoff") and not ps.get("closed"):
+                    ps.update(handoff=True, handoff_used=True, handoff_kind="challenge", handoff_deadline=0,
+                              handoff_note="call interrupted (hand-off state unknown)")
+                if _expire_handoff(st, led, k, ps, force=force or k in unknown):
+                    _atomic(sp, json.dumps(ps))
+                if k in unknown:
+                    done_unknown.append(unknown[k])
+    if done_unknown:
+        with _locked(bd / ".state.lock"):
+            state = _read_state(bd)
+            hu = state.get("handoff_unknown") or {}
+            for pk in done_unknown:
+                hu.pop(pk, None)
+            state["handoff_unknown"] = hu
+            _write_state(bd, state)
+
+
 def wrapper_main(batch_dir: str, argv: list[str]) -> int:
-    """`tbsgen-browser N <action> [arg]` / `tbsgen-browser finish`."""
-    from .dlledger import COOLDOWN_429_S, DownloadLedger
-    from .fulltext import publisher_of
+    """`tbsgen-browser N <action> [arg...]` / `tbsgen-browser finish`."""
     bd = Path(batch_dir)
     st = json.loads((bd / "batch.json").read_text())
 
@@ -291,24 +515,75 @@ def wrapper_main(batch_dir: str, argv: list[str]) -> int:
     if (bd / "STOP").exists():
         return say("tbsgen: STOP - the batch was stopped (egress changed or deadline). End now.", 3)
     if argv[:1] == ["finish"]:
-        r = browser_ego.finish(dict(binary=st["ego_binary"], space=st["space"]))
-        return say(f"tbsgen: TaskSpace closed ({r.get('status')})", 0)
-    if len(argv) < 2 or argv[0] not in st["papers"] or argv[1] not in ("look", "open", "click", "save_pdf"):
-        return say("usage: tbsgen-browser N look|open URL|click I|save_pdf  |  tbsgen-browser finish", 2)
-    n, action, arg = argv[0], argv[1], (argv[2] if len(argv) > 2 else "")
+        state = _read_state(bd)
+        spaces = sorted(set(state.get("spaces") or []) | {st["space"]})
+        done = _finish_spaces(bd, st, spaces)
+        return say(f"tbsgen: TaskSpaces closed ({', '.join(done)})", 0)
+    usage = ("usage: tbsgen-browser N look [full] [@REF] [OFFSET]|open URL|click I|click_xy X Y|hover I|"
+             "scroll up|down [PX]|select I VALUE|type I TEXT|screenshot|tabs|switch LABEL|back|"
+             "wait_for url SUB|sel CSS [S]|save_pdf|sso_login|handoff_status  |  tbsgen-browser finish")
+    if len(argv) < 2 or argv[0] not in st["papers"] or not _TOOL_CMD.match("tbsgen-browser " + " ".join(argv)):
+        return say(usage, 2)
+    n = argv[0]
+    # one call per paper at a time (budgets, hand-off and the paper's TaskSpace are per paper)
+    with _locked(bd / "papers" / f".{n}.lock"):
+        return _paper_call(bd, st, n, argv[1], " ".join(argv[2:]), say)
+
+
+def _paper_call(bd: Path, st: dict, n: str, action: str, arg: str, say) -> int:
+    from urllib.parse import unquote
+
+    from .dlledger import COOLDOWN_429_S, DownloadLedger
+    from .fulltext import publisher_of
+    if action in ("type", "select") and "%" in arg:
+        head, _, txt = arg.partition(" ")
+        arg = head + " " + unquote(txt)[:120]          # percent-encoded characters (', &, ...) decoded here
     p = st["papers"][n]
     sp = bd / "papers" / f"{n}.json"
-    ps = json.loads(sp.read_text()) if sp.exists() else dict(calls=0)
+    ps: dict = json.loads(sp.read_text()) if sp.exists() else dict(calls=0)
+    led = DownloadLedger(st["ledger_path"], st["limits"], st["global_limits"], st["host_caps"])
+    if (why := _expire_handoff(st, led, n, ps)):
+        _atomic(sp, json.dumps(ps))
+        return say(f"tbsgen: paper {n}: hand-off timed out - paper closed ({why}).", 2)
+    _sweep_handoffs(bd, st, led, skip=n)
+    with _locked(bd / ".state.lock"):
+        own_unknown = n in {str(v) for v in (_read_state(bd).get("handoff_unknown") or {}).values()}
+    if own_unknown and not ps.get("closed"):
+        # this paper's previous call failed in the wrapper while it held the hand-off budget: closed here
+        ps.update(handoff=True, handoff_used=True, handoff_kind="challenge", handoff_deadline=0,
+                  handoff_note="call interrupted (hand-off state unknown)")
+        why = _expire_handoff(st, led, n, ps, force=True)
+        _atomic(sp, json.dumps(ps))
+        with _locked(bd / ".state.lock"):
+            state = _read_state(bd)
+            state["handoff_unknown"] = {k: v for k, v in (state.get("handoff_unknown") or {}).items() if str(v) != n}
+            _write_state(bd, state)
+        return say(f"tbsgen: paper {n}: its last browser call failed - paper closed ({why}); move on.", 2)
     if ps.get("closed"):
         return say(f"tbsgen: paper {n} is closed ({ps['closed']}); move on", 2)
-    if ps["calls"] >= int(st["max_calls_per_paper"]):
+    if action == "handoff_status" and not ps.get("handoff"):
+        # nothing is with the user: answered here, no browser call (round 11)
+        return say(f"tbsgen: paper {n}: no hand-off is open; continue with this paper or move on", 0)
+    if action != "handoff_status" and ps.get("calls", 0) >= int(st["max_calls_per_paper"]):
         return say(f"tbsgen: paper {n}: call limit reached; give up on this paper", 2)
+    if action == "handoff_status" and ps.get("polls", 0) >= int(st["max_calls_per_paper"]):
+        # hand-off polls have a budget of their own (the hand-off still expires at its deadline)
+        return say(f"tbsgen: paper {n}: hand-off poll limit reached; work on other papers - the hand-off is "
+                   "closed when its time is up", 2)
     if time.time() >= float(st["deadline"]):
         return say("tbsgen: the batch deadline has passed; end now.", 3)
-    led = DownloadLedger(st["ledger_path"], st["limits"], st["global_limits"], st["host_caps"])
-    _, keys, web_hosts = publisher_of(p["doi"])
+    pub, keys, web_hosts = publisher_of(p["doi"])
     lkey = "chrome:" + p["doi"].split("/", 1)[0]
     aliases = tuple(k for k in keys if k != lkey)
+    pkey = "pub:" + pub                                 # one publisher, whatever DOI prefix (pacing, hand-off)
+    space = f"{st['space']}-p{n}"                      # one TaskSpace per paper (hand-offs pause one paper only)
+    slock = bd / ".state.lock"
+    with _locked(slock):
+        state = _read_state(bd)
+        state.setdefault("spaces", [])
+        if space not in state["spaces"]:
+            state["spaces"].append(space)
+            _write_state(bd, state)
     if "rid" not in ps:
         # first call for this paper: book its slot (pacing / caps / cooldowns of the publisher)
         try:
@@ -328,59 +603,288 @@ def wrapper_main(batch_dir: str, argv: list[str]) -> int:
         ps["closed"] = "publisher in cooldown"
         _atomic(sp, json.dumps(ps))
         return say(f"tbsgen: paper {n}: {msg[:120]}; move on", 2)
-    ps["calls"] += 1
+    # a hand-off that is still open: only handoff_status may act on the paper
+    if ps.get("handoff") and action != "handoff_status":
+        _atomic(sp, json.dumps(ps))
+        return say("tbsgen: this paper is with the user (hand-off). Poll `tbsgen-browser N handoff_status` "
+                   "and work on other papers meanwhile.", 2)
+    if action != "handoff_status":
+        ps["calls"] = ps.get("calls", 0) + 1
+    else:
+        ps["polls"] = ps.get("polls", 0) + 1
+    # budgets shared by the batch's concurrent calls are reserved under one lock: navigation pacing per
+    # publisher and the publisher's single hand-off
+    with _locked(slock):
+        state = _read_state(bd)
+        if action in NAV_ACTIONS:
+            if ps.get("navs", 0) >= int(st["max_navigations_per_paper"]):
+                _atomic(sp, json.dumps(ps))
+                return say(f"tbsgen: paper {n}: navigation limit reached; give up on this paper", 2)
+            ps["navs"] = ps.get("navs", 0) + 1
+        sso_ok = False
+        if action == "sso_login":
+            s_ = state.setdefault("sso", {})
+            sso_ok = (bool(st.get("sso_login_enabled")) and bool(st.get("sso_domains"))
+                      and int(s_.get("submissions") or 0) < int(st.get("sso_max_submissions", 2))
+                      and not s_.get("failed") and not s_.get("logged_in") and not s_.get("pending"))
+            if sso_ok:                       # reserved BEFORE the script runs; returned only if nothing was submitted
+                s_["submissions"] = int(s_.get("submissions") or 0) + 1
+                s_["pending"] = n
+        # a hand-off reservation this paper left behind (its wrapper was killed after the script may have handed
+        # the page over): the hand-off is unknown - the publisher's budget is used, never re-opened
+        if (state.get("handoff_inflight") or {}).get(pkey) == n:
+            state["handoff_inflight"].pop(pkey, None)
+            state.setdefault("handoff", {})[pkey] = True
+            state.setdefault("handoff_unknown", {})[pkey] = n
+        handoff_free = (bool(st.get("handoff_enabled")) and not ps.get("handoff")
+                        and not (state.get("handoff") or {}).get(pkey)
+                        and not (state.get("handoff_inflight") or {}).get(pkey))
+        if handoff_free:
+            state.setdefault("handoff_inflight", {})[pkey] = n
+        _write_state(bd, state)
     _atomic(sp, json.dumps(ps))
+    # page loads of one publisher run one at a time (a lock held over the wait AND the action), at least
+    # nav_gap_s after the previous one FINISHED
+    nav_lock = (_locked(bd / f".nav-{re.sub(r'[^A-Za-z0-9_.-]', '_', pkey)}.lock") if action in NAV_ACTIONS
+                else contextlib.nullcontext())
+    returned = False
+    try:
+        with nav_lock:
+            rc = _paced_run(bd, st, n, p, ps, action, arg, say, led, pkey, space, handoff_free, slock,
+                            COOLDOWN_429_S, aliases, web_hosts, sp, sso_ok)
+        returned = True
+        return rc
+    finally:
+        with _locked(slock):
+            state = _read_state(bd)
+            if handoff_free and (state.get("handoff_inflight") or {}).get(pkey) == n:   # only our own reservation
+                state["handoff_inflight"].pop(pkey, None)
+                if not returned:
+                    # the wrapper itself failed while it held the publisher's hand-off budget: the hand-off
+                    # state is unknown - the budget is used (never re-opened); the final sweep closes the paper
+                    state.setdefault("handoff", {})[pkey] = True
+                    state.setdefault("handoff_unknown", {})[pkey] = n
+                _write_state(bd, state)
+
+
+def _paced_run(bd, st, n, p, ps, action, arg, say, led, pkey, space, handoff_free, slock, COOLDOWN_429_S,
+               aliases, web_hosts, sp, sso_ok=False) -> int:
+    ran = False
+    try:
+        if action in NAV_ACTIONS:
+            last = float((_read_state(bd).get("nav") or {}).get(pkey) or 0)
+            nav_at = last + float(st["nav_gap_s"])
+            if nav_at > float(st["deadline"]):
+                return say("tbsgen: the batch deadline comes before the next navigation; end now.", 3)
+            # cancellable wait, then re-check everything that may have changed meanwhile
+            while (wait := nav_at - time.time()) > 0:
+                if (bd / "STOP").exists():
+                    return say("tbsgen: STOP - the batch was stopped (egress changed or deadline). End now.", 3)
+                time.sleep(min(0.5, wait))
+        if (bd / "STOP").exists():
+            return say("tbsgen: STOP - the batch was stopped (egress changed or deadline). End now.", 3)
+        if time.time() >= float(st["deadline"]):
+            return say("tbsgen: the batch deadline has passed; end now.", 3)
+        if (msg := led.cooling(ps["lkey"], *aliases, *web_hosts)):
+            ps = json.loads(sp.read_text())
+            ps["closed"] = "publisher in cooldown"
+            _atomic(sp, json.dumps(ps))
+            return say(f"tbsgen: paper {n}: {msg[:120]}; move on", 2)
+        ran = True
+        return _paper_run(bd, st, n, p, ps, action, arg, say, led, pkey, space, handoff_free, slock,
+                          COOLDOWN_429_S, sso_ok)
+    finally:
+        if sso_ok and not ran:                          # the script never started: nothing was submitted
+            _sso_finalize(bd, slock, n, {"sso_submitted": False, "sso_stage": "pre"})
+        if action in NAV_ACTIONS:
+            with _locked(slock):
+                state = _read_state(bd)
+                state.setdefault("nav", {})[pkey] = time.time()       # when this page load finished
+                _write_state(bd, state)
+
+
+_VALID_STATUS = ("ok", "refused", "error", "handoff", "paused")
+
+
+def _sso_available(bd: Path, st: dict) -> bool:
+    """An automatic SSO login is still possible in this batch (enabled, budget left, none failed, none signed in
+    yet).  Otherwise an SSO login page is handed to the user like any other login page."""
+    if not st.get("sso_login_enabled"):
+        return False
+    s = _read_state(bd).get("sso") or {}
+    return (int(s.get("submissions") or 0) < int(st.get("sso_max_submissions", 2)) and not s.get("failed")
+            and not s.get("logged_in"))
+
+
+def _sso_finalize(bd: Path, slock: Path, n: str, res: dict) -> str | None:
+    """Book a reserved SSO submission.  Only an explicit `sso_submitted: false` with `sso_stage: "pre"` (the
+    script ended before the login button was touched) returns the reservation; anything else - a result, no
+    result, an error - counts as a submission, and a failed / unknown one ends the logins of this batch."""
+    with _locked(slock):
+        state = _read_state(bd)
+        s = state.setdefault("sso", {})
+        if s.get("pending") != n:
+            return None
+        s.pop("pending", None)
+        if res and res.get("sso_submitted") is False and res.get("sso_stage") == "pre":
+            s["submissions"] = max(0, int(s.get("submissions") or 0) - 1)
+            result = None
+        else:
+            result = res.get("sso") if res and res.get("sso") in ("ok", "fail", "handoff") else "unknown"
+            # one success signs the batch in; a failed / unknown / handed-over one ends the automatic logins
+            s["logged_in" if result == "ok" else "failed"] = True
+        _write_state(bd, state)
+    return result
+
+
+def _paper_run(bd, st, n, p, ps, action, arg, say, led, pkey, space, handoff_free, slock,
+               COOLDOWN_429_S, sso_ok=False) -> int:
+    sp = bd / "papers" / f"{n}.json"
     files = (bd / "files" / n).resolve()
     files.mkdir(parents=True, exist_ok=True)
-    inp = dict(space=st["space"], action=action, arg=arg, allow=p["allow"], files_dir=str(files),
-               look_url=ps.get("look_url") if action == "click" else None,
-               nav_timeout_ms=45000, download_timeout_ms=120000, download_wait_ms=6000, challenge_wait_ms=20000)
-    script = "const INPUT = " + json.dumps(inp) + ";\n" + ACTION.read_text()
+    inp = dict(space=space, action=action, arg=arg, allow=p["allow"], files_dir=str(files),
+               look_key=ps.get("look_key") if action in ("click", "hover", "select", "type") else None,
+               look_scope=ps.get("look_scope") or "",
+               page_label=ps.get("page_label") or "",
+               nav_timeout_ms=45000, download_timeout_ms=120000, download_wait_ms=6000,
+               challenge_wait_ms=int(st.get("challenge_wait_ms", 40000)),
+               handoff={"enabled": handoff_free},
+               sso={"login": sso_ok, "enabled": _sso_available(bd, st), "domains": st.get("sso_domains") or []},
+               handoff_state={"active": bool(ps.get("handoff")),
+                              "deadline_ms": int(float(ps.get("handoff_deadline") or 0) * 1000),
+                              "title": ps.get("handoff_title") or "", "page_label": ps.get("handoff_page") or ""})
     timeout = max(5.0, min(float(st["call_timeout_s"]), float(st["deadline"]) - time.time()))
-    proc = subprocess.Popen([st["ego_binary"], "nodejs"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE, text=True, env=browser_ego.child_env())
-    t_end = time.time() + timeout
-    so = se = ""
-    first = True
-    while True:
-        try:
-            so, se = proc.communicate(script if first else None, timeout=0.5)
-            break
-        except subprocess.TimeoutExpired:
-            first = False
-            if (bd / "STOP").exists() or time.time() > t_end:
-                proc.kill()
-                proc.communicate()
-                return say("tbsgen: stopped (egress changed, deadline or call timeout). End now.", 3)
-    res: dict = {}
-    for line in reversed((so + "\n" + se).splitlines()):
-        if line.startswith("TBSGEN_RESULT "):
+    try:
+        res, err = _run_script(st, inp, timeout, bd)
+    except Exception as e:                           # noqa: BLE001 - started (or not): settled as "no result" below
+        res, err = {}, f"wrapper error {type(e).__name__}"
+    if not (isinstance(res, dict) and res.get("status") in _VALID_STATUS):
+        res = {}                                   # no valid result line: treated exactly like no output
+    sso_result = _sso_finalize(bd, slock, n, res) if sso_ok else None
+    if sso_result is not None:
+        cur = json.loads(sp.read_text())
+        host = str(res.get("sso_host") or "")[:80]
+        if not host:
             with contextlib.suppress(ValueError):
-                res = json.loads(line[len("TBSGEN_RESULT "):])
-            break
-    if res.get("blocked"):
-        # a verification page / bot wall / 429: cool the publisher now, close the paper (never interact)
-        secs = COOLDOWN_429_S if res.get("http429") else float(st.get("challenge_cooldown_s", 24 * 3600))
-        ps = json.loads(sp.read_text())
-        ps.update(closed="challenge", challenge=str(res["blocked"])[:80])
-        _atomic(sp, json.dumps(ps))
-        _cool_publisher(led, ps, p["doi"], str(res["blocked"]), secs)
-        return say(f"tbsgen: paper {n}: {res['blocked']} - publisher cooled down; report `challenge` and move on.", 2)
+                host = urlparse((res.get("page") or {}).get("url") or "").hostname or ""
+        cur["sso_note"] = f"sso_login host={host} result={sso_result} at={time.strftime('%H:%M:%S')}"
+        if sso_result == "fail":
+            cur["closed"] = "login_failed (sso, not retried)"
+        _atomic(sp, json.dumps(cur))
+    if not res and err != "not-started" and handoff_free:
+        # ANY call that started and gave no valid result (timeout, STOP, a normal or an error exit without a
+        # result line, an unparseable one) may have handed the space to the user before its output was lost:
+        # the hand-off state is unknown.  Only `not-started` is exempt.  Never re-open the publisher's
+        # hand-off and never act on the paper again: book it as a hand-off that was not cleared (paper
+        # closed, publisher cooled)
+        with _locked(slock):
+            state = _read_state(bd)
+            state.setdefault("handoff", {})[pkey] = True
+            _write_state(bd, state)
+        cur = json.loads(sp.read_text())
+        cur.update(handoff=True, handoff_used=True, handoff_kind="challenge", handoff_deadline=0,
+                   handoff_note=f"call without a result ({err if err in ('timeout', 'stopped') else 'exit'}) "
+                                f"at={time.strftime('%H:%M:%S')} (hand-off state unknown)")
+        why = _expire_handoff(st, led, n, cur, force=True)
+        _atomic(sp, json.dumps(cur))
+        if err == "stopped":
+            return say("tbsgen: stopped (egress changed, deadline or call timeout). End now.", 3)
+        return say(f"tbsgen: paper {n}: the browser call gave no result - paper closed ({why}); move on.", 2)
+
+    def save_ps(**kw):
+        cur = json.loads(sp.read_text())
+        cur.update(kw)
+        _atomic(sp, json.dumps(cur))
+        return cur
+    if not res:
+        return say("tbsgen: stopped (egress changed, deadline or call timeout). End now.", 3)
+    if res.get("status") == "paused":
+        return say("tbsgen: this paper's browser workspace is with the user (hand-off). Poll "
+                   "`tbsgen-browser N handoff_status` and work on other papers meanwhile.", 2)
+    # files the call saved are booked first, whatever happens next (a hand-off / block returns early)
     for rj in res.get("rejected") or []:              # never validated, whatever the script managed to delete
         with contextlib.suppress(OSError):
             Path(rj).unlink()
-    acc = [x for x in res.get("files") or [] if Path(x).resolve().parent == files]
-    if acc:
-        ps = json.loads(sp.read_text())
-        ps["accepted"] = sorted(set(ps.get("accepted") or []) | set(acc))
+    acc0 = [x for x in res.get("files") or [] if Path(x).resolve().parent == files]
+    if acc0:
+        ps = save_ps()
+        ps["accepted"] = sorted(set(ps.get("accepted") or []) | set(acc0))
         _atomic(sp, json.dumps(ps))
-    if action == "look" and res.get("look_url"):
-        ps = json.loads(sp.read_text())
-        ps["look_url"] = res["look_url"]
+    if res.get("handoff") and res.get("status") == "handoff":
+        # the tool handed the page to the user (verification / login): notify, mark, keep the paper open
+        ho = res.get("handoff") or {}
+        reason = str(ho.get("reason") or "")
+        kind = ho.get("kind") if ho.get("kind") in ("challenge", "login", "mfa") else (
+            "challenge" if "challenge" in reason else "login")
+        with _locked(slock):
+            state = _read_state(bd)
+            state.setdefault("handoff", {})[pkey] = True
+            _write_state(bd, state)
+        save_ps(handoff=True, handoff_used=True, handoff_reason=reason[:80], handoff_kind=kind,
+                handoff_title=str(ho.get("title") or "")[:200], handoff_page=str(ho.get("page_label") or "")[:40],
+                # counted from when the script handed the page over (the call may have returned much later)
+                handoff_deadline=min(_handoff_start(ho) + float(st["handoff_wait_s"]), float(st["deadline"])),
+                handoff_note=f"handoff at={time.strftime('%H:%M:%S')} kind={kind} host={ho.get('host', '')}")
+        if (why := _expire_handoff(st, led, n, ps := json.loads(sp.read_text()))):
+            _atomic(sp, json.dumps(ps))             # already past its window when the call returned
+            return say(f"tbsgen: paper {n}: hand-off timed out - paper closed ({why}).", 2)
+        what = "验证" if kind == "challenge" else "登录"
+        _notify_user(st, f"请在 ego lite 里完成 {ho.get('host') or '出版商'} 的{what}（论文 {n}），完成后不用做别的")
+        return say("tbsgen: handed the page to the user (the notification explains what is needed). Work on "
+                   "other papers now and poll `tbsgen-browser N handoff_status`.", 0)
+    if res.get("blocked"):
+        # a verification page / bot wall / 429: cool the publisher now, close the paper (never interact)
+        secs = COOLDOWN_429_S if res.get("http429") else float(st.get("challenge_cooldown_s", 24 * 3600))
+        ps = save_ps(closed="challenge", challenge=str(res["blocked"])[:80])
+        _cool_publisher(led, ps, p["doi"], str(res["blocked"]), secs)
+        return say(f"tbsgen: paper {n}: {res['blocked']} - publisher cooled down; report `challenge` and move on.", 2)
+    acc = acc0
+    if action == "handoff_status":
+        chk = res.get("handoff_check")
+        if res.get("handoff_kind_now") == "challenge" and ps.get("handoff_kind") != "challenge":
+            # a login hand-off that turned into a verification page: from now on booked as a challenge (a
+            # timeout cools the publisher)
+            ps = save_ps(handoff_kind="challenge")
+        if chk == "cleared" and time.time() > float(ps.get("handoff_deadline") or 0):
+            chk = "expired"                   # the deadline passed while the poll ran: not a clear
+        if chk == "cleared":
+            ps = save_ps()
+            for k in ("handoff", "handoff_title", "handoff_page"):
+                ps.pop(k, None)
+            _atomic(sp, json.dumps(ps))
+            return say("tbsgen: the user cleared the page; continue with this paper (run `look`).", 0)
+        if chk == "waiting":
+            return say(f"tbsgen: still waiting for the user ({res.get('handoff_left_s')}s left); do other work "
+                       "and poll again.", 0)
+        if chk == "expired":
+            ps = save_ps()
+            ps["handoff_deadline"] = 0
+            why = _expire_handoff(st, led, n, ps, force=True)
+            _atomic(sp, json.dumps(ps))
+            return say(f"tbsgen: paper {n}: hand-off timed out - paper closed ({why}).", 2)
+        return say("tbsgen: no hand-off in progress for this paper.", 0)
+    if res.get("page_label"):
+        ps = save_ps()
+        ps["page_label"] = res["page_label"]
+        _atomic(sp, json.dumps(ps))
+    if res.get("shot"):                                # viewable by the agent, never the paper's text
+        ps = save_ps()
+        ps["shots"] = sorted(set(ps.get("shots") or []) | {str(res["shot"])})
+        _atomic(sp, json.dumps(ps))
+    if action == "look" and res.get("look_key"):
+        ps = save_ps()
+        ps["look_key"] = res["look_key"]
+        ps["look_scope"] = str(res.get("look_scope") or "")[:12]
         _atomic(sp, json.dumps(ps))
     show = dict(status=res.get("status"), error=res.get("error"), files_saved=len(res.get("files") or []),
-                page=res.get("page"), note=res.get("note"), left_allowed=res.get("left_allowed"))
-    return say(json.dumps(show, ensure_ascii=False)[:9000], 0 if res.get("status") == "ok" else 1)
+                page=res.get("page"), note=res.get("note"), left_allowed=res.get("left_allowed") or res.get("reset_foreign"),
+                login_required=res.get("login_required"),
+                tabs=res.get("tabs"), acted=res.get("acted"), sso=res.get("sso"), sso_page=res.get("sso_page"),
+                shot=res.get("shot"), scroll=res.get("scroll"),
+                waited=res.get("waited"), page_label=res.get("page_label"),
+                handoff_check=res.get("handoff_check"), handoff_left_s=res.get("handoff_left_s"))
+    return say(json.dumps({k: v for k, v in show.items() if v is not None}, ensure_ascii=False)[:9000],
+               0 if res.get("status") == "ok" else 1)
 
 
 def led_next_slot(led, channel: str, keys: tuple) -> float:
@@ -399,11 +903,247 @@ def render_prompt(template: str, **kw) -> str:
     return string.Template(template).safe_substitute(**kw)
 
 
-def default_hermes_runner(argv: list[str], env: dict, timeout: float, on_event, stop: threading.Event) -> dict:
+STDERR_KEEP = 64 * 1024           # bytes of the agent's stderr kept in the batch directory (the tail)
+STDERR_LOG_TAIL = 1500            # characters of it repeated in the agent_end log event
+# credential-like text in the agent's stderr: whole auth headers, key=value / key: value pairs (also with spaces
+# inside a quoted value), URL userinfo and well-known token shapes
+_SECRET_PATTERNS = (
+    # a sensitive key (also as a JSON key) and EVERYTHING after it on the line: no quote / escape parsing
+    # that a crafted value could get around
+    # (the key may be quoted and escaped any number of times - JSON inside JSON - or URL-encoded)
+    re.compile(r"(?im)((?:[\\\"']|%2[27]|%5c)*(?:proxy-)?(?:authorization|cookie|set-cookie|x-api-key|api-key|"
+               r"api[_-]?key|access[_-]?token|refresh[_-]?token|id[_-]?token|token|secret|client[_-]?secret|"
+               r"password|passwd|pwd|session(?:id)?|sid|credentials?)(?:[\\\"'\s]|%2[27]|%5c|%20)*(?:[:=]|%3a|%3d)).*$"),
+    re.compile(r"(?i)\b((?:bearer|basic)\s+).*$", re.M),
+    # URL userinfo, whole (user, :password, user:password - either part may be empty; round 13)
+    re.compile(r"(?i)(\b[a-z][a-z0-9+.-]*://)[^/\s@?#\"<>]*@"),
+    # every URL loses its query and fragment (OAuth / SAML / API callbacks: code, signature, ticket, key ...);
+    # ' and ` are legal URL characters, so only whitespace, " and <> end it (round 12)
+    re.compile(r"(?i)(\b[a-z][a-z0-9+.-]*://[^\s?#\"<>]*)[?#][^\s\"<>]*"),
+    re.compile(r"()\b(?:sk|pk|rk|ghp|gho|ghu|ghs|github_pat|xox[abprs]|glpat|hf)[-_][A-Za-z0-9_\-]{8,}"),
+    re.compile(r"()\beyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{4,}"),     # JWT
+)
+
+
+class _Redactor:
+    """Record-wise redaction of the agent's stderr (kept as a tail in memory: `keep` characters, None = all).
+
+    A record is a line plus its continuation lines (indented, starting with a closing bracket / quote, or inside
+    a sensitive value that is still open).  A one-line record with a credential-like field is masked from the
+    key to the end of the line; a record with such a field that spans lines is DROPPED WHOLE - its earlier lines
+    are taken back and the following ones are discarded up to the next record - with no attempt to find where
+    the value ends inside it.  A sensitive value counts as open while, after its key, a quote (counted with and
+    without backslash escapes; either count odd = open) or a bracket is unbalanced, or the line ends in a
+    backslash; an open value is only closed by balance, never by a blank line or a new-looking line."""
+
+    MARK = "[record with a credential-like field dropped]\n"
+    SINK = "[rest of stderr dropped: a credential-like value of unknown length]\n"
+    _CLOSERS = ")]}\"'"
+
+    def __init__(self, keep: int | None = None):
+        self.out: list[str] = []
+        self.size = 0
+        self.keep = keep
+        self.base = 0                      # absolute index of out[0] (the tail drops lines at the front)
+        self.rec_start = None              # absolute index of the current record's first line
+        self.rec_lines = 0
+        self.sensitive = False             # the current record has a credential-like field
+        self.dropping = False              # the current record is being discarded
+        self.val = ""                      # text of the sensitive value(s) so far (for the balance check)
+        self.unbounded = False             # a sensitive key with an empty value: its end cannot be known
+        self.hold = False                  # set after an over-long line with / inside a sensitive value: drop the rest
+
+    def _push(self, s: str):
+        self.out.append(s)
+        self.size += len(s)
+        if self.keep is not None:
+            while self.size > self.keep and len(self.out) > 1:
+                self.size -= len(self.out.pop(0))
+                self.base += 1
+
+    def _open(self) -> bool:
+        v = self.val
+        if self.unbounded:
+            return True
+        if not v.strip():
+            return self.sensitive
+        esc = re.sub(r"\\.", "", v)
+        if any(x.count(q) % 2 for x in (v, esc) for q in ('"', "'")):
+            return True
+        if sum(v.count(c) for c in "([{") > sum(v.count(c) for c in ")]}"):
+            return True
+        return v.rstrip("\n").endswith("\\")
+
+    def _drop_record(self):
+        k = max(0, (self.rec_start or 0) - self.base)
+        gone = self.out[k:]
+        del self.out[k:]
+        self.size -= sum(len(x) for x in gone)
+        self._push(self.MARK)
+        self.dropping = True
+
+    def opaque(self, marker: str, sensitive: bool):
+        """A line that is not shown (too long).  Its content is unknown, so where a record boundary is would be a
+        guess: when it carries a sensitive key, or comes inside a still-open sensitive value, EVERYTHING after
+        it is dropped (the rest of the stderr), with no attempt to find the value's end."""
+        if self.hold:
+            return
+        if self.sensitive and self._open():
+            if not self.dropping:
+                self._drop_record()
+            self._push(self.SINK)
+            self.hold = True
+            return
+        self.rec_start, self.rec_lines, self.sensitive, self.dropping, self.val = (
+            self.base + len(self.out), 1, False, False, "")
+        self._push(marker)
+        if sensitive:
+            self._push(self.SINK)
+            self.hold = True
+
+    def line(self, line: str):
+        nl = "\n" if line.endswith("\n") else ""
+        body = line[:-1] if nl else line
+        if self.hold:
+            return                           # after an unknown-length sensitive value: nothing more is kept
+        if self.unbounded:
+            # the line after a sensitive key with an empty value: it may be the value, and so may any line
+            # after it - the rest of the stderr is dropped
+            if not self.dropping and self.rec_lines > 1:
+                self._drop_record()
+            self._push(self.SINK)
+            self.hold = True
+            return
+        still_open = self.sensitive and self._open()
+        new = (self.rec_start is None or not still_open) and (
+            not body.strip() or (body[:1] not in " \t" and body[:1] not in self._CLOSERS))
+        if new:
+            self.rec_start, self.rec_lines, self.sensitive, self.dropping, self.val = (
+                self.base + len(self.out), 0, False, False, "")
+            self.unbounded = False
+        self.rec_lines += 1
+        m = _SECRET_PATTERNS[0].search(body) or _SECRET_PATTERNS[1].search(body)
+        if m:
+            if not body[m.end(1):].strip():
+                # nothing after the key: the value (if any) follows on lines whose end no delimiter marks -
+                # everything after it is dropped (round 9), no guess at where a new record starts
+                self.unbounded = True
+            self.val = (self.val + "\n" + body) if self.sensitive else body[m.end(1):]
+            self.sensitive = True
+        elif self.sensitive:
+            self.val += "\n" + body
+        if self.dropping:
+            return
+        if self.sensitive and self.rec_lines > 1:
+            self._drop_record()              # a credential-like field in a multi-line record: drop it whole
+            return
+        for pat in _SECRET_PATTERNS:
+            body = pat.sub(lambda m: m.group(1) + "[redacted]", body)
+        self._push(body + nl)
+
+    def text(self) -> str:
+        return "".join(self.out)
+
+
+def redact(text: str) -> str:
+    """Mask anything that looks like a credential (stderr of the agent process is logged)."""
+    r = _Redactor()
+    for x in text.splitlines(keepends=True):
+        r.line(x)
+    return r.text()
+
+
+class _StderrTail:
+    """Reads the agent's stderr pipe in a thread.  Every complete line is redacted as it arrives, record by
+    record (_Redactor: before any truncation, so a secret is never cut away from its key); only the last
+    `keep` characters of redacted text are kept in memory.  A line longer than the limit is replaced by a
+    marker (with a sensitive key in it, or inside an open sensitive value, the rest of the stderr is dropped).
+    Nothing unredacted reaches disk."""
+
+    MAX_LINE = 16 * 1024
+
+    def __init__(self, pipe, keep: int = STDERR_KEEP):
+        self.keep = keep
+        self.red = _Redactor(keep=keep)
+        self.th = threading.Thread(target=self._read, args=(pipe,), daemon=True)
+        self.th.start()
+
+    def _add(self, raw: bytes):
+        self.red.line(raw.decode("utf-8", "replace"))
+
+    def _read(self, pipe):
+        buf = b""
+        skipping = False                  # inside an over-long line: drop everything up to its newline
+        hit = False                       # the over-long line has a sensitive key
+        tail = b""
+        with contextlib.suppress(Exception):
+            for chunk in iter(lambda: pipe.read(8192), b""):
+                buf += chunk
+                while b"\n" in buf:
+                    line, buf = buf.split(b"\n", 1)
+                    if skipping:
+                        hit = hit or self._key_in(tail + line)
+                        self.red.opaque("[long line dropped]\n", hit)
+                        skipping, hit, tail = False, False, b""
+                        continue
+                    if len(line) + 1 > self.MAX_LINE:
+                        self.red.opaque("[long line dropped]\n", self._key_in(line))
+                        continue
+                    self._add(line + b"\n")
+                if len(buf) > self.MAX_LINE:
+                    hit = hit or self._key_in(tail + buf)
+                    tail = buf[-256:]            # a key cut by the chunk boundary is still found
+                    skipping = True
+                    buf = b""
+        if skipping:
+            self.red.opaque("[long line dropped]\n", hit or self._key_in(tail + buf))
+        elif buf:
+            self._add(buf)
+
+    @staticmethod
+    def _key_in(b: bytes) -> bool:
+        t = b.decode("utf-8", "replace")
+        return bool(_SECRET_PATTERNS[0].search(t) or _SECRET_PATTERNS[1].search(t))
+
+    def text(self) -> str:
+        self.th.join(timeout=5)
+        return self.red.text()[-self.keep:]
+
+
+def _write_private(path: Path, text: str):
+    """Write a 0600 file (created with that mode, never readable by others in between)."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as fh:
+        fh.write(text)
+    os.chmod(path, 0o600)
+
+
+def _stderr_tail(path: Path | None, keep: int = STDERR_KEEP) -> str:
+    """Truncate a stderr file to its last `keep` bytes, redact it in place; return the redacted tail."""
+    if path is None:
+        return ""
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return ""
+    # redact the whole text first (a cut must never separate a secret from its key), then keep whole lines
+    text = redact(data.decode("utf-8", "replace"))
+    if len(text) > keep:
+        text = text[-keep:]
+        text = text.split("\n", 1)[1] if "\n" in text else ""
+    with contextlib.suppress(OSError):
+        _write_private(path, text)
+    return text
+
+
+def default_hermes_runner(argv: list[str], env: dict, timeout: float, on_event, stop: threading.Event,
+                          stderr_path: Path | None = None) -> dict:
     """Run `hermes chat ... --format stream-json`; call on_event(ev) per JSON line (it returns a reason string
-    to kill the run).  Returns dict(exit, killed, result_event)."""
-    p = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
-                         env=env, text=True, start_new_session=True)
+    to kill the run).  stderr is read through a pipe; only its redacted tail is written, to `stderr_path` (0600).
+    Returns dict(exit, killed, result_event, stderr_tail)."""
+    p = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL,
+                         env=env, text=False, start_new_session=True)
+    err_tail = _StderrTail(p.stderr)
     killed = ""
     result = None
     t_end = time.time() + timeout
@@ -425,7 +1165,8 @@ def default_hermes_runner(argv: list[str], env: dict, timeout: float, on_event, 
     th = threading.Thread(target=watch, daemon=True)
     th.start()
     assert p.stdout is not None
-    for line in p.stdout:
+    import io
+    for line in io.TextIOWrapper(p.stdout, encoding="utf-8", errors="replace"):
         line = line.strip()
         if not line.startswith("{"):
             continue
@@ -443,7 +1184,11 @@ def default_hermes_runner(argv: list[str], env: dict, timeout: float, on_event, 
         with contextlib.suppress(ProcessLookupError):
             os.killpg(p.pid, signal.SIGKILL)
         p.wait()
-    return dict(exit=p.returncode, killed=killed, result=result)
+    tail = err_tail.text()
+    if stderr_path is not None:
+        with contextlib.suppress(OSError):
+            _write_private(stderr_path, tail)
+    return dict(exit=p.returncode, killed=killed, result=result, stderr_tail=tail)
 
 
 def run_batch(fetcher, *, wait_for_egress: bool = False, max_wait_s: float | None = None, on_success=None,
@@ -843,14 +1588,37 @@ def _user_provider(path: Path, name: str) -> dict | None:
     return out or None
 
 
+def _hermes_data_root(src_home: Path) -> Path | None:
+    """The Hermes data root holding the dependency state (`installs/`) of the user's Hermes install.
+
+    Hermes scopes its dependency environments per data root (`<root>/installs/<key>`), and a HERMES_HOME
+    outside `~/.hermes` is a root of its own.  The agent's isolated home (inside the batch directory) would
+    then have no committed environment and the launcher exits 1 at once (\"no dependency environment is
+    committed for this install\")."""
+    for cand in (src_home, src_home.parent.parent if src_home.parent.name == "profiles" else None,
+                 Path.home() / ".hermes"):
+        if cand is not None and (cand / "installs").is_dir():
+            return cand
+    return None
+
+
 def _hermes_home(bd: Path, ag: dict, hook_cmd: str) -> Path:
     """An isolated Hermes home for the agent: only the configured provider, the requested skills and the
     pre_tool_call hook.  No user memory, rules, plugins or other skills.  The provider entry comes from
     `agent.provider_config` or, for a user-defined provider, from the user's Hermes config; its `api_key` is never
-    copied (use a provider that needs no key, e.g. a local proxy, or `key_env`)."""
+    copied (use a provider that needs no key, e.g. a local proxy, or `key_env`).  `installs/` (Hermes' dependency
+    environments; no credentials) is linked from the user's data root so the launcher finds its Python packages."""
     home = bd / "hermes-home"
     (home / "skills").mkdir(parents=True, exist_ok=True)
     src_home = Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
+    if ag.get("hermes_installs_dir"):
+        installs = Path(str(ag["hermes_installs_dir"])).expanduser()
+    else:
+        root = _hermes_data_root(src_home)
+        installs = root / "installs" if root is not None else None
+    if installs is not None and installs.is_dir() and not (home / "installs").exists():
+        with contextlib.suppress(OSError):
+            (home / "installs").symlink_to(installs.resolve(), target_is_directory=True)
     pname = ag.get("provider") or ""
     entry = ag.get("provider_config")
     if entry is None and pname:
@@ -879,23 +1647,34 @@ def _agent_phase(fetcher, todo: list[dict], deadline: float, bd: Path, wd: Watch
     ft = fetcher.ft
     b = ft["browser"]
     ag = b.get("agent") or {}
+    ho = b.get("handoff") or {}
+    sso = b.get("sso") or {}
+    sso_login = b.get("sso_login") or {}
     led = fetcher.ledger
     papers = {}
+    # institution / WAYF / SSO login domains: allowed for every paper
+    sso_domains = [str(x).lower() for x in [*(sso.get("domains") or []), *(sso_login.get("domains") or [])]]
     for i, e in enumerate(todo, 1):
         papers[str(i)] = dict(doi=e["doi"], title=e.get("title") or "", ident=paper_ident(e),
-                              allow=allowed_domains(e["doi"], e.get("_landing"), ag.get("extra_domains") or []))
+                              allow=allowed_domains(e["doi"], e.get("_landing"),
+                                                    [*(ag.get("extra_domains") or []), *sso_domains]))
     if deadline - time.time() - 10 < min(30.0, float(ag.get("run_budget_s", 420))):
         return dict(usage=dict(skipped="not enough time left in the egress window"),
                     papers={v["ident"]: dict(status="deferred") for v in papers.values()})
-    stats_used = getattr(stop, "used", None)
-    if stats_used is not None:
-        stats_used.add(agent_space(b))
     st = dict(space=agent_space(b), papers=papers, deadline=deadline,
               ledger_path=str(led.path), limits=led.limits, global_limits=led.g, host_caps=led.host_caps,
               ego_binary=browser_ego.binary(b), gate_max_wait_s=float(ag.get("gate_max_wait_s", 150)),
-              max_calls_per_paper=int(ag.get("max_calls_per_paper", 8)),
+              max_calls_per_paper=int(ag.get("max_calls_per_paper", 25)),
               call_timeout_s=float(ag.get("call_timeout_s", 150)),
-              challenge_cooldown_s=float(b.get("challenge_cooldown_s", 24 * 3600)))
+              challenge_cooldown_s=float(b.get("challenge_cooldown_s", 24 * 3600)),
+              challenge_wait_ms=int(b.get("challenge_wait_s", 40) * 1000),
+              max_navigations_per_paper=int(ag.get("max_navigations_per_paper", 12)),
+              nav_gap_s=float(ag.get("nav_gap_s", 2.5)),
+              handoff_enabled=bool(ho.get("enabled")), handoff_wait_s=float(ho.get("wait_s", 120)),
+              handoff_notify=bool(ho.get("notify", True)), bark_cmd=[list(x) for x in ho.get("bark_cmd") or []],
+              sso_login_enabled=bool(sso_login.get("enabled")) and bool(sso_login.get("domains")),
+              sso_domains=[str(x).lower() for x in sso_login.get("domains") or []],
+              sso_max_submissions=int(sso_login.get("max_submissions", 2)))
     (bd / "papers").mkdir(exist_ok=True)
     (bd / "files").mkdir(exist_ok=True)
     _atomic(bd / "batch.json", json.dumps(st))
@@ -913,12 +1692,15 @@ def _agent_phase(fetcher, todo: list[dict], deadline: float, bd: Path, wd: Watch
     lim = led.limits["browser"]
     prompt = render_prompt(tmpl, papers_json=json.dumps(lines, indent=1, ensure_ascii=False),
                            minutes=f"{budget / 60:.0f}", gap_s=f"{float(lim['gap_s']):.0f}",
-                           gap_max_s=f"{float(lim['gap_s']) + float(lim['jitter_s']):.0f}")
+                           gap_max_s=f"{float(lim['gap_s']) + float(lim['jitter_s']):.0f}",
+                           calls=str(st["max_calls_per_paper"]), navs=str(st["max_navigations_per_paper"]))
     (bd / "prompt.md").write_text(prompt)
     hermes = ag.get("hermes_bin") or "hermes"
+    # the wrapper, plus vision_analyze for the batch's own screenshots (hook: shot-*.png in the files dir only)
+    toolsets = "terminal,vision" if ag.get("vision", True) else "terminal"
     argv = [hermes, "chat", "--query-file", str(bd / "prompt.md"), "--oneshot", "--format", "stream-json",
             "--source", "tool", "--accept-hooks", "--ignore-rules", "--max-turns", str(int(ag.get("max_turns", 80))),
-            "--run-budget", str(int(budget)), "-t", "terminal"]
+            "--run-budget", str(int(budget)), "-t", toolsets]
     if ag.get("provider"):
         argv += ["--provider", str(ag["provider"])]
     if ag.get("model"):
@@ -932,9 +1714,14 @@ def _agent_phase(fetcher, todo: list[dict], deadline: float, bd: Path, wd: Watch
         if ev.get("type") == "tool_use":          # second line of defence (the hook already blocked it)
             events["tool_calls"] += 1
             inp = ev.get("input") or {}
-            why = (f"tool not allowed: {ev.get('name')}" if ev.get("name") != "terminal" else
-                   "background / pty terminal not allowed" if inp.get("background") or inp.get("pty") else
-                   shell_allowed(inp.get("command")))
+            if ev.get("name") == VISION_TOOL and ag.get("vision", True):
+                why = _vision_allowed(str(bd), inp)
+            elif ev.get("name") != "terminal":
+                why = f"tool not allowed: {ev.get('name')}"
+            elif inp.get("background") or inp.get("pty"):
+                why = "background / pty terminal not allowed"
+            else:
+                why = shell_allowed(inp.get("command"))
             if why:
                 events["violations"].append(why[:120])
                 if len(events["violations"]) >= int(ag.get("max_violations", 3)):
@@ -946,8 +1733,25 @@ def _agent_phase(fetcher, todo: list[dict], deadline: float, bd: Path, wd: Watch
     log(json.dumps(dict(event="agent_start", papers=len(papers), budget_s=int(budget),
                         model=ag.get("model"), provider=ag.get("provider"))))
     runner = hermes_runner or default_hermes_runner
-    rr = runner(argv, env, budget + float(ag.get("kill_grace_s", 20)), on_event, stop)
-    (bd / "STOP").write_text("agent run ended")       # a late tool call cannot book anything any more
+    err_path = bd / "agent-stderr.log"
+    kw = {}
+    with contextlib.suppress(TypeError, ValueError):
+        if "stderr_path" in inspect.signature(runner).parameters:
+            kw["stderr_path"] = err_path
+    rr: dict = {}
+    closed_spaces: list = []
+    try:
+        rr = runner(argv, env, budget + float(ag.get("kill_grace_s", 20)), on_event, stop, **kw)
+    finally:
+        # also when the runner raised / was interrupted: no late tool call can book anything any more, open
+        # hand-offs are closed (challenge publishers cooled) and the batch's TaskSpaces are closed
+        with contextlib.suppress(OSError):
+            (bd / "STOP").write_text("agent run ended")
+        with contextlib.suppress(Exception):
+            _sweep_handoffs(bd, st, led, force=True)
+        if fetcher.browser_runner is None and st.get("ego_binary"):
+            spaces = sorted(set(_read_state(bd).get("spaces") or []) | {agent_space(b)})
+            closed_spaces = _finish_spaces(bd, st, spaces)
     res = rr.get("result") or {}
     usage = dict(tokens=res.get("tokens"), duration_ms=res.get("duration_ms"), session_id=res.get("session_id"),
                  exit=rr.get("exit"), killed=rr.get("killed"), tool_calls=events["tool_calls"],
@@ -955,8 +1759,10 @@ def _agent_phase(fetcher, todo: list[dict], deadline: float, bd: Path, wd: Watch
                  provider=ag.get("provider"), model=ag.get("model"))
     with contextlib.suppress(OSError):
         with open(bd.parent / "usage.jsonl", "a") as fh:
-            fh.write(json.dumps(dict(usage, ts=time.strftime("%F %T"), papers=len(papers))) + "\n")
-    log(json.dumps(dict(event="agent_end", **{k: v for k, v in usage.items() if k != "session_id"})))
+            fh.write(json.dumps(dict(usage, ts=time.strftime("%F %T"), papers=len(papers),
+                                     closed_spaces=closed_spaces)) + "\n")
+    log(json.dumps(dict(event="agent_end", **{k: v for k, v in usage.items() if k != "session_id"},
+                        stderr_tail=(rr.get("stderr_tail") or "")[-STDERR_LOG_TAIL:])))
     # ---- validate and book every paper (the agent's own report is not used)
     out: dict = dict(usage=usage, papers={})
     cut = stop.is_set() and not rr.get("result")     # killed by egress loss / deadline
@@ -1001,7 +1807,12 @@ def _agent_phase(fetcher, todo: list[dict], deadline: float, bd: Path, wd: Watch
             why = f"challenge: {ps['challenge']} (publisher cooled down)"
         ok = txt is not None
         interrupted = not ok and (lost or cut) and not ps.get("challenge")
+        # every hand-off of the paper is noted in the ledger row (time, host, kind; never credentials - the
+        # action script never reads the values of credential fields)
+        extras = "; ".join(x for x in (ps.get("handoff_note"), ps.get("sso_note")) if x)
         note = "" if ok else ("cancelled: batch stopped" if interrupted else fetcher._r(f"agent: {why}")[:300])
+        if extras:
+            note = (note + "; " if note else "") + extras
         led.record("browser", ps["lkey"], p["doi"], "ok" if ok else "fail", None, size, note, reservation=rid)
         if ok:
             out["papers"][p["ident"]] = dict(status="ok", outcome=Outcome(txt, rec))

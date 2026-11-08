@@ -186,7 +186,9 @@ allow_submit = false
 | `fulltext.egress_check` | 关闭 | 开启后，出口 IP 不在 `allow_cidrs` 内则拒绝所有网络通道 |
 | `fulltext.use_env_proxy` | False | 下载不读 `HTTP(S)_PROXY` |
 | `fulltext.browser.*` | 关闭；并发 2；验证页等 40 秒 | ego-browser 通道；S3 只入队，`tbsgen fetch` 执行；同一出版商间隔 60–120 秒，不点击任何验证 |
-| `fulltext.browser.batch` / `.agent` | 窗口 600 s、余量 60 s；agent 关闭 | `tbsgen fetch --browser [--wait-for-egress]`：出口门控的限时批次；agent 为 Hermes CLI |
+| `fulltext.browser.batch` / `.agent` | 窗口 600 s、余量 60 s；agent 关闭；每篇 ≤25 次工具调用、≤12 次页面加载，同出版商两次加载间隔 ≥2.5 s | `tbsgen fetch --browser [--wait-for-egress]`：出口门控的限时批次；agent 为 Hermes CLI，每篇独立 TaskSpace，唯一工具 `tbsgen-browser`（look [full|@REF]/open/click/click_xy/hover/scroll/select/type/screenshot/tabs/switch/back/wait_for/save_pdf/sso_login/handoff_status/finish；另有 vision_analyze 只能看本批次自己的截图；硬底线：凭据值不进入模型、日志或外部（不读字段值，snapshot 先去掉字段文本，截图遮盖字段、遮不住就拒绝，type/select 拒绝凭据字段），不自动解验证码（交接），只在允许域名内导航（含 SSO 域），文件由代码校验）；页面有任何登录或机构选择（WAYF）迹象时拒绝 click 并交给用户）；agent 的 stderr 尾部（凭据样式字符串打码）写入批次目录 `agent-stderr.log` 和 `agent_end` 日志 |
+| `fulltext.browser.handoff` | 关闭；等 120 s | 验证页（Cloudflare/Turnstile/验证码/滑块）与非机构登录页交给本机用户处理（macOS 通知，可选本地 `bark_cmd`），agent 从不自己过验证；每篇、每出版商每批最多 1 次，超时则冷却该出版商 |
+| `fulltext.browser.sso` | carsi.edu.cn、openathens.net、shibboleth.net | `sso.domains`：机构/WAYF 域，加入每篇的可访问域。`sso_login`（默认关闭）：`domains` 为机构自己的登录域（如 `authserver.nju.edu.cn`，HTTPS，同样加入可访问域），`tbsgen-browser N sso_login` 只在浏览器自动填充后点登录（不读取、不输出、不记录凭据值；表单须 POST 到登录域），每批最多 `max_submissions`（2）次、点击前扣减、失败不重试；验证码/短信/无自动填充时交给用户 |
 | `fulltext.remote` | 关闭 | HTTP 通道（oa/elsevier/wiley/inst）经 ssh 在 `host` 上运行；远端须开启 egress_check |
 | `package.dockerfile_mode` | selfcontained | Dockerfile 里用 pip 安装固定版本；`local_base` 只用于本机检查 |
 
@@ -205,7 +207,7 @@ hard 和 unstable 保留。reward=1 一律算通过，即使之后报了 API 错
 
 **已验证（实际跑过）**
 
-- 测试：69 个（53 单测 + 16 个在 Docker 里执行任务代码的集成测试），每次推送由 GitHub Actions CI 运行。
+- 测试：gen 共 269 个（238 个离线单测，含 S3 全文通道与浏览器批次的 161 个；16 个在 Docker 里执行任务代码的集成测试；15 个用本机真实 ego-browser 打本地测试页的动作脚本 live 测试，CI 上无 ego-browser 时跳过），每次推送由 GitHub Actions CI 运行。
 - 集成测试覆盖的情况：断点续跑（中途停止，换新进程继续，已完成阶段不重复调用模型）；预算上限触发暂停，`resume` 后继续；quota 错误触发熔断并暂停；参考解崩溃 → S8 修复 → 恢复；注入泄漏 → L2 阻塞 → 修复后通过；修不好 → 2 轮后丢弃；S6A 截断续写；mid 不可区分时 S6M 只重写 mid；真值隔离探针；筛选丢弃；取不到全文 → 暂存。
 - fake 模型端到端干跑：人造条目走完 S1→S9，再用模拟的校准结果走到 S10。
 - 打包出的 Harbor 任务：用本机 Docker 实际跑 Harbor，oracle reward=1，nop reward=0（`tbsgen harbor-local`，Dockerfile 换成本地基础镜像）。
@@ -216,7 +218,7 @@ hard 和 unstable 保留。reward=1 一律算通过，即使之后报了 API 错
 
 - 校准的教师（Opus agent）分支。
 - L4b 反解攻击、廉价模型各角色、S9b 变体、DOMF/CODE/MULTI 形态。
-- S3 出版商通道（TDM、校园 IP、浏览器）只有用伪造响应的单测；真实下载依赖使用者自己的订阅与出口网络。
+- S3 出版商通道（TDM、校园 IP、浏览器）只有用伪造响应的单测；真实下载依赖使用者自己的订阅与出口网络。浏览器 agent 的探索动作与 handoff 只在本地测试页上验证过，尚未在真实出版商/机构站点端到端跑通。
 - 专家时长是教师模型的自报值；价格是占位值，美元数字不是账单。
 
 ## 6b. 真实论文端到端测试后新增的门与检查

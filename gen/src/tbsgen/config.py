@@ -159,6 +159,30 @@ DEFAULTS: dict[str, Any] = {
                 "watch_urls": [],           # IP-echo pages for the probes (rotated); [] -> egress_check.urls
                 "refuse_hint": "",          # extra text printed when the browser egress is outside allow_cidrs
             },
+            # Verification (bot wall) and login pages are never solved by the agent: with handoff.enabled the
+            # tool hands the paper's TaskSpace to the user (macOS notification), waits up to wait_s for the
+            # user to finish and continue (the agent works on other papers meanwhile), then re-checks the
+            # page.  One hand-off per paper and per publisher per batch; the wait counts against the window.
+            "handoff": {
+                "enabled": False,           # repo default off; enable on the machine in front of the browser
+                "wait_s": 120,              # max wait for the user (also capped by the window deadline)
+                "notify": True,             # macOS notification when the control is handed to the user
+                "bark_cmd": [],             # optional local notification command; off by default, never group chats
+            },
+            # Institution / WAYF domains every paper may navigate to (they are added to allowed_domains).
+            "sso": {
+                "domains": ["carsi.edu.cn", "openathens.net", "shibboleth.net"],
+            },
+            # Browser-autofill login on the institution's own SSO domains (also allowed for every paper):
+            # `tbsgen-browser N sso_login` checks that Chromium autofilled the form (its :autofill state - values
+            # are never read, returned or logged) and clicks Login; POST to the SSO domain only.  The submission
+            # is counted BEFORE the click; no retry after a failure; at most max_submissions per batch; a
+            # captcha / slider / SMS / MFA code or missing autofill hands the page to the user instead.
+            "sso_login": {
+                "enabled": False,           # repo default off; enable on the machine with the logged-in profile
+                "domains": [],              # e.g. ["authserver.nju.edu.cn"]; HTTPS only
+                "max_submissions": 2,       # per batch
+            },
             "agent": {
                 "enabled": False,
                 "hermes_bin": "hermes",
@@ -172,9 +196,14 @@ DEFAULTS: dict[str, Any] = {
                 "extra_domains": ["doi.org"],   # always allowed besides the queued papers' publisher domains
                 "gate_max_wait_s": 150,     # the per-paper gate waits at most this long for the publisher's slot
                 "prompt_template": None,    # None -> packaged browser_agent_prompt.md
-                "max_calls_per_paper": 8,   # ego-browser calls the agent may make per paper
+                "max_calls_per_paper": 25,  # ego-browser calls the agent may make per paper
+                "max_navigations_per_paper": 12,   # page-changing calls per paper (open / click / click_xy / hover /
+                                                   # scroll / select / type / back / sso_login / save_pdf)
+                "vision": True,             # the agent may view the screenshots it saved (vision_analyze, batch only)
+                "nav_gap_s": 2.5,           # min seconds between two page loads of the same publisher
                 "call_timeout_s": 150,      # one ego-browser call of the agent
                 "keep_batch_dir": False,    # keep prompt / wrapper state after the batch (debugging)
+                "hermes_installs_dir": None,  # Hermes' dependency state; None -> <HERMES_HOME or ~/.hermes>/installs
             },
         },
         # Remote mode: run the HTTP channels (oa / elsevier / wiley / inst) on another host over ssh, e.g. a
