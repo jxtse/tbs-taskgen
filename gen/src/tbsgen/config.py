@@ -198,7 +198,7 @@ DEFAULTS: dict[str, Any] = {
                 "gate_max_wait_s": 150,     # the per-paper gate waits at most this long for the publisher's slot
                 "prompt_template": None,    # None -> packaged browser_agent_prompt.md
                 "max_calls_per_paper": 25,  # ego-browser calls the agent may make per paper
-                "max_navigations_per_paper": 12,   # page loads per paper (open / click / back / sso_login)
+                "max_navigations_per_paper": 12,   # page loads per paper (open / click / select / type / hover / sso_login / save_pdf)
                 "nav_gap_s": 2.5,           # min seconds between two page loads of the same publisher
                 "institution_names": [],    # the ONLY strings `type` may type, e.g. ["Nanjing University", "南京大学"]
                 "call_timeout_s": 150,      # one ego-browser call of the agent

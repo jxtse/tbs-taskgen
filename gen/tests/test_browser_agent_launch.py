@@ -614,6 +614,8 @@ def test_redaction_drops_a_multi_line_record_whole():
         ("secret=SECRET\\\nSECRET2\nnext\n", "SECRET"),
         # an open value is not closed by a blank line
         ('password: "SECRET\n\nSECRET2"\nnext\n', "SECRET"),
+        # an empty value after the key: the value may be on the next line (round 8)
+        ("password:\nSECRET\nnext\n", "SECRET"), ("token =\n  SECRET\nnext\n", "SECRET"),
     ]
     for txt, gone in cases:
         for r in (browser_agent.redact(txt), browser_agent._StderrTail(io.BytesIO(txt.encode()), keep=4096).text()):

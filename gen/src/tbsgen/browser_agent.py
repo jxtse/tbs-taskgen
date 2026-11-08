@@ -249,7 +249,6 @@ _PAPER_ACTIONS = "|".join((
     r"type \d{1,3} " + _SAFE_TXT,
     "tabs",
     r"switch [A-Za-z0-9_.-]{1,24}",
-    "back",
     # the pattern never starts with '#' (a shell comment) and has no glob / quote characters
     r"wait_for url [A-Za-z0-9/._%=:-]{1,200}( \d{1,3})?",
     r"wait_for sel [A-Za-z][A-Za-z0-9_.#:-]{0,100}( \d{1,3})?",
@@ -261,7 +260,7 @@ DENY_TEXT = re.compile(r"sci-?hub|libgen|z-lib|annas-archive", re.I)
 # actions that can load a page of the publisher (paced per publisher and capped per paper)
 # (select / type / hover can trigger a navigation from the page's handlers: reserved and paced like one)
 # actions that may load a page or request a file: navigation budget, per-publisher lock and pacing
-NAV_ACTIONS = frozenset({"open", "click", "back", "sso_login", "select", "type", "hover", "save_pdf"})
+NAV_ACTIONS = frozenset({"open", "click", "sso_login", "select", "type", "hover", "save_pdf"})
 
 
 def shell_allowed(cmd) -> str | None:
@@ -498,7 +497,7 @@ def wrapper_main(batch_dir: str, argv: list[str]) -> int:
         done = _finish_spaces(bd, st, spaces)
         return say(f"tbsgen: TaskSpaces closed ({', '.join(done)})", 0)
     usage = ("usage: tbsgen-browser N look [OFFSET]|open URL|click I|hover I|"
-             "select I VALUE|type I TEXT|tabs|switch LABEL|back|"
+             "select I VALUE|type I TEXT|tabs|switch LABEL|"
              "wait_for url SUB|sel CSS [S]|save_pdf|sso_login|handoff_status  |  tbsgen-browser finish")
     if len(argv) < 2 or argv[0] not in st["papers"] or not _TOOL_CMD.match("tbsgen-browser " + " ".join(argv)):
         return say(usage, 2)
@@ -905,8 +904,9 @@ class _Redactor:
 
     def _open(self) -> bool:
         v = self.val
-        if not v:
-            return False
+        if not v.strip():
+            # a sensitive key with nothing after it: its value may be on the next line (round 8) - open
+            return self.sensitive
         esc = re.sub(r"\\.", "", v)
         if any(x.count(q) % 2 for x in (v, esc) for q in ('"', "'")):
             return True

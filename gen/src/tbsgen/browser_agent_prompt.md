@@ -35,7 +35,6 @@ Use your terminal tool to run exactly one of these commands per call (nothing el
 - `tbsgen-browser N tabs` — list the pages of the paper's browser workspace (a publisher may have opened a PDF
   in a new tab; `allowed` shows whether its host is usable).
 - `tbsgen-browser N switch LABEL` — make page LABEL (from `tabs`) the current page.
-- `tbsgen-browser N back` — go back one history step.
 - `tbsgen-browser N wait_for url SUBSTR|sel CSS [S]` — wait until the URL contains SUBSTR or a CSS selector
   matches (at most 60 s). The selector must start with a letter and use only letters, digits and `_.#:-`
   (e.g. `div#pdf`, `a.download`; not `#pdf`).
@@ -66,7 +65,7 @@ run is blocked before it executes, and repeated attempts end the batch.
    above and otherwise report `login_required`. The tool is deliberately conservative: on any page that shows
    an e-mail, phone, password or verification-code field, or login wording ("Sign in", "Log in", "登录",
    "Continue with ...") in its title, URL, a form or its buttons, `click`, `hover`, `select` and `type` are
-   refused (`look` reports `login_form`). Use `open` with the paper's DOI / publisher URLs, `back`, `tabs` /
+   refused (`look` reports `login_form`). Use `open` with the paper's DOI / publisher URLs, `tabs` /
    `switch` or `save_pdf` there instead, or report `login_required`. A form with a text field is only submitted
    after you typed an institution name into every text field of it.
 

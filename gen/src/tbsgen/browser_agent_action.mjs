@@ -23,7 +23,6 @@
 //                                 INPUT.type_allow, never into anything that can hold credentials
 //   tabs                          list the TaskSpace's pages (label, URL, allowed)
 //   switch LABEL                  make page LABEL the current page (never a page opened by the user)
-//   back                          go back one history step
 //   wait_for url SUBSTR|sel CSS [S]   wait until the URL contains SUBSTR / a CSS selector matches (<= 60 s)
 //   save_pdf                      the current page is a PDF document: save it
 //   sso_login                     on a configured institution SSO login domain (INPUT.sso.domains): submit the
@@ -649,13 +648,15 @@ async function act(task, page, kind, k, value) {
 // refusal is returned with stage "pre" (nothing was clicked).  Field values are never read (the browser's
 // :autofill state only; in the local test mode a non-empty stand-in value counts).
 function ssoSubmit(args) {
-  const [domains, lt, scanSrc] = args;
+  const [domains, lt, scanSrc, infoSrc, chSrc] = args;
   const pre = (why) => ({ refused: why, stage: "pre" });
   const inDom = (u) => { try { const x = new URL(u); const hh = x.hostname.toLowerCase();
     const local = hh === "127.0.0.1" || hh === "localhost" || hh.endsWith(".localhost");
     if (x.protocol !== "https:" && !(local && lt)) return false;
     return domains.some((d) => hh === d || hh.endsWith("." + d)); } catch (e) { return false; } };
   if (!inDom(location.href)) return pre("the page left the SSO login domain");
+  // the same verification-page test as everywhere else (title rules, challenge forms, captcha widgets)
+  if ((new Function("return (" + infoSrc + ")")())(chSrc).challenge_page) return pre("verification page on the SSO login page");
   if ((new Function("return (" + scanSrc + ")")())().mfa
       || document.querySelector("iframe[src*='captcha'], .g-recaptcha, .h-captcha, .cf-turnstile")) return pre("MFA / captcha on the login page");
   const af = (el) => { try { return el.matches(":autofill") || el.matches(":-webkit-autofill"); } catch (e) { return false; } };
@@ -675,6 +676,16 @@ function ssoSubmit(args) {
   const r = b.getBoundingClientRect();
   if (r.width < 1 || r.height < 1) return pre("the login button is not visible");
   b.click();
+  // the page's own click / submit handlers ran synchronously inside b.click(): if they changed the form's
+  // method or target, the submission (a navigation not yet started) is cancelled here, before any request.
+  // (A script of the SSO page that reads the autofilled values itself is outside what any tool can prevent:
+  // the configured SSO domain is trusted, as when the user logs in by hand.)
+  const t2 = (b.hasAttribute("formaction") ? b.formAction : "") || form.action || location.href;
+  const m2 = ((b.hasAttribute("formmethod") ? b.formMethod : "") || form.method || "get").toLowerCase();
+  if (m2 !== "post" || !inDom(t2) || !inDom(location.href)) {
+    window.stop();
+    return { submitted: true, aborted: "the login form changed while it was submitted; stopped" };
+  }
   return { submitted: true };
 }
 
@@ -720,7 +731,8 @@ async function ssoLogin(task, page) {
   // (POST only - never GET, which would put the credentials into a URL) to a browser-resolved target
   // (form.action / button.formAction; <base href> included) on such a host - and only then clicks the button
   // (button.click(): the page's own click / submit handlers run as for a real click).
-  const expr = "(" + ssoSubmit.toString() + ")(" + JSON.stringify([sso.domains, localTest, credScan.toString()]) + ")";
+  const expr = "(" + ssoSubmit.toString() + ")(" + JSON.stringify([sso.domains, localTest, credScan.toString(),
+                                                                    pageInfo.toString(), CHALLENGE.source]) + ")";
   out.sso_stage = "submit";
   out.sso_submitted = true;                          // from here on the outcome counts as a submission
   let chk = null;
@@ -732,6 +744,11 @@ async function ssoLogin(task, page) {
   if (!chk || !chk.submitted) {
     if (chk && chk.refused && !chk.unknown && chk.stage === "pre") { out.sso_stage = "pre"; out.sso_submitted = false; }
     out.status = "refused"; out.error = (chk && chk.refused) || "not submitted"; return;
+  }
+  if (chk.aborted) {                                 // counted as a (failed) submission: no more logins this batch
+    out.sso = "fail"; out.note = chk.aborted; out.status = "ok";
+    out.page = { url: bareUrl(i.url), title: i.title, login_form: true };
+    return;
   }
   // wait for the login page to go away (never resubmit; a failure ends the logins of this batch)
   const t0 = Date.now();
@@ -812,7 +829,8 @@ try {
       }
     } else if (INPUT.action === "tabs") {
       const tabs = await task.tabs();
-      out.tabs = tabs.map((t) => ({ label: t.label, url: cleanUrl(t.url || "").slice(0, 200), title: (t.title || "").slice(0, 80),
+      out.tabs = tabs.map((t) => ({ label: t.label, url: cleanUrl(t.url || "").slice(0, 200),
+                                    title: hostOk(t.url || "") ? (t.title || "").slice(0, 80) : "",
                                     active: !!t.active, opened_by: t.openedBy || "", allowed: hostOk(t.url || "") }));
       out.status = "ok";
     } else if (INPUT.action === "switch") {
@@ -830,13 +848,6 @@ try {
         out.page = { url: i.url, title: i.title, pdf: /pdf/i.test(i.ctype), login_form: i.login_form };
         out.status = "ok";
       }
-    } else if (INPUT.action === "back") {
-      await withDownload(task, page, () => page.evaluate(() => history.back()));
-      await sleep(1500);
-      const i = await after(page);
-      if (!out.blocked && !out.left_allowed) await postCheck(task, page, i);
-      out.page = { url: i.url, title: i.title, pdf: /pdf/i.test(i.ctype), login_form: i.login_form };
-      if (out.status !== "handoff") out.status = "ok";
     } else if (INPUT.action === "wait_for") {
       const a = String(INPUT.arg || "").split(" ");
       const what = a[0], pat = a[1] || "";

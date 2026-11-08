@@ -313,7 +313,7 @@ uv run tbsgen fetch --run runs/R --config config.toml --browser --wait-for-egres
   per paper. Actions: `look` (page summary with a numbered list of links, buttons and fields of the page's own
   DOM, including hidden dropdown items and same-origin iframes; a cross-origin iframe is one item whose `click`
   opens its checked URL; an offset for long pages), `open URL`, `click I`, `hover I`,
-  `select I VALUE`, `type I TEXT`, `tabs` / `switch`, `back`, `wait_for`, `save_pdf`, `sso_login`,
+  `select I VALUE`, `type I TEXT`, `tabs` / `switch`, `wait_for`, `save_pdf`, `sso_login`,
   `handoff_status` and `finish`. There are deliberately no coordinate clicks, no screenshots, no native mouse
   actions (hover dispatches pointer events, top document only), no actions inside cross-origin iframes and no
   interaction at all on anything that looks like a login page (each was a recurring source of credential /
@@ -368,7 +368,9 @@ uv run tbsgen fetch --run runs/R --config config.toml --browser --wait-for-egres
   (`click_xy`), screenshots / vision, the browser's page snapshot (`look full`, `@REF` items), any action
   inside a cross-origin iframe, native clicks on `target=_blank` links (their checked URL is opened in the page
   instead), native mouse hover (and hover inside any frame), `scroll` (its fallback was a native wheel at a
-  fixed point; `look` already lists the whole page, so scrolling is not needed to find a link), and every
+  fixed point; `look` already lists the whole page, so scrolling is not needed to find a link), `back` (the
+  history may hold a page outside the allowed domains that was reset after it landed; `history.back()` would
+  request it again - `open` the paper's DOI or publisher URL instead), and every
   click / hover / select / type on a page with any login signal. No native mouse input is left at all:
   `sso_login` checks and submits in one page evaluation run with a browser user gesture. Expected effect: publisher pages whose PDF link only appears after a canvas /
   coordinate interaction, inside a cross-origin viewer frame or behind an e-mail / "Sign in" prompt are not
@@ -385,8 +387,11 @@ uv run tbsgen fetch --run runs/R --config config.toml --browser --wait-for-egres
   password fields (their values are never read, returned or logged) and presses the login button. No credential
   is ever typed, configured or stored by tbsgen. The check and the press are ONE page evaluation, run with a
   browser user gesture (which is what releases autofilled values to the page): the button is pressed only if,
-  at that moment, the page is on an HTTPS `sso_login.domains` host, both fields are still autofilled, there is
-  no captcha / MFA, the form uses POST and its browser-resolved target is on such a host. No autofill, a captcha / slider / SMS or other MFA code, or a
+  at that moment, the page is on an HTTPS `sso_login.domains` host, it is no verification page, both fields
+  are still autofilled, there is no captcha / MFA, the form uses POST and its browser-resolved target is on
+  such a host. If the page's own click / submit handlers change the form's method or target while the button
+  is pressed, the submission is stopped before its request goes out and counted as a failed login. The SSO
+  domain itself is trusted (its own scripts see the login, as when you sign in by hand). No autofill, a captcha / slider / SMS or other MFA code, or a
   login that does not leave the login page is handed to you (with hand-off on) or reported as
   `login_required`. A submission is counted before the click; any outcome other than a clear success (failure,
   timeout, error, MFA after the click) ends the automatic logins of the batch, and a batch submits at most

