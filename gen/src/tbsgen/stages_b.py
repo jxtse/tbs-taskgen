@@ -173,6 +173,8 @@ def s9(P, it):
             if not c.get("allow_submit"):
                 return it.finish("waiting", f"calib {rec['job_name']} in state {rec['state']}; submit disabled")
             rec = calib.launch(P.cfg, rec, P.ledger, lambda r: _save_run(it, r))
+            if rec.get("blocked") and rec["state"] == "intent":
+                return it.finish("waiting", f"calib blocked: {rec['blocked']}")
             P.store.event("calib_reconciled", item=it.item_id, job=rec["job_name"], state=rec["state"])
         elif rec.get("outcome") is None and rec.get("state") == "launched":
             why = calib.launcher_failed(rec)

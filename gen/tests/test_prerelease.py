@@ -1,5 +1,6 @@
 """Pre-release checks (prerelease.py) and the package's network policy (package.py): unit tests.  The Docker /
 Harbor end-to-end checks are in test_integration.py."""
+import json
 import tomllib
 from pathlib import Path
 
@@ -46,10 +47,14 @@ def test_dependency_on_the_papers_package_is_blocking(tmp_path, req):
     assert not r["ok"] and r["findings"][0]["kind"] == "dependency" and "DecayFit" in r["findings"][0]["matches"]
 
 
-def test_pip_line_in_a_dockerfile_is_blocking(tmp_path):
-    df = "FROM python:3.11-slim\nRUN pip install --no-cache-dir numpy==2.1.3 \\\\\n    decayfit==0.3\n"
+@pytest.mark.parametrize("df", [
+    "FROM python:3.11-slim\nRUN pip install --no-cache-dir numpy==2.1.3 \\\n    decayfit==0.3\n",   # continuation
+    "FROM python:3.11-slim\nRUN apt-get update && python -m pip install -q decayfit && rm -rf /root/.cache\n",
+    "FROM python:3.11-slim\nRUN uv pip install --system git+https://github.com/someone/DecayFit.git@v1\n",
+])
+def test_pip_line_in_a_dockerfile_is_blocking(tmp_path, df):
     r = prerelease.readymade_check(mk_task(tmp_path, dockerfile=df), CAND, SPEC)
-    assert [f["name"] for f in r["findings"]] == ["decayfit==0.3".split("==")[0]]
+    assert [f["kind"] for f in r["findings"]] == ["dependency"], r
 
 
 def test_reference_or_baseline_import_is_blocking(tmp_path):
@@ -64,6 +69,33 @@ def test_vendored_copy_shipped_to_the_agent_is_blocking(tmp_path):
     t = mk_task(tmp_path, extra={"environment/data/decayfit/core.py": "def fit(): pass\n"})
     r = prerelease.readymade_check(t, CAND, SPEC)
     assert r["findings"][0]["kind"] == "public_code"
+
+
+def test_generated_public_output_is_checked_too(tmp_path):
+    """At S7 the public files are the generator's output (runs/s7-N/detA/environment), not task/environment."""
+    t = mk_task(tmp_path)
+    pub = tmp_path / "runs" / "s7-1" / "detA" / "environment"
+    (pub / "data" / "spikerobustfit").mkdir(parents=True)
+    (pub / "data" / "spikerobustfit" / "__init__.py").write_text("")
+    assert prerelease.readymade_check(t, CAND, SPEC)["ok"]
+    r = prerelease.readymade_check(t, CAND, SPEC, public_env=pub)
+    assert not r["ok"] and r["findings"][0]["kind"] == "public_code"
+
+
+def test_scheme_less_links_from_retrieval_count(tmp_path):
+    cand = dict(CAND, code_links=["github.com/lab/DecayFit"], data_links=[])
+    r = prerelease.readymade_check(mk_task(tmp_path, solve="import decayfit\n"), cand, {})
+    assert not r["ok"] and r["companion_code"] == ["https://github.com/lab/DecayFit"]
+
+
+def test_candidate_software_names_are_signals(tmp_path):
+    r = prerelease.readymade_check(mk_task(tmp_path, req="pyqsm\n"), dict(doi="10.1/x", libs=["QSM"]), {})
+    assert not r["ok"]
+
+
+def test_s5_prompt_asks_for_method_names():
+    from tbsgen import prompts
+    assert '"method_names"' in prompts.S5_SPEC
 
 
 def test_unrelated_dependencies_and_generic_repo_names_pass(tmp_path):
@@ -129,9 +161,18 @@ def test_calib_job_config_allows_the_model_host_in_the_agent_phase(tmp_path):
     assert conf["agents"][0]["extra_allowed_hosts"] == ["models.example.com"]
 
 
+def _pkg_task(item, **net):
+    """items/<id>/pkg/task.toml as package.py writes it."""
+    (item / "pkg").mkdir(parents=True, exist_ok=True)
+    cfg = load_config(overrides={"package": {"network": net}} if net else None)
+    (item / "pkg" / "task.toml").write_text(package.TASK_TOML.format(
+        task_id="t", desc='"d"', keywords="[]", domain='"x"', field='"x"', form='"ANS"', expert_h=1.0,
+        verifier_sec=60.0, agent_sec=60.0, **package.network_policy(cfg)))
+
+
 def test_calib_refuses_to_launch_an_allowlisted_task_without_a_model_host(tmp_path):
     item = tmp_path / "items" / "i1"
-    (item / "pkg").mkdir(parents=True)
+    _pkg_task(item)
     cfg = load_config(overrides={"calib": {"allow_submit": True, "harbor_root": str(tmp_path), "student_launcher": "x.sh",
                                            "jobs_dir": str(tmp_path / "jobs")}})
     rec = calib.prepare(cfg, item, "glm", 1)
@@ -142,3 +183,37 @@ def test_calib_refuses_to_launch_an_allowlisted_task_without_a_model_host(tmp_pa
     cfg["calib"]["agent_allowed_hosts"] = ["models.example.com"]
     cfg["calib"]["allow_submit"] = True
     assert not calib.prepare(cfg, item, "glm", 1).get("blocked")
+
+
+def test_calib_reads_the_network_of_the_task_it_runs_not_the_current_config(tmp_path):
+    """A task packaged public stays launchable after the default changes; a task packaged offline is refused even
+    if the config now says allowlist."""
+    cfg = load_config(overrides={"calib": {"allow_submit": True, "harbor_root": str(tmp_path), "student_launcher": "x.sh",
+                                           "jobs_dir": str(tmp_path / "jobs")}})
+    pub, off = tmp_path / "items" / "pub", tmp_path / "items" / "off"
+    _pkg_task(pub, mode="public")
+    _pkg_task(off, mode="no-network")
+    assert not calib.prepare(cfg, pub, "glm", 1).get("blocked")
+    cfg["calib"]["agent_allowed_hosts"] = ["models.example.com"]
+    assert "no-network" in calib.prepare(cfg, off, "glm", 1)["blocked"]
+    assert calib.agent_network(pub / "pkg") == ("public", [])
+
+
+def test_an_intent_saved_with_submit_off_is_rechecked_and_rewritten_at_launch(tmp_path):
+    """Intent written while allow_submit=false and before the model host was configured: enabling submit later
+    must not launch a job whose agent cannot reach its model; once the host is set the job config gets it."""
+    item = tmp_path / "items" / "i1"
+    _pkg_task(item)
+    base = {"harbor_root": str(tmp_path), "student_launcher": "x.sh", "jobs_dir": str(tmp_path / "jobs"),
+            "tmux_bin": "/nonexistent-tmux"}
+    rec = calib.prepare(load_config(overrides={"calib": base}), item, "glm", 1)
+    assert rec["state"] == "intent" and "warning" in rec
+    saved = []
+    cfg = load_config(overrides={"calib": dict(base, allow_submit=True)})
+    out = calib.launch(cfg, dict(rec), None, saved.append)
+    assert out["state"] == "intent" and "allowlist without hosts" in out["blocked"]
+    cfg["calib"]["agent_allowed_hosts"] = ["models.example.com"]
+    out = calib.launch(cfg, dict(rec), None, saved.append)
+    conf = json.loads(Path(rec["config"]).read_text())
+    assert conf["agents"][0]["extra_allowed_hosts"] == ["models.example.com"]
+    assert out["state"] == "launch_failed" and "not launched" not in out["error"]   # got past the check (no tmux)

@@ -54,7 +54,7 @@ GENERIC = {"python", "code", "src", "lib", "main", "master", "data", "dataset", 
 CODE_HOSTS = ("github.com", "gitlab.com", "bitbucket.org", "codeberg.org", "sourceforge.net", "pypi.org",
               "cran.r-project.org", "huggingface.co")
 
-PIP_LINE = re.compile(r"\b(?:pip3?|python3?\s+-m\s+pip|uv\s+pip)\s+install\b([^\n\\\\]*(?:\\\\\n[^\n\\\\]*)*)", re.I)
+PIP_LINE = re.compile(r"\b(?:pip3?|python3?\s+-m\s+pip|uv\s+pip)\s+install\b(.*)", re.I)
 
 
 def _norm(name: str) -> str:
@@ -77,7 +77,10 @@ def repo_names(links: list[str]) -> list[dict]:
     for u in links or []:
         if not isinstance(u, str):
             continue
-        m = re.match(r"https?://(?:www\.)?([^/]+)/+([^/?#]+)(?:/+([^/?#]+))?", u.strip())
+        u = u.strip()
+        if not re.match(r"[a-z][a-z0-9+.-]*://", u, re.I):          # retrieval writes github.com/owner/repo too
+            u = "https://" + u.removeprefix("//")
+        m = re.match(r"https?://(?:www\.)?([^/]+)/+([^/?#]+)(?:/+([^/?#]+))?", u)
         if not m:
             continue
         host, a, b = m.group(1).lower(), m.group(2), m.group(3)
@@ -88,7 +91,7 @@ def repo_names(links: list[str]) -> list[dict]:
         elif host.endswith("cran.r-project.org") and b:
             out.append(dict(url=u, host=host, name=b, kind="cran"))
         elif b:
-            out.append(dict(url=u, host=host, owner=a, name=re.sub(r"\.git$", "", b), kind="repo"))
+            out.append(dict(url=u, host=host, owner=a, name=re.sub(r"(\.git)?(@.*)?$", "", b), kind="repo"))
     return out
 
 
@@ -104,6 +107,11 @@ def signals(candidate: dict, spec: dict | None) -> dict:
     for m in (spec or {}).get("method_names") or []:
         for t in _tokens(str(m)):
             names.setdefault(t, f"method name {m}")
+    # software names given in the candidate record (retrieval: `libs`, `software`, `tools`)
+    for k in ("libs", "software", "tools", "packages"):
+        for m in candidate.get(k) or []:
+            for t in _tokens(str(m)):
+                names.setdefault(t, f"{k} {m}")
     return dict(repos=repos, names=names)
 
 
@@ -140,8 +148,12 @@ def environment_packages(task: Path) -> list[dict]:
         elif name in ("environment.yml", "environment.yaml"):
             out += [dict(name=n, file=rel) for n in re.findall(r"^\s*-\s*(?:pip:\s*)?([A-Za-z0-9][\w.-]*)", txt, re.M)]
         elif name == "dockerfile" or name.endswith(".dockerfile"):
-            for m in PIP_LINE.finditer(txt):
-                for w in m.group(1).replace("\\\n", " ").split():
+            joined = re.sub(r"\\[ \t]*\r?\n", " ", txt)          # Dockerfile line continuations
+            for cmd in re.split(r"&&|;|\|\||\n", joined):
+                m = PIP_LINE.search(cmd)
+                if not m:
+                    continue
+                for w in m.group(1).split():
                     if w.startswith("-") or "=" in w and not re.match(r"[\w.-]+==", w):
                         continue
                     if w.startswith(("git+", "http")):
@@ -175,7 +187,7 @@ def _match(name: str, sig: dict[str, str]) -> str | None:
     return None
 
 
-def readymade_check(task: Path, candidate: dict, spec: dict | None) -> dict:
+def readymade_check(task: Path, candidate: dict, spec: dict | None, public_env: Path | None = None) -> dict:
     """Rule check: does the task image install, or does the reference / a baseline import, the paper's own
     implementation?  Any third-party import of the reference or baselines outside the pinned stack is reported
     too (the sandbox image has only that stack, so such an import is either unused or a dependency to review)."""
@@ -195,15 +207,17 @@ def readymade_check(task: Path, candidate: dict, spec: dict | None) -> dict:
             why = _match(mod, sg["names"])
             if why:
                 findings.append(dict(kind="import", name=mod, file=rel, matches=why))
-    # code shipped to the agent under environment/ whose name matches the paper's implementation
-    env = task / "environment"
-    for p in sorted(env.rglob("*")) if env.exists() else []:
+    # code shipped to the agent under environment/ whose name matches the paper's implementation: the task tree and
+    # the generator's public output (`public_env`, e.g. runs/s7-N/detA/environment at S7)
+    shipped = [task / "environment"] + ([public_env] if public_env else [])
+    for env, p in [(e, p) for e in shipped if e.exists() for p in sorted(e.rglob("*"))]:
         if p.is_file() and p.suffix.lower() in (".py", ".r", ".jl", ".m", ".c", ".cpp", ".f90", ".ipynb", ".whl",
                                                 ".tar", ".gz", ".zip"):
             for part in p.relative_to(env).parts:
                 name = re.sub(r"\.(py|r|jl|m|c|cpp|f90|ipynb|whl|tar|gz|zip)$", "", part, flags=re.I)
                 if (why := _match(name.split("-")[0], sg["names"]) or _match(name, sg["names"])):
-                    findings.append(dict(kind="public_code", name=part, file=str(p.relative_to(task)), matches=why))
+                    findings.append(dict(kind="public_code", name=part, file=str(p.relative_to(env.parent)),
+                                         matches=why))
                     break
     return dict(ok=not findings, findings=findings, companion_code=[r["url"] for r in sg["repos"]],
                 signals=sorted(sg["names"]))

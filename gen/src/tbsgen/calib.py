@@ -97,6 +97,32 @@ def job_config(cfg: dict, pkg: Path, who: str, job_name: str) -> dict:
             "agents": [agent], "tasks": [{"path": str(pkg.resolve())}]}
 
 
+def agent_network(task: Path) -> tuple[str, list[str]]:
+    """Network mode + hosts of the agent phase as Harbor resolves them from the task's own task.toml: [agent]
+    overrides [environment]; a missing task.toml or table means "public"."""
+    import tomllib
+    try:
+        t = tomllib.loads((task / "task.toml").read_text())
+    except (OSError, ValueError):
+        return "public", []
+    env, ag = t.get("environment") or {}, t.get("agent") or {}
+    src = ag if ag.get("network_mode") else env
+    return str(src.get("network_mode") or "public"), [str(h) for h in src.get("allowed_hosts") or []]
+
+
+def network_problem(cfg: dict, task: Path, conf: dict) -> str | None:
+    """Why an agent that calls a model could not run this job: the task's agent phase is offline, or an allowlist
+    that names no host while the job config adds none (the model endpoint would be unreachable)."""
+    mode, hosts = agent_network(task)
+    extra = [h for a in conf.get("agents") or [] for h in a.get("extra_allowed_hosts") or []]
+    if mode == "no-network":
+        return f"{task}/task.toml: the agent phase is offline (no-network); an agent that calls a model cannot run"
+    if mode == "allowlist" and not hosts and not extra:
+        return (f"{task}/task.toml: the agent phase is an allowlist without hosts: set calib.agent_allowed_hosts to "
+                "the model endpoint host(s), or add --allow-agent-host to the command")
+    return None
+
+
 def job_name_for(item_dir: Path, who: str, n: int) -> str:
     """Stable per (item, who, attempt): a re-run after a crash finds the same job instead of starting another."""
     return f"tbsgen-{item_dir.name}-{who}{n}"
@@ -123,14 +149,7 @@ def prepare(cfg: dict, item_dir: Path, who: str, n: int) -> dict:
         # remote sandbox backends cannot build a Dockerfile: a missing prepared template means the run would die
         # at environment start (e2e-iter1: FileUploadException, no model use) -> do not launch
         rec["blocked"] = "no prepared sandbox template for this item"
-    net = (cfg["package"].get("network") or {}).get("mode", "agent-allowlist")
-    why = None
-    if net == "agent-allowlist" and not c.get("agent_allowed_hosts") and \
-            not (cfg["package"].get("network") or {}).get("agent_hosts"):
-        why = ("the task allows no host in the agent phase (package.network.mode = agent-allowlist): set "
-               "calib.agent_allowed_hosts to the model endpoint host(s), or add --allow-agent-host to the command")
-    elif net == "no-network":
-        why = "package.network.mode = no-network: an agent that calls a model cannot run"
+    why = network_problem(cfg, Path(rec["task"]), conf)
     if why:
         # an automatic launch would only burn a sandbox; a printed command is for a human, who can add the host
         rec["blocked" if c.get("allow_submit") else "warning"] = why
@@ -154,12 +173,35 @@ def launch(cfg: dict, rec: dict, ledger, save) -> dict:
     import subprocess
     c = cfg["calib"]
     if rec["state"] == "intent":
+        # an intent has no side effect outside item_dir: rewrite its job config from the current settings (it may
+        # have been written while submit was off, before calib.agent_allowed_hosts was set) and re-check it
+        conf = job_config(cfg, Path(rec["task"]), rec["who"], rec["job_name"])
+        Path(rec["config"]).write_text(json.dumps(conf, indent=1))
+        why = network_problem(cfg, Path(rec["task"]), conf)
+        if why:
+            rec["blocked"] = why
+            save(rec)
+            return rec
+        rec.pop("blocked", None)
         rec["ledger_call"] = ledger.reserve(rec["model"], "S9", rec["item"], True,
                                             est_usd=float(c["est_usd_per_run"])) if ledger is not None else None
         rec["state"] = "reserved"
         save(rec)
     if rec["state"] != "reserved":
         return rec
+    if not job_started(rec):
+        # the record may predate a config change (written while submit was off): re-check the job's own config
+        try:
+            conf = json.loads(Path(rec["config"]).read_text())
+        except (OSError, ValueError):
+            conf = {}
+        why = network_problem(cfg, Path(rec["task"]), conf)
+        if why:
+            if ledger is not None and rec.get("ledger_call"):
+                ledger.settle(rec["ledger_call"], 0.0, status="error", note=f"not launched: {why}"[:500])
+            rec.update(state="launch_failed", outcome="infra", error=f"not launched: {why}")
+            save(rec)
+            return rec
     if job_started(rec):                                   # crashed after launch, before recording it
         rec.update(state="launched", submitted=True, recovered=True)
         save(rec)

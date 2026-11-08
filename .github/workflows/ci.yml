@@ -76,6 +76,11 @@ jobs:
       - name: Sync
         working-directory: gen
         run: uv sync --locked
+      - name: Harbor (packaged-task network test)
+        # not a tbsgen dependency; the version whose network policy semantics the package targets
+        run: |
+          uv tool install harbor==0.23.0
+          echo "TBS_HARBOR_BIN=$(uv tool dir --bin)/harbor" >> "$GITHUB_ENV"
       - name: Integration tests (must not be skipped)
         working-directory: gen
         # test_integration.py skips itself when Docker or the image is missing; fail instead.

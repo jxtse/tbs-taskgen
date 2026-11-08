@@ -138,7 +138,8 @@ def run_gates(cfg: dict, item_dir: Path, spec: dict, thresholds: dict, attempt: 
     # ready-made implementation of the paper in the image, the reference or a baseline (prerelease.py)
     from . import prerelease
     from .state import read_json
-    rm = prerelease.readymade_check(task, read_json(item_dir / "S1_candidate.json", {}), spec)
+    rm = prerelease.readymade_check(task, read_json(item_dir / "S1_candidate.json", {}), spec,
+                                    public_env=gen0 / "environment")
     g["readymade"] = rm["ok"]
     det["readymade"] = rm
     blocking = [k for k, v in g.items() if not v and k in _blocking(cfg)]

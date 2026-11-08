@@ -71,7 +71,7 @@ for u in ("https://pypi.org/simple/six/", "https://github.com/"):
     except Exception as e:
         print("BLOCKED", u, type(e).__name__)
 PY
-if timeout 60 pip download --no-deps -q -d /tmp/x six >/dev/null 2>&1; then echo "PIP_OK"; else echo "PIP_FAILED"; fi
+if timeout 60 pip download --no-cache-dir --no-deps -q -d /tmp/x requests >/dev/null 2>&1; then echo "PIP_OK"; else echo "PIP_FAILED"; fi
 } > /logs/agent/net_probe.txt 2>&1
 python /solution/solve.py
 """
@@ -98,7 +98,8 @@ def test_packaged_image_builds_and_reference_runs_offline(tmp_path):
     assert b.returncode == 0, b.stderr[-2000:]
     try:
         cmd = ("bash /solution/solve.sh && bash /tests/test.sh && cat /logs/verifier/reward.txt && "
-               "(pip install --no-cache-dir -q six >/dev/null 2>&1 && echo PIP_OK || echo PIP_FAILED)")
+               "(pip download --no-cache-dir --no-deps -q -d /tmp/dl requests >/dev/null 2>&1 "
+               "&& echo PIP_OK || echo PIP_FAILED)")
         r = subprocess.run(["docker", "run", "--rm", "--network", "none", "-v", f"{pkg / 'solution'}:/solution:ro",
                             "-v", f"{pkg / 'tests'}:/tests:ro", tag, "bash", "-c", cmd],
                            capture_output=True, text=True, timeout=1200)
