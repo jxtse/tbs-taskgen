@@ -463,7 +463,8 @@ class DownloadLedger:
         if not doi:
             return
         with self._tx():
-            self.db.execute("insert or ignore into not_entitled values(?,?,?,?)", (channel, doi, self.clock(), note[:200]))
+            self.db.execute("insert into not_entitled values(?,?,?,?) on conflict(channel, doi) do update set "
+                            "ts = excluded.ts, note = excluded.note", (channel, doi, self.clock(), note[:200]))
 
     def not_entitled(self, channel: str, doi: str, ttl_days: float | None = None) -> str | None:
         """Why `channel` must not ask for `doi` (a not-entitled answer recorded earlier), else None.  ttl_days:

@@ -5,7 +5,8 @@ substantial or systematic reproduction; Wiley's TDM terms forbid redistributing 
 full text came through a TDM channel (`gates.tdm_verbatim_channels`, default elsevier and wiley -- also when it
 was served from a cache that one of them filled), the longest verbatim overlap between the full text and every
 public task file (instruction.md and the text files under environment/data) must not exceed
-`gates.tdm_verbatim_max_chars` (200), compared after whitespace normalisation and case folding.
+`gates.tdm_verbatim_max_chars` (200), compared after whitespace normalisation and case folding.  Every textual
+file is checked whole (exact longest common substring via a suffix automaton of the full text).
 
 A text whose channel is unknown is treated as TDM only when `gates.tdm_verbatim_unknown` is true (default false:
 the earlier pipeline's caches carry a channel in their provenance).  A paper from a TDM channel whose full text
@@ -20,55 +21,73 @@ from pathlib import Path
 from .leakcheck import TEXT_SUFFIX
 
 _WS = re.compile(r"\s+")
-_B = 1_000_003
-_M = (1 << 61) - 1
 
 
 def normalise(s: str) -> str:
     return _WS.sub(" ", s or "").strip().casefold()
 
 
-def _hashes(s: str, k: int) -> list[int]:
-    if len(s) < k:
-        return []
-    h, out = 0, []
-    p = pow(_B, k - 1, _M)
-    for i, ch in enumerate(s):
-        if i >= k:
-            h = (h - ord(s[i - k]) * p) % _M
-        h = (h * _B + ord(ch)) % _M
-        if i >= k - 1:
-            out.append(h)
-    return out
+class _SAM:
+    """Suffix automaton of one text: exact longest common substring with another text in linear time."""
 
+    def __init__(self, s: str):
+        self.nxt: list[dict] = [{}]
+        self.link = [-1]
+        self.len = [0]
+        last = 0
+        for ch in s:
+            cur = len(self.len)
+            self.nxt.append({})
+            self.len.append(self.len[last] + 1)
+            self.link.append(0)
+            p = last
+            while p != -1 and ch not in self.nxt[p]:
+                self.nxt[p][ch] = cur
+                p = self.link[p]
+            if p != -1:
+                q = self.nxt[p][ch]
+                if self.len[p] + 1 == self.len[q]:
+                    self.link[cur] = q
+                else:
+                    clone = len(self.len)
+                    self.nxt.append(dict(self.nxt[q]))
+                    self.len.append(self.len[p] + 1)
+                    self.link.append(self.link[q])
+                    while p != -1 and self.nxt[p].get(ch) == q:
+                        self.nxt[p][ch] = clone
+                        p = self.link[p]
+                    self.link[q] = self.link[cur] = clone
+            last = cur
 
-def longest_overlap(public: str, source: str, at_least: int) -> tuple[int, str]:
-    """Length of the longest common substring of the two (normalised) texts if it is >= at_least, else 0, plus
-    the start of that passage.  Rolling-hash windows of `at_least` chars find candidate positions; each hit is
-    verified and extended in both texts."""
-    a, b = normalise(public), normalise(source)
-    k = max(1, int(at_least))
-    if len(a) < k or len(b) < k:
-        return 0, ""
-    src = {}
-    for j, h in enumerate(_hashes(b, k)):
-        src.setdefault(h, []).append(j)
-    best, snip, i = 0, "", 0
-    ha = _hashes(a, k)
-    while i < len(ha):
-        hit = 0
-        for j in src.get(ha[i], ())[:50]:
-            if a[i:i + k] != b[j:j + k]:
-                continue
-            n = k
-            while i + n < len(a) and j + n < len(b) and a[i + n] == b[j + n]:
+    def longest_in(self, t: str) -> tuple[int, int, int]:
+        """(length without a space at either end, start, end) of the longest substring of t that occurs in the
+        automaton's text.  At each end position only the longest match matters: its shorter suffixes lose at
+        most the same leading space."""
+        v, n, best, start, end = 0, 0, 0, 0, 0
+        for i, ch in enumerate(t):
+            while v and ch not in self.nxt[v]:
+                v = self.link[v]
+                n = self.len[v]
+            if ch in self.nxt[v]:
+                v = self.nxt[v][ch]
                 n += 1
-            hit = max(hit, n)
-            m = len(a[i:i + n].strip())          # a shared space at either end is not quoted text
-            if m > best:
-                best, snip = m, a[i:i + n].strip()[:120]
-        i += max(1, hit - k + 1) if hit else 1
-    return best, snip
+            if n:
+                eff = n - (t[i - n + 1] == " ") - (ch == " " and n > 1)
+                if eff > best:
+                    best, start, end = eff, i - n + 1, i + 1
+        return best, start, end
+
+
+def longest_overlap(public: str, source: str, at_least: int = 1, sam: _SAM | None = None) -> tuple[int, str]:
+    """Length of the longest common substring of the two normalised texts (shared spaces at either end of the
+    passage are not counted), and its start; (0, "") when shorter than `at_least`."""
+    a = normalise(public)
+    sam = sam or _SAM(normalise(source))
+    n, start, end = sam.longest_in(a)
+    passage = a[start:end].strip()
+    if n < max(1, int(at_least)):
+        return 0, ""
+    return n, passage[:120]
 
 
 def tdm_channel(item_dir: Path) -> str | None:
@@ -84,13 +103,22 @@ def tdm_channel(item_dir: Path) -> str | None:
     return ch
 
 
+def _textual(p: Path) -> bool:
+    """Any file that could carry prose: a known text suffix, or no NUL byte in its first 8 KB."""
+    if p.suffix.lower() in TEXT_SUFFIX:
+        return True
+    with p.open("rb") as fh:
+        return b"\0" not in fh.read(8192)
+
+
 def public_files(task: Path, data_dir: Path) -> list[tuple[str, str]]:
+    """instruction.md and every textual file under environment/data, whole (no size limit)."""
     out = []
     ins = task / "instruction.md"
     if ins.exists():
         out.append(("instruction.md", ins.read_text(errors="replace")))
     for p in sorted(data_dir.rglob("*")) if data_dir.exists() else []:
-        if p.is_file() and p.suffix.lower() in TEXT_SUFFIX and p.stat().st_size < 2e6:
+        if p.is_file() and not p.is_symlink() and _textual(p):
             out.append((f"environment/data/{p.relative_to(data_dir)}", p.read_text(errors="replace")))
     return out
 
@@ -109,9 +137,9 @@ def check(cfg: dict, item_dir: Path, task: Path, data_dir: Path) -> dict:
     if not ft.exists():
         out.update(ok=False, error="full text not available (purged?): cannot verify the public files")
         return out
-    src = ft.read_text(errors="replace")
+    sam = _SAM(normalise(ft.read_text(errors="replace")))
     for rel, txt in public_files(task, data_dir):
-        n, snip = longest_overlap(txt, src, limit + 1)
+        n, snip = longest_overlap(txt, "", limit + 1, sam=sam)
         if n > limit:
             out["findings"].append(dict(file=rel, chars=n, starts=snip))
     out["ok"] = not out["findings"]

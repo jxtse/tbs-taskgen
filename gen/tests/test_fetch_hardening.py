@@ -104,6 +104,45 @@ def test_limited_channel_does_not_reset_backoff_of_a_failed_one(tmp_path):
     assert st["ok"] == 1 and all("elsevier" not in u for u, _ in net.calls[n:])
 
 
+def test_refusal_without_known_end_is_rechecked_soon(tmp_path):
+    """Egress refused (no end time) next to a cap that lifts at midnight: due again after LIMIT_RECHECK_S."""
+    f, net, led, clock = mkfetcher(tmp_path, {}, SECRETS, oa={"enabled": True},
+                                   egress_check={"enabled": True, "allow_cidrs": ["198.51.100.0/24"],
+                                                 "urls": ["https://echo.example/ip"]})
+    net.routes["echo.example"] = b"203.0.113.9"
+    qp = q(f, dict(doi="10.1016/j.u.1", title=TITLE, oa_url="https://repo.example/u.pdf"))
+    st = drain(f, clock)
+    assert st["limited"] == 1 and st["failed"] == 0
+    e = entry(qp, "10.1016/j.u.1")
+    assert not e.get("tries") and e["next_try"] == pytest.approx(clock.t + fulltext.LIMIT_RECHECK_S)
+
+
+def test_new_link_resets_channel_backoff(tmp_path):
+    f, net, led, clock = mkfetcher(tmp_path, {"repo.example/old": Resp(404, {}, b"", "u")}, SECRETS)
+    qp = q(f, dict(doi="10.9999/n.1", title=TITLE, oa_url="https://repo.example/old.pdf"))
+    drain(f, clock)
+    assert entry(qp, "10.9999/n.1")["chan_backoff"]["oa"]["tries"] == 1
+    fulltext.enqueue(qp, fulltext.queue_entry(dict(doi="10.9999/n.1", title=TITLE, oa_url="https://repo.example/new.pdf"),
+                                              subscribers=[["r", "x"]]))
+    e = entry(qp, "10.9999/n.1")
+    assert not e.get("chan_backoff") and e["next_try"] == 0
+    net.routes["repo.example/new"] = FAKE_PDF
+    assert drain(f, clock)["ok"] == 1
+
+
+def test_old_queue_format_item_ids_still_delivered(tmp_path):
+    """Queue entries written before `subscribers` (run + item_ids) keep notifying their items."""
+    f, net, led, clock = mkfetcher(tmp_path, {"api.elsevier.com": ELS_XML}, SECRETS, oa={"enabled": False})
+    qp = fulltext.queue_path(f.cfg)
+    qp.parent.mkdir(parents=True, exist_ok=True)
+    qp.write_text(json.dumps(dict(doi="10.1016/j.l.1", title=TITLE, ident="doi:10.1016/j.l.1", run="/runs/A",
+                                  item_ids=["i1", "i2"])) + "\n")
+    got = []
+    fulltext.drain_queue(f, browser=False, on_success=lambda e, o, s: got.append(s) or True, log=lambda s: None,
+                         now=clock.t)
+    assert got == [["/runs/A", "i1"], ["/runs/A", "i2"]] and fulltext.read_queue(qp) == []
+
+
 # ------------------------------------------------------------------ A3: not entitled
 def test_elsevier_short_text_zero_is_not_entitled_and_never_asked_again(tmp_path):
     f, net, led, clock = mkfetcher(tmp_path, {"api.elsevier.com": ELS_ABSTRACT_ONLY}, SECRETS, oa={"enabled": False})
@@ -131,6 +170,8 @@ def test_wiley_short_text_is_not_entitled_and_ttl_expires(tmp_path, monkeypatch)
     assert f.fetch(dict(doi="10.1002/abc.9", title=TITLE)).text is None and len(net.calls) == n
     clock.t += 11 * 86400                                            # ttl_days passed: ask once more
     f.fetch(dict(doi="10.1002/abc.9", title=TITLE))
+    assert len(net.calls) == n + 1
+    f.fetch(dict(doi="10.1002/abc.9", title=TITLE))                  # the new answer renewed the record
     assert len(net.calls) == n + 1
 
 
@@ -287,6 +328,26 @@ def test_remote_status_reports_both_sides(tmp_path):
 
 
 # ------------------------------------------------------------------ A6: lease counting on recall
+def test_reused_fetcher_does_not_consume_earlier_remote_results(tmp_path, monkeypatch):
+    """Round 1 collects a failed remote result; round 2 is refused by the preflight: the paper must not be
+    charged a try from round 1's stale result."""
+    f, net, led, clock = mkfetcher(tmp_path, {}, SECRETS, remote=dict(enabled=True, host="h", python="/p",
+                                                                         workdir="/w"))
+    qp = q(f, dict(doi="10.1016/j.s.1", title=TITLE))
+    ident = "doi:10.1016/j.s.1"
+    rounds = iter([dict(results={ident: dict(ok=False, text=None, rec=dict(tried=["elsevier:u"], errors=["x"]))},
+                        jobs=[]),
+                   dict(results={}, jobs=[], refused="code fingerprint mismatch")])
+    monkeypatch.setattr(remote, "run_job", lambda *a, **k: next(rounds))
+    st1 = drain(f, clock)
+    assert st1["failed"] == 1 and entry(qp, "10.1016/j.s.1")["chan_backoff"]["elsevier"]["tries"] == 1
+    before = entry(qp, "10.1016/j.s.1")
+    clock.t += 7 * 86400
+    st2 = drain(f, clock, only=["10.1016/j.s.1"])
+    assert st2["remote_error"] and st2["not_tried"] == 1 and st2["failed"] == 0
+    assert entry(qp, "10.1016/j.s.1") == before
+
+
 def test_lease_rows_never_count_as_attempts_or_breaker(tmp_path):
     f, net, led, clock = mkfetcher(tmp_path, {}, SECRETS)
     remote.lease_and_snapshot(led, "j", 3)
@@ -342,7 +403,7 @@ def test_purge_tdm_channels_keeps_ledger_and_other_texts(tmp_path):
     f, led = _fetch_three(tmp_path)
     w = Path(f.cfg["fulltext"]["write_cache_dir"])
     run = tmp_path / "run"
-    for name, ch, stage in (("it-els", "elsevier", "S9"), ("it-active", "wiley", "S4")):
+    for name, ch, stage in (("it-els", "elsevier", "S9"), ("it-active", "wiley", "S7")):
         d = run / "items" / name
         d.mkdir(parents=True)
         (d / "fulltext.txt").write_text(BODY)

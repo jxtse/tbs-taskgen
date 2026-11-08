@@ -32,6 +32,35 @@ def test_longest_overlap_is_whitespace_and_case_insensitive():
     assert tdmgate.longest_overlap("short", SRC, 20) == (0, "")
 
 
+def test_overlapping_repeats_are_found_exactly():
+    """A rolling scan that skips ahead after a hit misses overlapping occurrences (Codex review r1)."""
+    c = "b" * 198
+    public, source = "x a " + c + " z", "y a " + c + " q#a " + c + " z"
+    assert tdmgate.longest_overlap(public, source)[0] == len(("a " + c + " z").strip())
+
+
+def test_matches_brute_force_on_random_texts():
+    import random
+    rnd = random.Random(7)
+    for _ in range(200):
+        a = "".join(rnd.choice("ab ") for _ in range(rnd.randint(0, 40)))
+        b = "".join(rnd.choice("ab ") for _ in range(rnd.randint(0, 40)))
+        na, nb = tdmgate.normalise(a), tdmgate.normalise(b)
+        best = max([len(na[i:j].strip()) for i in range(len(na)) for j in range(i + 1, len(na) + 1)
+                    if na[i:j] in nb] or [0])
+        assert tdmgate.longest_overlap(a, b)[0] == best, (a, b)
+
+
+def test_large_and_unknown_suffix_files_are_checked(tmp_path):
+    cfg = load_config()
+    item, task, data = mk_item(tmp_path)
+    (data / "big.csv").write_text("x," * 1_100_000 + "\n" + SRC)            # > 2 MB
+    (data / "notes.dat").write_text(SRC)                                    # unknown suffix, textual
+    (data / "blob.bin").write_bytes(b"\0\1\2" + SRC.encode())              # binary: skipped
+    r = tdmgate.check(cfg, item, task, data)
+    assert {f["file"] for f in r["findings"]} == {"environment/data/big.csv", "environment/data/notes.dat"}
+
+
 def test_quote_up_to_200_chars_passes_longer_blocks(tmp_path):
     cfg = load_config()
     quote = SRC[14:14 + 200]

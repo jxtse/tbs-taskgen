@@ -977,7 +977,8 @@ class Fetcher:
 
 
 # ------------------------------------------------------------------------------------------- purge (TDM terms)
-_EARLY_STAGES = ("S1", "S2", "S3", "S4", "S5")     # stages that still read items/<id>/fulltext.txt
+# stages that still read items/<id>/fulltext.txt (S4/S5 prompts, S7 tdm_verbatim gate, S8 repair -> S7)
+_EARLY_STAGES = ("S1", "S2", "S3", "S4", "S5", "S6A", "S6A_run", "S6M", "S6B", "S6C", "S7", "S8")
 
 
 def _text_channel(prov: dict) -> str | None:
@@ -1003,8 +1004,8 @@ def purge(cfg: dict, channels: list[str], *, before: str | None = None, dry_run:
 
     Only the write cache (`fulltext.write_cache_dir`) is purged.  Read-only caches (`fulltext.cache_dirs`) are
     never written: matching texts there are reported (`readonly_matches`) for the owner to delete.  Item copies
-    of items still at S1..S5 (which read fulltext.txt) are not deleted unless the item is finished; they are
-    reported as `items_active`."""
+    of items not yet packaged (S1..S8 read fulltext.txt; S7's tdm_verbatim gate needs it) are kept unless the item
+    is dropped; they are reported as `items_active`."""
     from .state import read_json
     bad = [c for c in channels if c not in LICENCES]
     if not channels or bad:
@@ -1055,7 +1056,7 @@ def purge(cfg: dict, channels: list[str], *, before: str | None = None, dry_run:
             if not match(rec, ft):
                 continue
             st = read_json(idir / "state.json", {})
-            if st.get("stage") in _EARLY_STAGES and st.get("status") not in ("dropped", "done"):
+            if st.get("stage") in _EARLY_STAGES and st.get("status") != "dropped":
                 out["items_active"].append(idir.name)
                 continue
             out["items"] += 1
@@ -1157,6 +1158,9 @@ def enqueue(path: Path, entry: dict) -> bool:
     entry.pop("key", None)
     if not entry["ident"]:
         return False
+    if "item_ids" in entry:
+        entry["subscribers"] = _subs(entry)
+        entry.pop("item_ids")
     with queue_lock(path):
         q = read_queue(path)
         for e in q:
@@ -1166,14 +1170,19 @@ def enqueue(path: Path, entry: dict) -> bool:
                 subs = old_subs + [list(s) for s in _subs(entry) if list(s) not in old_subs]
                 if subs != old_subs:
                     e["subscribers"] = subs
+                    e.pop("item_ids", None)
                     changed = True
+                new_link = False
                 for k in QUEUE_FIELDS:
                     if entry.get(k) and entry[k] != e.get(k):
                         e[k] = entry[k]
                         changed = True
+                        new_link |= k != "title"
                 if changed:
                     e["next_try"] = 0
                     e["ver"] = int(e.get("ver") or 0) + 1      # a drain that read an older version keeps it due
+                    if new_link:
+                        e.pop("chan_backoff", None)            # a new link / id: every channel may try again
                     write_queue(path, q)
                 return False
         q.append(entry)
@@ -1199,8 +1208,10 @@ def reconcile(store, path: Path) -> int:
 
 
 def _subs(e: dict) -> list[list[str]]:
-    """[(run, item_id)] waiting for this paper."""
-    return [list(s) for s in e.get("subscribers") or []]
+    """[(run, item_id)] waiting for this paper (older entries: item_ids + run)."""
+    if e.get("subscribers"):
+        return [list(s) for s in e["subscribers"]]
+    return [[e.get("run") or "", i] for i in e.get("item_ids") or []]
 
 
 # ------------------------------------------------------------------------------------------- queue drain
@@ -1220,7 +1231,7 @@ def match_only(e: dict, only: list[str]) -> bool:
     return False
 
 
-def classify(out: Outcome) -> tuple[str, float | None, set[str], set[str]]:
+def classify(out: Outcome, now: float | None = None) -> tuple[str, float | None, set[str], set[str]]:
     """Queue verdict for an attempt that produced no text -> (verdict, until, failed_channels, limited_channels).
 
     "limited": some channel was refused without sending anything (ledger cap / cooldown / breaker, egress
@@ -1235,8 +1246,13 @@ def classify(out: Outcome) -> tuple[str, float | None, set[str], set[str]]:
         lim_ch |= {t.split(":", 1)[0] for t in rec.get("skipped") or [] if "egress refused" in t}
     failed = {t.split(":", 1)[0] for t in rec.get("tried") or [] if not t.startswith("cache:")} - lim_ch
     if limited or rec.get("egress_refused"):
-        ends = [float(x["until"]) for x in limited if x.get("until")]
-        return "limited", (min(ends) if ends else None), failed, lim_ch
+        # the earliest time any refusal may lift; a refusal with no known end (egress, a slot that never came)
+        # is looked at again after LIMIT_RECHECK_S
+        now = time.time() if now is None else now
+        ends = [float(x["until"]) if x.get("until") else now + LIMIT_RECHECK_S for x in limited]
+        if rec.get("egress_refused"):
+            ends.append(now + LIMIT_RECHECK_S)
+        return "limited", min(ends), failed, lim_ch
     if not rec.get("tried") and rec.get("backing_off"):
         return "limited", None, failed, lim_ch          # every applicable channel is still backing off
     return "failed", None, failed, lim_ch
@@ -1356,7 +1372,9 @@ def _drain_locked(fetcher, qp, now, max_papers, channels, browser, dry_run, on_s
         want = [ch for ch in (channels or fetcher.ft.get("cascade") or CHANNELS) if ch in remote.HTTP_CHANNELS]
         rjob = remote.run_job(fetcher, [e for e in todo if not fetcher.cached(e)], want or None,
                               log=lambda m: log(m)) if want else dict(results={}, jobs=[])
-        fetcher.remote_results.update(rjob.get("results") or {})
+        round_results = rjob.get("results") or {}
+        fetcher.remote_results.clear()             # a reused Fetcher must not consume an earlier round's results
+        fetcher.remote_results.update(round_results)
         stats["remote"] = {k: v for k, v in rjob.items() if k != "results"}
         for j in stats["remote"].get("jobs") or []:
             j.pop("results", None)
@@ -1369,7 +1387,7 @@ def _drain_locked(fetcher, qp, now, max_papers, channels, browser, dry_run, on_s
             stats["remote_error"] = "; ".join(errs)
             # nothing was tried for the papers of a refused round: leave them untouched (no try, no backoff, no
             # browser attempt that would charge them a try); only results already collected are delivered
-            keep = [e for e in todo if paper_ident(e) in fetcher.remote_results or fetcher.cached(e)]
+            keep = [e for e in todo if paper_ident(e) in round_results or fetcher.cached(e)]
             stats["not_tried"] = len(todo) - len(keep)
             todo = keep
 
@@ -1403,7 +1421,7 @@ def _drain_locked(fetcher, qp, now, max_papers, channels, browser, dry_run, on_s
                 deferred.add(k)
                 stats["deferred"] += 1
             else:
-                verdict, until, failed_ch, _ = classify(out)
+                verdict, until, failed_ch, _ = classify(out, now)
                 chan_failed[k] = failed_ch
                 if verdict == "limited":
                     limited[k] = until
