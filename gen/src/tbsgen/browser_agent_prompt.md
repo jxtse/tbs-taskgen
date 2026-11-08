@@ -28,7 +28,6 @@ Use your terminal tool to run exactly one of these commands per call (nothing el
 - `tbsgen-browser N hover I` — hover item I of the page itself (opens "Download" dropdown menus; run `look`
   again afterwards to see the menu items). Not available for items inside frames; dropdown items are already
   in the `look` list (hidden), so `click` them directly when hover does not help.
-- `tbsgen-browser N scroll up|down [PX]` — scroll the page.
 - `tbsgen-browser N select I VALUE` — choose VALUE (option value or label) of select item I (institution
   selection lists).
 - `tbsgen-browser N type I TEXT` — type TEXT into text item I. Only $type_names, nothing else; never into

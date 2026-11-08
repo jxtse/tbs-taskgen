@@ -428,11 +428,15 @@ def test_wrapper_never_enables_the_local_sso_test_mode(tmp_path, monkeypatch):
 def test_long_stderr_line_never_leaks_its_tail():
     import io
     body = b"x" * (browser_agent._StderrTail.MAX_LINE + 100) + b"password=" + b"\n"
-    data = body[:-1] + b"LEAKEDSECRET\nmaybe still the value\n\nnext record\n"
+    data = b"before\n" + body[:-1] + b"LEAKEDSECRET\nmaybe still the value\n\nnext record\n"
     tail = browser_agent._StderrTail(io.BytesIO(data), keep=4096).text()
-    # an over-long line with a sensitive key: the lines after it are dropped up to a blank line
-    assert "LEAKEDSECRET" not in tail and "still the value" not in tail, tail
-    assert "next record" in tail and "long line dropped" in tail, tail
+    # an over-long line with a sensitive key: everything after it is dropped (its value's end is unknown)
+    assert "LEAKEDSECRET" not in tail and "still the value" not in tail and "next record" not in tail, tail
+    assert "before" in tail and "long line dropped" in tail and "rest of stderr dropped" in tail, tail
+    # an over-long CONTINUATION of an open sensitive value (round 7): the record and the rest are dropped
+    data = (b'token: "START\n' + b"y" * (browser_agent._StderrTail.MAX_LINE + 10) + b'\nSECRET_END"\nlater\n')
+    tail = browser_agent._StderrTail(io.BytesIO(data), keep=4096).text()
+    assert "START" not in tail and "SECRET_END" not in tail and "later" not in tail, tail
     # without a sensitive key the next line is kept
     data = b"x" * (browser_agent._StderrTail.MAX_LINE + 100) + b"\nnext line\n"
     assert "next line" in browser_agent._StderrTail(io.BytesIO(data), keep=4096).text()
@@ -626,3 +630,45 @@ def test_redaction_drop_survives_the_tail_cut():
     txt = "rec:\n" + "".join(f"  line {k}\n" for k in range(50)) + "  password=SECRET\n  more\nnext\n"
     r = browser_agent._StderrTail(io.BytesIO(txt.encode()), keep=120).text()
     assert "SECRET" not in r and "line 49" not in r and "more" not in r and r.rstrip().endswith("next"), r
+
+
+def test_wrapper_exception_after_start_never_reopens_the_handoff(tmp_path, monkeypatch):
+    """Round 7: a Python exception after the script started (e.g. while decoding its output) is booked as
+    an unknown hand-off: the paper closes, the publisher cools, the hand-off budget stays used."""
+    bd, led = _batch(tmp_path, monkeypatch, ["10.1080/a.1", "10.1080/b.2"], handoff_enabled=True,
+                     sso_login_enabled=False)
+    # output cut in the middle of a UTF-8 character, then a hang: killed at the call timeout
+    (tmp_path / "ego").write_text("#!" + sys.executable + "\nimport sys, time\nsys.stdout.buffer.write(b'x\\xe4\\xb8')\n"
+                                  "sys.stdout.flush()\ntime.sleep(60)\n")
+    st = json.loads((bd / "batch.json").read_text())
+    st["call_timeout_s"] = 2
+    (bd / "batch.json").write_text(json.dumps(st))
+    out, _ = _call(bd, "1", "open", "https://pub.example/a").communicate(timeout=90)
+    ps = json.loads((bd / "papers" / "1.json").read_text())
+    assert ps.get("closed") and not ps.get("handoff"), (out, ps)
+    state = json.loads((bd / "state.json").read_text())
+    assert state["handoff"]["pub:" + _pub("10.1080/a.1")] and not (state.get("handoff_inflight") or {})
+    assert led.cooling("chrome:10.1080")
+
+
+def test_wrapper_crash_while_holding_the_handoff_budget_books_it(tmp_path, monkeypatch):
+    bd, led = _batch(tmp_path, monkeypatch, ["10.1080/a.1", "10.1080/b.2"], handoff_enabled=True,
+                     sso_login_enabled=False)
+    st = json.loads((bd / "batch.json").read_text())
+
+    def boom(*a, **k):
+        raise RuntimeError("wrapper bug")
+    monkeypatch.setattr(browser_agent, "_paced_run", boom)
+    with pytest.raises(RuntimeError):
+        browser_agent._paper_call(bd, st, "1", "open", "https://pub.example/a", lambda m, rc: rc)
+    state = json.loads((bd / "state.json").read_text())
+    pk = "pub:" + _pub("10.1080/a.1")
+    assert state["handoff"][pk] and not (state.get("handoff_inflight") or {}) and state["handoff_unknown"][pk] == "1"
+    monkeypatch.undo()
+    # the next call of the paper closes it and cools the publisher
+    msgs = []
+    rc = browser_agent._paper_call(bd, st, "1", "look", "", lambda m, rc: msgs.append(m) or rc)
+    assert rc == 2 and "failed" in msgs[-1], msgs
+    assert json.loads((bd / "papers" / "1.json").read_text())["closed"]
+    assert led.cooling("chrome:10.1080")
+    assert not json.loads((bd / "state.json").read_text()).get("handoff_unknown")

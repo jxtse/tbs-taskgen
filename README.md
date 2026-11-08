@@ -312,7 +312,7 @@ uv run tbsgen fetch --run runs/R --config config.toml --browser --wait-for-egres
   action script [`browser_agent_action.mjs`](gen/src/tbsgen/browser_agent_action.mjs) in a TaskSpace of its own
   per paper. Actions: `look` (page summary with a numbered list of links, buttons and fields of the page's own
   DOM, including hidden dropdown items and same-origin iframes; a cross-origin iframe is one item whose `click`
-  opens its checked URL; an offset for long pages), `open URL`, `click I`, `hover I`, `scroll`,
+  opens its checked URL; an offset for long pages), `open URL`, `click I`, `hover I`,
   `select I VALUE`, `type I TEXT`, `tabs` / `switch`, `back`, `wait_for`, `save_pdf`, `sso_login`,
   `handoff_status` and `finish`. There are deliberately no coordinate clicks, no screenshots, no native mouse
   actions (hover dispatches pointer events, top document only), no actions inside cross-origin iframes and no
@@ -367,8 +367,10 @@ uv run tbsgen fetch --run runs/R --config config.toml --browser --wait-for-egres
   Removed by design (review rounds 4-7; fewer actions rather than more guards): coordinate clicks
   (`click_xy`), screenshots / vision, the browser's page snapshot (`look full`, `@REF` items), any action
   inside a cross-origin iframe, native clicks on `target=_blank` links (their checked URL is opened in the page
-  instead), native mouse hover (and hover inside any frame), and every click / hover / select / type on a
-  page with any login signal. Expected effect: publisher pages whose PDF link only appears after a canvas /
+  instead), native mouse hover (and hover inside any frame), `scroll` (its fallback was a native wheel at a
+  fixed point; `look` already lists the whole page, so scrolling is not needed to find a link), and every
+  click / hover / select / type on a page with any login signal. No native mouse input is left at all:
+  `sso_login` checks and submits in one page evaluation run with a browser user gesture. Expected effect: publisher pages whose PDF link only appears after a canvas /
   coordinate interaction, inside a cross-origin viewer frame or behind an e-mail / "Sign in" prompt are not
   fetched by the agent; they are reported (`login_required`) or handed to you. A WAYF / institution-selection
   page that itself carries login wording ("Sign in via your institution" as its title or a form button) is
@@ -380,9 +382,11 @@ uv run tbsgen fetch --run runs/R --config config.toml --browser --wait-for-egres
   has the institution account saved. `tbsgen-browser N sso_login` works only on a page of an HTTPS domain in
   `sso_login.domains` (your institution's own login server, e.g. reached through CARSI / WAYF). It relies on
   the browser's password manager: it checks the browser's own autofill state (`:autofill`) of the user and
-  password fields (their values are never read, returned or logged) and presses the login button with a real
-  click. No credential is ever typed, configured or stored by tbsgen. The button is pressed only if the page and
-  the browser-resolved form target are both on an HTTPS `sso_login.domains` host and the form uses POST. No autofill, a captcha / slider / SMS or other MFA code, or a
+  password fields (their values are never read, returned or logged) and presses the login button. No credential
+  is ever typed, configured or stored by tbsgen. The check and the press are ONE page evaluation, run with a
+  browser user gesture (which is what releases autofilled values to the page): the button is pressed only if,
+  at that moment, the page is on an HTTPS `sso_login.domains` host, both fields are still autofilled, there is
+  no captcha / MFA, the form uses POST and its browser-resolved target is on such a host. No autofill, a captcha / slider / SMS or other MFA code, or a
   login that does not leave the login page is handed to you (with hand-off on) or reported as
   `login_required`. A submission is counted before the click; any outcome other than a clear success (failure,
   timeout, error, MFA after the click) ends the automatic logins of the batch, and a batch submits at most

@@ -245,7 +245,6 @@ _PAPER_ACTIONS = "|".join((
     r"open https?://" + _SAFE_TOK,
     r"click \d{1,3}",
     r"hover \d{1,3}",
-    r"scroll (up|down)( \d{1,4})?",
     r"select \d{1,3} " + _SAFE_TXT,
     r"type \d{1,3} " + _SAFE_TXT,
     "tabs",
@@ -260,9 +259,9 @@ _TOOL_CMD = re.compile(rf"^tbsgen-browser (finish|[1-9]\d? ({_PAPER_ACTIONS}))$"
 _SLEEP_CMD = re.compile(r"^sleep ([1-9]\d?|[12]\d\d|300)$")
 DENY_TEXT = re.compile(r"sci-?hub|libgen|z-lib|annas-archive", re.I)
 # actions that can load a page of the publisher (paced per publisher and capped per paper)
-# (select / type / hover / scroll can trigger a navigation from the page's handlers: reserved and paced like one)
+# (select / type / hover can trigger a navigation from the page's handlers: reserved and paced like one)
 # actions that may load a page or request a file: navigation budget, per-publisher lock and pacing
-NAV_ACTIONS = frozenset({"open", "click", "back", "sso_login", "select", "type", "hover", "scroll", "save_pdf"})
+NAV_ACTIONS = frozenset({"open", "click", "back", "sso_login", "select", "type", "hover", "save_pdf"})
 
 
 def shell_allowed(cmd) -> str | None:
@@ -343,10 +342,11 @@ def _run_script(st: dict, inp: dict, timeout: float, bd: Path, honor_stop: bool 
     script = "const INPUT = " + json.dumps(inp) + ";\n" + ACTION.read_text()
     if honor_stop and (bd / "STOP").exists():
         return {}, "not-started"
+    # bytes, decoded tolerantly below: a process killed in the middle of a UTF-8 character must not raise
     proc = subprocess.Popen([st["ego_binary"], "nodejs", script], stdin=subprocess.DEVNULL,
-                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=browser_ego.child_env())
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=browser_ego.child_env())
     t_end = time.time() + max(5.0, timeout)
-    so = se = ""
+    so = se = b""
     why = ""
     while True:
         try:
@@ -360,6 +360,8 @@ def _run_script(st: dict, inp: dict, timeout: float, bd: Path, honor_stop: bool 
                 # BEFORE the space is handed to the user, and must be booked even if the call then times out
                 so, se = proc.communicate()
                 break
+    so = (so or b"").decode("utf-8", "replace")
+    se = (se or b"").decode("utf-8", "replace")
     res: dict = {}
     for line in reversed((so + "\n" + se).splitlines()):
         if line.startswith("TBSGEN_RESULT "):
@@ -439,15 +441,19 @@ def _sweep_handoffs(bd: Path, st: dict, led, skip: str | None = None, force: boo
     of the batch (`force`), a call that still holds a publisher's hand-off slot (its wrapper was killed: the
     hand-off state is unknown) is booked as a hand-off that was not cleared."""
     inflight = {}
-    if force:
-        with _locked(bd / ".state.lock"):
-            state = _read_state(bd)
+    with _locked(bd / ".state.lock"):
+        state = _read_state(bd)
+        # calls whose wrapper failed while holding a hand-off budget (booked as used in _paper_call)
+        unknown = {str(v): k for k, v in (state.get("handoff_unknown") or {}).items()}
+        if force:
             inflight = {str(v): k for k, v in (state.get("handoff_inflight") or {}).items()}
             if inflight:
                 state["handoff_inflight"] = {}
                 for pk in inflight.values():
                     state.setdefault("handoff", {})[pk] = True
                 _write_state(bd, state)
+    inflight.update(unknown)
+    done_unknown = []
     for k in st["papers"]:
         if k == skip:
             continue
@@ -460,10 +466,20 @@ def _sweep_handoffs(bd: Path, st: dict, led, skip: str | None = None, force: boo
             with contextlib.suppress(OSError, ValueError):
                 ps = json.loads(sp.read_text())
                 if k in inflight and not ps.get("handoff") and not ps.get("closed"):
-                    ps.update(handoff=True, handoff_used=True, handoff_kind="challenge",
+                    ps.update(handoff=True, handoff_used=True, handoff_kind="challenge", handoff_deadline=0,
                               handoff_note="call interrupted (hand-off state unknown)")
-                if _expire_handoff(st, led, k, ps, force=force):
+                if _expire_handoff(st, led, k, ps, force=force or k in unknown):
                     _atomic(sp, json.dumps(ps))
+                if k in unknown:
+                    done_unknown.append(unknown[k])
+    if done_unknown:
+        with _locked(bd / ".state.lock"):
+            state = _read_state(bd)
+            hu = state.get("handoff_unknown") or {}
+            for pk in done_unknown:
+                hu.pop(pk, None)
+            state["handoff_unknown"] = hu
+            _write_state(bd, state)
 
 
 def wrapper_main(batch_dir: str, argv: list[str]) -> int:
@@ -482,7 +498,7 @@ def wrapper_main(batch_dir: str, argv: list[str]) -> int:
         done = _finish_spaces(bd, st, spaces)
         return say(f"tbsgen: TaskSpaces closed ({', '.join(done)})", 0)
     usage = ("usage: tbsgen-browser N look [OFFSET]|open URL|click I|hover I|"
-             "scroll up|down [PX]|select I VALUE|type I TEXT|tabs|switch LABEL|back|"
+             "select I VALUE|type I TEXT|tabs|switch LABEL|back|"
              "wait_for url SUB|sel CSS [S]|save_pdf|sso_login|handoff_status  |  tbsgen-browser finish")
     if len(argv) < 2 or argv[0] not in st["papers"] or not _TOOL_CMD.match("tbsgen-browser " + " ".join(argv)):
         return say(usage, 2)
@@ -503,6 +519,19 @@ def _paper_call(bd: Path, st: dict, n: str, action: str, arg: str, say) -> int:
         _atomic(sp, json.dumps(ps))
         return say(f"tbsgen: paper {n}: hand-off timed out - paper closed ({why}).", 2)
     _sweep_handoffs(bd, st, led, skip=n)
+    with _locked(bd / ".state.lock"):
+        own_unknown = n in {str(v) for v in (_read_state(bd).get("handoff_unknown") or {}).values()}
+    if own_unknown and not ps.get("closed"):
+        # this paper's previous call failed in the wrapper while it held the hand-off budget: closed here
+        ps.update(handoff=True, handoff_used=True, handoff_kind="challenge", handoff_deadline=0,
+                  handoff_note="call interrupted (hand-off state unknown)")
+        why = _expire_handoff(st, led, n, ps, force=True)
+        _atomic(sp, json.dumps(ps))
+        with _locked(bd / ".state.lock"):
+            state = _read_state(bd)
+            state["handoff_unknown"] = {k: v for k, v in (state.get("handoff_unknown") or {}).items() if str(v) != n}
+            _write_state(bd, state)
+        return say(f"tbsgen: paper {n}: its last browser call failed - paper closed ({why}); move on.", 2)
     if ps.get("closed"):
         return say(f"tbsgen: paper {n} is closed ({ps['closed']}); move on", 2)
     if action != "handoff_status" and ps.get("calls", 0) >= int(st["max_calls_per_paper"]):
@@ -581,15 +610,23 @@ def _paper_call(bd: Path, st: dict, n: str, action: str, arg: str, say) -> int:
     # nav_gap_s after the previous one FINISHED
     nav_lock = (_locked(bd / f".nav-{re.sub(r'[^A-Za-z0-9_.-]', '_', pkey)}.lock") if action in NAV_ACTIONS
                 else contextlib.nullcontext())
+    returned = False
     try:
         with nav_lock:
-            return _paced_run(bd, st, n, p, ps, action, arg, say, led, pkey, space, handoff_free, sso_ok, slock,
-                              COOLDOWN_429_S, aliases, web_hosts, sp)
+            rc = _paced_run(bd, st, n, p, ps, action, arg, say, led, pkey, space, handoff_free, sso_ok, slock,
+                            COOLDOWN_429_S, aliases, web_hosts, sp)
+        returned = True
+        return rc
     finally:
         with _locked(slock):
             state = _read_state(bd)
             if (state.get("handoff_inflight") or {}).get(pkey) == n:
                 state["handoff_inflight"].pop(pkey, None)
+                if not returned:
+                    # the wrapper itself failed while it held the publisher's hand-off budget: the hand-off
+                    # state is unknown - the budget is used (never re-opened); the final sweep closes the paper
+                    state.setdefault("handoff", {})[pkey] = True
+                    state.setdefault("handoff_unknown", {})[pkey] = n
                 _write_state(bd, state)
 
 
@@ -674,7 +711,10 @@ def _paper_run(bd, st, n, p, ps, action, arg, say, led, pkey, space, handoff_fre
                               "deadline_ms": int(float(ps.get("handoff_deadline") or 0) * 1000),
                               "title": ps.get("handoff_title") or "", "page_label": ps.get("handoff_page") or ""})
     timeout = max(5.0, min(float(st["call_timeout_s"]), float(st["deadline"]) - time.time()))
-    res, err = _run_script(st, inp, timeout, bd)
+    try:
+        res, err = _run_script(st, inp, timeout, bd)
+    except Exception as e:                           # noqa: BLE001 - started (or not): settled as "no result" below
+        res, err = {}, f"wrapper error {type(e).__name__}"
     if not (isinstance(res, dict) and res.get("status") in _VALID_STATUS):
         res = {}                                   # no valid result line: treated exactly like no output
     sso_result = _sso_finalize(bd, slock, n, res) if sso_ok else None
@@ -788,7 +828,7 @@ def _paper_run(bd, st, n, p, ps, action, arg, say, led, pkey, space, handoff_fre
                 page=res.get("page"), note=res.get("note"), left_allowed=res.get("left_allowed") or res.get("reset_foreign"),
                 login_required=res.get("login_required"),
                 tabs=res.get("tabs"), acted=res.get("acted"), sso=res.get("sso"),
-                waited=res.get("waited"), scroll=res.get("scroll"), page_label=res.get("page_label"),
+                waited=res.get("waited"), page_label=res.get("page_label"),
                 handoff_check=res.get("handoff_check"), handoff_left_s=res.get("handoff_left_s"))
     return say(json.dumps({k: v for k, v in show.items() if v is not None}, ensure_ascii=False)[:9000],
                0 if res.get("status") == "ok" else 1)
@@ -840,6 +880,7 @@ class _Redactor:
     backslash; an open value is only closed by balance, never by a blank line or a new-looking line."""
 
     MARK = "[record with a credential-like field dropped]\n"
+    SINK = "[rest of stderr dropped: a credential-like value of unknown length]\n"
     _CLOSERS = ")]}\"'"
 
     def __init__(self, keep: int | None = None):
@@ -852,7 +893,7 @@ class _Redactor:
         self.sensitive = False             # the current record has a credential-like field
         self.dropping = False              # the current record is being discarded
         self.val = ""                      # text of the sensitive value(s) so far (for the balance check)
-        self.hold = False                  # after an over-long line with a sensitive key: drop to a blank line
+        self.hold = False                  # set after an over-long line with / inside a sensitive value: drop the rest
 
     def _push(self, s: str):
         self.out.append(s)
@@ -882,24 +923,29 @@ class _Redactor:
         self.dropping = True
 
     def opaque(self, marker: str, sensitive: bool):
-        """A line that is not shown (too long).  With a sensitive key in it, its value may go on over the next
-        lines: those are dropped up to the next blank line."""
+        """A line that is not shown (too long).  Its content is unknown, so where a record boundary is would be a
+        guess: when it carries a sensitive key, or comes inside a still-open sensitive value, EVERYTHING after
+        it is dropped (the rest of the stderr), with no attempt to find the value's end."""
         if self.hold:
-            return                          # still inside an opaque sensitive record
-        if self.dropping and self._open():
-            return                          # still inside an open sensitive value
+            return
+        if self.sensitive and self._open():
+            if not self.dropping:
+                self._drop_record()
+            self._push(self.SINK)
+            self.hold = True
+            return
         self.rec_start, self.rec_lines, self.sensitive, self.dropping, self.val = (
             self.base + len(self.out), 1, False, False, "")
         self._push(marker)
-        self.hold = sensitive
+        if sensitive:
+            self._push(self.SINK)
+            self.hold = True
 
     def line(self, line: str):
         nl = "\n" if line.endswith("\n") else ""
         body = line[:-1] if nl else line
         if self.hold:
-            if body.strip():
-                return                       # an opaque sensitive record goes on up to a blank line
-            self.hold = False
+            return                           # after an unknown-length sensitive value: nothing more is kept
         still_open = self.sensitive and self._open()
         new = (self.rec_start is None or not still_open) and (
             not body.strip() or (body[:1] not in " \t" and body[:1] not in self._CLOSERS))
@@ -938,8 +984,8 @@ class _StderrTail:
     """Reads the agent's stderr pipe in a thread.  Every complete line is redacted as it arrives, record by
     record (_Redactor: before any truncation, so a secret is never cut away from its key); only the last
     `keep` characters of redacted text are kept in memory.  A line longer than the limit is replaced by a
-    marker (and with a sensitive key in it, the lines after it up to a blank line are dropped too).  Nothing
-    unredacted reaches disk."""
+    marker (with a sensitive key in it, or inside an open sensitive value, the rest of the stderr is dropped).
+    Nothing unredacted reaches disk."""
 
     MAX_LINE = 16 * 1024
 

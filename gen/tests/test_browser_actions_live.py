@@ -381,15 +381,13 @@ def test_new_tab_link_opens_in_the_page_switch_and_save(origins):
         _finish(sp)
 
 
-def test_scroll_and_wait_for_no_screenshots(origins):
+def test_wait_for_and_removed_actions(origins):
     sp = "tbsgen-test-misc"
     try:
         assert _run(sp, "open", origins[0] + "/landing")["status"] == "ok"
-        for a, arg in (("screenshot", ""), ("click_xy", "10 10")):
+        for a, arg in (("screenshot", ""), ("click_xy", "10 10"), ("scroll", "down 400")):
             r = _run(sp, a, arg)
             assert r["status"] == "refused" and r["error"] == "unknown action", r     # removed actions
-        r = _run(sp, "scroll", "down 400")
-        assert r["status"] == "ok", r
         r = _run(sp, "wait_for", "url landing")
         assert r["status"] == "ok" and r["waited"]["ok"], r
         r = _run(sp, "wait_for", "sel #dl-btn")
@@ -833,17 +831,29 @@ def test_round7_checks_run_in_the_evaluation_that_acts(origins):
     try:
         assert _run(sp, "open", origins[0] + "/landing")["status"] == "ok"
         body = (f"const domAct = {_fn_src('domAct')};\nconst domWalk = {_fn_src('domWalk')};\n"
-                f"const credScan = {_fn_src('credScan')};\n"
+                f"const credScan = {_fn_src('credScan')};\nconst pageInfo = {_fn_src('pageInfo')};\n"
+                f"const itemList = {_fn_src('itemList')};\nconst lookEval = {_fn_src('lookEval')};\n"
+                f"const ssoSubmit = {_fn_src('ssoSubmit')};\n"
                 "const t = await taskSpace(" + json.dumps(sp) + ");\nconst pg = (await t.pages())[0];\n"
-                "const run = (u, allow, setup) => pg.evaluate(([a, w, s, u, allow, setup]) => {\n"
+                "const run = (u, allow, setup) => pg.evaluate(([a, w, s, u, allow, setup, pi]) => {\n"
                 "  if (setup) document.body.insertAdjacentHTML('beforeend', setup);\n"
                 "  const f = new Function('return (' + a + ')')();\n"
                 "  const k = new Function('return (' + w + ')')()().findIndex((p) => (p[0].innerText || '').trim() === 'Accept');\n"
-                "  return f(w, k, allow, 'hover', '', u, s);\n"
-                "}, [domAct.toString(), domWalk.toString(), credScan.toString(), u, allow, setup || '']);\n"
+                "  return f(w, k, allow, 'hover', '', u, s, pi, 'just a moment');\n"
+                "}, [domAct.toString(), domWalk.toString(), credScan.toString(), u, allow, setup || '', pageInfo.toString()]);\n"
                 "const here = (await pg.info()).url;\n"
                 "const res = [await run(here + '#x', ['127.0.0.1'], ''), await run(here, ['example.org'], ''),\n"
                 "             await run(here, ['127.0.0.1'], '<form><input type=email name=e><button>Continue</button></form>')];\n"
+                # a verification page appearing on the same URL after the Node-side checks (round 7)
+                "await pg.evaluate(() => { document.title = 'Just a moment...'; document.querySelectorAll('form').forEach((f) => f.remove()); });\n"
+                "res.push(await run(here, ['127.0.0.1'], ''));\n"
+                # look's single evaluation: nothing is extracted from a page off the allowed domains
+                "const lk = (allow) => pg.evaluate(([f, a, b, w, allow, ch]) => (new Function('return (' + f + ')')())(a, b, w, allow, ch),\n"
+                "  [lookEval.toString(), pageInfo.toString(), itemList.toString(), domWalk.toString(), allow, 'just a moment']);\n"
+                "const l1 = await lk(['example.org']), l2 = await lk(['127.0.0.1']);\n"
+                "res.push({ foreign: l1.foreign || null, leaked: !!(l1.info || l1.items), ok: !!(l2.info && l2.items && l2.items.length) });\n"
+                # sso_login's one evaluation refuses (before any click) off the SSO domains
+                "res.push(await pg.evaluate(([f, s]) => (new Function('return (' + f + ')')())([['sso.elsewhere'], true, s]), [ssoSubmit.toString(), credScan.toString()]));\n"
                 "console.log('R7 ' + JSON.stringify(res));\nprocess.exit(0);")
         p = subprocess.run([EGO, "nodejs", body], capture_output=True, text=True, timeout=90)
         line = next(x for x in (p.stdout + p.stderr).splitlines() if x.startswith("R7 "))
@@ -851,5 +861,8 @@ def test_round7_checks_run_in_the_evaluation_that_acts(origins):
         assert "changed" in res[0]["refused"], res
         assert "outside the allowed" in res[1]["refused"], res
         assert "login" in res[2]["refused"], res
+        assert "verification" in res[3]["refused"], res
+        assert res[4] == {"foreign": "127.0.0.1", "leaked": False, "ok": True}, res
+        assert res[5] == {"refused": "the page left the SSO login domain", "stage": "pre"}, res
     finally:
         _finish(sp)

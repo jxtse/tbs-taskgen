@@ -68,7 +68,6 @@ def test_shell_allowed_new_actions():
         "tbsgen-browser 1 look", "tbsgen-browser 1 look 40",
         "tbsgen-browser 1 open https://doi.org/10.1080/x",
         "tbsgen-browser 1 click 12", "tbsgen-browser 1 hover 3",
-        "tbsgen-browser 1 scroll down", "tbsgen-browser 1 scroll up 800",
         "tbsgen-browser 1 select 2 Nanjing University", "tbsgen-browser 1 type 4 Nanjing University",
         "tbsgen-browser 1 type 4 南京大学", "tbsgen-browser 1 type 4 hunter2",   # shape ok; the wrapper's
         # whitelist (institution names only) refuses it before the action script runs
@@ -81,6 +80,7 @@ def test_shell_allowed_new_actions():
     for c in ok:
         assert browser_agent.shell_allowed(c) is None, c
     bad = [
+        "tbsgen-browser 1 scroll down", "tbsgen-browser 1 scroll up 800",   # removed (round 7)
         "tbsgen-browser 1 open https://x.example/a;rm -rf /",     # shell metachar
         "tbsgen-browser 1 open https://x.example/a && echo hi",
         "tbsgen-browser 1 open \"https://x.example/a\"",

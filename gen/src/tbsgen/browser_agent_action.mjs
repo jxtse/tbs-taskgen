@@ -18,7 +18,6 @@
 //   click I                       click item I of the last `look` list (same numbering; run `look` first)
 //   hover I                       hover item I of the top document (pointer / mouse events dispatched in the
 //                                 checking evaluation; opens JS dropdown menus; never inside frames)
-//   scroll up|down [PX]           scroll the page
 //   select I VALUE                choose VALUE (option value or label) of select item I
 //   type I TEXT                   type TEXT into text item I - only the whitelisted institution names in
 //                                 INPUT.type_allow, never into anything that can hold credentials
@@ -35,8 +34,8 @@
 //   finish                        close the TaskSpace
 // Rules enforced here: nothing is typed except whitelisted institution names into checked plain text fields,
 // no interaction with verification pages / widgets, no reading of input values, storage or the browser's
-// page snapshot (it carries field values), no screenshots, no native mouse actions except sso_login's checked
-// Login button, no click / hover / select / type at all on a page with ANY login signal (credScan, checked in
+// page snapshot (it carries field values), no screenshots, no native mouse / wheel input at all (sso_login presses its
+// checked Login button inside the checking evaluation, with a CDP user gesture), no click / hover / select / type at all on a page with ANY login signal (credScan, checked in
 // the same page evaluation that acts, together with the looked-at URL and the allowed domains), login forms
 // are never submitted except by `sso_login` with browser autofill, navigation targets are checked before and the
 // landed URL is checked after (a page that ends up outside INPUT.allow is reset to about:blank), files are
@@ -121,8 +120,7 @@ function domWalk() {
 
 // The numbered item list of `look` (the page's own DOM only).  `look` and the acting actions must build it
 // identically (the wrapper refuses actions after the page changed).
-async function items(page) {
-  const dom = await page.evaluate((src) => {
+function itemList(src) {
     const walk = new Function("return (" + src + ")")();
     const W = /captcha|turnstile|challenge|recaptcha|hcaptcha|verify|i am human|not a robot|cf-|px-|验证/i;
     return walk().map(([el, frame]) => {
@@ -150,24 +148,34 @@ async function items(page) {
         form_action: form ? (form.getAttribute("action") || "") : "",
       };
     });
-  }, domWalk.toString()).catch(() => []);
-  return dom;
+}
+async function items(page) {
+  return await page.evaluate(([a, w]) => (new Function("return (" + a + ")")())(w),
+                             [itemList.toString(), domWalk.toString()]).catch(() => []);
 }
 
 // ---------- page state --------------------------------------------------------------------------
+// in-page (serialized): the page state; `chSrc` is CHALLENGE.source - `challenge_page` applies the same test
+// as isChallenge() below, inside the page (used by the evaluation that acts)
+function pageInfo(chSrc) {
+  // a RENDERED password field (publisher pages often carry a hidden header-login template)
+  const pw = [...document.querySelectorAll("input[type=password]")].some((x) => x.getClientRects().length > 0
+    && getComputedStyle(x).visibility !== "hidden");
+  const r = {
+    url: location.href, title: document.title || "", ctype: document.contentType || "",
+    text: (document.body && document.body.innerText || "").slice(0, 1500),
+    challenge: !!document.querySelector("#challenge-form, #cf-challenge-running, .cf-turnstile, #px-captcha, iframe[src*='challenges.cloudflare.com'], iframe[src*='captcha'], .g-recaptcha, .h-captcha"),
+    login_form: pw,
+  };
+  if (chSrc) {
+    const C = new RegExp(chSrc, "i");
+    r.challenge_page = r.challenge || C.test(r.title) || (/^\s*$/.test(r.title) && C.test(r.text.slice(0, 300)));
+  }
+  return r;
+}
 async function info(page) {
   try {
-    return await page.evaluate(() => {
-      // a RENDERED password field (publisher pages often carry a hidden header-login template)
-      const pw = [...document.querySelectorAll("input[type=password]")].some((x) => x.getClientRects().length > 0
-        && getComputedStyle(x).visibility !== "hidden");
-      return {
-        url: location.href, title: document.title || "", ctype: document.contentType || "",
-        text: (document.body && document.body.innerText || "").slice(0, 1500),
-        challenge: !!document.querySelector("#challenge-form, #cf-challenge-running, .cf-turnstile, #px-captcha, iframe[src*='challenges.cloudflare.com'], iframe[src*='captcha'], .g-recaptcha, .h-captcha"),
-        login_form: pw,
-      };
-    });
+    return await page.evaluate((src) => (new Function("return (" + src + ")")())(""), pageInfo.toString());
   } catch (e) {
     return { url: "", title: "", ctype: "", text: "", challenge: false, login_form: false };
   }
@@ -402,10 +410,34 @@ function parseLookArg(arg) {
 
 const LIMIT = 120;                                   // items per `look` page
 
+// in-page (serialized): the page state and the item list in ONE evaluation, only on an allowed host (a page
+// that redirected off the domains after the entry check is never read)
+function lookEval(infoSrc, listSrc, walkSrc, allow, chSrc) {
+  const x = location.href;
+  let ok = false;
+  try { const u = new URL(x); const h = u.hostname.toLowerCase();
+        ok = !/^https?:$/.test(u.protocol) ? !/^(https?|ftp|wss?|file):/i.test(x) : allow.some((d) => h === d || h.endsWith("." + d)); } catch (e) { ok = false; }
+  if (!ok) { let h = ""; try { h = new URL(x).hostname; } catch (e) {} return { foreign: h || "?" }; }
+  return { info: (new Function("return (" + infoSrc + ")")())(chSrc), items: (new Function("return (" + listSrc + ")")())(walkSrc) };
+}
+
 async function look(task, page) {
   const { offset } = parseLookArg(INPUT.arg);
-  const i = await info(page);
-  const all = await items(page);
+  const r = await page.evaluate(([f, a, b, w, allow, ch]) => (new Function("return (" + f + ")")())(a, b, w, allow, ch),
+    [lookEval.toString(), pageInfo.toString(), itemList.toString(), domWalk.toString(), INPUT.allow, CHALLENGE.source])
+    .catch((e) => ({ error: String(e).slice(0, 120) }));
+  if (!r || r.error || !r.info) {
+    if (r && r.foreign) {                           // nothing of it is returned; the page is reset
+      await page.goto("about:blank", { timeout: 5000 }).catch(() => {});
+      out.reset_foreign = r.foreign;
+      out.status = "refused"; out.error = "the page left the allowed domains (reset); open an allowed URL";
+      return;
+    }
+    out.status = "error"; out.error = "the page could not be read" + (r && r.error ? ": " + r.error : "");
+    return;
+  }
+  const i = r.info;
+  const all = r.items || [];
   const pageItems = all.slice(offset, offset + LIMIT).map((it, k) => ({
     i: offset + k, kind: it.kind, text: it.text, href: it.href ? cleanUrl(it.href).slice(0, 200) : "",
     allowed: it.href ? hostOk(it.href) : undefined,
@@ -423,7 +455,7 @@ async function look(task, page) {
 
 // The one evaluation that finds, checks and clicks / hovers / fills item k of the dom list.  `walk` is the
 // domWalk function itself; both run inside the page (ego's evaluate takes ONE argument, passed as an array).
-function domAct(walkSrc, k, allow, kind, value, expectUrl, scanSrc) {
+function domAct(walkSrc, k, allow, kind, value, expectUrl, scanSrc, infoSrc, chSrc) {
   const ok = (u) => { try { const x = new URL(u, location.href); if (!/^https?:$/.test(x.protocol)) return false;
     const h = x.hostname.toLowerCase(); return allow.some((d) => h === d || h.endsWith("." + d)); } catch (e) { return false; } };
   // re-checked in the SAME evaluation that acts (the page may have changed since the Node-side checks): still
@@ -431,6 +463,7 @@ function domAct(walkSrc, k, allow, kind, value, expectUrl, scanSrc) {
   if (location.href !== expectUrl) return { refused: "the page changed since `look`; run look again" };
   if (!ok(location.href)) return { refused: "the page is outside the allowed domains" };
   if ((new Function("return (" + scanSrc + ")")())().cred) return { refused: "login / verification-code page: no click, hover, select or type here" };
+  if ((new Function("return (" + infoSrc + ")")())(chSrc).challenge_page) return { refused: "verification page: do not interact" };
   const pair = new Function("return (" + walkSrc + ")")()()[k];   // domWalk: source -> function -> [el, frame]
   const el = pair && pair[0];
   if (!el) return { refused: "no such item; run look first" };
@@ -532,7 +565,7 @@ function domAct(walkSrc, k, allow, kind, value, expectUrl, scanSrc) {
     el.setAttribute("data-tbsgen-typed", "1");             // filled by this tool: its form may be submitted
     el.dispatchEvent(new Event("input", { bubbles: true }));
     el.dispatchEvent(new Event("change", { bubbles: true }));
-    return { typed: true, len: el.value.length };                    // the length only - never the value
+    return { typed: true };                                          // nothing of the field is read back
   }
   return { refused: "unknown action" };
 }
@@ -557,10 +590,11 @@ async function act(task, page, kind, k, value) {
   }
   if (it.widget || WIDGET.test(it.text || "")) { out.status = "refused"; out.error = "verification widget: do not interact"; return; }
   if (kind === "click" && it.login) { out.status = "refused"; out.error = "login form: credentials are not entered by this tool (report login_required)"; return; }
-  const domRun = () => page.evaluate(([src, walk, k, allow, kind, value, u, scanSrc]) => {   // ONE arg for ego
+  const domRun = () => page.evaluate(([src, walk, k, allow, kind, value, u, scanSrc, infoSrc, chSrc]) => {   // ONE arg for ego
     const f = new Function("return (" + src + ")")();        // domAct; walk is domWalk, both plain functions
-    return f(walk, k, allow, kind, value, u, scanSrc);
-  }, [domAct.toString(), domWalk.toString(), k, INPUT.allow, kind, value || "", seen, credScan.toString()]);
+    return f(walk, k, allow, kind, value, u, scanSrc, infoSrc, chSrc);
+  }, [domAct.toString(), domWalk.toString(), k, INPUT.allow, kind, value || "", seen, credScan.toString(),
+      pageInfo.toString(), CHALLENGE.source]);
   {
     if (kind === "click") {
       await withDownload(task, page, async () => {
@@ -611,6 +645,39 @@ async function act(task, page, kind, k, value) {
   }
 }
 
+// in-page (serialized; run with a CDP user gesture): check and submit the SSO login form in one go.  Every
+// refusal is returned with stage "pre" (nothing was clicked).  Field values are never read (the browser's
+// :autofill state only; in the local test mode a non-empty stand-in value counts).
+function ssoSubmit(args) {
+  const [domains, lt, scanSrc] = args;
+  const pre = (why) => ({ refused: why, stage: "pre" });
+  const inDom = (u) => { try { const x = new URL(u); const hh = x.hostname.toLowerCase();
+    const local = hh === "127.0.0.1" || hh === "localhost" || hh.endsWith(".localhost");
+    if (x.protocol !== "https:" && !(local && lt)) return false;
+    return domains.some((d) => hh === d || hh.endsWith("." + d)); } catch (e) { return false; } };
+  if (!inDom(location.href)) return pre("the page left the SSO login domain");
+  if ((new Function("return (" + scanSrc + ")")())().mfa
+      || document.querySelector("iframe[src*='captcha'], .g-recaptcha, .h-captcha, .cf-turnstile")) return pre("MFA / captcha on the login page");
+  const af = (el) => { try { return el.matches(":autofill") || el.matches(":-webkit-autofill"); } catch (e) { return false; } };
+  const filled = (el) => af(el) || (lt && el.value.length > 0);
+  const pwd = document.querySelector("form input[type=password]") || document.querySelector("input[type=password]");
+  const form = pwd && (pwd.form || pwd.closest("form"));
+  if (!form) return pre("no login form");
+  const user = form.querySelector("input[autocomplete=username], input[type=text], input[type=email], input:not([type])");
+  if (!user || !filled(pwd) || !filled(user)) return pre("the login form is not autofilled");
+  const b = [...form.elements].find((x) => (x.type || "").toLowerCase() === "submit" && !x.disabled)
+    || [...form.querySelectorAll("button")].find((x) => /log ?in|sign ?in|登录|登陆|submit/i.test((x.innerText || "")));
+  if (!b) return pre("no submit button on the login form");
+  const target = (b.hasAttribute("formaction") ? b.formAction : "") || form.action || location.href;
+  const method = ((b.hasAttribute("formmethod") ? b.formMethod : "") || form.method || "get").toLowerCase();
+  if (method !== "post") return pre("the login form does not use POST");
+  if (!inDom(target)) return pre("the login form posts outside the SSO login domains");
+  const r = b.getBoundingClientRect();
+  if (r.width < 1 || r.height < 1) return pre("the login button is not visible");
+  b.click();
+  return { submitted: true };
+}
+
 async function ssoLogin(task, page) {
   const sso = INPUT.sso || {};
   const localTest = sso.local_test === true;          // only the local test suite sets this; never the wrapper
@@ -647,37 +714,25 @@ async function ssoLogin(task, page) {
     if (st.mfa) return handoff(task, page, "MFA / verification code on the SSO login page", h, "mfa", i.title);
     if (!st.pwFilled || !st.userFilled) return handoff(task, page, "the browser did not autofill the login form", h, "login", i.title);
   }
-  // Check, in one page evaluation: the page is still on an HTTPS configured SSO host, the form posts (method
-  // POST - never GET, which would put the credentials into a URL) to the browser-resolved target (form.action /
-  // button.formAction; <base href> included) on such a host.  Then press the button with a native click (the
-  // browser releases autofilled values to the page on a real user gesture only).
-  const chk = await page.evaluate(([domains, lt]) => {
-    const inDom = (u) => { try { const x = new URL(u); const hh = x.hostname.toLowerCase();
-      const local = hh === "127.0.0.1" || hh === "localhost" || hh.endsWith(".localhost");
-      if (x.protocol !== "https:" && !(local && lt)) return false;
-      return domains.some((d) => hh === d || hh.endsWith("." + d)); } catch (e) { return false; } };
-    if (!inDom(location.href)) return { refused: "the page left the SSO login domain" };
-    const pwd = document.querySelector("form input[type=password]") || document.querySelector("input[type=password]");
-    const form = pwd && (pwd.form || pwd.closest("form"));
-    if (!form) return { refused: "no login form" };
-    const b = [...form.elements].find((x) => (x.type || "").toLowerCase() === "submit" && !x.disabled)
-      || [...form.querySelectorAll("button")].find((x) => /log ?in|sign ?in|登录|登陆|submit/i.test((x.innerText || "")));
-    if (!b) return { refused: "no submit button on the login form" };
-    const target = (b.hasAttribute("formaction") ? b.formAction : "") || form.action || location.href;
-    const method = ((b.hasAttribute("formmethod") ? b.formMethod : "") || form.method || "get").toLowerCase();
-    if (method !== "post") return { refused: "the login form does not use POST" };
-    if (!inDom(target)) return { refused: "the login form posts outside the SSO login domains" };
-    b.scrollIntoView({ block: "center" });
-    const r = b.getBoundingClientRect();
-    if (r.width < 1 || r.height < 1) return { refused: "the login button is not visible" };
-    const cx = Math.round(r.left + r.width / 2), cy = Math.round(r.top + r.height / 2);
-    if (document.elementFromPoint(cx, cy) !== b && !b.contains(document.elementFromPoint(cx, cy))) return { refused: "the login button is covered" };
-    return { center: [cx, cy] };
-  }, [sso.domains, localTest]).catch((e) => ({ refused: "the login form could not be checked: " + String(e).slice(0, 80) }));
-  if (!chk || !chk.center) { out.status = "refused"; out.error = (chk && chk.refused) || "not submitted"; return; }
+  // ONE evaluation checks and submits (no later, separate click): it runs through CDP with a user gesture (the
+  // browser releases autofilled values to the page on a user activation), re-checks that the page is still an
+  // HTTPS configured SSO host, both fields are still autofilled, there is no MFA / captcha, the form posts
+  // (POST only - never GET, which would put the credentials into a URL) to a browser-resolved target
+  // (form.action / button.formAction; <base href> included) on such a host - and only then clicks the button
+  // (button.click(): the page's own click / submit handlers run as for a real click).
+  const expr = "(" + ssoSubmit.toString() + ")(" + JSON.stringify([sso.domains, localTest, credScan.toString()]) + ")";
   out.sso_stage = "submit";
   out.sso_submitted = true;                          // from here on the outcome counts as a submission
-  await withDownload(task, page, () => page.mouse.click(chk.center[0], chk.center[1]));
+  let chk = null;
+  await withDownload(task, page, async () => {
+    const r = await page.cdp("Runtime.evaluate", { expression: expr, returnByValue: true, userGesture: true, awaitPromise: false },
+                             { timeout: 15000 });
+    chk = (r && r.result && r.result.value) || { refused: "the login form could not be checked" + (r && r.exceptionDetails ? " (exception)" : "") };
+  }).catch((e) => { chk = { refused: "the login form could not be checked: " + String(e).slice(0, 80), unknown: true }; });
+  if (!chk || !chk.submitted) {
+    if (chk && chk.refused && !chk.unknown && chk.stage === "pre") { out.sso_stage = "pre"; out.sso_submitted = false; }
+    out.status = "refused"; out.error = (chk && chk.refused) || "not submitted"; return;
+  }
   // wait for the login page to go away (never resubmit; a failure ends the logins of this batch)
   const t0 = Date.now();
   for (;;) {
@@ -754,28 +809,6 @@ try {
         out.status = "refused"; out.error = "only the whitelisted institution names may be typed";
       } else {
         await act(task, page, INPUT.action, k, value);
-      }
-    } else if (INPUT.action === "scroll") {
-      const a = String(INPUT.arg || "").split(/\s+/);
-      const d = a[0] === "up" ? -1 : 1;
-      const px = Math.min(5000, Math.max(50, parseInt(a[1] || "700", 10) || 700));
-      const before = await page.info().catch(() => ({}));
-      await page.evaluate(([d, px]) => window.scrollBy(0, d * px), [d, px]).catch(() => {});
-      await sleep(300);
-      let afterI = await page.info().catch(() => ({}));
-      if ((afterI.sy || 0) === (before.sy || 0)) {                       // the window cannot scroll: wheel over the page
-        await page.mouse.move(400, 400).catch(() => {});
-        await page.mouse.wheel(0, d * px).catch(() => {});
-        await sleep(300);
-        afterI = await page.info().catch(() => ({}));
-      }
-      out.scroll = { from: before.sy || 0, to: afterI.sy || 0 };
-      out.status = "ok";
-      if ((afterI.url || "") && before.url && afterI.url !== before.url) {   // scrolling triggered a navigation
-        out.navigated = true;
-        const i = await after(page);
-        if (!out.blocked && !out.left_allowed) await postCheck(task, page, i);
-        if (out.status !== "handoff") out.status = "ok";
       }
     } else if (INPUT.action === "tabs") {
       const tabs = await task.tabs();
