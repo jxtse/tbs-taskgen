@@ -549,3 +549,159 @@ def test_external_locations_come_from_config_only(monkeypatch):
     assert c["fulltext"]["cache_dirs"] == [] and c["probe"]["tbs_tasks_root"] is None and c["calib"]["harbor_root"] is None
     monkeypatch.undo()
     importlib.reload(gc)
+
+
+# ------------------------------------------------------------------ teacher: thinking used the whole output budget
+class _SSEResp:
+    def __init__(self, lines):
+        self.lines = [x.encode() for x in lines]
+
+    def __iter__(self):
+        return iter(self.lines)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+def _sse(text, stop, out_tok):
+    ev = [{"type": "message_start", "message": {"model": "claude-opus-5-5", "usage": {"input_tokens": 1000}}}]
+    if text:
+        ev.append({"type": "content_block_delta", "delta": {"type": "text_delta", "text": text}})
+    ev.append({"type": "message_delta", "delta": {"stop_reason": stop}, "usage": {"output_tokens": out_tok}})
+    return _SSEResp(["data: " + json.dumps(e) for e in ev])
+
+
+def _teacher(tmp_path, monkeypatch, responses, **teacher):
+    import urllib.request
+    from tbsgen.models import TeacherClient
+    sent = []
+
+    class Opener:
+        def open(self, req, timeout=None):
+            sent.append(json.loads(req.data))
+            return responses.pop(0)
+
+    monkeypatch.setattr(urllib.request, "build_opener", lambda *a, **k: Opener())
+    cfg = load_config(None, {"run": {"root": str(tmp_path)}, "budget": {"daily_usd_total": 50.0},
+                             "models": {"teacher": dict({"url": "http://127.0.0.1:9/v1/messages"}, **teacher)}})
+    led = Ledger(tmp_path / "l.sqlite", cfg)
+    return TeacherClient(led, cfg), led, sent
+
+
+def _calls(led):
+    with led._db() as db:
+        return db.execute("SELECT status, error_class, usd, out_tok FROM calls ORDER BY id").fetchall()
+
+
+def test_teacher_empty_max_tokens_is_billed_and_retried_at_low_effort(tmp_path, monkeypatch):
+    c, led, sent = _teacher(tmp_path, monkeypatch, [_sse("", "max_tokens", 64000), _sse("=== FILE: a ===\nx\n", "end_turn", 500)])
+    r = c.chat("sys", "user", stage="S6A", item="i1", max_tokens=64000)
+    assert r.text.startswith("=== FILE: a")
+    assert [s["output_config"]["effort"] for s in sent] == ["medium", "low"]
+    rows = _calls(led)
+    assert [(x[0], x[1], x[3]) for x in rows] == [("error", "empty", 64000), ("ok", None, 500)]
+    assert rows[0][2] == pytest.approx((1000 * 5 + 64000 * 25) / 1e6)     # the failed call is billed, not $0
+
+
+def test_teacher_empty_max_tokens_retries_only_once(tmp_path, monkeypatch):
+    c, led, sent = _teacher(tmp_path, monkeypatch, [_sse("", "max_tokens", 64000), _sse("", "max_tokens", 64000)])
+    with pytest.raises(ModelError) as e:
+        c.chat("sys", "user", stage="S6A", item="i1", max_tokens=64000)
+    assert e.value.thinking_exhausted and len(sent) == 2
+    assert all(x[2] > 0 for x in _calls(led))
+
+
+def test_teacher_empty_retry_counts_against_item_cap(tmp_path, monkeypatch):
+    c, led, sent = _teacher(tmp_path, monkeypatch, [_sse("", "max_tokens", 64000), _sse("ok", "end_turn", 5)])
+    led.cfg["budget"]["max_calls_per_item"] = 1
+    with pytest.raises(BudgetStop) as e:
+        c.chat("sys", "user", stage="S6A", item="i1", max_tokens=64000)
+    assert e.value.reason == "item_calls" and len(sent) == 1
+
+
+def test_teacher_effort_by_stage_and_no_retry_when_disabled(tmp_path, monkeypatch):
+    c, led, sent = _teacher(tmp_path, monkeypatch, [_sse("ok", "end_turn", 5), _sse("", "max_tokens", 9000)],
+                            effort_by_stage={"S6A": "low"}, effort_on_thinking_exhausted=None)
+    c.chat("sys", "user", stage="S6A", item="i1", max_tokens=9000)
+    with pytest.raises(ModelError) as e:
+        c.chat("sys", "user", stage="S5", item="i1", max_tokens=9000)
+    assert [s["output_config"]["effort"] for s in sent] == ["low", "medium"] and e.value.cls == "empty"
+
+
+def test_teacher_other_empty_answers_are_not_retried(tmp_path, monkeypatch):
+    c, led, sent = _teacher(tmp_path, monkeypatch, [_sse("", "end_turn", 3)])
+    with pytest.raises(ModelError) as e:
+        c.chat("sys", "user", stage="S5", item="i1", max_tokens=9000)
+    assert not e.value.thinking_exhausted and len(sent) == 1
+
+
+def test_teacher_no_retry_when_already_at_fallback_effort(tmp_path, monkeypatch):
+    # the retry only lowers the effort: a call already at the fallback effort is not repeated
+    c, led, sent = _teacher(tmp_path, monkeypatch, [_sse("", "max_tokens", 64000), _sse("ok", "end_turn", 5)],
+                            effort_by_stage={"S6A": "low"})
+    with pytest.raises(ModelError) as e:
+        c.chat("sys", "user", stage="S6A", item="i1", max_tokens=64000)
+    assert e.value.thinking_exhausted and len(sent) == 1 and _calls(led)[0][2] > 0
+
+
+def test_teacher_stream_failure_bills_usage_already_reported(tmp_path, monkeypatch):
+    start = {"type": "message_start", "message": {"model": "claude-opus-5-5", "usage": {"input_tokens": 1000}}}
+    delta = {"type": "message_delta", "delta": {}, "usage": {"output_tokens": 4000}}
+    err = {"type": "error", "error": {"type": "overloaded_error", "message": "overloaded"}}
+
+    class Broken(_SSEResp):
+        def __iter__(self):
+            yield from self.lines
+            raise TimeoutError("read timeout")
+
+    for resp, cls in [(_SSEResp(["data: " + json.dumps(e) for e in (start, delta, err)]), "stream"),
+                      (_SSEResp(["data: " + json.dumps(start)]), "stream"),
+                      (Broken(["data: " + json.dumps(e) for e in (start, delta)]), "network")]:
+        c, led, sent = _teacher(tmp_path / cls / str(id(resp)), monkeypatch, [resp])
+        with pytest.raises(ModelError) as e:
+            c.chat("sys", "user", stage="S6A", item="i1", max_tokens=64000)
+        assert e.value.cls == cls
+        assert _calls(led)[0][2] > 0                     # input (and any reported output) tokens are billed
+
+
+def test_teacher_fallback_never_raises_effort_and_fake_matches(tmp_path, monkeypatch):
+    c, led, sent = _teacher(tmp_path, monkeypatch, [_sse("", "max_tokens", 64000), _sse("ok", "end_turn", 5)],
+                            effort_by_stage={"S6A": "low"}, effort_on_thinking_exhausted="high")
+    with pytest.raises(ModelError):
+        c.chat("sys", "user", stage="S6A", item="i1", max_tokens=64000)
+    assert [s["output_config"]["effort"] for s in sent] == ["low"]
+    # the fake client resolves the same effective effort (stage override) and makes the same decision
+    cfg = load_config(None, {"run": {"root": str(tmp_path)}, "budget": {"daily_usd_total": 50.0},
+                             "models": {"teacher": {"url": "http://x/v1/messages", "effort_by_stage": {"S6A": "low"}}}})
+    f = FakeClient(Ledger(tmp_path / "f.sqlite", cfg), cfg,
+                   [{"stage": "S6A", "error": "empty", "stop": "max_tokens", "usage": {"output_tokens": 9}},
+                    {"stage": "S6A", "text": "ok"}])
+    with pytest.raises(ModelError):
+        f.chat("sys", "user", stage="S6A", item="i1")
+    assert [x["effort"] for x in f.log] == ["low"]
+
+
+def test_teacher_malformed_sse_event_bills_reported_usage(tmp_path, monkeypatch):
+    start = {"type": "message_start", "message": {"model": "claude-opus-5-5", "usage": {"input_tokens": 1000}}}
+    bad = {"type": "content_block_delta", "delta": None}
+    c, led, sent = _teacher(tmp_path, monkeypatch, [_SSEResp(["data: " + json.dumps(e) for e in (start, bad)])])
+    with pytest.raises(ModelError) as e:
+        c.chat("sys", "user", stage="S5", item="i1", max_tokens=9000)
+    assert e.value.cls == "stream" and _calls(led)[0][2] > 0
+
+
+@pytest.mark.parametrize("bad", ['data: {"type": "content_block_delta", "delta": {"type": "text_delta", "text": nul',
+                                 'data: {"type": "content_block_delta", "delta": {"type": "text_delta", "text": null}}',
+                                 'data: {"type": "content_block_delta", "delta": {"type": "text_delta", "text": 7}}',
+                                 'data: [1, 2]'])
+def test_teacher_corrupt_sse_is_a_billed_stream_error_not_a_retry(tmp_path, monkeypatch, bad):
+    start = {"type": "message_start", "message": {"model": "claude-opus-5-5", "usage": {"input_tokens": 1000}}}
+    end = {"type": "message_delta", "delta": {"stop_reason": "max_tokens"}, "usage": {"output_tokens": 4000}}
+    resp = _SSEResp(["data: " + json.dumps(start), bad, "data: " + json.dumps(end)])
+    c, led, sent = _teacher(tmp_path, monkeypatch, [resp, _sse("ok", "end_turn", 5)])
+    with pytest.raises(ModelError) as e:
+        c.chat("sys", "user", stage="S6A", item="i1", max_tokens=64000)
+    assert e.value.cls == "stream" and len(sent) == 1 and _calls(led)[0][2] > 0
