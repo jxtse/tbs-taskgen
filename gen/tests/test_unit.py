@@ -810,3 +810,18 @@ def test_metrics_at_the_floating_point_noise_floor():
             "mid": {"0": {"hidden_relerr": 0.41, "hidden_l2": 3e-10, "hidden_sigma_relerr": 2.7e-11}},
             "naive": {"0": {"hidden_relerr": 0.29, "hidden_l2": 0.47, "hidden_sigma_relerr": 2.7e-11}}}
     assert set_thresholds(spec, meas, cfg0)["ref_worse_than_naive"] == ["hidden_sigma_relerr"]
+
+
+def test_noise_floor_separation_branch_and_nonfinite_values():
+    spec = {"metrics": [{"name": "hidden_a", "direction": "<="}, {"name": "hidden_b", "direction": "<="}]}
+    meas = {"ref": {"0": {"hidden_a": 1e-10, "hidden_b": 0.1}}, "mid": {"0": {"hidden_a": 2e-10, "hidden_b": 0.9}},
+            "naive": {"0": {"hidden_a": 4e-10, "hidden_b": 0.9}}}
+    on = set_thresholds(spec, meas, load_config())
+    off = set_thresholds(spec, meas, load_config(None, {"thresholds": {"noise_floor_abs": 0}}))
+    assert off["thresholds"]["hidden_a"]["separating"] and not on["thresholds"]["hidden_a"]["separating"]
+    assert on["mid_fail"]["0"] == 1 and off["mid_fail"]["0"] == 2
+    # a non-finite mid value on one seed: not "all at the floor" -> plain loose rule, not the floor
+    meas = {"ref": {"0": {"hidden_a": 1e-10, "hidden_b": 0.1}, "1": {"hidden_a": 1e-10, "hidden_b": 0.1}},
+            "mid": {"0": {"hidden_a": 2e-10, "hidden_b": 0.9}, "1": {"hidden_a": float("inf"), "hidden_b": 0.9}},
+            "naive": {"0": {"hidden_a": 1e-10, "hidden_b": 0.9}, "1": {"hidden_a": 1e-10, "hidden_b": 0.9}}}
+    assert set_thresholds(spec, meas, load_config())["thresholds"]["hidden_a"]["threshold"] < 1e-9

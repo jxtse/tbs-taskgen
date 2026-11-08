@@ -83,7 +83,8 @@ def is_resource_metric(m: dict) -> bool:
 
 def _noise(a: float, b: float, floor_abs: float) -> bool:
     """Both values below the absolute floating-point noise floor (thresholds.noise_floor_abs): their difference is
-    rounding, not a difference in method.  Metrics whose natural scale is that small must not use such a floor."""
+    rounding, not a difference in method.  This drops ref/mid separation whenever both sit below the floor, even if
+    naive is above it -- a metric whose natural scale is that small needs noise_floor_abs = 0 (or smaller)."""
     return abs(a) < floor_abs and abs(b) < floor_abs
 
 
@@ -161,9 +162,10 @@ def set_thresholds(spec: dict, measure: dict, cfg: dict) -> dict:
                     mid_n = floor
                 if _worse(d, thr, mid_n):
                     thr, naive_capped = mid_n, True
-        all_vals = r_vals + mm + [x for v in measure.get("naive", {}).values() for x in [v.get(name)]
-                                  if x is not None and math.isfinite(x)]
-        if not separating and d == "<=" and all(0 <= x < floor_abs for x in all_vals):
+        # raw values (None / inf / nan included): a missing or non-finite value is not "at the floor"
+        all_vals = r_vals + m_vals + [v.get(name) for v in measure.get("naive", {}).values()]
+        if not separating and d == "<=" and all(x is not None and math.isfinite(x) and 0 <= x < floor_abs
+                                                 for x in all_vals):
             # every measured solution (ref, mid, naive) sits at the floating-point noise floor of an error metric
             # (e2e-prod-20261109: ref 4.3e-11, mid 2.7e-11, naive 4.3e-11): the metric separates nothing, and ref x1.5
             # would fail a correct implementation that merely rounds differently
