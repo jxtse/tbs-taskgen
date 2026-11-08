@@ -72,7 +72,7 @@ DEFAULTS: dict[str, Any] = {
         # the same text; 1 was picked on the dev half of the S2 reference set (gen/eval/screen_jev/).
         "min_score": 1,
         "min_score_v1": 2,                  # rules-v1 threshold (unchanged)
-        # Papers whose full text we cannot obtain (S3 history: 0 successes, every channel), dropped at S2 before
+        # Papers whose full text S3 has rarely or never obtained (history per rule below), dropped at S2 before
         # any screen call.  Match = DOI prefix [+ published before `before_year`].  Set to [] to disable.
         "blocklist": [
             {"name": "elsevier-pre2000", "doi_prefix": "10.1016", "before_year": 2000,
