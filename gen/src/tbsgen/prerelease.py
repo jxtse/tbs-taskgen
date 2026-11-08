@@ -28,6 +28,19 @@ environment (requirements files, `pip install` lines in a Dockerfile under the t
 the S5 spec.  A hit is (a) a dependency of the task image or (b) an import in the reference solution or a
 baseline that matches one of those signals.  Known companion repositories are written to the task metadata
 (provenance `companion_code`) for calibration and human review.
+
+Scope (design contract): this is a NAME-BASED rule check.  It covers these naming forms only:
+  - requirement specifiers `name[extra]==v`, `name @ url`, `-e <url|path>`, `#egg=name`, VCS URLs
+    (`git+https://host/owner/repo.git@ref`), direct archive URLs / files (`decay-fit-1.2.0.tar.gz`,
+    `x-1.0-py3-none-any.whl#sha256=...`: version and fragment removed), local paths (last component);
+  - code-host links: github / bitbucket / codeberg / huggingface `owner/repo`, GitLab `group/sub/.../repo` (last
+    project segment), PyPI `/project/<name>` and `/simple/<name>`, CRAN `?package=<name>` / `/package=<name>` /
+    `/web/packages/<name>` / `/src/contrib/<name>_<ver>.tar.gz`;
+  - files shipped under environment/ whose path component (minus version / branch suffix) or compiled-module stem
+    (`decayfit.cpython-311-*.so`, `libdecayfit.so`, `decayfit.pyc`) matches a signal; name variants: case,
+    `-`/`_`/`.`, `py`/`python-` prefix, `-py`/`py` suffix.
+It does NOT promise to find an implementation that was renamed, vendored under another name, obfuscated, or
+fetched at run time by other means; calibration (a strong agent's score) and human review cover those.
 """
 from __future__ import annotations
 
@@ -75,19 +88,46 @@ def repo_names(links: list[str]) -> list[dict]:
         u = u.strip()
         if not re.match(r"[a-z][a-z0-9+.-]*://", u, re.I):          # retrieval writes github.com/owner/repo too
             u = "https://" + u.removeprefix("//")
-        m = re.match(r"https?://(?:www\.)?([^/]+)/+([^/?#]+)(?:/+([^/?#]+))?", u)
+        m = re.match(r"https?://(?:[^@/]*@)?(?:www\.)?([^/:?#]+)(?::\d+)?(/[^?#]*)?", u)
         if not m:
             continue
-        host, a, b = m.group(1).lower(), m.group(2), m.group(3)
+        host = m.group(1).lower()
+        parts = [p for p in (m.group(2) or "").split("/") if p]
         if not any(host == h or host.endswith("." + h) for h in CODE_HOSTS):
             continue
-        if host.endswith("pypi.org") and a == "project" and b:
-            out.append(dict(url=u, host=host, name=b, kind="pypi"))
-        elif host.endswith("cran.r-project.org") and b:
-            out.append(dict(url=u, host=host, name=b, kind="cran"))
-        elif b:
-            out.append(dict(url=u, host=host, owner=a, name=re.sub(r"(\.git)?(@.*)?$", "", b), kind="repo"))
+        if host.endswith("cran.r-project.org"):
+            # /package=<name>, /web/packages/<name>/..., /src/contrib/<name>_<ver>.tar.gz
+            q = re.search(r"/package=([A-Za-z0-9.]+)", u)
+            name = q.group(1) if q else None
+            if not name and len(parts) >= 3 and parts[:2] == ["web", "packages"]:
+                name = parts[2]
+            if not name and parts[:2] == ["src", "contrib"] and len(parts) >= 3:
+                name = parts[-1].split("_")[0]
+            if name:
+                out.append(dict(url=u, host=host, name=name, kind="cran"))
+            continue
+        if host.endswith("pypi.org"):
+            if len(parts) >= 2 and parts[0] in ("project", "simple"):
+                out.append(dict(url=u, host=host, name=parts[1], kind="pypi"))
+            continue
+        if host.endswith("gitlab.com") and "-" in parts:      # gitlab.com/group/sub/.../repo/-/tree/main
+            parts = parts[:parts.index("-")]
+        elif not host.endswith("gitlab.com"):
+            parts = parts[:2]                                   # github / bitbucket / ...: owner/repo/...
+        if len(parts) >= 2:                                     # gitlab: the last segment is the project
+            name = re.sub(r"(\.git)?(@.*)?$", "", parts[-1])
+            out.append(dict(url=u, host=host, owner="/".join(parts[:-1]), name=name, kind="repo"))
     return out
+
+
+_ARCHIVE = re.compile(r"\.(tar\.gz|tar\.bz2|tar\.xz|tgz|zip|whl|egg|tar)$", re.I)
+
+
+def _archive_dist(fname: str) -> str:
+    """Distribution name of a source / wheel archive file name: `decay-fit-1.2.0.tar.gz` -> `decay-fit`,
+    `decay_fit-1.2-py3-none-any.whl` -> `decay_fit`, `DecayFit-main.zip` -> `DecayFit`."""
+    stem = _ARCHIVE.sub("", fname)
+    return re.split(r"-v?\d|-(?:main|master)$", stem, maxsplit=1)[0] or stem
 
 
 def signals(candidate: dict, spec: dict | None) -> dict:
@@ -126,10 +166,14 @@ def _spec_name(tok: str) -> list[str]:
     if re.match(r"(https?|ssh|file)://", url) or re.match(r"[\w.-]+\.[a-z]{2,}/", url):
         out += [r["name"] for r in repo_names([url])]
         if not out:
-            out.append(re.split(r"[/#?]", url.rstrip("/"))[-1].split("-")[0])
+            # direct archive / file URL: last path segment without query / fragment (#sha256=...) and version
+            path = re.split(r"[#?]", url, maxsplit=1)[0].rstrip("/")
+            out.append(_archive_dist(path.rsplit("/", 1)[-1]))
         return out
     if tok.startswith((".", "/", "~")):
-        return [Path(tok.rstrip("/")).name]
+        return [_archive_dist(Path(re.split(r"[#?]", tok)[0].rstrip("/")).name)]
+    if _ARCHIVE.search(re.split(r"[#?]", tok)[0]):
+        return [_archive_dist(re.split(r"[#?]", tok)[0])]
     if (m := _REQ_NAME.match(tok)):
         out.append(m.group(0))
     return out
@@ -231,9 +275,9 @@ def _match(name: str, sig: dict[str, str]) -> str | None:
     return None
 
 
-# source / package files (compound archive suffixes first)
-_CODE_FILE = re.compile(r"\.(tar\.gz|tar\.bz2|tar\.xz|tgz|zip|whl|tar|gz|egg|py|pyx|r|jl|m|c|cc|cpp|h|f90|f|ipynb)$",
-                        re.I)
+# source / package / compiled files (compound archive suffixes first)
+_CODE_FILE = re.compile(r"\.(tar\.gz|tar\.bz2|tar\.xz|tgz|zip|whl|tar|gz|egg|py|pyx|r|jl|m|c|cc|cpp|h|f90|f|ipynb"
+                        r"|so|pyd|pyc|pyo|dylib|dll|a|o|jar|mex\w*)$", re.I)
 
 
 def readymade_check(task: Path, candidate: dict, spec: dict | None, public_env: Path | None = None) -> dict:
@@ -265,7 +309,9 @@ def readymade_check(task: Path, candidate: dict, spec: dict | None, public_env: 
                 stem = _CODE_FILE.sub("", part)
                 # DecayFit-1.2.0 / decayfit_v2 / decayfit-main: also the part before a version / branch suffix
                 base = re.split(r"[-_.]v?\d|[-_](?:main|master|src|dist)$", stem, maxsplit=1)[0]
-                if (why := _match(stem, sg["names"]) or _match(base, sg["names"])):
+                # compiled modules: decayfit.cpython-311-x86_64-linux-gnu.so, decayfit.abi3.so, libdecayfit.so
+                first = re.sub(r"^lib(?=\w{3})", "", stem.split(".")[0])
+                if (why := _match(stem, sg["names"]) or _match(base, sg["names"]) or _match(first, sg["names"])):
                     findings.append(dict(kind="public_code", name=part, file=str(p.relative_to(env.parent)),
                                          matches=why))
                     break

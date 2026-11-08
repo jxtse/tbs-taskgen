@@ -431,6 +431,14 @@ names of the S5 spec. A hit goes to S8 repair (drop the dependency, implement th
 Known companion repositories are written to the task's `provenance.json` (`companion_code`) for calibration and
 human review.
 
+Scope and known limits: `readymade` is a name-based rule check. It recognises requirement specifiers (`name==v`,
+`name @ url`, `-e`, `#egg=`), VCS and direct archive URLs/files (version and `#sha256=` fragments removed),
+GitHub/Bitbucket/Codeberg/Hugging Face `owner/repo`, GitLab `group/subgroup/.../repo`, PyPI `/project/<name>`,
+CRAN `package=<name>` and `/web/packages/<name>`, and shipped source, archive and compiled files (`.so`, `.pyd`,
+`.pyc`, ...) whose name matches, ignoring case, `-`/`_`/`.`, version or branch suffixes and `py` prefixes or
+suffixes. It does not promise to find an implementation that was renamed, vendored under another name,
+obfuscated, or fetched at run time some other way; calibration and human review cover those.
+
 ### Environment variables
 
 | Variable | Used by | Purpose |

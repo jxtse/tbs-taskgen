@@ -160,7 +160,7 @@ allow_submit = false
 | `gen.s6a_max_tokens / s6c_max_tokens / continue_calls` | 64000 / 48000 / 1 | 多文件输出上限；被截断时最多 1 次续写，只要缺的文件 |
 | `gen.mid_rework_max` | 1 | mid 不可区分时先由 S6M 只重写 `baselines/mid.py`，再不行才回 S5 |
 | `gates.max_repair_rounds` | 2 | S8 修复轮数上限 |
-| `gates.blocking` 中的 `readymade` | 阻塞 | 现成实现检查：任务镜像声明的依赖（requirements、Dockerfile 里的 pip install）、参考解/基线的 import、`environment/` 下随题分发的代码，与论文 `code_links`/`data_links` 的仓库名/包名、S5 规格的 `method_names` 匹配即阻塞，进 S8（去掉依赖、自己实现或改题）。已知配套仓库写入 `provenance.json` 的 `companion_code`。纯规则，不调模型 |
+| `gates.blocking` 中的 `readymade` | 阻塞 | 现成实现检查：任务镜像声明的依赖（requirements、Dockerfile 里的 pip install）、参考解/基线的 import、`environment/` 下随题分发的代码，与论文 `code_links`/`data_links` 的仓库名/包名、S5 规格的 `method_names` 匹配即阻塞，进 S8（去掉依赖、自己实现或改题）。已知配套仓库写入 `provenance.json` 的 `companion_code`。纯规则，不调模型。基于名称：覆盖 requirement 写法（`==`、`@ url`、`-e`、`#egg=`）、VCS/直接归档 URL 与文件（去版本号和 `#sha256=` 片段）、GitHub 等 `owner/repo`、GitLab 子组（取最后一段）、PyPI `/project/`、CRAN `package=` 与 `/web/packages/`、随题分发的源码/归档/编译产物（`.so`/`.pyd`/`.pyc` 等）；不保证发现改名、改名后 vendored 或混淆的实现，由校准和人工复核兜底 |
 | `package.network.mode` | agent-allowlist | 打包任务的网络策略：`[agent]` 阶段 allowlist（`agent_hosts` + 启动时 `--allow-agent-host` 给的模型端点），`[verifier]` 断网，`[environment]` 公网只用于 agent 安装；`no-network` 全程断网（只适合 oracle）；`public` 旧行为，仅作对照 |
 | `package.network.disable_index` | False | True 时镜像构建完成后去掉 pip/uv/conda 索引并设 `PIP_NO_INDEX=1` 等（减速带，不是屏障；默认关，避免 agent 安装自身运行时失败） |
 | `calib.agent_allowed_hosts` | 空 | 校准作业里给 agent 阶段放行的模型端点主机（写成 `agents[].extra_allowed_hosts`）。allowlist 模式下为空且 `allow_submit=true` 时 S9 拒绝提交 |
