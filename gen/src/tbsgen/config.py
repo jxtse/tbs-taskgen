@@ -55,7 +55,12 @@ DEFAULTS: dict[str, Any] = {
         # The teacher model (S5 / S6 / S8): an Anthropic-compatible /v1/messages endpoint.  No default URL: set
         # models.teacher.url or TBS_TEACHER_URL.
         "teacher": {"model": "claude-opus-5-5", "url": os.environ.get("TBS_TEACHER_URL") or None,
-                 "effort": "medium", "max_tokens": 32000, "timeout": 1800, "retries": 2},
+                 "effort": "medium", "max_tokens": 32000, "timeout": 1800, "retries": 2,
+                 # per-stage effort override, e.g. {"S6A": "low"}; empty -> "effort" for every stage
+                 "effort_by_stage": {},
+                 # empty answer with stop_reason=max_tokens (adaptive thinking used the whole output budget, seen on
+                 # S6A at 64k with effort medium): one retry at this effort; None -> no retry
+                 "effort_on_thinking_exhausted": "low"},
         # USD per million tokens.  PLACEHOLDERS: set real prices for your model.
         "prices": {"claude-opus-5-5": {"in": 5.0, "out": 25.0, "cache_read": 0.5},
                    # TypeSafe list price: input tokens only, $0.042 per million (output not billed)

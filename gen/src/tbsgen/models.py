@@ -5,7 +5,9 @@
     r.text, r.usage, r.usd, r.model
 
 * TeacherClient: Anthropic /v1/messages request to an Anthropic-compatible endpoint (by default a local gateway;
-  model claude-opus-5-5, adaptive thinking, effort medium, SSE for long outputs).  No key in this process: the
+  model claude-opus-5-5, adaptive thinking, effort medium (per stage: models.teacher.effort_by_stage), SSE for long
+  outputs).  An empty answer cut at max_tokens (thinking used the whole output budget) is billed and retried once at
+  models.teacher.effort_on_thinking_exhausted (default "low").  No key in this process: the
   gateway holds the credentials.  If cfg.models.teacher.key_env is set, the key is read from that env var
   (injected by your secret manager) and only placed in a request header; never logged.
 * FakeClient: scripted responses for tests / dry runs.  A script is a list of rules
@@ -46,9 +48,18 @@ class ModelResult:
 
 
 class ModelError(RuntimeError):
-    def __init__(self, cls: str, msg: str):
+    def __init__(self, cls: str, msg: str, usage: dict | None = None, stop_reason: str | None = None):
         super().__init__(f"{cls}: {msg}")
         self.cls = cls
+        # usage of a call that did reach the model (e.g. an empty answer after all output tokens went to
+        # thinking): billed and recorded in the ledger like a successful call
+        self.usage = usage or {}
+        self.stop_reason = stop_reason
+
+    @property
+    def thinking_exhausted(self) -> bool:
+        """Empty answer cut at max_tokens: adaptive thinking used up the whole output budget."""
+        return self.cls == "empty" and self.stop_reason == "max_tokens"
 
 
 QUOTA_PAT = re.compile(r"额度|quota|insufficient|balance|credit|billing|exceeded your", re.I)
@@ -87,14 +98,25 @@ class _Base:
     def __init__(self, ledger: Ledger, cfg: dict):
         self.ledger, self.cfg = ledger, cfg
 
-    def chat(self, system: str, user: str, *, stage: str, item: str = "", max_tokens: int | None = None) -> ModelResult:
+    def chat(self, system: str, user: str, *, stage: str, item: str = "", max_tokens: int | None = None,
+             effort: str | None = None) -> ModelResult:
+        """effort: per-call override of the teacher's reasoning effort (None: models.<alias>.effort_by_stage
+        for this stage, else models.<alias>.effort)."""
         cid = self.ledger.reserve(self.name, stage, item, self.real, _sha(system, user))
         t0 = time.time()
+        kw = {"effort": effort} if effort else {}
         try:
-            text, usage, resp_model, stop = self._call(system, user, stage=stage, max_tokens=max_tokens)
+            text, usage, resp_model, stop = self._call(system, user, stage=stage, max_tokens=max_tokens, **kw)
         except ModelError as e:
-            self.ledger.finish(cid, error_class=e.cls, error=_redact(str(e)), latency=time.time() - t0)
-            raise
+            # a call that reached the model is billed even when it failed (empty answer after thinking)
+            e.usd = self.ledger.finish(cid, e.usage or None, error_class=e.cls, error=_redact(str(e)),
+                                       latency=time.time() - t0)
+            low = self._fallback_effort(stage, effort) if e.thinking_exhausted else None
+            if low is None:
+                raise
+            # adaptive thinking used the whole max_tokens budget without writing any answer: one retry at a lower
+            # effort (a new, separately budgeted call; the failed one stays billed in the ledger)
+            return self.chat(system, user, stage=stage, item=item, max_tokens=max_tokens, effort=low)
         except BudgetStop:
             raise
         except Exception as e:  # noqa: BLE001
@@ -109,7 +131,11 @@ class _Base:
         usd = self.ledger.finish(cid, usage, latency=time.time() - t0, resp_model=resp_model)
         return ModelResult(text, resp_model or self.name, usage, usd, stop, round(time.time() - t0, 2), cid)
 
-    def _call(self, system, user, *, stage, max_tokens):  # pragma: no cover
+    def _fallback_effort(self, stage: str, effort: str | None) -> str | None:
+        """Effort for one retry after an empty max_tokens answer, or None (no retry)."""
+        return None
+
+    def _call(self, system, user, *, stage, max_tokens, effort=None):  # pragma: no cover
         raise NotImplementedError
 
 
@@ -153,14 +179,21 @@ class TeacherClient(_Base):
         if not self.m.get("url"):
             raise ModelError("config", f"models.{alias}.url is not set (set models.{alias}.url or TBS_TEACHER_URL)")
 
-    def _call(self, system, user, *, stage, max_tokens):
+    def effort_for(self, stage: str, effort: str | None = None) -> str:
+        return effort or (self.m.get("effort_by_stage") or {}).get(stage) or self.m.get("effort", "medium")
+
+    def _fallback_effort(self, stage: str, effort: str | None) -> str | None:
+        low = self.m.get("effort_on_thinking_exhausted")
+        return low if low and low != self.effort_for(stage, effort) else None
+
+    def _call(self, system, user, *, stage, max_tokens, effort=None):
         m = self.m
         mt = int(max_tokens or m.get("max_tokens", 32000))
         stream = mt > 8000
         body = {"model": m["model"], "max_tokens": mt,
                 "system": [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
                 "messages": [{"role": "user", "content": user}], "stream": stream,
-                "output_config": {"effort": m.get("effort", "medium")}, "thinking": {"type": "adaptive"}}
+                "output_config": {"effort": self.effort_for(stage, effort)}, "thinking": {"type": "adaptive"}}
         hdr = {"content-type": "application/json", "anthropic-version": "2023-06-01"}
         if m.get("key_env"):
             k = os.environ.get(m["key_env"])
@@ -183,7 +216,8 @@ class TeacherClient(_Base):
         except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
             raise ModelError("network", f"{type(e).__name__}: {e}") from None
         if not txt and stop != "refusal":
-            raise ModelError("empty", f"empty response stop_reason={stop}")
+            raise ModelError("empty", f"empty response stop_reason={stop} output_tokens={usage.get('output_tokens')}",
+                             usage=usage, stop_reason=stop)
         return txt, usage, mresp, stop
 
 
@@ -201,13 +235,18 @@ class FakeClient(_Base):
         self.used: list[int] = []
         self.log: list[dict] = []
 
-    def _call(self, system, user, *, stage, max_tokens):
-        self.log.append(dict(stage=stage, sha=_sha(system, user)))
+    def _fallback_effort(self, stage: str, effort: str | None) -> str | None:
+        low = self.cfg["models"].get("teacher", {}).get("effort_on_thinking_exhausted")
+        return low if low and low != effort else None
+
+    def _call(self, system, user, *, stage, max_tokens, effort=None):
+        self.log.append(dict(stage=stage, sha=_sha(system, user), effort=effort))
         if callable(self.script):
             out = self.script(stage, system, user)
             if isinstance(out, dict):
                 if out.get("error"):
-                    raise ModelError(out["error"], out.get("text", "scripted error"))
+                    raise ModelError(out["error"], out.get("text", "scripted error"), usage=out.get("usage"),
+                                     stop_reason=out.get("stop"))
                 return out.get("text", ""), out.get("usage", {}), self.name, out.get("stop", "end_turn")
             return out, {"input_tokens": len(system + user) // 4, "output_tokens": len(out) // 4}, self.name, "end_turn"
         for i, rule in enumerate(self.script):
@@ -218,7 +257,8 @@ class FakeClient(_Base):
             if not rule.get("sticky"):
                 self.used.append(i)
             if rule.get("error"):
-                raise ModelError(rule["error"], rule.get("text", "scripted error"))
+                raise ModelError(rule["error"], rule.get("text", "scripted error"), usage=rule.get("usage"),
+                                 stop_reason=rule.get("stop"))
             txt = rule["text"]
             return txt, rule.get("usage", {"input_tokens": len(system + user) // 4, "output_tokens": len(txt) // 4}), \
                 self.name, "end_turn"
