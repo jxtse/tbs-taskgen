@@ -198,6 +198,10 @@ def _fetch(P: Pipeline, a) -> int:
         return True                                        # delivered now, or already past S3 / not waiting
 
     readded = fulltext.reconcile(P.store, fulltext.queue_path(P.cfg)) if not a.dry_run else 0
+    if getattr(a, "browser", False) and (getattr(a, "only", "") or "").strip():
+        print("tbsgen fetch: --only is not supported with --browser (a browser batch plans its own papers)",
+              file=sys.stderr)
+        return 2
     if getattr(a, "browser", False):
         from . import browser_agent
         stats = browser_agent.run_batch(f, wait_for_egress=a.wait_for_egress, max_wait_s=a.max_wait, dry_run=a.dry_run,

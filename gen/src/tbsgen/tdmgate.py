@@ -112,14 +112,25 @@ def _textual(p: Path) -> bool:
 
 
 def public_files(task: Path, data_dir: Path) -> list[tuple[str, str]]:
-    """instruction.md and every textual file under environment/data, whole (no size limit)."""
+    """instruction.md and every textual file under environment/data, whole (no size limit).  Symbolic links are
+    followed (files and directories), as packaging copies their targets."""
+    import os
     out = []
     ins = task / "instruction.md"
     if ins.exists():
         out.append(("instruction.md", ins.read_text(errors="replace")))
-    for p in sorted(data_dir.rglob("*")) if data_dir.exists() else []:
-        if p.is_file() and not p.is_symlink() and _textual(p):
-            out.append((f"environment/data/{p.relative_to(data_dir)}", p.read_text(errors="replace")))
+    seen: set[str] = set()
+    for root, dirs, files in os.walk(data_dir, followlinks=True) if data_dir.exists() else []:
+        real = os.path.realpath(root)
+        if real in seen:                       # a link cycle
+            dirs[:] = []
+            continue
+        seen.add(real)
+        dirs.sort()
+        for name in sorted(files):
+            p = Path(root) / name
+            if p.is_file() and _textual(p):
+                out.append((f"environment/data/{p.relative_to(data_dir)}", p.read_text(errors="replace")))
     return out
 
 

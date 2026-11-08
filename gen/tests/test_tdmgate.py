@@ -61,6 +61,21 @@ def test_large_and_unknown_suffix_files_are_checked(tmp_path):
     assert {f["file"] for f in r["findings"]} == {"environment/data/big.csv", "environment/data/notes.dat"}
 
 
+def test_symlinked_file_and_dir_are_followed(tmp_path):
+    """Packaging copies link targets, so the gate must read them too (Codex r2)."""
+    cfg = load_config()
+    item, task, data = mk_item(tmp_path)
+    outside = tmp_path / "outside"
+    (outside / "sub").mkdir(parents=True)
+    (outside / "quote.txt").write_text(SRC)
+    (outside / "sub" / "more.txt").write_text(SRC)
+    (data / "notes.txt").symlink_to(outside / "quote.txt")
+    (data / "linked").symlink_to(outside / "sub", target_is_directory=True)
+    (data / "loop").symlink_to(data, target_is_directory=True)        # a cycle must not hang
+    r = tdmgate.check(cfg, item, task, data)
+    assert {f["file"] for f in r["findings"]} >= {"environment/data/notes.txt", "environment/data/linked/more.txt"}
+
+
 def test_quote_up_to_200_chars_passes_longer_blocks(tmp_path):
     cfg = load_config()
     quote = SRC[14:14 + 200]

@@ -144,7 +144,7 @@ def merge_rows(ledger, job: str, rows: dict, keep_lease: bool = False) -> dict:
     """Merge the remote job's new ledger rows into the local ledger and drop the job's lease, atomically and at
     most once per remote row (table remote_merged).  Remote rows still pending (worker died) become
     'fail' / 'cancelled: remote worker ended' (they still count as attempts, never towards a breaker)."""
-    n = dict(attempts=0, blocks=0, meta_calls=0, cooldown=0, hosts=0)
+    n = dict(attempts=0, blocks=0, meta_calls=0, cooldown=0, hosts=0, not_entitled=0)
     with ledger._tx() as db:
         db.execute("create table if not exists remote_merged(job text, kind text, rid int, "
                    "primary key(job, kind, rid))")
@@ -166,6 +166,11 @@ def merge_rows(ledger, job: str, rows: dict, keep_lease: bool = False) -> dict:
             db.execute("insert into hosts values(?,?) on conflict(host) do update set "
                        "next_ts = max(next_ts, excluded.next_ts)", (host, nxt))
             n["hosts"] += 1
+        for ch, doi, ts, note in rows.get("not_entitled") or []:     # incl. ones booked before a worker crash
+            db.execute("insert into not_entitled values(?,?,?,?) on conflict(channel, doi) do update set "
+                       "ts = max(ts, excluded.ts), note = case when excluded.ts > ts then excluded.note else note end",
+                       (ch, doi, ts, note))
+            n["not_entitled"] += 1
         if not keep_lease:
             db.execute("delete from attempts where note=? and channel='lease'", (f"lease:{job}",))
     return n
@@ -841,6 +846,7 @@ def cmd_export(workdir: str, job: str, stdout) -> int:
             for k in ("attempts", "blocks", "meta_calls")}
     rows["cooldown"] = db.execute("select host, until, reason from cooldown").fetchall()
     rows["hosts"] = db.execute("select host, next_ts from hosts").fetchall()
+    rows["not_entitled"] = db.execute("select channel, doi, ts, note from not_entitled").fetchall()
     db.close()
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w:") as tf:

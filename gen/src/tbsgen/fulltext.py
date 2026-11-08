@@ -1029,7 +1029,8 @@ def purge(cfg: dict, channels: list[str], *, before: str | None = None, dry_run:
                 txt = pj.with_suffix(".txt")
                 if not isinstance(prov, dict) or not match(prov, txt) or prov.get("purged_at"):
                     continue
-                raws = sorted((w / "raw").glob(pj.stem + ".*")) if (w / "raw").exists() else []
+                raws = [p for p in (w / "raw").glob(pj.stem + ".*") if p.suffix and p.stem == pj.stem] \
+                    if (w / "raw").exists() else []
                 victims = [p for p in (txt, *raws) if p.exists()]
                 out["texts"] += txt.exists()
                 out["raw"] += len(raws)
@@ -1261,7 +1262,9 @@ def classify(out: Outcome, now: float | None = None) -> tuple[str, float | None,
 def _requeue(e: dict, now: float, backoff: float, was_limited: bool, until: float | None, failed_ch: set[str],
              same_version: bool, backoff_only: bool = False) -> None:
     """Update a queue entry after an attempt without text (see drain_queue)."""
-    if failed_ch:
+    if failed_ch and same_version:
+        # (an entry updated meanwhile -- a new link, a new subscriber -- had its channel backoff reset by enqueue;
+        # a failure of the old link must not bring it back)
         # every channel that really failed backs off on its own (doubling per channel)
         cb = dict(e.get("chan_backoff") or {})
         for ch in sorted(failed_ch):

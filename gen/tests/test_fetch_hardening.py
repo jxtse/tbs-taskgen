@@ -130,6 +130,24 @@ def test_new_link_resets_channel_backoff(tmp_path):
     assert drain(f, clock)["ok"] == 1
 
 
+def test_failure_of_old_link_does_not_restore_backoff_after_new_link(tmp_path):
+    """A new OA link enqueued while the old one is being fetched: the old link's failure must not put the new
+    one behind the channel backoff (Codex r2)."""
+    f, net, led, clock = mkfetcher(tmp_path, {}, SECRETS)
+    qp = q(f, dict(doi="10.9999/m.1", title=TITLE, oa_url="https://repo.example/old.pdf"))
+
+    def old_fails_and_new_link_arrives(url):
+        fulltext.enqueue(qp, fulltext.queue_entry(dict(doi="10.9999/m.1", title=TITLE,
+                                                       oa_url="https://repo.example/new.pdf"), subscribers=[]))
+        return Resp(404, {}, b"", url)
+    net.routes["repo.example/old"] = old_fails_and_new_link_arrives
+    drain(f, clock)
+    e = entry(qp, "10.9999/m.1")
+    assert not e.get("chan_backoff") and e["next_try"] == 0 and not e.get("tries")
+    net.routes["repo.example/new"] = FAKE_PDF
+    assert drain(f, clock)["ok"] == 1
+
+
 def test_old_queue_format_item_ids_still_delivered(tmp_path):
     """Queue entries written before `subscribers` (run + item_ids) keep notifying their items."""
     f, net, led, clock = mkfetcher(tmp_path, {"api.elsevier.com": ELS_XML}, SECRETS, oa={"enabled": False})
@@ -208,6 +226,15 @@ def test_fetch_only_processes_just_the_named_entries(tmp_path):
     st = drain(f, clock, only=["https://doi.org/10.1016/J.O.2", "arxiv:2101.00001", "doi:10.9/missing"])
     assert st["considered"] == 2 and st["ok"] == 2 and st["only_unmatched"] == ["doi:10.9/missing"]
     assert [e["doi"] for e in fulltext.read_queue(qp)] == ["10.1016/j.o.1"]
+
+
+def test_cli_fetch_only_with_browser_is_refused(tmp_path, monkeypatch, capsys):
+    cfgp = tmp_path / "c.toml"
+    cfgp.write_text(f'[fulltext]\nqueue_path = "{tmp_path / "q.jsonl"}"\nledger_path = "{tmp_path / "l.sqlite"}"\n')
+    from tbsgen import browser_agent
+    monkeypatch.setattr(browser_agent, "run_batch", lambda *a, **k: pytest.fail("batch must not run"))
+    rc = cli.main(["fetch", "--run", str(tmp_path / "run"), "--config", str(cfgp), "--browser", "--only", "10.1/a"])
+    assert rc == 2 and "--only is not supported with --browser" in capsys.readouterr().err
 
 
 def test_cli_fetch_only_and_exit_codes(tmp_path, monkeypatch, capsys):
@@ -348,6 +375,24 @@ def test_reused_fetcher_does_not_consume_earlier_remote_results(tmp_path, monkey
     assert entry(qp, "10.1016/j.s.1") == before
 
 
+def test_remote_not_entitled_survives_worker_crash(tmp_path):
+    """A worker that booked not_entitled and died before writing its result: the export carries the table with the
+    ledger rows and the local import merges it (Codex r2)."""
+    import io
+    from tbsgen.dlledger import DownloadLedger
+    f, net, led, clock = mkfetcher(tmp_path, {}, SECRETS)
+    d = tmp_path / "jobs" / "rjob"
+    d.mkdir(parents=True)
+    (d / "results").mkdir()
+    DownloadLedger(d / "ledger.sqlite").mark_not_entitled("wiley", "10.1002/zz", "not_entitled: short text 5")
+    (d / "spec.json").write_text(json.dumps(dict(entries=[], marks={})))
+    (d / "status.json").write_text(json.dumps(dict(state="dead")))
+    buf = io.BytesIO()
+    assert remote.cmd_export(str(tmp_path), "rjob", buf) == 0
+    res = remote.import_export(f, "rjob", buf.getvalue())
+    assert res["merged"]["not_entitled"] == 1 and led.not_entitled("wiley", "10.1002/zz")
+
+
 def test_lease_rows_never_count_as_attempts_or_breaker(tmp_path):
     f, net, led, clock = mkfetcher(tmp_path, {}, SECRETS)
     remote.lease_and_snapshot(led, "j", 3)
@@ -427,6 +472,17 @@ def test_purge_tdm_channels_keeps_ledger_and_other_texts(tmp_path):
     assert f.cached(dict(doi="10.1016/j.p.1", title=TITLE)) is None
     # idempotent
     assert fulltext.purge(f.cfg, ["elsevier", "wiley"], runs=[run])["texts"] == 0
+
+
+def test_purge_raw_match_is_exact_stem(tmp_path):
+    """Purging 10.1016/a must not delete the raw file of another paper whose key starts the same (Codex r2)."""
+    f, net, led, clock = mkfetcher(tmp_path, {"api.elsevier.com": ELS_XML, "repo.example": FAKE_PDF}, SECRETS)
+    assert f.fetch(dict(doi="10.1016/a", title=TITLE)).text
+    assert f.fetch(dict(doi="10.9999/x", title=TITLE, oa_url="https://repo.example/x.pdf")).text
+    w = Path(f.cfg["fulltext"]["write_cache_dir"])
+    (w / "raw" / "10.1016_a.b.pdf").write_bytes(FAKE_PDF)          # another paper's raw file, same prefix
+    out = fulltext.purge(f.cfg, ["elsevier"])
+    assert out["raw"] == 1 and (w / "raw" / "10.1016_a.b.pdf").exists() and not (w / "raw" / "10.1016_a.xml").exists()
 
 
 def test_purge_before_date_and_bad_args(tmp_path):
