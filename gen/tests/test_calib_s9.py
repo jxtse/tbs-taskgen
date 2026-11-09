@@ -605,3 +605,70 @@ def test_launch_failed_run_has_cost_fields(tmp_path):
     P.run(only=[iid], max_steps=1)
     r = _runs(P, iid)[0]
     assert r["state"] == "launch_failed" and r["cost_usd"] == 0.0 and r["cost_kind"] == "not_launched"
+
+
+# ------------------------------------------------------------------ review round 3
+def _launched(tmp_path, jobs, **kw):
+    P, [iid], counter, _ = _env(tmp_path, **kw)
+    P.run()
+    return P, iid, counter, _runs(P, iid)[0]
+
+
+def test_session_gone_after_log_but_before_job_result_is_infra(tmp_path):
+    P, iid, counter, r = _launched(tmp_path, None)
+    import shutil
+    shutil.rmtree(Path(r["job_dir"]))                                    # Harbor never wrote result.json
+    Path(r["log"]).write_text("starting\n")                             # job_started() is true via the log
+    assert watch_tick(P)["actions"] == []                               # session alive: still starting
+    _kill_session(tmp_path, r)
+    out = watch_tick(P)
+    assert out["actions"][0]["action"] == "job_died" and _runs(P, iid)[0]["state"] == "died"
+
+
+def test_exit_seen_then_finished_job_is_not_dead(tmp_path):
+    P, iid, counter, r = _launched(tmp_path, None)
+    jobs = Path(r["job_dir"]).parent
+    _finish(jobs, r["job_name"], reward=1.0, cost=1.0)
+    Path(r["log"] + ".exit").write_text("0\n")
+    assert not calib.launcher_died(r, P.cfg["calib"])
+    assert watch_tick(P)["actions"][0]["action"] == "ingest"
+
+
+def test_tmux_permission_error_is_unknown_not_dead(tmp_path):
+    t = tmp_path / "tmux-perm"
+    t.write_text("#!/bin/bash\necho 'error connecting to /tmp/tmux-1/default (Permission denied)' >&2\nexit 1\n")
+    t.chmod(0o755)
+    assert calib.session_alive({"tmux_bin": str(t)}, {"tmux": "x"}) is None
+    t.write_text("#!/bin/bash\necho 'error connecting to /tmp/tmux-1/default (No such file or directory)' >&2\n"
+                 "exit 1\n")
+    assert calib.session_alive({"tmux_bin": str(t)}, {"tmux": "x"}) is False
+
+
+def test_tmux_timeout_with_live_session_keeps_the_reservation(tmp_path):
+    t = tmp_path / "tmux-slow"
+    t.write_text("#!/bin/bash\nif [ \"$1\" = has-session ]; then exit 0; fi\nsleep 5\n")
+    t.chmod(0o755)
+    P, [iid], counter, jobs = _env(tmp_path, tmux_bin=str(t))
+    import subprocess
+    real = subprocess.run
+
+    def fast(cmd, *a, **kw):
+        if cmd and cmd[0] == str(t) and cmd[1] == "new-session":
+            raise subprocess.TimeoutExpired(cmd, 60)
+        return real(cmd, *a, **kw)
+    import unittest.mock
+    with unittest.mock.patch("subprocess.run", fast):
+        P.run(only=[iid], max_steps=1)
+    r = _runs(P, iid)[0]
+    assert r["state"] == "launched" and "launch_uncertain" in r and len(_runs(P, iid)) == 1
+    with P.ledger._db() as db:
+        assert db.execute("SELECT status FROM calls WHERE item=?", (iid,)).fetchone() == ("reserved",)
+
+
+def test_launcher_exit_without_job_records_not_launched_cost(tmp_path):
+    P, [iid], counter, jobs = _env(tmp_path)
+    (Path(P.cfg["calib"]["harbor_root"]) / "launch.sh").write_text("#!/bin/bash\nexit 2\n")
+    P.run()
+    watch_tick(P)
+    r = _runs(P, iid)[0]
+    assert r["state"] == "launch_failed" and r["cost_kind"] == "not_launched" and r["cost_usd"] == 0.0

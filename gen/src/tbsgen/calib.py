@@ -383,9 +383,18 @@ def launch(cfg: dict, rec: dict, ledger, save) -> dict:
         r = subprocess.run([c.get("tmux_bin", "tmux"), "new-session", "-d", "-s", rec["job_name"][-60:],
                             "bash", "-lc", inner], capture_output=True, text=True, timeout=60)
         err = None if r.returncode == 0 else f"tmux rc={r.returncode}: {r.stderr[-300:]}"
+        uncertain = False
     except Exception as e:  # noqa: BLE001  (missing tmux, timeout, ...)
         err = f"{type(e).__name__}: {e}"
+        uncertain = isinstance(e, subprocess.TimeoutExpired)    # tmux may have started the session anyway
     if err:
+        alive = session_alive(c, rec)
+        if job_started(rec) or alive or (uncertain and alive is None):
+            # the launch may have happened: keep the reservation, never start another attempt; watch / s9
+            # settle it from the job or the session
+            rec.update(state="launched", submitted=True, launch_uncertain=err[:300])
+            save(rec)
+            return rec
         if ledger is not None and rec.get("ledger_call"):
             ledger.settle(rec["ledger_call"], 0.0, status="error", kind="not_launched", note=f"launch failed: {err}"[:500])
         rec.update(state="launch_failed", outcome="infra", result_type="infra", cost_usd=0.0, cost_kind="not_launched", error=err)
@@ -425,8 +434,11 @@ def session_alive(c: dict, rec: dict) -> bool | None:
     if r.returncode == 0:
         return True
     err = (r.stderr or "").lower()
-    return False if ("can't find session" in err or "no server running" in err or "error connecting" in err
-                     or not err.strip()) else None
+    if "can't find session" in err or "no server running" in err:
+        return False
+    if "error connecting" in err and "no such file or directory" in err:
+        return False                                    # no tmux server socket at all
+    return None                                         # permission errors etc.: cannot tell
 
 
 def launcher_died(rec: dict, c: dict | None = None) -> bool:
@@ -438,15 +450,16 @@ def launcher_died(rec: dict, c: dict | None = None) -> bool:
         return False
     jr = Path(rec["job_dir"]) / "result.json"
     ex = Path(rec.get("log", "") + ".exit")
-    if not jr.exists():
-        return False                                    # launcher_failed() covers an exit without a job
-    if (_load(jr) or {}).get("finished_at"):
-        return False
     if ex.exists():
-        return True
+        if not jr.exists():
+            return False                                # launcher_failed() covers an exit without a job
+        # Harbor writes finished_at before it returns and the .exit is written after: read finished_at only
+        # after seeing .exit
+        return not (_load(jr) or {}).get("finished_at")
     if c is None or session_alive(c, rec) is not False:
         return False
-    return not ex.exists() and not (_load(jr) or {}).get("finished_at")
+    # session gone without an exit status (killed / reboot), job started (log/config) or not
+    return not ex.exists() and not (_load(jr) or {}).get("finished_at") and launcher_failed(rec, c) is None
 
 
 def actual_spend(ledger) -> float:

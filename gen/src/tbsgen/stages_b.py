@@ -231,7 +231,8 @@ def _s9(P, it):
             if why:
                 if rec.get("ledger_call"):
                     P.ledger.settle(rec["ledger_call"], 0.0, status="error", kind="not_launched", note=why[:500])
-                rec.update(state="launch_failed", outcome="infra", result_type="infra", error=why)
+                rec.update(state="launch_failed", outcome="infra", result_type="infra", cost_usd=0.0,
+                           cost_kind="not_launched", error=why)
                 _save_run(it, rec)
             elif calib.launcher_died(rec, c):
                 _settle_dead_job(P, it, rec)
