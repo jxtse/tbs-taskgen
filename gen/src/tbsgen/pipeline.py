@@ -209,15 +209,18 @@ class Pipeline:
         last = _stage_pos(until) if until else None
         steps = 0
         progress = True
-        self.prefetch_screen(only)
+        if last is None or last >= _stage_pos("S2"):    # the S2 Jev prefetch is S2 work
+            self.prefetch_screen(only)
+
+        def runnable(it) -> bool:
+            return (not only or it.item_id in only) and it.state["status"] == "active" and \
+                (last is None or _stage_pos(it.state["stage"]) <= last)
+
         while progress and steps < max_steps:
             progress = False
-            for it in self.order(self.store.items()):
-                if only and it.item_id not in only:
-                    continue
-                if it.state["status"] != "active":
-                    continue
-                if last is not None and _stage_pos(it.state["stage"]) > last:
+            # filter first, then order: skipped items must not take a round-robin slot (review)
+            for it in self.order([i for i in self.store.items() if runnable(i)]):
+                if not runnable(it):            # its status may have changed since the snapshot
                     continue
                 r = self.step(it)
                 steps += 1

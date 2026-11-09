@@ -965,6 +965,14 @@ def test_order_round_robin_by_target_and_similar_titles_last(tmp_path):
     ])
     order = [i.item_id for i in P.order(P.store.items())]
     assert order == ["a1", "b1", "c1", "a2", "b2", "a4", "a3"], order        # a3 ~ a1 (Jaccard >= 0.5): last in A
+    # only runnable items take round-robin slots: a dropped best paper does not push its target back
+    a1 = P.store.item("a1")
+    a1.state["status"] = "dropped"
+    a1.save()
+    seen = []
+    P.step = lambda it: (seen.append(it.item_id), it.finish("dropped", "test"))[0]
+    P.run(max_steps=2)
+    assert seen == ["a2", "b1"], seen
     P.cfg["schedule"]["order"] = "score"
     assert [i.item_id for i in P.order(P.store.items())][:3] == ["a1", "a2", "a3"]
     P.cfg["schedule"]["order"] = "id"
@@ -986,3 +994,10 @@ def test_run_until_stops_before_later_stages(tmp_path):
     assert not any(h["stage"] == "S5" for h in it.state["history"])
     with pytest.raises(SystemExit):
         cli.main(["run", "--run", str(tmp_path), "--until", "S99"])
+    # --until before S2 does not run the S2 Jev prefetch
+    calls = []
+    P.prefetch_screen = lambda only=None: calls.append(1) or 0
+    P.run(until="S1")
+    assert calls == []
+    P.run(until="S3")
+    assert calls == [1]
