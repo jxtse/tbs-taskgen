@@ -221,7 +221,10 @@ def s4_feasibility(client: "JevClient", it, c: dict, fulltext: str, cfg: dict) -
     rk = request_key(client.name, state, S4_QUESTIONS_VERSION)
     cache = read_json(it.p(S4_CACHE), {}) or {}
     if rk in cache:
-        return dict(cache[rk], cached=True)
+        # the cache keeps the answers; the verdict is recomputed with the current thresholds (review: a cached
+        # verdict would ignore a threshold change)
+        hit = cache[rk]
+        return dict(hit, **combine_s4(hit["probabilities"], pj.get("thresholds")), cached=True)
     r = client.ask(state, stage="S4", item=it.item_id, questions=S4_QUESTIONS)
     p = probabilities(r["answers"])
     dec = combine_s4(p, pj.get("thresholds"))

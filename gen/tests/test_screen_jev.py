@@ -349,11 +349,16 @@ def test_pipeline_s4_jev_drops_and_caches(tmp_path, key):
     assert set(body["questions"]) == set(screen_jev.S4_QUESTIONS)
     assert "  " not in body["state"]["paper"]["full_text_opening"]           # whitespace collapsed
     assert P.ledger.summary()["rows"][0]["stage"] == "S4"
-    # re-running S4 uses the cached answer
+    # re-running S4 uses the cached answer (no new HTTP call, no new ledger row) ...
+    tr = P.jev_transport
     it.state.update(stage="S4", status="active")
-    P.jev_transport = Transport([(500, {}, b"must not be called")])
     stages_a.s4(P, it)
-    assert P.jev_transport.calls == [] and it.state["status"] == "dropped"
+    assert len(tr.calls) == 1 and P.ledger.summary()["rows"][0]["calls"] == 1 and it.state["status"] == "dropped"
+    # ... but the verdict follows the current thresholds
+    cfg["probe"]["jev"]["thresholds"] = {"core_no": 0.05}
+    it.state.update(stage="S4", status="active")
+    stages_a.s4(P, it)
+    assert len(tr.calls) == 1 and it.state["stage"] == "S5" and read_json(it.p("S4_probe.json"))["jev"]["feasible"]
 
 
 def test_pipeline_s4_jev_unavailable_keeps_rule_verdict(tmp_path, monkeypatch):
