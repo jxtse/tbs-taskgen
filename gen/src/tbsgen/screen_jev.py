@@ -171,13 +171,13 @@ S4_QUESTIONS: dict[str, dict] = {
 }
 # Decision (combine_s4): drop when the probability that the paper is task-able is low on a hard requirement.
 # Defaults are conservative, set on e2e-prod-20261109 (111 papers that had passed the rule probe; offline run with
-# real Jev answers, gen/README.md): they drop 9/111 (deep-learning QSM nets, pure theory, a pharmacovigilance study,
+# real Jev answers, gen/README.md): they drop 10/111 (deep-learning QSM nets, pure theory, a pharmacovigilance study,
 # a DES-Y3 data analysis, a QC-report tool), none of the 3 released or the 9 failed generated tasks.  The failed
 # tasks are NOT separable by these answers (their S4 score is not lower than the released ones'): S4 removes
 # clearly unsuitable papers, the S6B early stops handle the rest.  The soft questions (graded_steps,
 # simple_baseline_worse) only enter the S4 score (recorded, not used for decisions).
 S4_THRESHOLDS = {
-    "core_no": 0.20,           # released task 836a87 (PT extension of CLASS) scored 0.25: keep a margin
+    "core_no": 0.20,           # released task 836a87 (PT extension of CLASS) scored 0.25-0.26: keep a margin
     "synthetic_no": 0.40,      # 0.35-0.38 only on two pure-theory papers; next lowest 0.62
     "numeric_no": 0.30,
     "restricted_yes": 0.70,    # 0.76 on a DES-Y3 data analysis; next highest 0.65
@@ -206,7 +206,15 @@ def combine_s4(p: dict, th: dict | None = None) -> dict:
 
 def build_s4_state(c: dict, fulltext: str, max_chars: int = 6000) -> dict:
     """Title + the full text's opening (whitespace collapsed: PDF text has long runs of spaces)."""
-    head = " ".join((fulltext or "")[: max_chars * 3].split())[:max_chars]
+    # collapse whitespace first, then cut (PDF text can be mostly spaces: cutting first lost the method text)
+    raw = fulltext or ""
+    words, n = [], 0
+    for w in raw[: max_chars * 50].split():
+        words.append(w)
+        n += len(w) + 1
+        if n > max_chars:
+            break
+    head = " ".join(words)[:max_chars]
     return {"paper": {"title": c.get("title") or "", "full_text_opening": head}}
 
 
