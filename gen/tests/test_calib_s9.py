@@ -26,7 +26,11 @@ def _env(tmp_path, n_items=1, **calib_kw):
     jobs.mkdir(exist_ok=True)
     counter = tmp_path / "tmux_calls"
     tmux = tmp_path / "fake-tmux"
-    tmux.write_text("#!/bin/bash\necho x >> %s\nshift 4\n\"$@\"\n" % counter)
+    # runs the launcher inline; a launcher that started a job is "still running" (its .exit is removed), like a
+    # real launcher that returns only when Harbor does
+    tmux.write_text("#!/bin/bash\necho x >> %s\nshift 4\n\"$@\"\n"
+                    "for f in %s/items/*/calib/*.log.exit; do [ -f \"$f\" ] || continue; j=$(basename \"$f\" .log.exit); "
+                    "[ -f \"%s/$j/result.json\" ] && rm \"$f\"; done; true\n" % (counter, tmp_path / "run", jobs))
     tmux.chmod(0o755)
     mk = ('J=$(python3 -c \'import json,sys;print(json.load(open(sys.argv[1]))["job_name"])\' $2); '
           'mkdir -p "%s/$J" && cp $2 "%s/$J/config.json" && echo "{}" > "%s/$J/result.json"' % (jobs, jobs, jobs))
@@ -411,3 +415,86 @@ def test_watch_flags_a_dead_launcher(tmp_path):
     assert out["actions"][0]["action"] == "launcher_failed", out
     r = _runs(P, iid)
     assert r[0]["state"] == "launch_failed" and r[0]["outcome"] == "infra"
+
+
+# ------------------------------------------------------------------ review round 1
+def test_job_that_died_without_finished_at_is_infra(tmp_path):
+    P, [iid], counter, jobs = _env(tmp_path)
+    P.run()
+    r = _runs(P, iid)[0]
+    _trial(jobs / r["job_name"], tokens=(1000, 0, 100))                 # partial trial, job result has no finished_at
+    Path(r["log"] + ".exit").write_text("1\n")
+    out = watch_tick(P)
+    assert out["actions"][0]["action"] == "job_died"
+    r = _runs(P, iid)[0]
+    assert r["state"] == "died" and r["outcome"] == "infra" and r["result_type"] == "infra"
+    assert r["cost_kind"] == "tokens" and calib.actual_spend(P.ledger) == pytest.approx((1000 + 400) / 1e6)
+    assert _runs(P, iid)[1]["who"] == "glm" and _runs(P, iid)[1]["n"] == 2   # infra does not count: GLM again
+
+
+def test_running_job_with_exit_file_pending_is_not_dead(tmp_path):
+    P, [iid], counter, jobs = _env(tmp_path)
+    P.run()
+    assert watch_tick(P)["actions"] == []                               # no .exit yet: still running
+    assert len(_runs(P, iid)) == 1
+
+
+def test_deliverable_own_missing_file_error_is_delivered(tmp_path):
+    t = _trial(tmp_path / "j", exc="AgentTimeoutError")
+    (t / "verifier" / "metrics.jsonl").write_text(json.dumps({
+        "name": "_solution_cli_run", "rc": 1, "stderr_tail": 'File "/app/output/solution_cli.py", line 3\n'
+        "FileNotFoundError: [Errno 2] No such file or directory: 'solution_cache.npy'"}) + "\n")
+    assert calib.classify_trial(t)["result_type"] == "timeout_with_output"
+
+
+def test_relative_prepared_dir_is_resolved_for_the_hook(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    P, [iid], counter, _ = _env(tmp_path, prepared_tasks_dir="prepared", prepare_command=_hook(tmp_path))
+    P.run(only=[iid])
+    r = _runs(P, iid)[0]
+    assert r["state"] == "launched" and r["task"] == str((tmp_path / "prepared" / iid).resolve())
+
+
+def test_started_intent_keeps_its_task(tmp_path):
+    """The printed command of an intent was run by hand (job dir exists): enabling preparation later must not
+    rewrite the record's task, or ingest would reject the job as a different task."""
+    prep = tmp_path / "prepared"
+    P, [iid], counter, jobs = _env(tmp_path, allow_submit=False)
+    P.run(only=[iid])
+    r = _runs(P, iid)[0]
+    (jobs / r["job_name"]).mkdir(parents=True)
+    (jobs / r["job_name"] / "config.json").write_text(Path(r["config"]).read_text())
+    cal = dict(P.cfg["calib"], allow_submit=True, prepared_tasks_dir=str(prep), prepare_command=_hook(tmp_path))
+    P2 = Pipeline(load_config(None, dict(P.cfg, calib=cal)), clients={})
+    calib.launch(P2.cfg, dict(r), P2.ledger, lambda x: None)
+    rec = calib.launch(P2.cfg, dict(r), None, lambda x: None)
+    assert rec["task"] == r["task"] and not counter.exists()
+
+
+def test_reserved_run_is_not_launched_once_the_run_total_is_reached(tmp_path):
+    P, [iid], counter, jobs = _env(tmp_path, allow_submit=False)
+    P.run(only=[iid])
+    r = _runs(P, iid)[0]
+    r["ledger_call"] = P.ledger.reserve(r["model"], "S9", iid, True, est_usd=30.0)
+    r["state"] = "reserved"
+    P.store.item(iid).p("calib", "runs.json").write_text(json.dumps([r]))
+    other = P.ledger.reserve("glm-5.3", "S9", "other", True, est_usd=30.0)
+    P.ledger.settle(other, 600.0, kind="reported")                       # actual spend above run_usd_total=500
+    P2 = Pipeline(load_config(None, dict(P.cfg, calib=dict(P.cfg["calib"], allow_submit=True))), clients={})
+    P2.run(only=[iid])
+    st = P2.store.item(iid).state
+    assert st["status"] == "paused" and st["reason"].startswith("budget:run_total_actual") and not counter.exists()
+    r = _runs(P2, iid)[0]
+    assert r["state"] == "intent" and r["ledger_call"] is None
+    with P2.ledger._db() as db:
+        assert db.execute("SELECT status, usd FROM calls WHERE item=?", (iid,)).fetchone() == ("error", 0.0)
+
+
+def test_s9_on_a_stale_item_view_does_nothing(tmp_path):
+    from tbsgen.stages_b import s9
+    P, [iid], counter, jobs = _env(tmp_path)
+    stale = P.store.item(iid)                                            # loaded as S9/active
+    P.run(only=[iid])                                                    # another process launched it
+    assert counter.read_text().count("x") == 1
+    s9(P, stale)                                                         # re-reads state under the item lock
+    assert counter.read_text().count("x") == 1 and len(_runs(P, iid)) == 1

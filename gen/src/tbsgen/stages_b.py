@@ -1,6 +1,7 @@
 """Stage handlers S6C, S7, S8, PKG, S9, S10."""
 from __future__ import annotations
 
+import contextlib
 import json
 import time
 from pathlib import Path
@@ -152,6 +153,29 @@ def _sha_file(p: Path) -> str:
     return hashlib.sha256(p.read_bytes()).hexdigest()[:16]
 
 
+@contextlib.contextmanager
+def item_lock(it):
+    """Per-item S9 lock (flock on calib/.lock): `run`, `calib watch` and `calib-ingest` may run at the same
+    time; S9 steps and ingests of one item are serialised so an intent is never launched twice and a result is
+    never attached twice.  Not re-entrant: never nest."""
+    import fcntl
+    p = it.p("calib", ".lock")
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with open(p, "a") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+
+
+def _cap_reached(P) -> float | None:
+    cap = P.cfg["budget"].get("run_usd_total")
+    if cap is not None and calib.actual_spend(P.ledger) >= float(cap):
+        return float(cap)
+    return None
+
+
 def _save_run(it, rec):
     runs = read_json(it.p("calib", "runs.json"), [])
     for i, r in enumerate(runs):
@@ -166,12 +190,31 @@ def _save_run(it, rec):
 def s9(P, it):
     """Schedule the next calibration run, or label.  Results are attached by `tbsgen calib-ingest`.
     Run records are persisted before every side effect (intent -> reserved -> launched); resume reconciles."""
+    with item_lock(it):
+        it.load()                       # another process may have moved the item while this one waited
+        if it.state.get("stage") != "S9" or it.state.get("status") != "active":
+            return None
+        return _s9(P, it)
+
+
+def _s9(P, it):
     c = P.cfg["calib"]
     runs = read_json(it.p("calib", "runs.json"), [])
     for rec in runs:                                         # reconcile interrupted submissions
         if rec.get("outcome") is None and rec.get("state") in ("intent", "reserved"):
             if not c.get("allow_submit"):
                 return it.finish("waiting", f"calib {rec['job_name']} in state {rec['state']}; submit disabled")
+            cap = None if calib.job_started(rec) else _cap_reached(P)
+            if cap is not None:
+                # same gate as a new run: settled spend reached the run total -> do not start it; a held
+                # reservation is released and the record goes back to intent (reserved again on resume)
+                if rec["state"] == "reserved" and rec.get("ledger_call"):
+                    P.ledger.settle(rec["ledger_call"], 0.0, status="error", kind="not_launched",
+                                    note="not launched: run_usd_total reached")
+                    rec.update(state="intent", ledger_call=None)
+                    _save_run(it, rec)
+                return it.finish("paused", f"budget:run_total_actual ({calib.actual_spend(P.ledger):.2f} >= {cap})",
+                                 paused_stage="S9")
             if rec["state"] == "intent" and c.get("prepare_command") and calib.prepared_dir(P.cfg, rec["who"]):
                 prep = calib.ensure_prepared(P.cfg, it.dir, rec["who"])    # an intent written before the hook ran
                 if not prep.get("ok"):
@@ -186,9 +229,11 @@ def s9(P, it):
             why = calib.launcher_failed(rec)
             if why:
                 if rec.get("ledger_call"):
-                    P.ledger.settle(rec["ledger_call"], 0.0, status="error", note=why[:500])
-                rec.update(state="launch_failed", outcome="infra", error=why)
+                    P.ledger.settle(rec["ledger_call"], 0.0, status="error", kind="not_launched", note=why[:500])
+                rec.update(state="launch_failed", outcome="infra", result_type="infra", error=why)
                 _save_run(it, rec)
+            elif calib.launcher_died(rec):
+                _settle_dead_job(P, it, rec)
     runs = read_json(it.p("calib", "runs.json"), [])
     pending = [r for r in runs if r.get("outcome") is None]
     if pending:
@@ -237,6 +282,12 @@ def ingest(P, it, job_dir: str | None = None) -> dict:
     """Attach a finished Harbor job to its pending run.  The job must be that run's own job (job name, task path,
     agent model all match) and each run is consumed once; repairs a crash between saving runs.json and the item
     state (review #3/#4)."""
+    with item_lock(it):
+        it.load()
+        return _ingest(P, it, job_dir)
+
+
+def _ingest(P, it, job_dir: str | None = None) -> dict:
     runs = read_json(it.p("calib", "runs.json"), [])
     pend = [r for r in runs if r.get("outcome") is None and r.get("state", "launched") == "launched"]
     if not pend:
@@ -282,11 +333,30 @@ def s10(P, it):
     rel.mkdir(exist_ok=True)
     with (rel / "manifest.jsonl").open("a") as f:
         runs = read_json(it.p("calib", "runs.json"), [])
+        summ = [x for x in calib.run_summary(runs) if x["outcome"] is not None]
         f.write(json.dumps(dict(item_id=it.item_id, pkg=str(it.p("pkg")), label=it.state.get("calib_label"),
-                                calib_runs=calib.run_summary(runs),
-                                result_types=[r.get("result_type") for r in runs if r.get("outcome") is not None],
+                                calib_runs=summ, result_types=[x["result_type"] for x in summ],
                                 ts=time.time())) + "\n")
     it.advance("S10", None, status="done")
+
+
+def _settle_dead_job(P, it, rec: dict) -> None:
+    """The Harbor job of a launched run ended without finished_at (crash / kill): an infra run.  Its cost is what
+    the trials written so far show (tokens), else unknown (reservation kept, not counted as actual spend)."""
+    jd = Path(rec["job_dir"])
+    try:
+        trials = calib.collect(jd, rec.get("model"), P.cfg["models"].get("prices", {}))
+    except (OSError, ValueError):
+        trials = []
+    usd, kind, usage = calib.job_cost(trials) if trials else (None, "reservation", None)
+    if rec.get("ledger_call"):
+        P.ledger.settle(rec["ledger_call"], usd, status="error", kind=kind, usage=usage,
+                        note="harbor job ended without finished_at")
+    ex = Path(rec["log"] + ".exit").read_text().strip()
+    rec.update(state="died", outcome="infra", result_type="infra", cost_usd=usd, cost_kind=kind,
+               error=f"launcher exit {ex}; harbor job has no finished_at")
+    _save_run(it, rec)
+    P.store.event("calib_job_died", item=it.item_id, job=rec["job_name"], cost_kind=kind)
 
 
 def reschedulable(cfg: dict, it) -> bool:
@@ -321,10 +391,12 @@ def watch_tick(P, only: list[str] | None = None, max_steps: int = 50) -> dict:
                                 result_type=t.get("result_type")))
             except ValueError as e:
                 did.append(dict(item=it.item_id, action="ingest_error", job=rec["job_name"], error=str(e)[:300]))
-        elif calib.launcher_failed(rec):
-            it.state["stage"], it.state["status"] = "S9", "active"   # s9() reconciles the dead launch
-            it.save()
-            did.append(dict(item=it.item_id, action="launcher_failed", job=rec["job_name"]))
+        elif calib.launcher_failed(rec) or calib.launcher_died(rec):
+            with item_lock(it):
+                it.state["stage"], it.state["status"] = "S9", "active"   # s9() reconciles the dead launch
+                it.save()
+            did.append(dict(item=it.item_id, action="launcher_failed" if calib.launcher_failed(rec) else "job_died",
+                            job=rec["job_name"]))
     s9 = [i.item_id for i in P.store.items() if i.state.get("stage") == "S9" and (not only or i.item_id in only)]
     if s9:
         P.run(max_steps=max_steps, only=s9)

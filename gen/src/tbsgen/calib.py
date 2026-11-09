@@ -136,7 +136,7 @@ def ensure_prepared(cfg: dict, item_dir: Path, who: str = "glm", force: bool = F
     cmd, d = c.get("prepare_command"), prepared_dir(cfg, who)
     if not cmd or not d:
         return dict(ok=bool(not d or (Path(d) / item_dir.name / "task.toml").exists()), skipped="no prepare_command")
-    out = Path(d) / item_dir.name
+    out = Path(d).resolve() / item_dir.name          # the hook runs in another cwd
     pkg = item_dir / "pkg"
     sha = pkg_sha(pkg)
     recp = item_dir / "calib" / f"prepare-{who}.json" if who != "glm" else item_dir / "calib" / "prepare.json"
@@ -297,7 +297,8 @@ def launch(cfg: dict, rec: dict, ledger, save) -> dict:
         # task, run-ready); the record's task changes with it, so ingest() still checks the job against it
         item_dir = Path(rec["config"]).parent.parent
         cur = task_path(cfg, item_dir, rec["who"])
-        if Path(rec["task"]) == (item_dir / "pkg").resolve() and cur != item_dir / "pkg":
+        if Path(rec["task"]) == (item_dir / "pkg").resolve() and cur != item_dir / "pkg" and not job_started(rec):
+            # (a job already started from this intent, e.g. its printed command was run by hand, keeps its task)
             for t in conf.get("tasks") or []:
                 t["path"] = str(cur.resolve())
             rec["task"] = str(cur.resolve())
@@ -334,8 +335,8 @@ def launch(cfg: dict, rec: dict, ledger, save) -> dict:
         why = network_problem(cfg, Path(rec["task"]), conf)
         if why:
             if ledger is not None and rec.get("ledger_call"):
-                ledger.settle(rec["ledger_call"], 0.0, status="error", note=f"not launched: {why}"[:500])
-            rec.update(state="launch_failed", outcome="infra", error=f"not launched: {why}")
+                ledger.settle(rec["ledger_call"], 0.0, status="error", kind="not_launched", note=f"not launched: {why}"[:500])
+            rec.update(state="launch_failed", outcome="infra", result_type="infra", error=f"not launched: {why}")
             save(rec)
             return rec
     if job_started(rec):                                   # crashed after launch, before recording it
@@ -349,8 +350,8 @@ def launch(cfg: dict, rec: dict, ledger, save) -> dict:
     if not (launcher and root):
         err = "no launcher / harbor_root for this role"
         if ledger is not None and rec.get("ledger_call"):
-            ledger.settle(rec["ledger_call"], 0.0, status="error", note=f"launch failed: {err}")
-        rec.update(state="launch_failed", outcome="infra", error=err)
+            ledger.settle(rec["ledger_call"], 0.0, status="error", kind="not_launched", note=f"launch failed: {err}")
+        rec.update(state="launch_failed", outcome="infra", result_type="infra", error=err)
         save(rec)
         return rec
     # the launcher's exit status is written next to the log, so a launcher that dies at once is visible
@@ -366,8 +367,8 @@ def launch(cfg: dict, rec: dict, ledger, save) -> dict:
         err = f"{type(e).__name__}: {e}"
     if err:
         if ledger is not None and rec.get("ledger_call"):
-            ledger.settle(rec["ledger_call"], 0.0, status="error", note=f"launch failed: {err}"[:500])
-        rec.update(state="launch_failed", outcome="infra", error=err)
+            ledger.settle(rec["ledger_call"], 0.0, status="error", kind="not_launched", note=f"launch failed: {err}"[:500])
+        rec.update(state="launch_failed", outcome="infra", result_type="infra", error=err)
         save(rec)
         return rec
     rec.update(state="launched", submitted=True, tmux=rec["job_name"][-60:])
@@ -382,6 +383,19 @@ def launcher_failed(rec: dict) -> str | None:
         tail = Path(rec["log"]).read_text(errors="replace")[-300:] if Path(rec["log"]).exists() else ""
         return f"launcher exit {ex.read_text().strip()} without a job: {tail}"
     return None
+
+
+def launcher_died(rec: dict) -> bool:
+    """Launcher exited (its .exit file is written after Harbor returns) but the job never wrote finished_at:
+    Harbor crashed or was killed mid-job.  The .exit file is checked first, so a job finishing meanwhile is not
+    mistaken for a dead one."""
+    ex = Path(rec.get("log", "") + ".exit")
+    if rec.get("state") != "launched" or not ex.exists():
+        return False
+    jr = Path(rec["job_dir"]) / "result.json"
+    if not jr.exists():
+        return False                                    # launcher_failed() covers this case
+    return not (_load(jr) or {}).get("finished_at")
 
 
 def actual_spend(ledger) -> float:
@@ -468,8 +482,8 @@ def delivered(trial: Path) -> bool | None:
         if o.get("name") != "_solution_cli_run" or o.get("lock_failed"):
             continue
         err = str(o.get("stderr_tail") or "")
-        missing = o.get("rc") not in (0, None) and ("can't open file" in err or
-                                                  ("No such file or directory" in err and "solution" in err))
+        # only the interpreter failing to open the entry file itself (the deliverable's own errors do not count)
+        missing = o.get("rc") not in (0, None) and re.search(r"can't open file '[^']*'", err) is not None
         seen = (seen or False) or not missing
     return seen
 
@@ -562,6 +576,8 @@ def run_summary(runs: list[dict]) -> list[dict]:
     for r in runs:
         t = r.get("trial") or {}
         d = {k: r.get(k, t.get(k)) for k in keys}
+        if d["result_type"] is None and r.get("outcome") == "infra":
+            d["result_type"] = "infra"
         d["reward"] = t.get("reward")
         d["exception"] = t.get("exception")
         out.append(d)
