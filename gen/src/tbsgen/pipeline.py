@@ -18,11 +18,26 @@ from . import blocklist, intake, screen_jev, stages_a as A, stages_b as B
 from .budget import BudgetStop, Ledger, today
 from .config import resolve_role
 from .models import ModelError, get_client
-from .state import Store, read_json, write_json
+from .state import STAGES, Store, read_json, write_json
 
 HANDLERS = {"S1": A.s1, "S2": A.s2, "S3": A.s3, "S4": A.s4, "S5": A.s5, "S6A": A.s6a, "S6A_run": A.s6a_run, "S6M": A.s6m,
             "S6B": A.s6b, "S6C": B.s6c, "S7": B.s7, "S8": B.s8, "PKG": B.pkg, "S9": B.s9, "S10": B.s10}
 MODEL_STAGES = {"S5": "spec", "S6A": "gen", "S6M": "gen", "S6C": "tests", "S8": "repair"}
+# sub-stages that are not in state.STAGES (for `run --until`): S6A_run is part of S6A; S6M (a model call) comes
+# after S6B, so `--until S6B` does not start it
+_SUBSTAGE = {"S6A_run": ("S6A", 0.0), "S6M": ("S6B", 0.5)}
+_STOP = {"a", "an", "the", "of", "for", "and", "in", "on", "with", "by", "to", "from", "using", "via", "based",
+         "new", "novel", "fast", "efficient", "method", "methods", "approach", "algorithm", "data", "analysis"}
+
+
+def _stage_pos(stage: str) -> float:
+    s, off = _SUBSTAGE.get(stage, (stage, 0.0))
+    return STAGES.index(s) + off if s in STAGES else float(len(STAGES))
+
+
+def _title_words(title: str) -> frozenset:
+    import re
+    return frozenset(w for w in re.findall(r"[a-z0-9]+", title.lower()) if len(w) > 2 and w not in _STOP)
 
 
 class Pipeline:
@@ -148,23 +163,74 @@ class Pipeline:
                          sec=round(time.time() - t0, 2))
         return "ok"
 
-    def run(self, max_steps: int = 10000, only: list[str] | None = None) -> dict:
+    def order(self, items: list) -> list:
+        """Items in stepping order (schedule.order): with a daily model-call cap only the first papers in this order
+        reach S5 on a given day.  round_robin: targets take turns (target with the best paper first), within a
+        target best S2 score first and near-duplicate titles (schedule.similar_title_jaccard) moved to the end."""
+        sc = self.cfg.get("schedule") or {}
+        mode = sc.get("order", "round_robin")
+        if mode == "id":
+            return list(items)
+        info = {}
+        for it in items:
+            c = read_json(it.p("S1_candidate.json"), {}) or {}
+            s = (read_json(it.p("S2_screen.json"), {}) or {}).get("score")
+            info[it.item_id] = (c.get("_target") or "", s if isinstance(s, (int, float)) else float("-inf"),
+                                c.get("title") or "")
+        by_score = sorted(items, key=lambda i: (-info[i.item_id][1], i.item_id))
+        if mode == "score":
+            return by_score
+        groups: dict[str, list] = {}
+        for it in by_score:
+            groups.setdefault(info[it.item_id][0], []).append(it)
+        jac = float(sc.get("similar_title_jaccard", 0.5) or 0)
+        for t, g in groups.items():
+            if jac > 0:
+                placed, later, words = [], [], []
+                for it in g:
+                    w = _title_words(info[it.item_id][2])
+                    if w and any(len(w & p) / len(w | p) >= jac for p in words):
+                        later.append(it)
+                    else:
+                        placed.append(it)
+                        words.append(w)
+                groups[t] = placed + later
+        out, k = [], 0
+        rows = sorted(groups.values(), key=lambda g: (-info[g[0].item_id][1], info[g[0].item_id][0]))
+        while any(k < len(g) for g in rows):
+            out += [g[k] for g in rows if k < len(g)]
+            k += 1
+        return out
+
+    def run(self, max_steps: int = 10000, only: list[str] | None = None, until: str | None = None) -> dict:
+        """until: last stage to run (e.g. "S4"); items that reach a later stage are left active there, untouched."""
+        if until is not None and until not in STAGES:
+            raise ValueError(f"unknown stage {until!r}")
+        last = _stage_pos(until) if until else None
         steps = 0
         progress = True
-        self.prefetch_screen(only)
+        if last is None or last >= _stage_pos("S2"):    # the S2 Jev prefetch is S2 work
+            self.prefetch_screen(only)
+
+        def runnable(it) -> bool:
+            return (not only or it.item_id in only) and it.state["status"] == "active" and \
+                (last is None or _stage_pos(it.state["stage"]) <= last)
+
         while progress and steps < max_steps:
             progress = False
-            for it in self.store.items():
-                if only and it.item_id not in only:
-                    continue
-                if it.state["status"] != "active":
+            # filter first, then order: skipped items must not take a round-robin slot (review)
+            for it in self.order([i for i in self.store.items() if runnable(i)]):
+                if not runnable(it):            # its status may have changed since the snapshot
                     continue
                 r = self.step(it)
                 steps += 1
                 progress |= r in ("ok", "error", "crash")
                 if steps >= max_steps:
                     break
-        return self.status()
+        out = self.status()
+        if until:
+            out["until"] = until
+        return out
 
     def resume(self, reasons_prefix: tuple[str, ...] = ("budget:", "model:")) -> list[str]:
         out = []

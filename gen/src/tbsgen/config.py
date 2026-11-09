@@ -127,7 +127,14 @@ DEFAULTS: dict[str, Any] = {
         # "/cdn-cgi/trace") first, so the check sees the route the downloads take.
         "egress_check": {"enabled": False, "allow_cidrs": [], "ttl_s": 600, "timeout": 15,
                          "urls": ["https://api.ipify.org", "https://checkip.amazonaws.com"]},
-        "oa": {"enabled": True, "europepmc": True, "unpaywall_email": None, "max_urls": 3, "skip_hosts": []},
+        "oa": {"enabled": True, "europepmc": True, "unpaywall_email": None, "max_urls": 3, "skip_hosts": [],
+               # Europe PMC's render endpoint (www.ebi.ac.uk .../fullTextXML) answered HTTP 500 on 38 of 49 requests
+               # in e2e-prod-20261108/09: it is tried after the publisher / arXiv / Unpaywall links, and after
+               # server_error_streak consecutive 5xx from one host that host is cooled for server_error_cooldown_s
+               # (0 disables).  last_hosts: hosts sorted to the end of the OA candidate list.
+               "europepmc_last": True,
+               "last_hosts": ["www.ebi.ac.uk", "europepmc.org"],
+               "server_error_streak": 5, "server_error_cooldown_s": 1800},
         "elsevier": {"enabled": False, "prefixes": ["10.1016/"], "key_env": "ELSEVIER_API_KEY",
                      "insttoken_env": "ELSEVIER_INSTTOKEN"},
         "wiley": {"enabled": False, "prefixes": ["10.1002/", "10.1111/"], "token_env": "WILEY_TDM_TOKEN"},
@@ -248,6 +255,16 @@ DEFAULTS: dict[str, Any] = {
         "limits": {},
         "global_limits": {},
         "host_caps": {},
+    },
+    # Order in which active items are stepped (pipeline.Pipeline.order).  Matters for the expensive model stages:
+    # with a daily call cap only the first few papers get S5 each day.  e2e-prod-20261109 ordered globally by Jev
+    # score and 6 of the 12 papers that reached S5 were cosmology perturbation-theory papers from one target.
+    "schedule": {
+        "order": "round_robin",             # "round_robin" (targets in turn, best score first within a target) |
+                                            # "score" (global score order) | "id" (item id; old behaviour)
+        # within a target, a paper whose title shares >= this fraction of content words (Jaccard) with a paper
+        # already placed earlier in that target is moved behind the others (method near-duplicates); 0 disables
+        "similar_title_jaccard": 0.5,
     },
     "probe": {
         "tbs_tasks_root": None,             # TB-Science task texts (<task>/instruction.md ...); None -> no dedup

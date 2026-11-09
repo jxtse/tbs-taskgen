@@ -119,6 +119,7 @@ uv run tbsgen fetch --run runs/R --finish-browser                  # 关闭本�
 uv run tbsgen fetch --run runs/R --browser --wait-for-egress         # 等出口进入 allow_cidrs 后跑一个浏览器批次
 uv run tbsgen calib-ingest --run runs/R --item ID [--job-dir DIR]   # 回填校准结果（默认取该次提交的作业目录；作业未结束则拒绝）
 uv run tbsgen harbor-local --run runs/R [--item ID]                  # 本机 Harbor oracle/nop（换本地基础镜像）
+uv run tbsgen run    --run runs/R --until S4                      # 只跑到 S4（不启动模型阶段，不留 model:config 暂停）
 uv run tbsgen reset  --run runs/R --item ID --stage S6B [--regen]    # 管线修复后让条目从某阶段重来（记入 history）
 uv run tbsgen ping --run state/ping --calls 1 --budget-usd 1        # Opus 连通性（真实调用）
 ```
@@ -160,6 +161,8 @@ allow_submit = false
 | `thresholds.frac / min_ref_margin / loose_margin` | 0.5 / 0.10 / 0.50 | 阈值位置（**待定**）；非区分指标若 naive 明显更差，阈值收到参考与 naive 的对数中点（不紧于参考×(1±margin)） |
 | `thresholds.sentinel_abs` | 1e5 | "≤"指标上参考值达到此量级视为缺输出（判分脚本的哨兵值） |
 | `gen.s6a_max_tokens / s6c_max_tokens / continue_calls` | 64000 / 48000 / 1 | 多文件输出上限；被截断时最多 1 次续写，只要缺的文件 |
+| `schedule.order` / `schedule.similar_title_jaccard` | round_robin / 0.5 | 条目推进顺序（每日调用上限下决定谁先进 S5）：`round_robin` 按 target 轮转、组内按 S2 分数，组内标题实词 Jaccard ≥ 0.5 的近似重复后排；`score` 全局按分数；`id` 旧行为 |
+| `fulltext.oa.europepmc_last / last_hosts / server_error_streak / server_error_cooldown_s` | True / ebi.ac.uk、europepmc.org / 5 / 1800 s | Europe PMC render（2026-11-08/09 有 38/49 次 HTTP 500）放到 OA 候选最后；同一站点连续 5 次 5xx 冷却 30 分钟，论文保持待取 |
 | `gen.mid_rework_max` | 1 | mid 不可区分时先由 S6M 只重写 `baselines/mid.py` |
 | `gen.back_to_spec_max` | 0 | S6M 后仍拉不开时回 S5 的次数（e2e-prod-20261109：回 S5 的 5 篇无一救回）；>0 时只对“差一点”生效 |
 | `gen.mid_far_above` | 2 | mid 失败判据数 ≥ max_mid_fail+此值（或全部判据且 ≥ max_mid_fail+1）直接丢弃 |

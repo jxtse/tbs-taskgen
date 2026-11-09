@@ -693,7 +693,8 @@ def test_corrupt_provenance_does_not_break_cache(tmp_path):
 def test_host_cap_on_one_oa_source_does_not_stop_others(tmp_path, monkeypatch):
     monkeypatch.setattr(fulltext, "pdf_to_text", lambda b: TITLE + "\n" + BODY)
     f, net, led, _ = mkfetcher(tmp_path, {"good.example.org": FAKE_PDF}, SECRETS,
-                               oa={"europepmc": True, "max_urls": 3}, host_caps={"www.ebi.ac.uk": 0})
+                               oa={"europepmc": True, "max_urls": 3, "europepmc_last": False},   # EPMC first
+                               host_caps={"www.ebi.ac.uk": 0})
     led.meta["daily_calls"] = 0                                      # metadata host refused
     out = f.fetch(dict(doi="10.9/x", title=TITLE, oa_url="https://good.example.org/a.pdf"))
     assert out.rec["source"] == "oa" and any("metadata cap" in s for s in out.rec["skipped"])
@@ -1019,3 +1020,35 @@ def test_inline_browser_respects_taskspace_lock(tmp_path):
         fcntl.flock(fh, fcntl.LOCK_EX)
         out = f.fetch(dict(doi="10.1021/a", title=TITLE))
     assert calls == [] and any("in use" in s for s in out.rec["skipped"])
+
+
+
+def test_europepmc_tried_after_other_oa_links(tmp_path):
+    """e2e-prod-20261108/09: the Europe PMC render endpoint answered 500 on 38/49 requests -> publisher/arXiv links
+    first, Europe PMC last (oa.europepmc_last)."""
+    routes = {"rest/search": json.dumps({"resultList": {"result": [
+        {"pmcid": "PMC123", "inEPMC": "Y", "isOpenAccess": "Y"}]}}).encode(),
+        "PMC123/fullTextXML": JATS, "arxiv.org/pdf/x": Resp(404, {}, b"nope", "https://arxiv.org/pdf/x")}
+    f, net, led, _ = mkfetcher(tmp_path, routes, SECRETS, oa={"europepmc": True})
+    out = f.fetch(dict(doi="10.9999/x.1", title=TITLE, oa_url="https://arxiv.org/pdf/x"))
+    assert out.rec["source"] == "oa" and out.rec["provenance"]["kind"] == "jats"
+    hosts = net.hosts()
+    assert hosts.index("https://arxiv.org/pdf/x") < max(i for i, u in enumerate(hosts) if "fullTextXML" in u)
+
+
+def test_consecutive_5xx_cool_the_host(tmp_path):
+    def five(url):
+        return Resp(500, {}, b"err", url)
+    routes = {"rest/search": lambda u: Resp(200, {}, json.dumps({"resultList": {"result": [
+        {"pmcid": "PMC" + u.split("x.")[-1].split("%")[0], "inEPMC": "Y", "isOpenAccess": "Y"}]}}).encode(), u),
+        "fullTextXML": five}
+    f, net, led, clock = mkfetcher(tmp_path, routes, SECRETS, oa={"europepmc": True, "server_error_streak": 3,
+                                                                  "server_error_cooldown_s": 600})
+    for i in range(3):
+        f.fetch(dict(doi=f"10.9999/x.{i}", title=TITLE))
+    assert led.cooling("www.ebi.ac.uk")
+    n = sum("fullTextXML" in u for u in net.hosts())
+    f.fetch(dict(doi="10.9999/x.9", title=TITLE))
+    assert sum("fullTextXML" in u for u in net.hosts()) == n == 3
+    clock.t += 601
+    assert led.cooling("www.ebi.ac.uk") is None
