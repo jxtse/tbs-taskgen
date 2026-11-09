@@ -350,6 +350,8 @@ def test_pipeline_s4_jev_drops_and_caches(tmp_path, key):
     assert "  " not in body["state"]["paper"]["full_text_opening"]           # whitespace collapsed
     padded = screen_jev.build_s4_state({"title": "t"}, ("x" + " " * 40) * 400, 1000)["paper"]["full_text_opening"]
     assert len(padded) == 799 and padded.count("x") == 400                 # collapse first, then cut
+    far = screen_jev.build_s4_state({"title": "t"}, "We propose." + " " * 300000 + "Method details", 100)
+    assert far["paper"]["full_text_opening"] == "We propose. Method details"
     assert P.ledger.summary()["rows"][0]["stage"] == "S4"
     # re-running S4 uses the cached answer (no new HTTP call, no new ledger row) ...
     tr = P.jev_transport

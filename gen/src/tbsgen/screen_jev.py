@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import os
 import random
 import time
@@ -207,11 +208,10 @@ def combine_s4(p: dict, th: dict | None = None) -> dict:
 def build_s4_state(c: dict, fulltext: str, max_chars: int = 6000) -> dict:
     """Title + the full text's opening (whitespace collapsed: PDF text has long runs of spaces)."""
     # collapse whitespace first, then cut (PDF text can be mostly spaces: cutting first lost the method text)
-    raw = fulltext or ""
     words, n = [], 0
-    for w in raw[: max_chars * 50].split():
-        words.append(w)
-        n += len(w) + 1
+    for m in re.finditer(r"\S+", fulltext or ""):      # lazy scan of the whole text, no raw-prefix cap
+        words.append(m.group(0))
+        n += len(words[-1]) + 1
         if n > max_chars:
             break
     head = " ".join(words)[:max_chars]
