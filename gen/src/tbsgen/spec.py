@@ -223,3 +223,88 @@ def set_thresholds(spec: dict, measure: dict, cfg: dict) -> dict:
         status = "not_separable"
     return dict(status=status, thresholds=out, separating=sep, mid_fail=mid_fail, naive_fail=naive_fail,
                 ref_worse_than_naive=ref_worse)
+
+
+# ------------------------------------------------------------------------------------------------ S6B early stops
+def crashed_runs(measure: dict, who: str) -> dict:
+    """{run tag: stderr tail} of `who` (mid / naive / ref) runs that exited non-zero (crash / timeout)."""
+    return {k: (v.get("err") or "")[-400:] for k, v in (measure.get("runs") or {}).items()
+            if re.fullmatch(rf"{who}\d+", k) and v.get("solve_rc") not in (0, None)}
+
+
+def ref_naive_ratios(th: dict, measure: dict, cfg: dict) -> dict:
+    """For each metric flagged ref_worse_than_naive: how many times worse the reference is than the best naive seed
+    (error metrics "<=": ref / naive; score metrics ">=": naive / ref).  Metrics where the denominator is at the
+    noise floor or the values have mixed signs are left out (no meaningful ratio: e.g. naive FDR 0 because the
+    naive baseline selects nothing)."""
+    floor_abs = float(cfg["thresholds"].get("noise_floor_abs", 1e-9))
+    out = {}
+    for name in th.get("ref_worse_than_naive") or []:
+        t = th["thresholds"][name]
+        nv = [v.get(name) for v in (measure.get("naive") or {}).values()]
+        nv = [x for x in nv if x is not None and math.isfinite(x)]
+        if not nv:
+            continue
+        r = t["ref_worst"]
+        if t["direction"] == "<=":
+            n = min(nv)
+            num, den = r, n
+        else:
+            n = max(nv)
+            num, den = n, r
+        if den is None or num is None or den <= floor_abs or num <= 0:
+            continue
+        out[name] = num / den
+    return out
+
+
+def s6b_decision(th: dict, measure: dict, cfg: dict, state: dict) -> dict:
+    """What S6B does with a thresholds report: dict(action, reason, rule, detail).
+
+    action: "S6C" (ok) | "S8" (repair) | "S6M" (rewrite mid only) | "S5" (new spec) | "S6A" (regenerate code) |
+    "drop".  rule is set when an early-stop rule decided (also logged as an `early_stop` event):
+      ref_gross      reference worse than naive by >= gen.ref_gross_ratio -> S6A once, then drop
+      mid_crashed    mid exited non-zero -> S6M (code bug, the count of failed criteria means nothing)
+      mid_far        mid fails far more criteria than allowed -> drop without S6M / S5
+    Counters (state): mid_rework, back_to_spec, ref_rewrite.
+    A crashed mid only matters when the item is not separable: a mid that wrote its outputs and then exited
+    non-zero but still fails 1..max_mid_fail criteria is a valid near miss (status ok -> S6C, as before)."""
+    g = cfg["gen"]
+    st = th["status"]
+    if st == "ok":
+        return dict(action="S6C", reason="ok", rule=None, detail={})
+    if st == "ref_worse_than_naive":
+        ratios = ref_naive_ratios(th, measure, cfg)
+        gross = {k: v for k, v in ratios.items() if v >= float(g.get("ref_gross_ratio", 10.0))}
+        detail = dict(ratios={k: float(f"{v:.3g}") for k, v in ratios.items()}, gross_ratio=g.get("ref_gross_ratio"))
+        if gross:
+            if state.get("ref_rewrite", 0) < int(g.get("ref_rewrite_max", 1)):
+                return dict(action="S6A", reason="ref_grossly_wrong", rule="ref_gross", detail=detail)
+            return dict(action="drop", reason="ref_grossly_wrong", rule="ref_gross", detail=detail)
+        return dict(action="S8", reason=st, rule=None, detail=detail)
+    if st != "not_separable":
+        return dict(action="S8", reason=st, rule=None, detail={})
+    lo, hi = cfg["thresholds"]["min_mid_fail"], cfg["thresholds"]["max_mid_fail"]
+    n_crit = len({metric_family(k) for k in th["thresholds"]})
+    fails = list((th.get("mid_fail") or {}).values())
+    crashed = crashed_runs(measure, "mid")
+    detail = dict(mid_fail=th.get("mid_fail"), criteria=n_crit, allowed=[lo, hi], mid_crashed=sorted(crashed))
+    rework_left = state.get("mid_rework", 0) < g.get("mid_rework_max", 1)
+    if crashed:
+        if rework_left:
+            return dict(action="S6M", reason="mid_crashed", rule="mid_crashed", detail=detail)
+    elif fails:
+        n = min(fails)          # every seed must be far: one seed near the band keeps the item
+        far = n >= hi + int(g.get("mid_far_above", 2)) or (n >= hi + 1 and n >= n_crit)
+        if far:
+            return dict(action="drop", reason="mid_far_from_ref", rule="mid_far", detail=detail)
+    if rework_left:
+        return dict(action="S6M", reason="mid_not_separable", rule=None, detail=detail)
+    # back to S5 (new spec + all code) only for a near miss: mid ran, failed at least one criterion and at most one
+    # more than allowed.  A mid that fails nothing after S6M (the dropped steps do not matter) or far too much is
+    # a content verdict, not a near miss.
+    near = not crashed and bool(fails) and min(fails) >= 1 and max(fails) <= hi + 1
+    if near and state.get("back_to_spec", 0) < g["back_to_spec_max"]:
+        return dict(action="S5", reason="mid_not_separable", rule=None, detail=detail)
+    return dict(action="drop", reason="mid_not_separable", rule=None if near or not g["back_to_spec_max"]
+                else "not_near_miss", detail=detail)

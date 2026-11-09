@@ -13,8 +13,8 @@ from . import blocklist, intake, runner, screen_jev
 from .budget import BudgetStop
 from .config import resolve_role
 from .models import ModelError, extract_json, parse_files  # noqa: F401
-from .prompts import METRICS_API, PROMPT_VERSION, S5_SPEC, S6A_GEN, S6M_MID, SYSTEM
-from .spec import set_thresholds, validate_spec
+from .prompts import METRICS_API, PROMPT_VERSION, S5_SPEC, S6A_GEN, S6A_REWRITE, S6M_MID, SYSTEM
+from .spec import crashed_runs, s6b_decision, set_thresholds, validate_spec
 from .state import read_json, write_json
 
 
@@ -200,15 +200,18 @@ def s6a(P, it):
     if not (task / "generator" / "generate.py").exists() or it.state.get("regen_6a"):
         need = {"generator/generate.py", "solution/solve.py", "tests/measure.py", "baselines/mid.py",
                 "baselines/naive.py"}
-        files, log = chat_files(P, it, "gen", "S6A", S6A_GEN.format(spec=json.dumps(spec, indent=1),
-                                                                       metrics_api=METRICS_API), need,
-                                max_tokens=P.cfg["gen"].get("s6a_max_tokens"))
+        user = S6A_GEN.format(spec=json.dumps(spec, indent=1), metrics_api=METRICS_API)
+        fb = it.state.get("s6a_feedback")
+        if fb:
+            user += S6A_REWRITE.format(ratios=json.dumps(fb.get("ratios")))
+        files, log = chat_files(P, it, "gen", "S6A", user, need, max_tokens=P.cfg["gen"].get("s6a_max_tokens"))
         write_json(it.p("S6A_calls.json"), log)
         if not need <= set(files):
             write_json(it.p("S6A_error.json"), dict(missing=sorted(need - set(files)), got=sorted(files), calls=log))
             return it.finish("dropped", "s6a_missing_files")
         _write_files(task, files, ("generator/", "solution/", "tests/", "baselines/"))
         it.state.pop("regen_6a", None)
+        it.state.pop("s6a_feedback", None)
         it.save()
     it.advance("S6A", "S6A_run")
 
@@ -249,28 +252,45 @@ def s6a_run(P, it):
 
 
 def s6b(P, it):
+    """Thresholds from the measurement, then spec.s6b_decision: S6C / S8 / S6M / S5 / S6A / drop.  Every decision
+    is appended to S6B_decisions.json; an early stop (decision.rule set) is also an `early_stop` event."""
     spec = read_json(it.p("_spec", "spec.json"))
     meas = read_json(it.p("S6A_measure.json"))
     th = set_thresholds(spec, meas, P.cfg)
+    dec = s6b_decision(th, meas, P.cfg, it.state)
+    th["decision"] = dec
     write_json(it.p("thresholds.json"), th)
-    if th["status"] == "not_separable":
-        # v2.2: first try a cheaper fix: rewrite only baselines/mid.py around another drop node (S6M).  In
-        # e2e-iter1 3/5 papers had a mid that failed (almost) every metric -- the dropped node was too
-        # fundamental -- and going back to S5 regenerated spec + all code for the same outcome.
-        if it.state.get("mid_rework", 0) < P.cfg["gen"].get("mid_rework_max", 1):
-            return it.goto("S6M", "mid_not_separable")
-        back = it.state.get("back_to_spec", 0)
-        if back < P.cfg["gen"]["back_to_spec_max"]:
-            it.state["back_to_spec"] = back + 1
-            it.state.setdefault("avoid_mid_drop", []).extend(spec["depgraph"].get("mid_drop", []))
-            it.state["regen_6a"] = True
-            it.state["regen_6c"] = True
-            it.save()
-            return it.goto("S5", "mid_not_separable")
-        return it.finish("dropped", "mid_not_separable")
-    if th["status"] != "ok":
+    log = read_json(it.p("S6B_decisions.json"), []) or []
+    log.append(dict(ts=time.time(), status=th["status"], **dec))
+    write_json(it.p("S6B_decisions.json"), log)
+    if dec["rule"]:
+        P.store.event("early_stop", item=it.item_id, stage="S6B", rule=dec["rule"], action=dec["action"],
+                      reason=dec["reason"], detail=dec["detail"])
+    act = dec["action"]
+    if act == "S6C":
+        return it.advance("S6B", "S6C", separating=th["separating"])
+    if act == "S8":
         return _to_repair(P, it, th["status"], th)
-    it.advance("S6B", "S6C", separating=th["separating"])
+    if act == "S6M":
+        # v2.2: a cheaper fix than a new spec: rewrite only baselines/mid.py around another drop node
+        return it.goto("S6M", dec["reason"])
+    if act == "S5":
+        it.state["back_to_spec"] = it.state.get("back_to_spec", 0) + 1
+        it.state.setdefault("avoid_mid_drop", []).extend(spec["depgraph"].get("mid_drop", []))
+        it.state["regen_6a"] = True
+        it.state["regen_6c"] = True
+        return it.goto("S5", dec["reason"])     # one save: counters and stage change land together
+    if act == "S6A":
+        # the reference is grossly wrong (orders of magnitude worse than the naive baseline): regenerate the code
+        # once from the same spec instead of patching it in S8
+        it.state["ref_rewrite"] = it.state.get("ref_rewrite", 0) + 1
+        it.state["regen_6a"] = True
+        it.state["regen_6c"] = True
+        it.state["s6a_feedback"] = dict(why=dec["reason"], ratios=dec["detail"].get("ratios"))
+        # one save (in goto): a crash cannot leave ref_rewrite spent while the item still sits at S6B.  S8 rounds
+        # already spent stay spent (gates.max_repair_rounds is per item)
+        return it.goto("S6A", dec["reason"])
+    return it.finish("dropped", dec["reason"], early_stop=dec["rule"])
 
 
 def s6m(P, it):
@@ -286,7 +306,13 @@ def s6m(P, it):
                           naive_drop=g.get("naive_drop"),
                           ref=json.dumps(meas["ref"]), mid=json.dumps(meas["mid"]), old_drop=g.get("mid_drop"),
                           n_fail=n_fail, n_metrics=len(spec.get("metrics", [])), tried=tried)
-    if n_fail < P.cfg["thresholds"]["min_mid_fail"]:
+    crashed = crashed_runs(meas, "mid")
+    if crashed:
+        err = next(iter(crashed.values()))[-300:]
+        user = user.replace("The current mid fails too many", "The current mid CRASHED (non-zero exit; stderr tail: "
+                            + json.dumps(err) + "), so it fails everything; before it was").replace(
+            "is too\nfundamental", "may or may not be too\nfundamental")
+    elif n_fail < P.cfg["thresholds"]["min_mid_fail"]:
         user = user.replace("The current mid fails too many", "The current mid fails NONE of them (the dropped "
                             "step does not matter enough); before it was").replace(
             "is too\nfundamental", "has too little effect")

@@ -845,3 +845,94 @@ def test_load_candidates_accepts_tbsretr_per_target_files(tmp_path):
     assert [c["_target"] for c in load_candidates(tmp_path / "l.json")] == ["task:x", "task:y"]
     (tmp_path / "e.json").write_text(json.dumps({"target": {"id": "task:z"}, "selected": [{"doi": "10.1/c"}]}))
     assert load_candidates(tmp_path / "e.json")[0]["_target"] == "task:z"
+
+
+# ------------------------------------------------------------------------------------------------ S6B early stops
+def _th(status, mid_fail, crit=4, rwn=(), ref=None, direction="<="):
+    names = [f"hidden_m{i}" for i in range(crit)]
+    t = {n: dict(direction=direction, threshold=1.0, ref_worst=ref if (ref is not None and n in rwn) else 0.1,
+                 mid_best=1.0, separating=False, ref_passes=True) for n in names}
+    return dict(status=status, thresholds=t, separating=[], mid_fail={"0": mid_fail, "1": mid_fail},
+                naive_fail={}, ref_worse_than_naive=list(rwn))
+
+
+def _meas(mid_rc=0, naive=None):
+    runs = {f"mid{s}": dict(solve_rc=mid_rc, err="ModuleNotFoundError: No module named 'solve'" if mid_rc else "")
+            for s in (0, 1)}
+    return dict(runs=runs, naive={"0": naive or {}, "1": naive or {}})
+
+
+def test_s6b_decision_mid_far_drops_at_once():
+    """e2e-prod-20261109: mid failing 4 of 4 / 4 of 6 criteria never became a near miss (S6M, S5) -> drop at once;
+    3 of 4 (max_mid_fail + 1, the 3 released tasks at their first S6B) still gets S6M."""
+    from tbsgen.spec import s6b_decision
+    cfg = load_config()
+    d = s6b_decision(_th("not_separable", 4, crit=4), _meas(), cfg, {})
+    assert (d["action"], d["rule"], d["reason"]) == ("drop", "mid_far", "mid_far_from_ref")
+    assert s6b_decision(_th("not_separable", 4, crit=6), _meas(), cfg, {})["action"] == "drop"
+    assert s6b_decision(_th("not_separable", 3, crit=4), _meas(), cfg, {})["action"] == "S6M"
+    assert s6b_decision(_th("not_separable", 3, crit=5), _meas(), cfg, {})["action"] == "S6M"
+    assert s6b_decision(_th("not_separable", 0, crit=5), _meas(), cfg, {})["action"] == "S6M"
+    # a crashed mid is a code bug: S6M whatever the count
+    d = s6b_decision(_th("not_separable", 7, crit=7), _meas(mid_rc=1), cfg, {})
+    assert (d["action"], d["rule"]) == ("S6M", "mid_crashed") and d["detail"]["mid_crashed"] == ["mid0", "mid1"]
+    # S6M used: no back-to-S5 by default (0/5 items recovered that way in e2e-prod-20261109)
+    assert s6b_decision(_th("not_separable", 3, crit=5), _meas(), cfg, {"mid_rework": 1})["action"] == "drop"
+    cfg["gen"]["back_to_spec_max"] = 1          # when enabled: only a near miss goes back to S5
+    assert s6b_decision(_th("not_separable", 3, crit=5), _meas(), cfg, {"mid_rework": 1})["action"] == "S5"
+    d = s6b_decision(_th("not_separable", 0, crit=5), _meas(), cfg, {"mid_rework": 1})
+    assert (d["action"], d["rule"]) == ("drop", "not_near_miss")
+    cfg["gen"]["mid_far_above"] = 10            # configurable: far rule effectively off
+    assert s6b_decision(_th("not_separable", 4, crit=6), _meas(), cfg, {})["action"] == "S6M"
+
+
+def test_s6b_decision_gross_reference_error_rewrites_s6a_once():
+    """e2e-prod-20261109 (9f3a42): reference p22 error 3.6e8 vs naive 0.26-0.37 -> the reference is wrong: one S6A
+    rewrite, then drop.  Mild cases (1.2-9.8x) keep the S8 patch route; a naive at 0 gives no ratio."""
+    from tbsgen.spec import ref_naive_ratios, s6b_decision
+    cfg = load_config()
+    th = _th("ref_worse_than_naive", 2, rwn=["hidden_m0"], ref=3.58e8)
+    meas = _meas(naive={"hidden_m0": 0.28})
+    assert ref_naive_ratios(th, meas, cfg)["hidden_m0"] > 1e9
+    d = s6b_decision(th, meas, cfg, {})
+    assert (d["action"], d["rule"]) == ("S6A", "ref_gross") and d["detail"]["ratios"]["hidden_m0"] > 1e9
+    d = s6b_decision(th, meas, cfg, {"ref_rewrite": 1})
+    assert (d["action"], d["reason"]) == ("drop", "ref_grossly_wrong")
+    mild = _th("ref_worse_than_naive", 2, rwn=["hidden_m0"], ref=0.027)
+    assert s6b_decision(mild, _meas(naive={"hidden_m0": 0.00343}), cfg, {})["action"] == "S8"      # 7.9x
+    zero = _th("ref_worse_than_naive", 2, rwn=["hidden_m0"], ref=0.0017)
+    assert s6b_decision(zero, _meas(naive={"hidden_m0": 0.0}), cfg, {})["action"] == "S8"          # no ratio
+    score = _th("ref_worse_than_naive", 2, rwn=["hidden_m0"], ref=0.02, direction=">=")
+    assert s6b_decision(score, _meas(naive={"hidden_m0": 0.97}), cfg, {})["action"] == "S6A"       # 48x
+    assert s6b_decision(_th("ok", 1), _meas(), cfg, {})["action"] == "S6C"
+    assert s6b_decision(_th("ref_metric_missing", 1), _meas(), cfg, {})["action"] == "S8"
+
+
+def test_s6b_handler_logs_early_stop_and_regenerates_s6a(tmp_path):
+    from tbsgen import stages_a as A
+    from tbsgen.pipeline import Pipeline
+    from tbsgen.state import read_json, write_json
+    cfg = load_config(None, {"run": {"root": str(tmp_path)}})
+    P = Pipeline(cfg, clients={})
+    it = P.store.item("x")
+    spec = {"metrics": [{"name": "hidden_err", "direction": "<="}, {"name": "public_err", "direction": "<="},
+                        {"name": "hidden_cov", "direction": ">="}],
+            "depgraph": {"mid_drop": ["C1"], "naive_drop": ["C1", "C2"]}}
+    write_json(it.p("_spec", "spec.json"), spec)
+    meas = {"ref": {"0": {"hidden_err": 3.6e8, "public_err": 0.01, "hidden_cov": 0.9}},
+            "mid": {"0": {"hidden_err": 0.5, "public_err": 0.3, "hidden_cov": 0.9}},
+            "naive": {"0": {"hidden_err": 0.3, "public_err": 0.4, "hidden_cov": 0.2}},
+            "runs": {"mid0": {"solve_rc": 0}}}
+    write_json(it.p("S6A_measure.json"), meas)
+    it.state.update(stage="S6B", status="active")
+    A.s6b(P, it)
+    assert it.state["stage"] == "S6A" and it.state["regen_6a"] and it.state["ref_rewrite"] == 1
+    assert it.state["s6a_feedback"]["ratios"]["hidden_err"] > 1e8
+    ev = [e for e in P.store.events() if e["kind"] == "early_stop"]
+    assert ev and ev[0]["rule"] == "ref_gross" and ev[0]["action"] == "S6A"
+    assert read_json(it.p("S6B_decisions.json"))[-1]["action"] == "S6A"
+    assert read_json(it.p("thresholds.json"))["decision"]["rule"] == "ref_gross"
+    it.state["stage"] = "S6B"
+    A.s6b(P, it)                                # still that wrong after the rewrite -> dropped
+    assert it.state["status"] == "dropped" and it.state["reason"] == "ref_grossly_wrong"
+    assert it.state["history"][-1]["early_stop"] == "ref_gross"
