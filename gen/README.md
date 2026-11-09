@@ -68,7 +68,7 @@ items/<item_id>/
 | S5 | 全文摘录 + 探针卡 | `_spec/spec.json`、`depgraph.json`、`coverage.json`、`provenance.json` | Opus | 校验不过重试 1 次，仍不过 `dropped: spec_invalid` |
 | S6A | 规格 | `task/generator/`、`solution/`、`baselines/{mid,naive}.py`、`tests/measure.py` | Opus | 缺文件 `dropped` |
 | S6A_run | 工作树 | `S6A_measure.json`：两个种子下 ref/mid/naive 的实测指标 | 无（Docker） | 生成器或参考解失败 → S8 |
-| S6B | 实测指标 | `thresholds.json`：分离型指标取 ref 与 mid 的对数中点，非分离型取 ref 放宽 50%，取整一律向宽松方向，且保证 mid 仍不过 | 无 | mid 拉不开 → 先由 S6M 只重写 mid（限 1 次），再回 S5 换 `mid_drop`（限 1 次），再不行 `dropped`；ref 不过 → S8 |
+| S6B | 实测指标 | `thresholds.json`（含 `decision`）：分离型指标取 ref 与 mid 的对数中点，非分离型取 ref 放宽 50%，取整一律向宽松方向，且保证 mid 仍不过；每次决策追加到 `S6B_decisions.json` | 无 | 见下方“S6B 决策与提前止损”；ref 不过 → S8 |
 | S6C | 规格 + 阈值 + 实测 | `tests/test_outputs.py`、`instruction.md`、`baselines/exploit_*.py` | Opus | 缺文件 `dropped` |
 | S7 | 完整工作树 | `gates/attempt-n.json` | 无（Docker） | 阻塞级 → S8；只有“阈值未写明”时由程序追加判据表 |
 | S8 | 门日志 + 依赖图 + 相关文件 | `repair/round-n/`（补丁 + 审查结论） | Opus 修复；审查为机械 diff | 审查不过算用掉 1 轮；2 轮后 `dropped: repair_limit` |
@@ -160,7 +160,10 @@ allow_submit = false
 | `thresholds.frac / min_ref_margin / loose_margin` | 0.5 / 0.10 / 0.50 | 阈值位置（**待定**）；非区分指标若 naive 明显更差，阈值收到参考与 naive 的对数中点（不紧于参考×(1±margin)） |
 | `thresholds.sentinel_abs` | 1e5 | "≤"指标上参考值达到此量级视为缺输出（判分脚本的哨兵值） |
 | `gen.s6a_max_tokens / s6c_max_tokens / continue_calls` | 64000 / 48000 / 1 | 多文件输出上限；被截断时最多 1 次续写，只要缺的文件 |
-| `gen.mid_rework_max` | 1 | mid 不可区分时先由 S6M 只重写 `baselines/mid.py`，再不行才回 S5 |
+| `gen.mid_rework_max` | 1 | mid 不可区分时先由 S6M 只重写 `baselines/mid.py` |
+| `gen.back_to_spec_max` | 0 | S6M 后仍拉不开时回 S5 的次数（e2e-prod-20261109：回 S5 的 5 篇无一救回）；>0 时只对“差一点”生效 |
+| `gen.mid_far_above` | 2 | mid 失败判据数 ≥ max_mid_fail+此值（或全部判据且 ≥ max_mid_fail+1）直接丢弃 |
+| `gen.ref_gross_ratio / ref_rewrite_max` | 10 / 1 | 参考比 naive 差这么多倍 → 重写 S6A 一次，再错则丢弃 |
 | `gates.max_repair_rounds` | 2 | S8 修复轮数上限 |
 | `gates.blocking` 中的 `readymade` | 阻塞 | 现成实现检查：任务镜像声明的依赖（requirements、Dockerfile 里的 pip install）、参考解/基线的 import、`environment/` 下随题分发的代码，与论文 `code_links`/`data_links` 的仓库名/包名、S5 规格的 `method_names` 匹配即阻塞，进 S8（去掉依赖、自己实现或改题）。已知配套仓库写入 `provenance.json` 的 `companion_code`。纯规则，不调模型。基于名称：覆盖 requirement 写法（`==`、`@ url`、`-e`、`#egg=`）、VCS/直接归档 URL 与文件（去版本号和 `#sha256=` 片段）、GitHub 等 `owner/repo`、GitLab 子组（取最后一段）、PyPI `/project/`、CRAN `package=` 与 `/web/packages/`、随题分发的源码/归档/编译产物（`.so`/`.pyd`/`.pyc` 等）；不保证发现改名、改名后 vendored 或混淆的实现，由校准和人工复核兜底 |
 | `package.network.mode` | agent-allowlist | 打包任务的网络策略：`[agent]` 阶段 allowlist（`agent_hosts` + 启动时 `--allow-agent-host` 给的模型端点），`[verifier]` 断网，`[environment]` 公网只用于 agent 安装；`no-network` 全程断网（只适合 oracle）；`public` 旧行为，仅作对照 |
@@ -228,3 +231,9 @@ hard 和 unstable 保留。reward=1 一律算通过，即使之后报了 API 错
 - S6B：
   - mid "只差 1–2 项"按判据计数，同名的 public/hidden 指标算一个；
   - 参考在某指标上明显差于 naive 时记 `ref_worse_than_naive`，送去修复。
+- S6B 决策与提前止损（`spec.s6b_decision`；规则触发时写 `early_stop` 事件，条目 history 带 `early_stop`）：
+  - mid 运行崩溃（非零退出，例如 import 了未挂载的 `solution/solve.py`）→ S6M（规则 `mid_crashed`；失败项计数无意义）；
+  - mid 在每个种子上失败判据数 ≥ `max_mid_fail + gen.mid_far_above`（默认 2+2=4），或 ≥ `max_mid_fail+1` 且等于全部判据 → 直接 `dropped: mid_far_from_ref`（规则 `mid_far`），不走 S6M/S5；
+  - 其余拉不开 → S6M 一次；之后默认直接丢弃（`gen.back_to_spec_max` 默认 0）；若打开，只有“差一点”（失败 1 到 max_mid_fail+1 项）才回 S5；
+  - `ref_worse_than_naive` 且某指标参考比 naive 差 ≥ `gen.ref_gross_ratio` 倍（默认 10）→ 判为参考实现错误，带倍数回 S6A 重写全部代码一次（规则 `ref_gross`，`gen.ref_rewrite_max`=1），仍然如此 → `dropped: ref_grossly_wrong`；倍数较小的仍走 S8。
+  - 依据：e2e-prod-20261109 的离线回放（9 篇丢弃题的真实 S6A/S6M/S8 产物重新在沙箱实测）：3 篇入库题首轮 S6B 均为 mid 失败 3/4 判据、S6M 后变成 1 项，规则不误伤；回 S5 的 5 篇无一救回。

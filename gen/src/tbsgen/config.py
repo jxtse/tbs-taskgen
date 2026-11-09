@@ -266,10 +266,27 @@ DEFAULTS: dict[str, Any] = {
         "seeds": [0, 1],
         "gen_timeout": 300, "solve_timeout": 900, "baseline_timeout": 600, "test_timeout": 900,
         "max_public_mb": 50,
-        "back_to_spec_max": 1,              # S6B "mid not separable" -> back to S5 at most once
+        # S6B "mid not separable" -> back to S5 (new spec + all code).  0 since e2e-prod-20261109: back-to-S5 was
+        # taken by 5 items and none of them came through (3 dropped not separable again, 2 ref_worse_than_naive),
+        # each costing S5 + S6A (~$0.5-1.3).  S6M (rewrite mid.py only) stays the one cheap retry.
+        "back_to_spec_max": 0,
         "s6a_max_tokens": 64000,            # S6A emits 5 files + adaptive thinking; 32k truncated in e2e-iter1
         "s6c_max_tokens": 48000,
         "mid_rework_max": 1,                # S6B mid not separable -> S6M rewrites only mid.py (before back to S5)
+        # Early stops at S6B (content failures that a rewrite does not fix; spec.s6b_decision).  e2e-prod-20261109:
+        # the 9 dropped items spent 63% of the budget, mostly on S6M + back-to-S5 + 2 S8 rounds that never helped.
+        # mid fails >= max_mid_fail + mid_far_above criteria on every seed (or every criterion, if >= max_mid_fail+1)
+        # and did not crash -> drop at once (mid_far_from_ref).  2: the 3 released tasks had mid failing 3 of 4
+        # criteria (max_mid_fail + 1) at their first S6B and S6M turned them into near misses; the dropped ones
+        # failed 4/4, 4/6 (after repair).  A crashed mid (non-zero exit: e.g. it imports solution/solve.py, which is
+        # not mounted) is a code bug, not a content verdict: it goes to S6M regardless of the count.
+        "mid_far_above": 2,
+        # reference worse than naive by >= this factor (worst seed; error metrics ref/naive, score metrics
+        # naive/ref; skipped when the naive value is at the noise floor) -> the reference implementation is wrong:
+        # regenerate S6A once (ref_rewrite_max) instead of S8 patch rounds; still that wrong -> drop.  10: in
+        # e2e-prod-20261109 the gross case was 9e11x (p22 relerr) and the mild ones 1.2-9.8x (S8's domain).
+        "ref_gross_ratio": 10.0,
+        "ref_rewrite_max": 1,
         "continue_calls": 1,                # missing files after a truncated multi-file answer -> 1 continuation
     },
     "thresholds": {

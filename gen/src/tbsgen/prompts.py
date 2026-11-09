@@ -3,7 +3,7 @@ S8 local repair).  Outputs are machine-parsed: S5 -> one JSON object; S6A/S6C/S8
 "=== FILE: <rel path> ===" ... "=== END ===".  Kept short on purpose: the contract (file layout + rules)
 matters more than prose.  Version strings go into provenance so prompt changes are traceable.
 """
-PROMPT_VERSION = "v2.3-2026-11-06"
+PROMPT_VERSION = "v2.4-2026-11-09"
 
 METRICS_API = """Verifier helper module `_metrics` (provided, importable from tests/; exact signatures):
   check(name: str, value: float, threshold: float, direction: "<=" | ">=") -> None   # records + asserts
@@ -57,10 +57,25 @@ Write the task specification as ONE JSON object with keys:
 - "metrics": [{{"name", "direction": "<=" or ">=", "on": "public|hidden", "desc"}}]  (3-8 metrics, no thresholds yet),
 - "public_files": [..], "hidden_files": [..], "truth_files": [..],
 - "hidden_shift": str (PROG only), "why_naive_fails": str, "mid_missing_step": str,
+- "expected_separation": {{"<metric name>": "ref passes / mid fails / naive fails", ...}} for every metric: which
+  of the three is expected to pass it.
 - "method_names": [names of the paper's method and of its published software/package, if any] (used to check that
   the task does not install or import that implementation).
-Thresholds are NOT chosen now; they are set from measured reference vs mid results.  Keep the JSON compact
-(short descs): code is written in a later step."""
+Thresholds are NOT chosen now; they are set from measured reference vs mid results.
+
+Baselines (they decide whether the task survives; most rejected specs failed here):
+- mid = the reference minus exactly ONE key derive step (mid_drop), with the simplest sensible default in its
+  place; everything else identical to the reference.  It must be a NEAR miss: it should fail only 1-2 of the
+  metrics (criteria; a public_X / hidden_X pair counts once) and pass the rest.  Pick a step whose omission
+  degrades a specific part of the output, not one that breaks everything (if dropping it makes every metric
+  fail, it is too fundamental: choose a more local step).
+- naive = the simplest reasonable approach a competent non-expert would try first (e.g. the textbook / default
+  library method, no paper-specific steps): drops naive_drop (which includes mid_drop).  It must fail at least 2
+  metrics, and the reference must beat it on EVERY metric: a metric on which a correct reference can be worse
+  than the naive approach (e.g. a selection score that an all-or-nothing answer maximises) is not a valid metric.
+- Choose metrics so that the expected separation holds by construction: ref passes all; mid fails 1-2 criteria
+  (the ones its missing step affects); naive fails >= 2.  State it in "expected_separation".
+Keep the JSON compact (short descs): code is written in a later step."""
 
 S6A_GEN = """Specification:
 {spec}
@@ -76,7 +91,8 @@ Write the generator and the reference solution.  Files:
   public inputs; < 15 min on 2 CPUs.
 - baselines/mid.py: the reference minus exactly the mid_drop node (naive default instead);
   baselines/naive.py: also drops the naive_drop nodes.  Same I/O as solve.py (PROG: they write their own
-  self-contained solution_cli.py).  Keep the baselines compact.
+  self-contained solution_cli.py).  Keep the baselines compact.  Each baseline is run ALONE (only its own file
+  is mounted): it must not import or read solution/solve.py or any other task file -- copy what it needs.
 - tests/measure.py: defines `compute() -> dict` returning {{"<metric name>": float}} for every metric in the spec
   (reads /app/output and /tests/truth).  PROG: execute the agent program ONLY through the provided helper
   `from _metrics import run_solution, hidden_sets`; `for d in hidden_sets(): out_dir, sec, rc = run_solution(t, d)`
@@ -88,6 +104,13 @@ Write the generator and the reference solution.  Files:
   `if __name__ == "__main__":` prints ONE JSON line of compute().  No thresholds, no asserts.  Missing or
   malformed deliverables must give the worst value (e.g. inf / 0.0), never an exception.
 Format: === FILE: <path> === blocks, then === END ===.  Write the files in the order listed."""
+
+S6A_REWRITE = """
+
+A previous implementation of this spec was rejected: on these metrics the reference solution was worse than the
+naive baseline by the factors shown ({ratios}), i.e. the reference is wrong (units, normalisation, sign, a
+mis-scaled output, or a metric that compares the wrong quantities).  Write ALL files again from scratch and check
+the reference against the generator's truth on these metrics before you finish."""
 
 S6C_TESTS = """Specification:
 {spec}
@@ -133,6 +156,7 @@ fundamental.  Pick ONE other key derive node from the depgraph (not in {tried}) 
 only part of the metrics -- prefer a node of naive_drop {naive_drop}, so the naive baseline (which drops all of
 those) stays a superset of the mid baseline -- and write baselines/mid.py = the reference minus exactly that node
 (simple default instead), same I/O as solve.py (PROG: it writes its own self-contained /app/output/solution_cli.py).
+mid.py is run ALONE (only its own file is mounted): it must not import or read solution/solve.py -- copy the code.
 If the node you pick is NOT in naive_drop, also rewrite baselines/naive.py so it drops naive_drop + that node.
 First line of your answer: MID_DROP: <node id>.  Then === FILE: baselines/mid.py === ... (and naive.py if needed)
 === END ==="""
