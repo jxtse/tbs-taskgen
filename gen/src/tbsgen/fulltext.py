@@ -711,7 +711,20 @@ class Fetcher:
                 note = "cancelled: " + note             # our own limit on the redirect target: no breaker count
             self.ledger.record(channel, host, doi or key, "ok" if ok else "fail", r.status, len(r.body),
                                note[:300], reservation=rid)
+            self._server_error_streak(channel, host, r.status)
         return txt
+
+    def _server_error_streak(self, channel: str, host: str, status: int | None) -> None:
+        """oa.server_error_streak consecutive HTTP 5xx from one host (ledger rows, any paper) -> cool that host for
+        oa.server_error_cooldown_s.  An upstream outage (Europe PMC render: 500 on most requests) then costs a few
+        requests instead of one per paper; the papers stay due and retry after the cooldown."""
+        oa = self.ft.get("oa") or {}
+        n, secs = int(oa.get("server_error_streak", 5) or 0), float(oa.get("server_error_cooldown_s", 1800) or 0)
+        if not (n and secs and status and 500 <= status < 600) or not hasattr(self.ledger, "last_statuses"):
+            return
+        last = self.ledger.last_statuses(host, n)
+        if len(last) == n and all(s is not None and 500 <= s < 600 for s in last):
+            self.ledger.block(host, f"{n} consecutive HTTP 5xx on {channel}", seconds=secs)
 
     def _meta(self, url: str, rec: dict | None = None, channel: str = "oa") -> dict | None:
         """Metadata lookup (Unpaywall / Europe PMC search): paced and capped, never counted as a download.  A
@@ -764,22 +777,9 @@ class Fetcher:
     # ---------------------------------------------------------------- channels
     def ch_oa(self, c: dict, key: str, doi: str, title: str, rec: dict) -> str | None:
         oa = self.ft.get("oa") or {}
-        if oa.get("europepmc", True) and (doi or c.get("pmcid")):
-            pmcid = c.get("pmcid")
-            try:
-                if not pmcid:
-                    d = self._meta("https://www.ebi.ac.uk/europepmc/webservices/rest/search?" + urllib.parse.urlencode(
-                        {"query": f'DOI:"{doi}"', "format": "json", "resultType": "lite"}), rec)
-                    hits = ((d or {}).get("resultList") or {}).get("result") or []
-                    if hits and hits[0].get("pmcid") and hits[0].get("inEPMC") == "Y" and \
-                            hits[0].get("isOpenAccess") == "Y":
-                        pmcid = hits[0]["pmcid"]
-                if pmcid:
-                    url = f"https://www.ebi.ac.uk/europepmc/webservices/rest/{pmcid}/fullTextXML"
-                    if (t := self._download("oa", key, doi, title, url, {"Accept": "application/xml"}, "jats", rec)):
-                        return t
-            except LimitReached as e:
-                self._host_scoped(e, rec, "oa")
+        epmc_last = bool(oa.get("europepmc_last", True))
+        if not epmc_last and (t := self._oa_europepmc(c, key, doi, title, rec, oa)):
+            return t
         oap = c.get("openAccessPdf")
         urls = [u for u in (c.get("oa_url"), c.get("pdf_url"), oap.get("url") if isinstance(oap, dict) else oap)
                 if isinstance(u, str) and u]
@@ -791,18 +791,41 @@ class Fetcher:
             except LimitReached as e:
                 self._host_scoped(e, rec, "oa")
         skip = set(oa.get("skip_hosts") or [])
+        last = set(oa.get("last_hosts") or [])
         seen: list[str] = []
         for u in urls:
             u = re.sub(r"^http://", "https://", u)
             if u not in seen and urllib.parse.urlsplit(u).hostname not in skip:
                 seen.append(u)
-        seen.sort(key=lambda x: "arxiv.org" not in x)          # arXiv first: most tolerant host
+        # arXiv first (most tolerant host); hosts in last_hosts (Europe PMC render, mostly HTTP 500) at the end
+        seen.sort(key=lambda x: (urllib.parse.urlsplit(x).hostname in last, "arxiv.org" not in x))
         for u in seen[: int(oa.get("max_urls", 3))]:
             try:
                 if (t := self._download("oa", key, doi, title, u, {"User-Agent": UA_BROWSERISH}, "any", rec)):
                     return t
             except LimitReached as e:
                 self._host_scoped(e, rec, "oa")
+        if epmc_last:
+            return self._oa_europepmc(c, key, doi, title, rec, oa)
+        return None
+
+    def _oa_europepmc(self, c: dict, key: str, doi: str, title: str, rec: dict, oa: dict) -> str | None:
+        if not (oa.get("europepmc", True) and (doi or c.get("pmcid"))):
+            return None
+        pmcid = c.get("pmcid")
+        try:
+            if not pmcid:
+                d = self._meta("https://www.ebi.ac.uk/europepmc/webservices/rest/search?" + urllib.parse.urlencode(
+                    {"query": f'DOI:"{doi}"', "format": "json", "resultType": "lite"}), rec)
+                hits = ((d or {}).get("resultList") or {}).get("result") or []
+                if hits and hits[0].get("pmcid") and hits[0].get("inEPMC") == "Y" and \
+                        hits[0].get("isOpenAccess") == "Y":
+                    pmcid = hits[0]["pmcid"]
+            if pmcid:
+                url = f"https://www.ebi.ac.uk/europepmc/webservices/rest/{pmcid}/fullTextXML"
+                return self._download("oa", key, doi, title, url, {"Accept": "application/xml"}, "jats", rec)
+        except LimitReached as e:
+            self._host_scoped(e, rec, "oa")
         return None
 
     def ch_elsevier(self, c: dict, key: str, doi: str, title: str, rec: dict) -> str | None:

@@ -452,6 +452,12 @@ class DownloadLedger:
         if row and row[0] == "pending":
             self.record(channel, host, doi, "fail", None, 0, note, reservation=reservation)
 
+    def last_statuses(self, host: str, n: int) -> list[int | None]:
+        """HTTP statuses of the last n finished (not pending, not redirect-hop) download attempts at `host`."""
+        rows = self.db.execute("select http from attempts where host=? and status not in ('pending','hop') "
+                               "order by ts desc, rowid desc limit ?", (host, int(n))).fetchall()
+        return [r[0] for r in rows]
+
     def block(self, host: str, reason: str, seconds: float = COOLDOWN_S, channel: str | None = None):
         """Cool `host` for `seconds`; an existing longer cooldown is kept (responses may arrive out of order)."""
         until = self.clock() + seconds

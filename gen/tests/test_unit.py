@@ -936,3 +936,53 @@ def test_s6b_handler_logs_early_stop_and_regenerates_s6a(tmp_path):
     A.s6b(P, it)                                # still that wrong after the rewrite -> dropped
     assert it.state["status"] == "dropped" and it.state["reason"] == "ref_grossly_wrong"
     assert it.state["history"][-1]["early_stop"] == "ref_gross"
+
+
+
+# ------------------------------------------------------------------------------------------------ scheduling
+def _sched_items(tmp_path, rows):
+    from tbsgen.pipeline import Pipeline
+    from tbsgen.state import write_json
+    P = Pipeline(load_config(None, {"run": {"root": str(tmp_path)}}), clients={})
+    for iid, target, score, title in rows:
+        it = P.store.item(iid)
+        write_json(it.p("S1_candidate.json"), dict(_target=target, title=title))
+        write_json(it.p("S2_screen.json"), dict(score=score))
+        it.save()
+    return P
+
+
+def test_order_round_robin_by_target_and_similar_titles_last(tmp_path):
+    """e2e-prod-20261109: global score order sent 6 of 12 papers from one target (cosmology PT) to S5."""
+    P = _sched_items(tmp_path, [
+        ("a1", "A", 0.82, "One-loop matter power spectrum from Lagrangian perturbation theory"),
+        ("a2", "A", 0.81, "FAST-PT: convolution integrals in cosmological perturbation theory"),
+        ("a3", "A", 0.80, "One-loop matter power spectrum in Lagrangian perturbation theory revisited"),
+        ("a4", "A", 0.79, "Flat-sky angular power spectra"),
+        ("b1", "B", 0.80, "Phase unwrapping with a minimum spanning tree"),
+        ("b2", "B", 0.75, "SEGUE region growing phase unwrapping"),
+        ("c1", "C", 0.79, "ComBat-seq batch effect adjustment"),
+    ])
+    order = [i.item_id for i in P.order(P.store.items())]
+    assert order == ["a1", "b1", "c1", "a2", "b2", "a4", "a3"], order        # a3 ~ a1 (Jaccard >= 0.5): last in A
+    P.cfg["schedule"]["order"] = "score"
+    assert [i.item_id for i in P.order(P.store.items())][:3] == ["a1", "a2", "a3"]
+    P.cfg["schedule"]["order"] = "id"
+    assert [i.item_id for i in P.order(P.store.items())] == sorted(order)
+
+
+def test_run_until_stops_before_later_stages(tmp_path):
+    """`tbsgen run --until S4`: model stages are never started (no model:config pause without a teacher URL)."""
+    from tbsgen import cli
+    from tbsgen.dryrun import make_toy_candidate
+    from tbsgen.pipeline import Pipeline
+    cfg = load_config(None, {"run": {"root": str(tmp_path)},
+                             "fulltext": {"cache_dirs": [str(tmp_path / "fulltext_cache")], "allow_network": False}})
+    P = Pipeline(cfg, clients={})
+    [iid] = P.ingest([make_toy_candidate(tmp_path)])
+    out = P.run(until="S4")
+    it = P.store.item(iid)
+    assert it.state["stage"] == "S5" and it.state["status"] == "active" and out["until"] == "S4", it.state
+    assert not any(h["stage"] == "S5" for h in it.state["history"])
+    with pytest.raises(SystemExit):
+        cli.main(["run", "--run", str(tmp_path), "--until", "S99"])

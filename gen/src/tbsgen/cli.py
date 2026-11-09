@@ -1,7 +1,9 @@
 """tbsgen command line.
 
   tbsgen ingest  --run DIR --candidates FILE [--config C]      S1: create item dirs from retrieval output
-  tbsgen run     --run DIR [--config C] [--max-steps N] [--only ID,..]
+  tbsgen run     --run DIR [--config C] [--max-steps N] [--only ID,..] [--until STAGE]
+                                                                 --until S4: stop after that stage (no model stage is
+                                                                 started, so no model:config pause without a teacher)
   tbsgen resume  --run DIR                                       re-activate budget/model-paused items
   tbsgen status  --run DIR
   tbsgen report  --run DIR [--day YYYY-MM-DD]
@@ -46,7 +48,7 @@ from .config import load_config
 from .models import ModelError, TeacherClient
 from .pipeline import Pipeline
 from .report import daily_report
-from .state import read_json, write_json
+from .state import STAGES, read_json, write_json
 
 
 def _pipeline(a, overrides=None) -> Pipeline:
@@ -70,6 +72,8 @@ def main(argv=None):
         if name == "run":
             s.add_argument("--max-steps", type=int, default=10000)
             s.add_argument("--only", default="")
+            s.add_argument("--until", default=None, choices=STAGES,
+                           help="last stage to run (e.g. S4): later stages are not started, nothing is paused")
         if name == "report":
             s.add_argument("--day", default=None)
         if name == "breaker":
@@ -129,7 +133,8 @@ def main(argv=None):
             cs = cs[: a.top]
         print(json.dumps(dict(ingested=len(P.ingest(cs))), ensure_ascii=False))
     elif a.cmd == "run":
-        print(json.dumps(P.run(a.max_steps, [x for x in a.only.split(",") if x] or None), indent=1, ensure_ascii=False))
+        print(json.dumps(P.run(a.max_steps, [x for x in a.only.split(",") if x] or None, until=a.until), indent=1,
+                         ensure_ascii=False))
     elif a.cmd == "resume":
         print(json.dumps(dict(resumed=P.resume()), ensure_ascii=False))
     elif a.cmd == "status":
