@@ -298,3 +298,84 @@ def test_rules_v2_counts_stems_once_and_survey_is_not_a_review():
     lit = dict(title="Methods for X", abstract="This survey of the literature covers estimation methods.")
     assert screen(lit, v2)["neg"]
     assert not screen(REVIEW, v2)["keep"]
+
+
+
+# ------------------------------------------------------------------ S4 task-ability (roles.probe = jev)
+def s4ans(**p) -> dict:
+    base = dict(self_contained_core=0.8, synthetic_truth=0.85, numeric_score=0.9, graded_steps=0.6,
+                simple_baseline_worse=0.7, needs_restricted_resources=0.1)
+    base.update(p)
+    return {k: {"type": "noul", "noul": v} for k, v in base.items()}
+
+
+def test_combine_s4_defaults_from_e2e_prod():
+    """e2e-prod-20261109 (real answers): released task 836a87 had P(self-contained core) 0.25 -> kept (cut 0.20);
+    deep-learning QSM nets 0.15-0.20, pure theory P(synthetic truth) 0.35-0.38, DES-Y3 analysis restricted 0.76."""
+    c = screen_jev.combine_s4
+    p = screen_jev.probabilities(s4ans())
+    assert c(p)["feasible"] and 0 < c(p)["score"] < 1
+    assert c(dict(p, self_contained_core=0.25))["feasible"]
+    assert c(dict(p, self_contained_core=0.16))["reasons"] == ["jev_s4_no_self_contained_core"]
+    assert c(dict(p, synthetic_truth=0.35, numeric_score=0.24))["reasons"] == ["jev_s4_no_synthetic_truth",
+                                                                              "jev_s4_no_numeric_score"]
+    assert c(dict(p, needs_restricted_resources=0.76))["reasons"] == ["jev_s4_needs_restricted_resources"]
+    assert c({})["feasible"] and c({})["score"] is None                  # missing answers never drop
+    assert c(dict(p, self_contained_core=0.25), {"core_no": 0.3})["feasible"] is False
+
+
+def _s4_item(P, tmp_path):
+    (i,) = P.ingest([FAY])
+    it = P.store.item(i)
+    write_json(it.p("S2_screen.json"), dict(keep=True, method="jev", score=0.8))
+    it.p("fulltext.txt").write_text("Title\n\n   We   propose an estimator ... " + "method algorithm estimator " * 50)
+    it.state.update(stage="S4", status="active")
+    it.save()
+    return it
+
+
+def test_pipeline_s4_jev_drops_and_caches(tmp_path, key):
+    from tbsgen import stages_a
+    cfg = jcfg(tmp_path)
+    cfg["models"]["roles"]["probe"] = "jev"
+    P = Pipeline(cfg)
+    P.jev_transport = Transport([(200, {}, resp(s4ans(self_contained_core=0.1)))])
+    it = _s4_item(P, tmp_path)
+    stages_a.s4(P, it)
+    rec = read_json(it.p("S4_probe.json"))
+    assert it.state["status"] == "dropped" and it.state["reason"] == "jev_s4_no_self_contained_core"
+    assert rec["jev"]["probabilities"]["self_contained_core"] == 0.1 and rec["method"].endswith("+ jev")
+    body = P.jev_transport.calls[0]["body"]
+    assert set(body["questions"]) == set(screen_jev.S4_QUESTIONS)
+    assert "  " not in body["state"]["paper"]["full_text_opening"]           # whitespace collapsed
+    padded = screen_jev.build_s4_state({"title": "t"}, ("x" + " " * 40) * 400, 1000)["paper"]["full_text_opening"]
+    assert len(padded) == 799 and padded.count("x") == 400                 # collapse first, then cut
+    far = screen_jev.build_s4_state({"title": "t"}, "We propose." + " " * 300000 + "Method details", 100)
+    assert far["paper"]["full_text_opening"] == "We propose. Method details"
+    assert P.ledger.summary()["rows"][0]["stage"] == "S4"
+    # re-running S4 uses the cached answer (no new HTTP call, no new ledger row) ...
+    tr = P.jev_transport
+    it.state.update(stage="S4", status="active")
+    stages_a.s4(P, it)
+    assert len(tr.calls) == 1 and P.ledger.summary()["rows"][0]["calls"] == 1 and it.state["status"] == "dropped"
+    # ... but the verdict follows the current thresholds
+    cfg["probe"]["jev"]["thresholds"] = {"core_no": 0.05}
+    it.state.update(stage="S4", status="active")
+    stages_a.s4(P, it)
+    assert len(tr.calls) == 1 and it.state["stage"] == "S5" and read_json(it.p("S4_probe.json"))["jev"]["feasible"]
+
+
+def test_pipeline_s4_jev_unavailable_keeps_rule_verdict(tmp_path, monkeypatch):
+    from tbsgen import stages_a
+    monkeypatch.delenv("TYPESAFE_API_KEY", raising=False)
+    cfg = jcfg(tmp_path)
+    cfg["models"]["roles"]["probe"] = "jev"
+    P = Pipeline(cfg)
+    it = _s4_item(P, tmp_path)
+    stages_a.s4(P, it)
+    rec = read_json(it.p("S4_probe.json"))
+    assert it.state["stage"] == "S5" and rec["jev"]["unavailable"].startswith("auth")
+    cfg["probe"]["jev"]["on_unavailable"] = "park"
+    it.state.update(stage="S4", status="active")
+    stages_a.s4(P, it)
+    assert it.state["status"] == "paused" and it.state["reason"].startswith("model:jev_unavailable")
