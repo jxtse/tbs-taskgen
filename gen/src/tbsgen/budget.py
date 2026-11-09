@@ -69,6 +69,9 @@ class Ledger:
         self.cfg = cfg
         with self._db() as db:
             db.executescript(SCHEMA)
+            cols = {r[1] for r in db.execute("PRAGMA table_info(calls)")}
+            if "cost_kind" not in cols:     # added for S9 runs: reported / tokens / reservation (older ledgers: NULL)
+                db.execute("ALTER TABLE calls ADD COLUMN cost_kind TEXT")
 
     def _db(self):
         db = sqlite3.connect(self.path, timeout=60, isolation_level=None)
@@ -171,13 +174,21 @@ class Ledger:
         finally:
             db.close()
 
-    def settle(self, call_id: int, usd: float | None, status: str = "ok", note: str = "") -> None:
+    def settle(self, call_id: int, usd: float | None, status: str = "ok", note: str = "",
+               kind: str | None = None, usage: dict | None = None) -> None:
         """Close a non-token reservation (e.g. an S9 Harbor run) with its recorded cost; usd=None keeps the
-        reserved estimate as the cost (unknown actual cost is never booked as 0)."""
+        reserved estimate as the cost (unknown actual cost is never booked as 0) and marks the row
+        cost_kind="reservation".  kind: "reported" (default for a given usd) or "tokens" (estimated from token
+        usage); usage (if known) is stored in the token columns."""
+        kind = "reservation" if usd is None else (kind or "reported")
+        u = usage or {}
         db = self._db()
         try:
-            db.execute("UPDATE calls SET ended=?, status=?, usd=COALESCE(?, est_usd), error=? WHERE id=?",
-                       (time.time(), status, usd, note[:500], call_id))
+            db.execute("UPDATE calls SET ended=?, status=?, usd=COALESCE(?, est_usd), error=?, cost_kind=?, "
+                       "in_tok=COALESCE(?, in_tok), out_tok=COALESCE(?, out_tok), cache_read=COALESCE(?, cache_read), "
+                       "cache_write=COALESCE(?, cache_write) WHERE id=?",
+                       (time.time(), status, usd, note[:500], kind, u.get("input_tokens"), u.get("output_tokens"),
+                        u.get("cache_read_input_tokens"), u.get("cache_creation_input_tokens"), call_id))
             db.commit()
         finally:
             db.close()
@@ -207,4 +218,15 @@ class Ledger:
                     out_tok=r[6] or 0, cache_read=r[7] or 0, usd=round(r[8] or 0, 4)) for r in rows]
         return dict(day=day, rows=out, usd_total=round(sum(r["usd"] for r in out), 4),
                     calls_total=sum(r["calls"] for r in out),
-                    breakers_open=[dict(model=m, reason=rs) for m, o, rs in br])
+                    breakers_open=[dict(model=m, reason=rs) for m, o, rs in br],
+                    usd_by_cost_kind=self.cost_kinds(day))
+
+    def cost_kinds(self, day: str | None = None) -> dict:
+        """USD split by how the cost is known: "token_priced" (model calls: tokens x prices), "reported" (S9: Harbor
+        cost_usd), "tokens" (S9: estimated from the trial's token usage), "reservation" (S9: unknown, the reserved
+        estimate stands in; an upper bound, not a bill), "in_flight" (still reserved)."""
+        q = ("SELECT CASE WHEN status='reserved' THEN 'in_flight' ELSE COALESCE(cost_kind, 'token_priced') END, "
+             "SUM(COALESCE(usd, est_usd, 0)) FROM calls WHERE real=1 {} GROUP BY 1")
+        with self._db() as db:
+            rows = db.execute(q.format("AND day=?" if day else ""), (day,) if day else ()).fetchall()
+        return {k: round(v or 0, 4) for k, v in rows}

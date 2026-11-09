@@ -212,9 +212,17 @@ class Pipeline:
         if last is None or last >= _stage_pos("S2"):    # the S2 Jev prefetch is S2 work
             self.prefetch_screen(only)
 
+        rewoken: set[str] = set()
+
         def runnable(it) -> bool:
-            return (not only or it.item_id in only) and it.state["status"] == "active" and \
-                (last is None or _stage_pos(it.state["stage"]) <= last)
+            if only and it.item_id not in only:
+                return False
+            if last is not None and _stage_pos(it.state["stage"]) > last:
+                return False
+            if it.state["status"] == "active":
+                return True
+            # S9 waiting with nothing running (prepared while allow_submit was off, or blocked): once per run
+            return it.item_id not in rewoken and B.reschedulable(self.cfg, it)
 
         while progress and steps < max_steps:
             progress = False
@@ -222,6 +230,12 @@ class Pipeline:
             for it in self.order([i for i in self.store.items() if runnable(i)]):
                 if not runnable(it):            # its status may have changed since the snapshot
                     continue
+                if it.state["status"] == "waiting":
+                    rewoken.add(it.item_id)
+                    it.state["history"].append(dict(stage="S9", result="rewake", prev_reason=it.state.get("reason"),
+                                                    ts=time.time()))
+                    it.state["status"] = "active"
+                    it.save()
                 r = self.step(it)
                 steps += 1
                 progress |= r in ("ok", "error", "crash")
@@ -232,11 +246,19 @@ class Pipeline:
             out["until"] = until
         return out
 
-    def resume(self, reasons_prefix: tuple[str, ...] = ("budget:", "model:")) -> list[str]:
+    def resume(self, reasons_prefix: tuple[str, ...] = ("budget:", "model:"), only: list[str] | None = None,
+               stages: list[str] | None = None) -> list[str]:
+        """Re-activate paused items whose reason starts with one of reasons_prefix; only: just these item ids;
+        stages: just items paused at these stages."""
         out = []
         for it in self.store.items():
+            if only and it.item_id not in only:
+                continue
+            hist = it.state.get("history") or [{}]
+            if stages and hist[-1].get("paused_stage", it.state["stage"]) not in stages:
+                continue
             if it.state["status"] == "paused" and str(it.state.get("reason", "")).startswith(reasons_prefix):
-                it.state["stage"] = it.state["history"][-1].get("paused_stage", it.state["stage"])
+                it.state["stage"] = hist[-1].get("paused_stage", it.state["stage"])
                 it.state["status"] = "active"
                 it.save()
                 out.append(it.item_id)

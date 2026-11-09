@@ -146,8 +146,9 @@ becomes due again when the earliest of those limits lifts. `tbsgen fetch --only 
 idents) processes just those entries, due or not. Only one `tbsgen fetch` drains a queue at a time, and only one
 process at a time uses a browser TaskSpace (a second one skips the browser channel). With full text, a teacher endpoint and a
 budget in `my.toml` (see below), `tbsgen run` continues into the model stages. The other commands
-(`resume`, `reset`, `breaker`, `calib-ingest`, `harbor-local`, `ping`) are documented in
-[`gen/README.md`](gen/README.md) §3.
+(`resume`, `reset`, `breaker`, `calib-ingest`, `calib watch`, `calib prepare`, `harbor-local`, `ping`) are documented in
+[`gen/README.md`](gen/README.md) §3; calibrating only some items, the environment-preparation hook
+(`calib.prepare_command`) and teacher-only routing (`calib.teacher_*`) are in §4–§5 there.
 
 ## Configuration
 

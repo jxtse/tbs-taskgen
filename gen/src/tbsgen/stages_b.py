@@ -172,6 +172,12 @@ def s9(P, it):
         if rec.get("outcome") is None and rec.get("state") in ("intent", "reserved"):
             if not c.get("allow_submit"):
                 return it.finish("waiting", f"calib {rec['job_name']} in state {rec['state']}; submit disabled")
+            if rec["state"] == "intent" and c.get("prepare_command") and calib.prepared_dir(P.cfg, rec["who"]):
+                prep = calib.ensure_prepared(P.cfg, it.dir, rec["who"])    # an intent written before the hook ran
+                if not prep.get("ok"):
+                    return it.finish("waiting", f"calib blocked: prepare_command failed "
+                                                f"({(prep.get('error') or '')[:120]}); fix and run "
+                                                "`tbsgen calib prepare --item ID`")
             rec = calib.launch(P.cfg, rec, P.ledger, lambda r: _save_run(it, r))
             if rec.get("blocked") and rec["state"] == "intent":
                 return it.finish("waiting", f"calib blocked: {rec['blocked']}")
@@ -197,6 +203,15 @@ def s9(P, it):
             return it.advance("S9", "S10", label=what)
         return it.finish("done", f"label:{what} (not kept; S9b variants off)")
     n = sum(1 for r in runs if r["who"] == what) + 1
+    if c.get("prepare_command") and calib.prepared_dir(P.cfg, what):
+        # environment-preparation hook: build the run-ready copy of pkg/ before the job config points at it
+        prep = calib.ensure_prepared(P.cfg, it.dir, what)
+        if not prep.get("reused"):
+            P.store.event("calib_prepared", item=it.item_id, who=what, ok=prep.get("ok"), sec=prep.get("sec"),
+                          error=(prep.get("error") or "")[:300])
+        if not prep.get("ok"):
+            return it.finish("waiting", f"calib blocked: prepare_command failed ({(prep.get('error') or '')[:120]}); "
+                                        "fix and run `tbsgen calib prepare --item ID`")
     rec = calib.prepare(P.cfg, it.dir, what, n)
     if rec.get("blocked"):
         return it.finish("waiting", f"calib blocked: {rec['blocked']}")
@@ -245,13 +260,17 @@ def ingest(P, it, job_dir: str | None = None) -> dict:
     used = {r.get("trial", {}).get("job_dir") for r in runs if r.get("outcome") is not None}
     if str(jd.resolve()) in used:
         raise ValueError(f"job dir already consumed: {jd}")
-    trials = calib.collect(jd)
+    trials = calib.collect(jd, rec.get("model"), P.cfg["models"].get("prices", {}))
     if not trials:
         raise ValueError("no trial results in job dir")
     t = dict(trials[0], job_dir=str(jd.resolve()))
-    rec.update(outcome=t["outcome"], minutes=t["minutes"], trial=t)
+    usd, kind, usage = calib.job_cost(trials)
+    rec.update(outcome=t["outcome"], result_type=t["result_type"], minutes=t["minutes"], trial=t,
+               cost_usd=usd, cost_kind=kind, n_trials=len(trials))
     if rec.get("ledger_call"):
-        P.ledger.settle(rec["ledger_call"], t.get("cost_usd"), note=f"harbor cost_usd, outcome={t['outcome']}")
+        # unknown cost: the reservation stands in (cost_kind "reservation"), but actual_spend() does not count it
+        P.ledger.settle(rec["ledger_call"], usd, kind=kind, usage=usage,
+                        note=f"S9 cost {kind}, outcome={t['outcome']}, result_type={t['result_type']}")
     write_json(it.p("calib", "runs.json"), runs)
     it.state["stage"], it.state["status"] = "S9", "active"
     it.save()
@@ -262,6 +281,58 @@ def s10(P, it):
     rel = P.store.root / "release"
     rel.mkdir(exist_ok=True)
     with (rel / "manifest.jsonl").open("a") as f:
+        runs = read_json(it.p("calib", "runs.json"), [])
         f.write(json.dumps(dict(item_id=it.item_id, pkg=str(it.p("pkg")), label=it.state.get("calib_label"),
+                                calib_runs=calib.run_summary(runs),
+                                result_types=[r.get("result_type") for r in runs if r.get("outcome") is not None],
                                 ts=time.time())) + "\n")
     it.advance("S10", None, status="done")
+
+
+def reschedulable(cfg: dict, it) -> bool:
+    """An S9 item that is waiting although no job of it is running: prepared-only intents (allow_submit was
+    off), a blocked prepare / launch, or a reserved run.  With calib.allow_submit=true `run` steps it again."""
+    if it.state.get("stage") != "S9" or it.state.get("status") != "waiting" or not cfg["calib"].get("allow_submit"):
+        return False
+    runs = read_json(it.p("calib", "runs.json"), [])
+    return not any(r.get("outcome") is None and r.get("state", "launched") == "launched" for r in runs)
+
+
+def watch_tick(P, only: list[str] | None = None, max_steps: int = 50) -> dict:
+    """One pass of `tbsgen calib watch`: attach every finished Harbor job of an S9-waiting item (calib-ingest),
+    flag launchers that died without a job, then step the S9 items (label, or launch the next run: GLM ->
+    teacher).  Returns what it did and the S9 items still open."""
+    did = []
+    for it in P.store.items():
+        if only and it.item_id not in only:
+            continue
+        if it.state.get("stage") != "S9" or it.state.get("status") != "waiting":
+            continue
+        runs = read_json(it.p("calib", "runs.json"), [])
+        pend = [r for r in runs if r.get("outcome") is None and r.get("state", "launched") == "launched"]
+        if not pend:
+            continue
+        rec = pend[0]
+        jr = read_json(Path(rec["job_dir"]) / "result.json", {}) or {}
+        if jr.get("finished_at"):
+            try:
+                t = ingest(P, it)
+                did.append(dict(item=it.item_id, action="ingest", job=rec["job_name"], outcome=t.get("outcome"),
+                                result_type=t.get("result_type")))
+            except ValueError as e:
+                did.append(dict(item=it.item_id, action="ingest_error", job=rec["job_name"], error=str(e)[:300]))
+        elif calib.launcher_failed(rec):
+            it.state["stage"], it.state["status"] = "S9", "active"   # s9() reconciles the dead launch
+            it.save()
+            did.append(dict(item=it.item_id, action="launcher_failed", job=rec["job_name"]))
+    s9 = [i.item_id for i in P.store.items() if i.state.get("stage") == "S9" and (not only or i.item_id in only)]
+    if s9:
+        P.run(max_steps=max_steps, only=s9)
+    open_ = {}
+    for i in P.store.items():
+        if (not only or i.item_id in only) and i.state.get("stage") == "S9" and \
+                i.state.get("status") in ("waiting", "active"):
+            open_[i.item_id] = dict(status=i.state["status"], reason=i.state.get("reason"))
+    done = {i.item_id: dict(stage=i.state["stage"], status=i.state["status"], label=i.state.get("calib_label"))
+            for i in P.store.items() if i.item_id in s9 and i.item_id not in open_}
+    return dict(actions=did, open=open_, settled=done, ts=time.time())

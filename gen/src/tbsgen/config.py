@@ -367,6 +367,26 @@ DEFAULTS: dict[str, Any] = {
         "est_usd_per_run": 20.0,            # ledger reservation per Harbor run; settled with the job's cost_usd
         "teacher_available": True,          # False: GLM#1 fail -> parked:teacher_unavailable (no teacher run)
         "prepared_tasks_dir": None,         # sandbox-prepared task copies (docker_image set), one dir per item
+        # Environment-preparation hook: shell command (bash, cwd = prepare_cwd or harbor_root) that turns an item's
+        # pkg/ into the run-ready copy <prepared_tasks_dir>/<item_id> (e.g. build an image, register a sandbox
+        # template, write task.toml).  Placeholders {item_id} {pkg} {out} {who} (shell-quoted); env TBSGEN_ITEM_ID,
+        # TBSGEN_PKG, TBSGEN_PREPARED_DIR, TBSGEN_WHO.  Run by S9 before writing a job config (needs
+        # prepared_tasks_dir) and by `tbsgen calib prepare`.  None = prepare outside tbsgen.
+        "prepare_command": None,
+        "prepare_cwd": None,
+        "prepare_timeout_s": 3600,
+        # Teacher-only overrides (None = use the shared key above): a teacher routed through another endpoint /
+        # launcher host needs its own environment, allowed model hosts, launcher root and prepared copies.
+        "teacher_environment": None,
+        "teacher_agent_allowed_hosts": None,
+        "teacher_harbor_root": None,
+        "teacher_prepared_tasks_dir": None,
+        # A failed student run that timed out without writing its deliverable (result_type timeout_no_output):
+        # "fail" counts it like any fail (default, unchanged labels); "retry" reruns the student instead (up to
+        # timeout_no_output_retries times, then it counts as a fail); "park" parks the item for a human.
+        "timeout_no_output": "fail",
+        "timeout_no_output_retries": 1,
+        "watch_interval_s": 120,            # `tbsgen calib watch` poll interval
         # Hosts the agent may reach while it works when the task's agent phase is an allowlist
         # (package.network.mode = "agent-allowlist"): the model endpoint(s).  Written to the job config as
         # agents[].extra_allowed_hosts (= harbor run --allow-agent-host).  Empty with an allowlisted task: S9 does

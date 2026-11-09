@@ -11,6 +11,12 @@ Infra outcomes (API quota/auth/stream errors with reward 0, sandbox start/setup 
 attempts; they are retried up to calib.infra_retries, then the item is parked "infra".
 A trial with reward 1 counts as a pass even if Claude Code later raised an API error (this happens: the task
 can be solved before the error).
+
+Every collected run also gets a result type (RESULT_TYPES): pass / fail_delivered / fail_no_output /
+timeout_with_output / timeout_no_output / infra.  The label rule above uses outcome only, except that
+calib.timeout_no_output (default "fail" = unchanged) can make a student run that timed out without writing its
+deliverable non-decisive ("retry": rerun the student up to calib.timeout_no_output_retries times) or park the item
+("park").
 """
 from __future__ import annotations
 
@@ -29,12 +35,41 @@ AGENT_ENV = {
     "IS_SANDBOX": "1", "CLAUDE_CODE_MAX_OUTPUT_TOKENS": "128000", "ENABLE_TOOL_SEARCH": "true"}
 
 
+RESULT_TYPES = ("pass", "fail_delivered", "fail_no_output", "timeout_with_output", "timeout_no_output", "infra")
+TIMEOUT_EXC = {"AgentTimeoutError"}
+TNO_POLICIES = ("fail", "retry", "park")
+
+
+def role(c: dict, who: str, key: str):
+    """Per-role calib setting: the teacher's `teacher_<key>` when set (not None), else the shared `<key>`.  Lets the
+    teacher run with its own launcher root / environment / allowed hosts / prepared tasks (e.g. a different model
+    route) while the student keeps the shared ones."""
+    if who != "glm":
+        v = c.get(f"teacher_{key}")
+        if v is not None:
+            return v
+    return c.get(key)
+
+
 def next_action(runs: list[dict], cfg: dict) -> tuple[str, str | None]:
-    """runs: [{"who": "glm"|"teacher", "outcome": "pass"|"fail"|"infra", "minutes": float}] in order.
+    """runs: [{"who": "glm"|"teacher", "outcome": "pass"|"fail"|"infra", "minutes": float,
+    "result_type": optional}] in order.
     Returns ("run", "glm"|"teacher") or ("label", "hard"|"unstable"|"easy"|"parked:<why>")."""
     c = cfg["calib"]
-    infra = [r for r in runs if r["outcome"] == "infra"]
-    real = [r for r in runs if r["outcome"] != "infra"]
+    pol = c.get("timeout_no_output") or "fail"
+    if pol not in TNO_POLICIES:
+        raise ValueError(f"calib.timeout_no_output must be one of {TNO_POLICIES}, got {pol!r}")
+    real, skipped = [], 0
+    for r in runs:
+        if r["outcome"] == "infra":
+            continue
+        if r["who"] == "glm" and r["outcome"] == "fail" and r.get("result_type") == "timeout_no_output":
+            if pol == "park":
+                return "label", "parked:timeout_no_output"
+            if pol == "retry" and skipped < int(c.get("timeout_no_output_retries", 1)):
+                skipped += 1                # not decisive: the student is run again
+                continue
+        real.append(r)
     trailing_infra = 0
     for r in reversed(runs):
         if r["outcome"] != "infra":
@@ -63,13 +98,81 @@ def next_action(runs: list[dict], cfg: dict) -> tuple[str, str | None]:
     return "label", "unstable" if glm[1]["outcome"] == "fail" else "easy"
 
 
-def task_path(cfg: dict, item_dir: Path) -> Path:
+def prepared_dir(cfg: dict, who: str = "glm") -> str | None:
+    """calib.prepared_tasks_dir (teacher: calib.teacher_prepared_tasks_dir if set; "" = use pkg/ directly)."""
+    return role(cfg["calib"], who, "prepared_tasks_dir") or None
+
+
+def task_path(cfg: dict, item_dir: Path, who: str = "glm") -> Path:
     """Task folder the job runs: the sandbox-prepared copy (docker_image pointing at a registered template) when
     calib.prepared_tasks_dir has one for this item, else the item's own pkg/ (local Docker backends)."""
-    d = cfg["calib"].get("prepared_tasks_dir")
+    d = prepared_dir(cfg, who)
     if d and (Path(d) / item_dir.name / "task.toml").exists():
         return Path(d) / item_dir.name
     return item_dir / "pkg"
+
+
+def pkg_sha(pkg: Path) -> str:
+    """Content hash of a packaged task (paths + bytes): a prepared copy made from another pkg/ is stale."""
+    import hashlib
+    h = hashlib.sha256()
+    for f in sorted(p for p in Path(pkg).rglob("*") if p.is_file()):
+        h.update(str(f.relative_to(pkg)).encode() + b"\0" + f.read_bytes() + b"\0")
+    return h.hexdigest()[:16]
+
+
+def ensure_prepared(cfg: dict, item_dir: Path, who: str = "glm", force: bool = False) -> dict:
+    """Environment-preparation hook (calib.prepare_command): build the run-ready copy of pkg/ that a remote
+    backend needs (image + registered template, task.toml pointing at it) at <prepared_tasks_dir>/<item_id>.
+
+    The command is a template run with bash in calib.prepare_cwd (default: the role's harbor_root); placeholders
+    {item_id} {pkg} {out} {who} are shell-quoted, and the same values are in the environment as TBSGEN_ITEM_ID /
+    TBSGEN_PKG / TBSGEN_PREPARED_DIR / TBSGEN_WHO.  It must leave <out>/task.toml.  The outcome is recorded in
+    calib/prepare.json with the pkg/ hash: a copy made from the same pkg/ is reused, a failure for the same pkg/
+    is not retried automatically (force=True, i.e. `tbsgen calib prepare`, retries)."""
+    import shlex
+    import subprocess
+    c = cfg["calib"]
+    cmd, d = c.get("prepare_command"), prepared_dir(cfg, who)
+    if not cmd or not d:
+        return dict(ok=bool(not d or (Path(d) / item_dir.name / "task.toml").exists()), skipped="no prepare_command")
+    out = Path(d) / item_dir.name
+    pkg = item_dir / "pkg"
+    sha = pkg_sha(pkg)
+    recp = item_dir / "calib" / f"prepare-{who}.json" if who != "glm" else item_dir / "calib" / "prepare.json"
+    prev = {}
+    try:
+        prev = json.loads(recp.read_text())
+    except (OSError, ValueError):
+        pass
+    if prev.get("pkg_sha") == sha and not force:
+        if prev.get("ok") and (out / "task.toml").exists():
+            return dict(prev, reused=True)
+        if not prev.get("ok"):
+            return dict(prev, reused=True)          # same pkg failed before: needs `tbsgen calib prepare`
+    vals = dict(item_id=item_dir.name, pkg=str(pkg.resolve()), out=str(out), who=who)
+    line = cmd.format(**{k: shlex.quote(v) for k, v in vals.items()})
+    cwd = c.get("prepare_cwd") or role(c, who, "harbor_root") or str(item_dir)
+    log = item_dir / "calib" / ("prepare.log" if who == "glm" else f"prepare-{who}.log")
+    log.parent.mkdir(parents=True, exist_ok=True)
+    env = dict(os.environ, TBSGEN_ITEM_ID=vals["item_id"], TBSGEN_PKG=vals["pkg"], TBSGEN_PREPARED_DIR=vals["out"],
+               TBSGEN_WHO=who)
+    t0 = time.time()
+    try:
+        with log.open("w") as fh:
+            r = subprocess.run(["bash", "-c", line], cwd=cwd, env=env, stdout=fh, stderr=subprocess.STDOUT,
+                               timeout=float(c.get("prepare_timeout_s") or 3600))
+        rc, err = r.returncode, None
+    except Exception as e:  # noqa: BLE001  (timeout, missing cwd ...)
+        rc, err = None, f"{type(e).__name__}: {e}"
+    ok = rc == 0 and (out / "task.toml").exists()
+    if not ok and err is None:
+        tail = log.read_text(errors="replace")[-300:] if log.exists() else ""
+        err = f"exit {rc}" + ("" if (out / "task.toml").exists() else f"; no {out}/task.toml") + f": {tail}"
+    res = dict(ok=ok, pkg_sha=sha, out=str(out), rc=rc, error=err, sec=round(time.time() - t0, 1), ts=time.time(),
+               log=str(log))
+    recp.write_text(json.dumps(res, indent=1))
+    return res
 
 
 def _ref(import_path: str | None, builtin_key: str, builtin: str) -> dict:
@@ -86,14 +189,14 @@ def job_config(cfg: dict, pkg: Path, who: str, job_name: str) -> dict:
         agent = {**_ref(c.get("teacher_agent"), "name", c["harness"]), "model_name": c["teacher_model"],
                  "kwargs": {"version": c["cc_version"], "reasoning_effort": "max", "thinking_display": "summarized"},
                  "env": dict(AGENT_ENV)}
-    hosts = [str(h) for h in c.get("agent_allowed_hosts") or []]
+    hosts = [str(h) for h in role(c, who, "agent_allowed_hosts") or []]
     if hosts:
         agent["extra_allowed_hosts"] = hosts            # the model endpoint during the agent phase only
     return {"job_name": job_name, "jobs_dir": c["jobs_dir"], "n_attempts": 1, "n_concurrent_trials": 1,
             "timeout_multiplier": 1.0, "agent_timeout_multiplier": 1.0,
             "retry": {"max_retries": 2, "include_exceptions": ["AgentSetupTimeoutError", "EnvironmentStartTimeoutError",
                                                               "NetworkConnectionError"]},
-            "environment": {**_ref(c.get("environment"), "type", "docker"), "delete": True},
+            "environment": {**_ref(role(c, who, "environment"), "type", "docker"), "delete": True},
             "verifier": {"disable": False},
             "agents": [agent], "tasks": [{"path": str(pkg.resolve())}]}
 
@@ -133,20 +236,20 @@ def prepare(cfg: dict, item_dir: Path, who: str, n: int) -> dict:
     """Intent record for attempt n (no side effects outside item_dir).  Persist it BEFORE reserve/launch."""
     c = cfg["calib"]
     job_name = job_name_for(item_dir, who, n)
-    conf = job_config(cfg, task_path(cfg, item_dir), who, job_name)
+    conf = job_config(cfg, task_path(cfg, item_dir, who), who, job_name)
     p = item_dir / "calib" / f"{job_name}.json"
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(json.dumps(conf, indent=1))
     p = p.resolve()
     launcher = c.get("student_launcher") if who == "glm" else c.get("teacher_launcher")
     model = c["student_model"] if who == "glm" else c["teacher_model"]
-    command = (f"cd {c['harbor_root']} && ./{launcher} run {p}" if launcher and c.get("harbor_root")
-               else f"harbor run --config {p} --yes")
+    root = role(c, who, "harbor_root")
+    command = (f"cd {root} && ./{launcher} run {p}" if launcher and root else f"harbor run --config {p} --yes")
     rec = dict(who=who, n=n, item=item_dir.name, model=model, job_name=job_name, config=str(p),
                command=command, state="intent", submitted=False,
                ts=time.time(), job_dir=str(Path(c["jobs_dir"]) / job_name), task=conf["tasks"][0]["path"],
                outcome=None)
-    if c.get("prepared_tasks_dir") and not rec["task"].startswith(str(Path(c["prepared_tasks_dir"]))):
+    if _unprepared(cfg, who, rec["task"]):
         # remote sandbox backends cannot build a Dockerfile: a missing prepared template means the run would die
         # at environment start (e2e-iter1: FileUploadException, no model use) -> do not launch
         rec["blocked"] = "no prepared sandbox template for this item"
@@ -154,10 +257,15 @@ def prepare(cfg: dict, item_dir: Path, who: str, n: int) -> dict:
     if why:
         # an automatic launch would only burn a sandbox; a printed command is for a human, who can add the host
         rec["blocked" if c.get("allow_submit") else "warning"] = why
-    if c.get("allow_submit") and not (launcher and c.get("harbor_root")):
+    if c.get("allow_submit") and not (launcher and root):
         rec["blocked"] = (f"calib.allow_submit needs calib.harbor_root and calib.{'student' if who == 'glm' else 'teacher'}"
                           "_launcher (or set allow_submit=false and run the printed command yourself)")
     return rec
+
+
+def _unprepared(cfg: dict, who: str, task: str) -> bool:
+    d = prepared_dir(cfg, who)
+    return bool(d) and not Path(task).resolve().is_relative_to(Path(d).resolve())
 
 
 def job_started(rec: dict) -> bool:
@@ -184,7 +292,19 @@ def launch(cfg: dict, rec: dict, ledger, save) -> dict:
             rec["blocked"] = f"job config {rec['config']} unreadable ({type(e).__name__}); run prepare again"
             save(rec)
             return rec
-        hosts = [str(h) for h in c.get("agent_allowed_hosts") or []]
+        hosts = [str(h) for h in role(c, rec["who"], "agent_allowed_hosts") or []]
+        # an intent written before its sandbox copy existed points at pkg/: switch it to the prepared copy (same
+        # task, run-ready); the record's task changes with it, so ingest() still checks the job against it
+        item_dir = Path(rec["config"]).parent.parent
+        cur = task_path(cfg, item_dir, rec["who"])
+        if Path(rec["task"]) == (item_dir / "pkg").resolve() and cur != item_dir / "pkg":
+            for t in conf.get("tasks") or []:
+                t["path"] = str(cur.resolve())
+            rec["task"] = str(cur.resolve())
+        if _unprepared(cfg, rec["who"], rec["task"]):
+            rec["blocked"] = "no prepared sandbox template for this item"
+            save(rec)
+            return rec
         for a in conf.get("agents") or []:
             if hosts:
                 a["extra_allowed_hosts"] = hosts
@@ -225,8 +345,16 @@ def launch(cfg: dict, rec: dict, ledger, save) -> dict:
     item_dir = Path(rec["config"]).parent.parent
     log = item_dir / "calib" / f"{rec['job_name']}.log"
     launcher = c["student_launcher"] if rec["who"] == "glm" else c["teacher_launcher"]
+    root = role(c, rec["who"], "harbor_root")
+    if not (launcher and root):
+        err = "no launcher / harbor_root for this role"
+        if ledger is not None and rec.get("ledger_call"):
+            ledger.settle(rec["ledger_call"], 0.0, status="error", note=f"launch failed: {err}")
+        rec.update(state="launch_failed", outcome="infra", error=err)
+        save(rec)
+        return rec
     # the launcher's exit status is written next to the log, so a launcher that dies at once is visible
-    inner = (f"cd {shlex.quote(c['harbor_root'])} && env -u PYTHONPATH -u VIRTUAL_ENV ./{launcher} run "
+    inner = (f"cd {shlex.quote(root)} && env -u PYTHONPATH -u VIRTUAL_ENV ./{launcher} run "
              f"{shlex.quote(rec['config'])} > {shlex.quote(str(log))} 2>&1; "
              f"echo $? > {shlex.quote(str(log) + '.exit')}")
     rec["log"] = str(log)
@@ -257,8 +385,110 @@ def launcher_failed(rec: dict) -> str | None:
 
 
 def actual_spend(ledger) -> float:
+    """Settled spend the run-total gate compares with: reported costs and token-based estimates.  Runs whose cost
+    is unknown (cost_kind "reservation": the reserved estimate stands in) are not counted as spent here; they
+    still count at their reservation in Ledger.reserve()'s admission check."""
     with ledger._db() as db:
-        return db.execute("SELECT COALESCE(SUM(usd),0) FROM calls WHERE real=1 AND status!='reserved'").fetchone()[0]
+        return db.execute("SELECT COALESCE(SUM(usd),0) FROM calls WHERE real=1 AND status!='reserved' "
+                          "AND COALESCE(cost_kind,'') != 'reservation'").fetchone()[0]
+
+
+# ------------------------------------------------------------------ trial cost / tokens / result type
+_TOK = ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens", "output_tokens")
+
+
+def trial_usage(trial: Path, r: dict | None = None) -> tuple[dict | None, str | None]:
+    """Token usage of a trial's agent ({input_tokens (uncached), cache_read_input_tokens,
+    cache_creation_input_tokens, output_tokens}) and where it came from, or (None, None).  Sources in order:
+    Harbor's agent_result token counts (n_input_tokens includes cache reads), the ATIF trajectory's final_metrics,
+    the Claude Code stream-json log (agent/claude-code.txt; per message id the largest usage)."""
+    r = r if r is not None else _load(trial / "result.json")
+    traj = (_load(trial / "agent" / "trajectory.json") or {}).get("final_metrics") or {}
+    cw = int((traj.get("extra") or {}).get("total_cache_creation_input_tokens") or 0)
+    ar = (r or {}).get("agent_result") or {}
+    if ar.get("n_input_tokens") or ar.get("n_output_tokens"):
+        n_in, n_c = int(ar.get("n_input_tokens") or 0), int(ar.get("n_cache_tokens") or 0)
+        return dict(input_tokens=max(n_in - n_c - cw, 0), cache_read_input_tokens=n_c,
+                    cache_creation_input_tokens=cw, output_tokens=int(ar.get("n_output_tokens") or 0)), "agent_result"
+    if traj.get("total_prompt_tokens") or traj.get("total_completion_tokens"):
+        n_in, n_c = int(traj.get("total_prompt_tokens") or 0), int(traj.get("total_cached_tokens") or 0)
+        return dict(input_tokens=max(n_in - n_c - cw, 0), cache_read_input_tokens=n_c,
+                    cache_creation_input_tokens=cw, output_tokens=int(traj.get("total_completion_tokens") or 0)), \
+            "trajectory"
+    f = trial / "agent" / "claude-code.txt"
+    if f.exists():
+        per: dict = {}
+        with f.open(errors="replace") as fh:
+            for line in fh:
+                if '"usage"' not in line or '"assistant"' not in line:
+                    continue
+                try:
+                    m = (json.loads(line).get("message") or {})
+                except json.JSONDecodeError:
+                    continue
+                u = m.get("usage") or {}
+                k = m.get("id") or id(m)
+                old = per.get(k, {})
+                per[k] = {t: max(int(old.get(t, 0)), int(u.get(t) or 0)) for t in _TOK}
+        if per:
+            return {t: sum(v[t] for v in per.values()) for t in _TOK}, "stream_json"
+    return None, None
+
+
+def trial_cost(trial: Path, model: str | None, prices: dict, r: dict | None = None) -> dict:
+    """{cost_usd, cost_kind, cost_source, usage}.  cost_kind: "reported" (Harbor cost_usd), "tokens" (token usage
+    x models.prices[model]: an estimate from real usage), "unknown" (no cost and no usable usage/price)."""
+    r = r if r is not None else _load(trial / "result.json") or {}
+    usage, src = trial_usage(trial, r)
+    cost = ((r or {}).get("agent_result") or {}).get("cost_usd")
+    if cost is not None:
+        return dict(cost_usd=float(cost), cost_kind="reported", cost_source="harbor", usage=usage)
+    from .budget import price_usd
+    if usage and model and (prices.get(model) or prices.get(model.split(":")[0])):
+        return dict(cost_usd=round(price_usd(prices, model, usage), 4), cost_kind="tokens", cost_source=src,
+                    usage=usage)
+    return dict(cost_usd=None, cost_kind="unknown", cost_source=src,
+                usage=usage, note=None if usage else "no token usage in the trial",
+                **({"price_missing": model} if usage else {}))
+
+
+def delivered(trial: Path) -> bool | None:
+    """Did the agent leave its deliverable?  From the verifier's metrics.jsonl (tbsgen's _metrics.run_solution
+    records `_solution_cli_run`): the entry file missing ("can't open file" / "No such file") = False; any other
+    run = True; no record = None (unknown)."""
+    f = trial / "verifier" / "metrics.jsonl"
+    if not f.exists():
+        return None
+    seen = None
+    for line in f.read_text(errors="replace").splitlines():
+        try:
+            o = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if o.get("name") != "_solution_cli_run" or o.get("lock_failed"):
+            continue
+        err = str(o.get("stderr_tail") or "")
+        missing = o.get("rc") not in (0, None) and ("can't open file" in err or
+                                                  ("No such file or directory" in err and "solution" in err))
+        seen = (seen or False) or not missing
+    return seen
+
+
+def result_type(outcome: str, exc: str | None, deliv: bool | None) -> str:
+    """pass / infra as the outcome; a failed run splits by timeout and deliverable (unknown counts as delivered:
+    only a confirmed missing deliverable is "no_output")."""
+    if outcome in ("pass", "infra"):
+        return outcome
+    if exc in TIMEOUT_EXC:
+        return "timeout_no_output" if deliv is False else "timeout_with_output"
+    return "fail_no_output" if deliv is False else "fail_delivered"
+
+
+def _load(p: Path):
+    try:
+        return json.loads(Path(p).read_text())
+    except (OSError, ValueError):
+        return None
 
 
 def _api_status(trial: Path) -> tuple[int | None, str | None]:
@@ -275,7 +505,7 @@ def _api_status(trial: Path) -> tuple[int | None, str | None]:
     return None, None
 
 
-def classify_trial(trial: Path) -> dict:
+def classify_trial(trial: Path, model: str | None = None, prices: dict | None = None) -> dict:
     r = json.loads((trial / "result.json").read_text())
     ei = r.get("exception_info") or {}
     exc = ei.get("exception_type")
@@ -299,10 +529,40 @@ def classify_trial(trial: Path) -> dict:
     else:
         outcome = "fail"
     quota = bool(msg and re.search(r"额度|quota|429", msg))
-    cost = (r.get("agent_result") or {}).get("cost_usd")
-    return dict(trial=trial.name, outcome=outcome, reward=reward, exception=exc, api_status=status,
-                api_msg=msg, quota=quota, minutes=minutes, cost_usd=cost)
+    deliv = delivered(trial)
+    c = trial_cost(trial, model, prices or {}, r)
+    return dict(trial=trial.name, outcome=outcome, result_type=result_type(outcome, exc, deliv), delivered=deliv,
+                reward=reward, exception=exc, api_status=status, api_msg=msg, quota=quota, minutes=minutes,
+                cost_usd=c["cost_usd"], cost_kind=c["cost_kind"], cost_source=c["cost_source"], usage=c["usage"])
 
 
-def collect(job_dir: Path) -> list[dict]:
-    return [classify_trial(t) for t in sorted(Path(job_dir).iterdir()) if (t / "result.json").exists()]
+def collect(job_dir: Path, model: str | None = None, prices: dict | None = None) -> list[dict]:
+    return [classify_trial(t, model, prices) for t in sorted(Path(job_dir).iterdir()) if (t / "result.json").exists()]
+
+
+def job_cost(trials: list[dict]) -> tuple[float | None, str, dict | None]:
+    """Cost of a whole Harbor job (all its trials, retries included): (usd, kind, usage).  Any trial with an
+    unknown cost makes the job's cost unknown (None, "reservation"); otherwise "reported" if every trial was
+    reported by Harbor, else "tokens"."""
+    tot = {k: 0 for k in _TOK}
+    for t in trials:
+        for k in _TOK:
+            tot[k] += int((t.get("usage") or {}).get(k) or 0)
+    usage = tot if any(t.get("usage") for t in trials) else None
+    if not trials or any(t.get("cost_usd") is None for t in trials):
+        return None, "reservation", usage
+    kind = "reported" if all(t.get("cost_kind") == "reported" for t in trials) else "tokens"
+    return round(sum(float(t["cost_usd"]) for t in trials), 4), kind, usage
+
+
+def run_summary(runs: list[dict]) -> list[dict]:
+    """Per-run calibration record for the release manifest."""
+    keys = ("who", "n", "model", "job_name", "outcome", "result_type", "minutes", "cost_usd", "cost_kind")
+    out = []
+    for r in runs:
+        t = r.get("trial") or {}
+        d = {k: r.get(k, t.get(k)) for k in keys}
+        d["reward"] = t.get("reward")
+        d["exception"] = t.get("exception")
+        out.append(d)
+    return out
