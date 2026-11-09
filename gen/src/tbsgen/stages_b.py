@@ -215,7 +215,8 @@ def _s9(P, it):
                     _save_run(it, rec)
                 return it.finish("paused", f"budget:run_total_actual ({calib.actual_spend(P.ledger):.2f} >= {cap})",
                                  paused_stage="S9")
-            if rec["state"] == "intent" and c.get("prepare_command") and calib.prepared_dir(P.cfg, rec["who"]):
+            if rec["state"] == "intent" and not calib.job_started(rec) and c.get("prepare_command") and \
+                    calib.prepared_dir(P.cfg, rec["who"]):
                 prep = calib.ensure_prepared(P.cfg, it.dir, rec["who"])    # an intent written before the hook ran
                 if not prep.get("ok"):
                     return it.finish("waiting", f"calib blocked: prepare_command failed "
@@ -226,13 +227,13 @@ def _s9(P, it):
                 return it.finish("waiting", f"calib blocked: {rec['blocked']}")
             P.store.event("calib_reconciled", item=it.item_id, job=rec["job_name"], state=rec["state"])
         elif rec.get("outcome") is None and rec.get("state") == "launched":
-            why = calib.launcher_failed(rec)
+            why = calib.launcher_failed(rec, c)
             if why:
                 if rec.get("ledger_call"):
                     P.ledger.settle(rec["ledger_call"], 0.0, status="error", kind="not_launched", note=why[:500])
                 rec.update(state="launch_failed", outcome="infra", result_type="infra", error=why)
                 _save_run(it, rec)
-            elif calib.launcher_died(rec):
+            elif calib.launcher_died(rec, c):
                 _settle_dead_job(P, it, rec)
     runs = read_json(it.p("calib", "runs.json"), [])
     pending = [r for r in runs if r.get("outcome") is None]
@@ -352,11 +353,25 @@ def _settle_dead_job(P, it, rec: dict) -> None:
     if rec.get("ledger_call"):
         P.ledger.settle(rec["ledger_call"], usd, status="error", kind=kind, usage=usage,
                         note="harbor job ended without finished_at")
-    ex = Path(rec["log"] + ".exit").read_text().strip()
+    exf = Path(rec.get("log", "") + ".exit")
+    ex = exf.read_text().strip() if exf.exists() else "none (session gone)"
     rec.update(state="died", outcome="infra", result_type="infra", cost_usd=usd, cost_kind=kind,
                error=f"launcher exit {ex}; harbor job has no finished_at")
     _save_run(it, rec)
     P.store.event("calib_job_died", item=it.item_id, job=rec["job_name"], cost_kind=kind)
+
+
+def rewake(cfg: dict, it) -> bool:
+    """Under the item lock: re-read the item and, if still reschedulable, make it active (recorded in history)."""
+    with item_lock(it):
+        it.load()
+        if not reschedulable(cfg, it):
+            return False
+        it.state["history"].append(dict(stage="S9", result="rewake", prev_reason=it.state.get("reason"),
+                                        ts=time.time()))
+        it.state["status"] = "active"
+        it.save()
+        return True
 
 
 def reschedulable(cfg: dict, it) -> bool:
@@ -391,12 +406,22 @@ def watch_tick(P, only: list[str] | None = None, max_steps: int = 50) -> dict:
                                 result_type=t.get("result_type")))
             except ValueError as e:
                 did.append(dict(item=it.item_id, action="ingest_error", job=rec["job_name"], error=str(e)[:300]))
-        elif calib.launcher_failed(rec) or calib.launcher_died(rec):
+        else:
+            c = P.cfg["calib"]
             with item_lock(it):
+                it.load()                   # re-check under the lock: another watcher / run may have moved it
+                runs = read_json(it.p("calib", "runs.json"), [])
+                cur = next((r for r in runs if r.get("job_name") == rec["job_name"]), {})
+                if it.state.get("stage") != "S9" or it.state.get("status") != "waiting" or \
+                        cur.get("outcome") is not None or cur.get("state") != "launched":
+                    continue
+                kind = "launcher_failed" if calib.launcher_failed(cur, c) else \
+                    "job_died" if calib.launcher_died(cur, c) else None
+                if kind is None:
+                    continue
                 it.state["stage"], it.state["status"] = "S9", "active"   # s9() reconciles the dead launch
                 it.save()
-            did.append(dict(item=it.item_id, action="launcher_failed" if calib.launcher_failed(rec) else "job_died",
-                            job=rec["job_name"]))
+            did.append(dict(item=it.item_id, action=kind, job=rec["job_name"]))
     s9 = [i.item_id for i in P.store.items() if i.state.get("stage") == "S9" and (not only or i.item_id in only)]
     if s9:
         P.run(max_steps=max_steps, only=s9)

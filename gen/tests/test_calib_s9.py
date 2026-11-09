@@ -28,9 +28,12 @@ def _env(tmp_path, n_items=1, **calib_kw):
     tmux = tmp_path / "fake-tmux"
     # runs the launcher inline; a launcher that started a job is "still running" (its .exit is removed), like a
     # real launcher that returns only when Harbor does
-    tmux.write_text("#!/bin/bash\necho x >> %s\nshift 4\n\"$@\"\n"
+    # has-session: alive unless <tmp>/dead-sessions lists the name
+    tmux.write_text("#!/bin/bash\nif [ \"$1\" = has-session ]; then n=${3#=}; "
+                    "grep -qx \"$n\" %s/dead-sessions 2>/dev/null && { echo \"can't find session: $n\" >&2; exit 1; }; "
+                    "exit 0; fi\necho x >> %s\nshift 4\n\"$@\"\n"
                     "for f in %s/items/*/calib/*.log.exit; do [ -f \"$f\" ] || continue; j=$(basename \"$f\" .log.exit); "
-                    "[ -f \"%s/$j/result.json\" ] && rm \"$f\"; done; true\n" % (counter, tmp_path / "run", jobs))
+                    "[ -f \"%s/$j/result.json\" ] && rm \"$f\"; done; true\n" % (tmp_path, counter, tmp_path / "run", jobs))
     tmux.chmod(0o755)
     mk = ('J=$(python3 -c \'import json,sys;print(json.load(open(sys.argv[1]))["job_name"])\' $2); '
           'mkdir -p "%s/$J" && cp $2 "%s/$J/config.json" && echo "{}" > "%s/$J/result.json"' % (jobs, jobs, jobs))
@@ -498,3 +501,107 @@ def test_s9_on_a_stale_item_view_does_nothing(tmp_path):
     assert counter.read_text().count("x") == 1
     s9(P, stale)                                                         # re-reads state under the item lock
     assert counter.read_text().count("x") == 1 and len(_runs(P, iid)) == 1
+
+
+# ------------------------------------------------------------------ review round 2
+def _kill_session(tmp_path, rec):
+    with (tmp_path / "dead-sessions").open("a") as f:
+        f.write(rec["tmux"] + "\n")
+
+
+def test_job_whose_session_vanished_without_exit_is_infra(tmp_path):
+    P, [iid], counter, jobs = _env(tmp_path)
+    P.run()
+    r = _runs(P, iid)[0]
+    assert watch_tick(P)["actions"] == []                               # session alive: running
+    _kill_session(tmp_path, r)                                           # killed / reboot: no .exit written
+    out = watch_tick(P)
+    assert out["actions"][0]["action"] == "job_died" and _runs(P, iid)[0]["state"] == "died"
+
+
+def test_finished_job_is_ingested_even_if_session_is_gone(tmp_path):
+    P, [iid], counter, jobs = _env(tmp_path)
+    P.run()
+    r = _runs(P, iid)[0]
+    _finish(jobs, r["job_name"], reward=1.0, cost=1.0)
+    _kill_session(tmp_path, r)
+    assert watch_tick(P)["actions"][0]["action"] == "ingest"
+
+
+def test_crash_after_tmux_before_job_dir_is_not_relaunched(tmp_path):
+    """The launch info is saved before tmux runs; a crash before the job dir exists leaves a reserved record with
+    launch_attempted: while the session lives it is taken as launched, never started twice."""
+    P, [iid], counter, jobs = _env(tmp_path, allow_submit=False)
+    P.run(only=[iid])
+    r = _runs(P, iid)[0]
+    r.update(state="reserved", ledger_call=P.ledger.reserve(r["model"], "S9", iid, True, est_usd=30.0),
+             launch_attempted=1.0, tmux=r["job_name"][-60:], log=str(P.store.item(iid).p("calib", "x.log")))
+    P.store.item(iid).p("calib", "runs.json").write_text(json.dumps([r]))
+    P2 = Pipeline(load_config(None, dict(P.cfg, calib=dict(P.cfg["calib"], allow_submit=True))), clients={})
+    P2.run(only=[iid])
+    assert not counter.exists() and _runs(P2, iid)[0]["state"] == "launched"
+
+
+def test_attempted_launch_with_dead_session_and_no_job_is_launched_again(tmp_path):
+    P, [iid], counter, jobs = _env(tmp_path, allow_submit=False)
+    P.run(only=[iid])
+    r = _runs(P, iid)[0]
+    r.update(state="reserved", ledger_call=P.ledger.reserve(r["model"], "S9", iid, True, est_usd=30.0),
+             launch_attempted=1.0, tmux=r["job_name"][-60:], log=str(P.store.item(iid).p("calib", "x.log")))
+    P.store.item(iid).p("calib", "runs.json").write_text(json.dumps([r]))
+    _kill_session(tmp_path, r)
+    P2 = Pipeline(load_config(None, dict(P.cfg, calib=dict(P.cfg["calib"], allow_submit=True))), clients={})
+    P2.run(only=[iid])
+    assert counter.read_text().count("x") == 1 and _runs(P2, iid)[0]["state"] == "launched"
+
+
+def test_hand_started_intent_is_taken_over_even_with_preparation_enabled(tmp_path):
+    prep = tmp_path / "prepared"
+    P, [iid], counter, jobs = _env(tmp_path, allow_submit=False)
+    P.run(only=[iid])
+    r = _runs(P, iid)[0]
+    (jobs / r["job_name"]).mkdir(parents=True)
+    (jobs / r["job_name"] / "config.json").write_text(Path(r["config"]).read_text())
+    cal = dict(P.cfg["calib"], allow_submit=True, prepared_tasks_dir=str(prep), prepare_command=_hook(tmp_path))
+    P2 = Pipeline(load_config(None, dict(P.cfg, calib=cal)), clients={})
+    P2.run(only=[iid])
+    r2 = _runs(P2, iid)[0]
+    assert r2["state"] == "launched" and r2["task"] == r["task"] and not counter.exists()
+    assert not (tmp_path / "prep_calls").exists()                       # no preparation for an existing job
+    _finish(jobs, r["job_name"], reward=1.0, cost=2.0)
+    assert ingest(P2, P2.store.item(iid))["outcome"] == "pass"
+
+
+def test_missing_helper_script_is_not_a_missing_deliverable(tmp_path):
+    t = _trial(tmp_path / "j", exc="AgentTimeoutError")
+    (t / "verifier" / "metrics.jsonl").write_text(json.dumps({
+        "name": "_solution_cli_run", "rc": 2,
+        "stderr_tail": "python: can't open file '/app/helper.py': [Errno 2] No such file or directory"}) + "\n")
+    assert calib.classify_trial(t)["result_type"] == "timeout_with_output"
+    (t / "verifier" / "metrics.jsonl").write_text(json.dumps({
+        "name": "_solution_cli_run", "rc": 2, "entry": "/app/output/solution_cli.py", "entry_exists": False,
+        "stderr_tail": ""}) + "\n")
+    assert calib.classify_trial(t)["result_type"] == "timeout_no_output"
+
+
+def test_metrics_template_records_entry_existence(tmp_path, monkeypatch):
+    import importlib.util
+    from tbsgen import templates_metrics
+    src = Path(templates_metrics.__file__).read_text()
+    mod_path = tmp_path / "_metrics.py"
+    mod_path.write_text(src)
+    monkeypatch.setenv("TBSGEN_METRICS", str(tmp_path / "m.jsonl"))
+    spec = importlib.util.spec_from_file_location("_metrics_t", mod_path)
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    monkeypatch.setattr(m, "_sandbox_prepare", lambda i, o: None)
+    m.run_solution(5, input_dir=str(tmp_path), entry=str(tmp_path / "nope.py"))
+    rec = json.loads((tmp_path / "m.jsonl").read_text().splitlines()[0])
+    assert rec["entry_exists"] is False and rec["entry"].endswith("nope.py")
+
+
+def test_launch_failed_run_has_cost_fields(tmp_path):
+    P, [iid], counter, jobs = _env(tmp_path, tmux_bin=str(tmp_path / "no-such-tmux"))
+    P.run(only=[iid], max_steps=1)
+    r = _runs(P, iid)[0]
+    assert r["state"] == "launch_failed" and r["cost_usd"] == 0.0 and r["cost_kind"] == "not_launched"

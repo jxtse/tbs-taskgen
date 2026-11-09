@@ -35,6 +35,7 @@ AGENT_ENV = {
     "IS_SANDBOX": "1", "CLAUDE_CODE_MAX_OUTPUT_TOKENS": "128000", "ENABLE_TOOL_SEARCH": "true"}
 
 
+DEFAULT_ENTRY = "/app/output/solution_cli.py"        # _metrics.ENTRY default (TBSGEN_ENTRY)
 RESULT_TYPES = ("pass", "fail_delivered", "fail_no_output", "timeout_with_output", "timeout_no_output", "infra")
 TIMEOUT_EXC = {"AgentTimeoutError"}
 TNO_POLICIES = ("fail", "retry", "park")
@@ -281,6 +282,14 @@ def launch(cfg: dict, rec: dict, ledger, save) -> dict:
     import shlex
     import subprocess
     c = cfg["calib"]
+    if rec["state"] == "intent" and job_started(rec):
+        # its printed command was already run (by hand): take the job over as it is (task, config, identity
+        # unchanged); no preparation, path rewrite or pre-submit check applies to a job that exists
+        rec["ledger_call"] = ledger.reserve(rec["model"], "S9", rec["item"], True,
+                                            est_usd=float(c["est_usd_per_run"])) if ledger is not None else None
+        rec.update(state="launched", submitted=True, recovered=True)
+        save(rec)
+        return rec
     if rec["state"] == "intent":
         # an intent has no side effect outside item_dir.  It may have been written while submit was off, before
         # calib.agent_allowed_hosts was set: update only that field of its job config (model, job dir and task stay
@@ -297,8 +306,7 @@ def launch(cfg: dict, rec: dict, ledger, save) -> dict:
         # task, run-ready); the record's task changes with it, so ingest() still checks the job against it
         item_dir = Path(rec["config"]).parent.parent
         cur = task_path(cfg, item_dir, rec["who"])
-        if Path(rec["task"]) == (item_dir / "pkg").resolve() and cur != item_dir / "pkg" and not job_started(rec):
-            # (a job already started from this intent, e.g. its printed command was run by hand, keeps its task)
+        if Path(rec["task"]) == (item_dir / "pkg").resolve() and cur != item_dir / "pkg":
             for t in conf.get("tasks") or []:
                 t["path"] = str(cur.resolve())
             rec["task"] = str(cur.resolve())
@@ -336,13 +344,22 @@ def launch(cfg: dict, rec: dict, ledger, save) -> dict:
         if why:
             if ledger is not None and rec.get("ledger_call"):
                 ledger.settle(rec["ledger_call"], 0.0, status="error", kind="not_launched", note=f"not launched: {why}"[:500])
-            rec.update(state="launch_failed", outcome="infra", result_type="infra", error=f"not launched: {why}")
+            rec.update(state="launch_failed", outcome="infra", result_type="infra", cost_usd=0.0, cost_kind="not_launched", error=f"not launched: {why}")
             save(rec)
             return rec
     if job_started(rec):                                   # crashed after launch, before recording it
         rec.update(state="launched", submitted=True, recovered=True)
         save(rec)
         return rec
+    if rec.get("launch_attempted"):
+        # a launch was attempted before a crash and no job dir exists yet: the launcher may still be starting it
+        alive = session_alive(c, rec)
+        if alive or alive is None:
+            rec.update(state="launched", submitted=True, recovered=True)
+            save(rec)
+            return rec
+        # session gone and no job: the launcher exited without one (launcher_failed() in s9 settles it) or never
+        # ran; either way nothing is running, so it is safe to launch again below
     item_dir = Path(rec["config"]).parent.parent
     log = item_dir / "calib" / f"{rec['job_name']}.log"
     launcher = c["student_launcher"] if rec["who"] == "glm" else c["teacher_launcher"]
@@ -351,14 +368,17 @@ def launch(cfg: dict, rec: dict, ledger, save) -> dict:
         err = "no launcher / harbor_root for this role"
         if ledger is not None and rec.get("ledger_call"):
             ledger.settle(rec["ledger_call"], 0.0, status="error", kind="not_launched", note=f"launch failed: {err}")
-        rec.update(state="launch_failed", outcome="infra", result_type="infra", error=err)
+        rec.update(state="launch_failed", outcome="infra", result_type="infra", cost_usd=0.0, cost_kind="not_launched", error=err)
         save(rec)
         return rec
     # the launcher's exit status is written next to the log, so a launcher that dies at once is visible
     inner = (f"cd {shlex.quote(root)} && env -u PYTHONPATH -u VIRTUAL_ENV ./{launcher} run "
              f"{shlex.quote(rec['config'])} > {shlex.quote(str(log))} 2>&1; "
              f"echo $? > {shlex.quote(str(log) + '.exit')}")
-    rec["log"] = str(log)
+    rec.update(log=str(log), tmux=rec["job_name"][-60:], launch_attempted=time.time())
+    if Path(str(log) + ".exit").exists():
+        Path(str(log) + ".exit").unlink()                  # a previous attempt's exit status
+    save(rec)                                              # persisted before the side effect
     try:
         r = subprocess.run([c.get("tmux_bin", "tmux"), "new-session", "-d", "-s", rec["job_name"][-60:],
                             "bash", "-lc", inner], capture_output=True, text=True, timeout=60)
@@ -368,7 +388,7 @@ def launch(cfg: dict, rec: dict, ledger, save) -> dict:
     if err:
         if ledger is not None and rec.get("ledger_call"):
             ledger.settle(rec["ledger_call"], 0.0, status="error", kind="not_launched", note=f"launch failed: {err}"[:500])
-        rec.update(state="launch_failed", outcome="infra", result_type="infra", error=err)
+        rec.update(state="launch_failed", outcome="infra", result_type="infra", cost_usd=0.0, cost_kind="not_launched", error=err)
         save(rec)
         return rec
     rec.update(state="launched", submitted=True, tmux=rec["job_name"][-60:])
@@ -376,26 +396,57 @@ def launch(cfg: dict, rec: dict, ledger, save) -> dict:
     return rec
 
 
-def launcher_failed(rec: dict) -> str | None:
-    """Launcher exited without creating a Harbor job (bad cwd, missing script, key fetch failure ...)."""
+def launcher_failed(rec: dict, c: dict | None = None) -> str | None:
+    """Launcher exited without creating a Harbor job (bad cwd, missing script, key fetch failure ...), or its
+    tmux session vanished without an exit status and without a job."""
     ex = Path(rec.get("log", "") + ".exit")
+    if rec.get("state") == "launched" and c is not None and not ex.exists() and not job_started(rec) and \
+            session_alive(c, rec) is False and not ex.exists() and not job_started(rec):   # re-read after the check
+        return "launcher session gone without an exit status and without a job"
     if rec.get("state") == "launched" and ex.exists() and not (Path(rec["job_dir"]) / "result.json").exists():
         tail = Path(rec["log"]).read_text(errors="replace")[-300:] if Path(rec["log"]).exists() else ""
         return f"launcher exit {ex.read_text().strip()} without a job: {tail}"
     return None
 
 
-def launcher_died(rec: dict) -> bool:
-    """Launcher exited (its .exit file is written after Harbor returns) but the job never wrote finished_at:
-    Harbor crashed or was killed mid-job.  The .exit file is checked first, so a job finishing meanwhile is not
-    mistaken for a dead one."""
-    ex = Path(rec.get("log", "") + ".exit")
-    if rec.get("state") != "launched" or not ex.exists():
+def session_alive(c: dict, rec: dict) -> bool | None:
+    """Is the tmux session this run was launched in still there?  None = cannot tell (no tmux name recorded,
+    e.g. a job started by hand, or tmux unusable).  The launchers run Harbor in the foreground, so the session
+    lives exactly as long as the job's Harbor process."""
+    import subprocess
+    name = rec.get("tmux")
+    if not name:
+        return None
+    try:
+        r = subprocess.run([c.get("tmux_bin", "tmux"), "has-session", "-t", f"={name}"], capture_output=True,
+                           text=True, timeout=20)
+    except Exception:  # noqa: BLE001
+        return None
+    if r.returncode == 0:
+        return True
+    err = (r.stderr or "").lower()
+    return False if ("can't find session" in err or "no server running" in err or "error connecting" in err
+                     or not err.strip()) else None
+
+
+def launcher_died(rec: dict, c: dict | None = None) -> bool:
+    """The job of a launched run will never finish: Harbor created it (result.json) but never wrote finished_at,
+    and either the launcher exited (its .exit file, written after Harbor returns) or its tmux session is gone
+    without an .exit (killed / reboot).  .exit and finished_at are re-read after the session check, so a job
+    ending meanwhile is not taken for a dead one."""
+    if rec.get("state") != "launched":
         return False
     jr = Path(rec["job_dir"]) / "result.json"
+    ex = Path(rec.get("log", "") + ".exit")
     if not jr.exists():
-        return False                                    # launcher_failed() covers this case
-    return not (_load(jr) or {}).get("finished_at")
+        return False                                    # launcher_failed() covers an exit without a job
+    if (_load(jr) or {}).get("finished_at"):
+        return False
+    if ex.exists():
+        return True
+    if c is None or session_alive(c, rec) is not False:
+        return False
+    return not ex.exists() and not (_load(jr) or {}).get("finished_at")
 
 
 def actual_spend(ledger) -> float:
@@ -481,9 +532,14 @@ def delivered(trial: Path) -> bool | None:
             continue
         if o.get("name") != "_solution_cli_run" or o.get("lock_failed"):
             continue
+        if "entry_exists" in o:                         # recorded by newer _metrics.run_solution
+            seen = (seen or False) or bool(o["entry_exists"])
+            continue
         err = str(o.get("stderr_tail") or "")
-        # only the interpreter failing to open the entry file itself (the deliverable's own errors do not count)
-        missing = o.get("rc") not in (0, None) and re.search(r"can't open file '[^']*'", err) is not None
+        # older records: only the interpreter failing to open the entry file itself (a helper the deliverable
+        # runs that is missing does not count)
+        entry = str(o.get("entry") or DEFAULT_ENTRY)
+        missing = o.get("rc") not in (0, None) and f"can't open file '{entry}'" in err
         seen = (seen or False) or not missing
     return seen
 

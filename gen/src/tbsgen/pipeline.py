@@ -232,10 +232,8 @@ class Pipeline:
                     continue
                 if it.state["status"] == "waiting":
                     rewoken.add(it.item_id)
-                    it.state["history"].append(dict(stage="S9", result="rewake", prev_reason=it.state.get("reason"),
-                                                    ts=time.time()))
-                    it.state["status"] = "active"
-                    it.save()
+                    if not B.rewake(self.cfg, it):      # re-checked under the item lock
+                        continue
                 r = self.step(it)
                 steps += 1
                 progress |= r in ("ok", "error", "crash")

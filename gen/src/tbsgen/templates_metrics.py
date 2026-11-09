@@ -180,12 +180,13 @@ def run_solution(timeout_sec, input_dir=HIDDEN, entry=ENTRY):
     if key in _CACHE:
         return _CACHE[key]
     out = tempfile.mkdtemp(prefix="sol-")
+    entry_exists = os.path.isfile(entry)              # calibration tells "no deliverable" from "deliverable failed"
     try:
         sb = _sandbox_prepare(input_dir, out)
     except Exception as e:  # never run untrusted code with truth possibly readable
         _record({"name": "_solution_cli_run", "value": 0.0, "rc": -1, "stderr_tail": f"not run: {e}"[-500:],
                  "threshold": float(timeout_sec), "direction": "<=", "passed": False, "aux": True,
-                 "sandboxed": False, "lock_failed": True})
+                 "sandboxed": False, "lock_failed": True, "entry": entry, "entry_exists": entry_exists})
         _CACHE[key] = (out, 0.0, -1)
         return _CACHE[key]
     kw = dict(env=_thread_env(dict(os.environ))) if sb is None else \
@@ -201,6 +202,6 @@ def run_solution(timeout_sec, input_dir=HIDDEN, entry=ENTRY):
     sec = time.time() - t0
     _record({"name": "_solution_cli_run", "value": sec, "rc": rc, "stderr_tail": err[-500:],
              "threshold": float(timeout_sec), "direction": "<=", "passed": rc == 0, "aux": True,
-             "sandboxed": sb is not None})
+             "sandboxed": sb is not None, "entry": entry, "entry_exists": entry_exists})
     _CACHE[key] = (out, sec, rc)
     return _CACHE[key]
