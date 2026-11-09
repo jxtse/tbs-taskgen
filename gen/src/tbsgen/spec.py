@@ -266,7 +266,9 @@ def s6b_decision(th: dict, measure: dict, cfg: dict, state: dict) -> dict:
       ref_gross      reference worse than naive by >= gen.ref_gross_ratio -> S6A once, then drop
       mid_crashed    mid exited non-zero -> S6M (code bug, the count of failed criteria means nothing)
       mid_far        mid fails far more criteria than allowed -> drop without S6M / S5
-    Counters (state): mid_rework, back_to_spec, ref_rewrite."""
+    Counters (state): mid_rework, back_to_spec, ref_rewrite.
+    A crashed mid only matters when the item is not separable: a mid that wrote its outputs and then exited
+    non-zero but still fails 1..max_mid_fail criteria is a valid near miss (status ok -> S6C, as before)."""
     g = cfg["gen"]
     st = th["status"]
     if st == "ok":

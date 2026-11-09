@@ -279,8 +279,7 @@ def s6b(P, it):
         it.state.setdefault("avoid_mid_drop", []).extend(spec["depgraph"].get("mid_drop", []))
         it.state["regen_6a"] = True
         it.state["regen_6c"] = True
-        it.save()
-        return it.goto("S5", dec["reason"])
+        return it.goto("S5", dec["reason"])     # one save: counters and stage change land together
     if act == "S6A":
         # the reference is grossly wrong (orders of magnitude worse than the naive baseline): regenerate the code
         # once from the same spec instead of patching it in S8
@@ -288,7 +287,8 @@ def s6b(P, it):
         it.state["regen_6a"] = True
         it.state["regen_6c"] = True
         it.state["s6a_feedback"] = dict(why=dec["reason"], ratios=dec["detail"].get("ratios"))
-        it.save()                               # S8 rounds already spent stay spent (gates.max_repair_rounds per item)
+        # one save (in goto): a crash cannot leave ref_rewrite spent while the item still sits at S6B.  S8 rounds
+        # already spent stay spent (gates.max_repair_rounds is per item)
         return it.goto("S6A", dec["reason"])
     return it.finish("dropped", dec["reason"], early_stop=dec["rule"])
 
