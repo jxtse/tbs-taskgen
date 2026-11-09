@@ -4,12 +4,19 @@
   tbsgen run     --run DIR [--config C] [--max-steps N] [--only ID,..] [--until STAGE]
                                                                  --until S4: stop after that stage (no model stage is
                                                                  started, so no model:config pause without a teacher)
-  tbsgen resume  --run DIR                                       re-activate budget/model-paused items
+  tbsgen resume  --run DIR [--only ID,..] [--stage S9,..] [--reason budget:,model:]
+                                                                 re-activate paused items (default reasons budget:/model:);
+                                                                 --only / --stage / --reason narrow which ones
   tbsgen status  --run DIR
   tbsgen report  --run DIR [--day YYYY-MM-DD]
   tbsgen ledger  --run DIR                                       spend summary (all days)
   tbsgen breaker --run DIR --model M --reset
   tbsgen calib-ingest --run DIR --item ID --job-dir JOBDIR      attach Harbor results to the pending S9 run
+  tbsgen calib watch --run DIR [--only ID,..] [--once] [--interval S] [--max-hours H]
+                                                                 poll submitted S9 jobs: ingest finished ones, step S9
+                                                                 (label, or launch the next run GLM -> teacher)
+  tbsgen calib prepare --run DIR --item ID [--who glm|teacher]   run calib.prepare_command for one item (retries a
+                                                                 failed preparation)
   tbsgen ping    --run DIR --calls N                             real teacher-model connectivity check (needs budget)
   tbsgen harbor-local --run DIR [--item ID]                       local Harbor oracle+nop on packaged items
   tbsgen reset   --run DIR --item ID --stage S5 [--regen]        re-activate an item at a stage (after a pipeline fix);
@@ -62,7 +69,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser(prog="tbsgen")
     sub = ap.add_subparsers(dest="cmd", required=True)
     for name in ("ingest", "run", "resume", "status", "report", "ledger", "breaker", "calib-ingest", "ping", "reset",
-                 "harbor-local", "fetch", "remote", "fulltext"):
+                 "harbor-local", "fetch", "remote", "fulltext", "calib"):
         s = sub.add_parser(name)
         s.add_argument("--run", required=True)
         s.add_argument("--config", default=None)
@@ -74,6 +81,18 @@ def main(argv=None):
             s.add_argument("--only", default="")
             s.add_argument("--until", default=None, choices=STAGES,
                            help="last stage to run (e.g. S4): later stages are not started, nothing is paused")
+        if name == "resume":
+            s.add_argument("--only", default="", help="ID[,ID]: just these items")
+            s.add_argument("--stage", default="", help="STAGE[,STAGE]: just items paused at these stages")
+            s.add_argument("--reason", default="budget:,model:", help="reason prefixes (comma-separated)")
+        if name == "calib":
+            s.add_argument("action", choices=["watch", "prepare"])
+            s.add_argument("--only", default="", help="watch: ID[,ID]")
+            s.add_argument("--once", action="store_true", help="watch: one pass, then exit")
+            s.add_argument("--interval", type=float, default=None, help="watch: seconds (calib.watch_interval_s)")
+            s.add_argument("--max-hours", type=float, default=None, help="watch: stop after this long")
+            s.add_argument("--item", default=None, help="prepare: item id")
+            s.add_argument("--who", default="glm", choices=["glm", "teacher"])
         if name == "report":
             s.add_argument("--day", default=None)
         if name == "breaker":
@@ -136,7 +155,13 @@ def main(argv=None):
         print(json.dumps(P.run(a.max_steps, [x for x in a.only.split(",") if x] or None, until=a.until), indent=1,
                          ensure_ascii=False))
     elif a.cmd == "resume":
-        print(json.dumps(dict(resumed=P.resume()), ensure_ascii=False))
+        reasons = tuple(x.strip() for x in a.reason.split(",") if x.strip())
+        if not reasons:
+            sys.exit("tbsgen resume: --reason needs at least one prefix")
+        print(json.dumps(dict(resumed=P.resume(reasons, only=_ids(a.only), stages=_ids(a.stage))),
+                         ensure_ascii=False))
+    elif a.cmd == "calib":
+        return _calib(P, a)
     elif a.cmd == "status":
         print(json.dumps(P.status(), indent=1, ensure_ascii=False))
     elif a.cmd == "report":
@@ -173,6 +198,47 @@ def main(argv=None):
             sys.exit(str(e))
         print(json.dumps(t, ensure_ascii=False))
     return 0
+
+
+def _ids(v: str) -> list[str] | None:
+    return [x.strip() for x in (v or "").split(",") if x.strip()] or None
+
+
+def _calib(P: Pipeline, a) -> int:
+    import time
+    from .stages_b import watch_tick
+    if a.action == "prepare":
+        if not a.item:
+            sys.exit("tbsgen calib prepare: --item is required")
+        if not P.cfg["calib"].get("prepare_command") or not calib.prepared_dir(P.cfg, a.who):
+            sys.exit("tbsgen calib prepare: set calib.prepare_command and calib.prepared_tasks_dir")
+        it = P.store.item(a.item)
+        if not (it.p("pkg") / "task.toml").exists():
+            sys.exit(f"tbsgen calib prepare: {a.item} has no packaged task (pkg/task.toml)")
+        res = calib.ensure_prepared(P.cfg, it.dir, a.who, force=True)
+        P.store.event("calib_prepared", item=a.item, who=a.who, ok=res.get("ok"), sec=res.get("sec"), manual=True)
+        print(json.dumps(res, ensure_ascii=False))
+        return 0 if res.get("ok") else 1
+    only = _ids(a.only)
+    interval = a.interval if a.interval is not None else float(P.cfg["calib"].get("watch_interval_s") or 120)
+    t_end = time.time() + a.max_hours * 3600 if a.max_hours else None
+    while True:
+        out = watch_tick(P, only)
+        print(json.dumps(out, ensure_ascii=False), flush=True)
+        running = [i for i, v in out["open"].items() if v["status"] == "waiting" and _running(P, i)]
+        if a.once or not out["open"] or (t_end and time.time() >= t_end):
+            return 0
+        if not running and not P.cfg["calib"].get("allow_submit"):
+            print(json.dumps(dict(stop="nothing running and calib.allow_submit=false; S9 items wait for a human",
+                                  open=out["open"]), ensure_ascii=False), flush=True)
+            return 0
+        P.stopped_models.clear()
+        time.sleep(interval)
+
+
+def _running(P: Pipeline, item_id: str) -> bool:
+    runs = read_json(P.store.item(item_id).p("calib", "runs.json"), []) or []
+    return any(r.get("outcome") is None and r.get("state", "launched") == "launched" for r in runs)
 
 
 def _fetch(P: Pipeline, a) -> int:

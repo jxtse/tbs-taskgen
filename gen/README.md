@@ -103,6 +103,7 @@ uv run tbsgen ingest --run runs/R --candidates <tbsretr 输出.json> [--top N] -
 uv run tbsgen run    --run runs/R --config config.toml [--max-steps N] [--only ID]
 uv run tbsgen status --run runs/R ; uv run tbsgen report --run runs/R ; uv run tbsgen ledger --run runs/R
 uv run tbsgen resume --run runs/R --config config.toml              # 恢复因预算/熔断暂停的条目
+uv run tbsgen resume --run runs/R --only ID1,ID2 [--stage S9] [--reason budget:]  # 只恢复指定条目/阶段/原因前缀
 uv run tbsgen breaker --run runs/R --model claude-opus-5-5 --reset  # 人工解除熔断
 uv run tbsgen fetch --run runs/R --config config.toml [--max N] [--channels oa,browser] [--no-browser] [--dry-run]
                                                                     # 清全文队列（含 ego-browser 通道），取到全文后交给等待的条目并推进到 S4
@@ -118,6 +119,10 @@ uv run tbsgen fetch --run runs/R --status                          # 今日下�
 uv run tbsgen fetch --run runs/R --finish-browser                  # 关闭本工具的 ego TaskSpace
 uv run tbsgen fetch --run runs/R --browser --wait-for-egress         # 等出口进入 allow_cidrs 后跑一个浏览器批次
 uv run tbsgen calib-ingest --run runs/R --item ID [--job-dir DIR]   # 回填校准结果（默认取该次提交的作业目录；作业未结束则拒绝）
+uv run tbsgen calib watch --run runs/R --config config.toml [--only ID,..] [--once] [--interval 120] [--max-hours H]
+                                                                    # 校准监控：回填已结束的作业 → 推进 S9（打标签或提交下一次：GLM → 教师）；
+                                                                    # 前台循环，无未结束的 S9 条目时退出；allow_submit=false 且无运行中作业时也退出
+uv run tbsgen calib prepare --run runs/R --config config.toml --item ID [--who teacher]  # 手动运行环境准备钩子（失败后重试）
 uv run tbsgen harbor-local --run runs/R [--item ID]                  # 本机 Harbor oracle/nop（换本地基础镜像）
 uv run tbsgen run    --run runs/R --until S4                      # 只跑到 S4（不启动模型阶段，不留 model:config 暂停）
 uv run tbsgen reset  --run runs/R --item ID --stage S6B [--regen]    # 管线修复后让条目从某阶段重来（记入 history）
@@ -184,9 +189,13 @@ allow_submit = false
 | `calib.allow_submit` | **False** | True 时：账本预留 → tmux 后台运行启动脚本；预留超总额则拒绝；没配 `harbor_root` 和启动脚本时拒绝提交 |
 | `calib.harbor_root / student_launcher / teacher_launcher` | None | 启动脚本目录与脚本名（`./<launcher> run <作业配置>`）；未设置时只打印 `harbor run --config ...` |
 | `calib.student_agent / teacher_agent / environment` | None | Harbor 自定义 agent/环境的 `module:Class`；未设置用内置 `claude-code` agent 和 `docker` 环境 |
-| `calib.est_usd_per_run` | 20 | 每次校准作业的预留额，`calib-ingest` 用 Harbor `cost_usd` 冲销 |
+| `calib.est_usd_per_run` | 20 | 每次校准作业的预留额，`calib-ingest` 冲销：Harbor 报了 `cost_usd` 用实报（`reported`）；没报（如超时）用 trial 的 token 用量 × `models.prices[模型]` 估算（`tokens`，来源依次为 agent_result、trajectory.json、Claude Code stream-json）；都没有则保留预留额并标 `reservation`——它仍占用预留额度，但不算进 `run_usd_total` 的实际花费门。`tbsgen ledger` 的 `usd_by_cost_kind` 分开列出 |
 | `calib.teacher_available` | True | False：GLM 首次失败直接记 `parked:teacher_unavailable` |
 | `calib.prepared_tasks_dir` | None | 远端沙箱已注册模板的任务副本目录；设置后缺模板的条目不提交 |
+| `calib.prepare_command / prepare_cwd / prepare_timeout_s` | None / harbor_root / 3600 | 环境准备钩子：S9 写作业配置前对每题运行一次（bash），把 `pkg/` 变成 `<prepared_tasks_dir>/<item_id>`（如建镜像、注册沙箱模板、改写 task.toml）。占位符 `{item_id} {pkg} {out} {who}`（已 shell 转义），环境变量 `TBSGEN_ITEM_ID / TBSGEN_PKG / TBSGEN_PREPARED_DIR / TBSGEN_WHO`。结果连同 pkg 哈希记入 `calib/prepare.json`：同一 pkg 成功则复用、失败不自动重试（`tbsgen calib prepare` 重试），失败时条目 waiting 且不提交 |
+| `calib.teacher_environment / teacher_agent_allowed_hosts / teacher_harbor_root / teacher_prepared_tasks_dir` | None（沿用共享项） | 教师独立路由：教师作业用自己的 Harbor 环境、agent 阶段放行主机、启动脚本目录和准备副本目录；未设置时与学生共用 `environment / agent_allowed_hosts / harbor_root / prepared_tasks_dir` |
+| `calib.timeout_no_output / timeout_no_output_retries` | fail / 1 | 学生运行“超时且未交付”（`timeout_no_output`）的处理：`fail` 按普通失败（默认，标签规则不变）；`retry` 不计入决策、重跑学生（最多 N 次，用完后按失败计）；`park` 暂存 `parked:timeout_no_output` |
+| `calib.watch_interval_s` | 120 | `tbsgen calib watch` 轮询间隔 |
 | `fulltext.cascade` | cache → oa → elsevier → wiley → inst → browser | 下载级联顺序；每个通道有自己的 `enabled`，默认只开 cache 和 oa（见根 README「Full text (S3)」） |
 | `fulltext.write_cache_dir / ledger_path / queue_path` | `<run>/fulltext_cache`、`<run>/fulltext_ledger.sqlite`、`<run>/fulltext_queue.jsonl` | 写入缓存（含来源 json）、下载账本、浏览器队列 |
 | `fulltext.limits / global_limits / host_caps` | `dlledger.py` 中的默认值 | 每通道每天/每小时成功与尝试上限、同站点最小间隔、全局上限；429 冷却 6 小时，验证页冷却 24 小时 |
@@ -208,7 +217,11 @@ GLM-5.3 + Claude Code 2.1.280 先跑第 1 次：
 
 hard 和 unstable 保留。reward=1 一律算通过，即使之后报了 API 错误。没有 reward 的 API/沙箱异常算 `infra`，不计入次数，连续超过 2 次则暂存。`allow_submit=false` 时只写出作业配置和启动命令，由人执行；`true` 时先在账本预留、再后台启动。结果用 `calib-ingest` 回填。
 
-远端沙箱不执行 Dockerfile：提交前要为每题建好模板（可用"共享基础镜像 + 数据层"的薄镜像方式），并把准备好的任务副本目录配到 `calib.prepared_tasks_dir`。
+每次运行另记结果类型 `result_type`：`pass`、`fail_delivered`（交付了但没达标）、`fail_no_output`、`timeout_with_output`、`timeout_no_output`（超时且没写出交付文件，依据 verifier 的 `_solution_cli_run` 记录；无记录时按“已交付”处理）、`infra`。默认标签规则只看通过/失败；`calib.timeout_no_output` 可让“超时且未交付”的学生运行不单独决定结果（见 §4）。`release/manifest.jsonl` 每条带 `calib_runs`（每次运行的谁、结果类型、用时、费用及其类型）和 `result_types`。
+
+远端沙箱不执行 Dockerfile：提交前要为每题建好模板（可用"共享基础镜像 + 数据层"的薄镜像方式），并把准备好的任务副本目录配到 `calib.prepared_tasks_dir`；配 `calib.prepare_command` 后由 S9 对每题自动调用你的准备脚本。在 `allow_submit=false` 时写出的作业意图（指向 `pkg/`）在准备副本就绪后提交时会自动改指向准备副本。
+
+**只校准部分题**：把 `calib.allow_submit` 改为 true 后，`tbsgen run --only ID1,ID2`（或 `tbsgen calib watch --only ID1,ID2`）会推进这些 S9 waiting 且没有运行中作业的条目（未提交的意图、准备失败、提交被拒）；运行中的作业不会被重复提交，未列出的条目和其他暂停条目不受影响。预算/熔断暂停的条目用 `tbsgen resume --only ...` 单独恢复。之后用 `tbsgen calib watch --only ...` 等待作业结束、回填并推进（GLM → 教师 → 标签）。
 
 ## 6. 已验证 / 未验证
 
