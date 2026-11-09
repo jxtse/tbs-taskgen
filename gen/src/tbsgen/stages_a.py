@@ -96,7 +96,22 @@ def s4(P, it):
         write_json(it.p("S2_screen.json"), dict(rec, rescreened_at="S4"))
         if not rec["keep"]:
             return it.finish("dropped", rec["reason"])
-    rec = intake.probe(c, it.p("fulltext.txt").read_text(), read_json(it.p("S2_screen.json"), {}), P.cfg, P.tbs_index())
+    fulltext = it.p("fulltext.txt").read_text()
+    rec = intake.probe(c, fulltext, read_json(it.p("S2_screen.json"), {}), P.cfg, P.tbs_index())
+    if rec["feasible"] and resolve_role(P.cfg, "probe") == "jev":
+        try:
+            j = screen_jev.s4_feasibility(P.jev_client(), it, c, fulltext, P.cfg)
+        except (ModelError, BudgetStop) as e:
+            why = f"{getattr(e, 'cls', None) or 'budget'}:{getattr(e, 'reason', '') or ''}".rstrip(":")
+            P.store.event("probe_jev_unavailable", item=it.item_id, stage="S4", why=why, err=str(e)[:200])
+            if (P.cfg["probe"].get("jev") or {}).get("on_unavailable", "rules") == "park":
+                return it.finish("paused", f"model:jev_unavailable:{why}", paused_stage="S4")
+            j = dict(feasible=True, reasons=[], score=None, unavailable=why)
+        rec["jev"] = {k: v for k, v in j.items() if k != "cached"}
+        rec["method"] = rec["method"] + " + jev"
+        if not j["feasible"]:
+            rec["reasons"] = rec["reasons"] + j["reasons"]
+            rec["feasible"] = False
     write_json(it.p("S4_probe.json"), rec)
     if not rec["feasible"]:
         return it.finish("dropped", ",".join(rec["reasons"]))

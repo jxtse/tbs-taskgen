@@ -64,7 +64,7 @@ items/<item_id>/
 | S1 | 检索层输出（`tbsretr` 的 `papers` 或 `eval/raw/*.json` 的 `selected`）或候选 JSONL | `S1_candidate.json` | 无 | — |
 | S2 | 题录 + 摘要 | `S2_screen.json`（`score`、`keep`、`form_hint`、`method`、`reason`、`deferred`；Jev 模式另有各问题概率 `probabilities`、`decision`（keep/drop/uncertain）、`uncertain`、`jev_model`、`input_tokens`）；`S2_jev.json` 为按请求键缓存的 Jev 结果 | `roles.screen`：`rules`（默认）或 `jev`（TypeSafe Jev，失败回退规则） | `dropped: low_screen_score`（规则）/ `jev_*`（Jev）；无摘要时 `deferred`，S4 用全文开头重判 |
 | S3 | DOI、OA 链接 | `fulltext.txt` + `S3_fulltext.json` | 无 | `parked: fulltext_unavailable`，写 `S3_queue.json` 并加入全文队列；`tbsgen fetch` 取到后写入 `fulltext.txt` 并推进到 S4 |
-| S4 | 全文 + 筛选记录 | `S4_probe.json`（计算核心线索、与官方 70 题去重、形态禁令） | 规则（沙箱探针待定） | `dropped: no_compute_core / tbs_duplicate / interact_form_banned_until_isolation` |
+| S4 | 全文 + 筛选记录 | `S4_probe.json`（计算核心线索、与官方 70 题去重、形态禁令；Jev 模式另有 `jev`：可出题性各问题概率、`score`、`reasons`）；`S4_jev.json` 为按请求键缓存的 Jev 结果 | `roles.probe`：`rules`（默认）或 `jev`（全文开头 + 6 个可出题性问题，约 2k token/篇，≈$0.0001） | `dropped: no_compute_core / tbs_duplicate / interact_form_banned_until_isolation`；Jev：`jev_s4_no_self_contained_core / no_synthetic_truth / no_numeric_score / needs_restricted_resources` |
 | S5 | 全文摘录 + 探针卡 | `_spec/spec.json`、`depgraph.json`、`coverage.json`、`provenance.json` | Opus | 校验不过重试 1 次，仍不过 `dropped: spec_invalid` |
 | S6A | 规格 | `task/generator/`、`solution/`、`baselines/{mid,naive}.py`、`tests/measure.py` | Opus | 缺文件 `dropped` |
 | S6A_run | 工作树 | `S6A_measure.json`：两个种子下 ref/mid/naive 的实测指标 | 无（Docker） | 生成器或参考解失败 → S8 |
@@ -163,6 +163,7 @@ allow_submit = false
 | `gen.s6a_max_tokens / s6c_max_tokens / continue_calls` | 64000 / 48000 / 1 | 多文件输出上限；被截断时最多 1 次续写，只要缺的文件 |
 | `schedule.order` / `schedule.similar_title_jaccard` | round_robin / 0.5 | 条目推进顺序（每日调用上限下决定谁先进 S5）：`round_robin` 按 target 轮转、组内按 S2 分数，组内标题实词 Jaccard ≥ 0.5 的近似重复后排；`score` 全局按分数；`id` 旧行为 |
 | `fulltext.oa.europepmc_last / last_hosts / server_error_streak / server_error_cooldown_s` | True / ebi.ac.uk、europepmc.org / 5 / 1800 s | Europe PMC render（2026-11-08/09 有 38/49 次 HTTP 500）放到 OA 候选最后；同一站点连续 5 次 5xx 冷却 30 分钟，论文保持待取 |
+| `roles.probe` / `probe.jev` | rules / max_chars 6000、thresholds 空、on_unavailable rules | `jev`：S4 在规则探针通过后再问 Jev 可出题性（`screen_jev.S4_QUESTIONS`），阈值见 `screen_jev.S4_THRESHOLDS`（core≤0.20、synthetic≤0.40、numeric≤0.30、restricted≥0.70 丢弃）。离线评估（e2e-prod-20261109 的 111 篇，真实 Jev，$0.0097）：拦下 9 篇（深度学习 QSM 网络 3、纯理论 2、药物警戒统计 1、DES-Y3 数据分析 1、QC 报告工具 1、CMB 系统误差分析 1），3 篇入库题和 9 篇出题失败题均未被拦下。失败题无法用这些概率区分（S4 score 对入库/失败 AUC 0.26，样本仅 3 对 9），因此 S4 只去掉明显不合适的论文，其余交给 S6B 止损 |
 | `gen.mid_rework_max` | 1 | mid 不可区分时先由 S6M 只重写 `baselines/mid.py` |
 | `gen.back_to_spec_max` | 0 | S6M 后仍拉不开时回 S5 的次数（e2e-prod-20261109：回 S5 的 5 篇无一救回）；>0 时只对“差一点”生效 |
 | `gen.mid_far_above` | 2 | mid 失败判据数 ≥ max_mid_fail+此值（或全部判据且 ≥ max_mid_fail+1）直接丢弃 |

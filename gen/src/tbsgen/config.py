@@ -44,7 +44,8 @@ DEFAULTS: dict[str, Any] = {
         "cheap": None,                      # 待定: cheap-model role; None -> rules-only fallbacks
         "roles": {                          # stage role -> model alias ("teacher"/"cheap"/"rules"/explicit)
             "screen": "rules",              # S2: "rules" (rules-v2, intake.screen) | "jev" (TypeSafe Jev, screen.jev)
-            "probe": "rules",               # S4 (待定 cheap agent; sandbox repro not implemented in MVP)
+            "probe": "rules",               # S4: "rules" (rule probe + TB-Science dedup) | "jev" (+ Jev task-ability
+                                            # questions on the full-text opening, probe.jev; ~$0.0002 per paper)
             "spec": "teacher",              # S5
             "gen": "teacher",               # S6A
             "tests": "teacher",             # S6C
@@ -270,6 +271,13 @@ DEFAULTS: dict[str, Any] = {
         "tbs_tasks_root": None,             # TB-Science task texts (<task>/instruction.md ...); None -> no dedup
         "decontam_cos_max": 0.30,
         "min_method_hits": 2,
+        # roles.probe = "jev": screen_jev.S4_QUESTIONS on title + the first max_chars of the full text, decided by
+        # screen_jev.combine_s4 (thresholds overridable here).  Uses the screen.jev client settings (url, key, model).
+        "jev": {
+            "max_chars": 6000,
+            "thresholds": {},               # overrides of screen_jev.S4_THRESHOLDS
+            "on_unavailable": "rules",      # no key / API down: "rules" (keep the rule verdict) | "park"
+        },
     },
     "spec": {
         "allowed_forms": ["ANS", "PROG"],   # MVP; DOMF needs per-format readers; INTERACT banned until isolation (3rd phase)

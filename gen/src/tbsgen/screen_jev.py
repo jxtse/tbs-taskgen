@@ -125,6 +125,113 @@ QUESTIONS: dict[str, dict] = {
     },
 }
 
+# ------------------------------------------------------------------------------------------- S4 feasibility
+# S4 asks a second question set about task-ability, on the full text's opening (title + abstract + introduction):
+# S2 (abstract only) says "is this a computational method paper"; every paper that reaches S4 already is one, and
+# in e2e-prod-20261109 the S2 probabilities of the 3 released and the 9 failed papers were indistinguishable
+# (P(method) 0.87-0.93, P(single machine) 0.91-0.97).  These questions target why generated tasks failed.
+S4_QUESTIONS_VERSION = "jev-s4-q1"
+S4_QUESTIONS: dict[str, dict] = {
+    "self_contained_core": {
+        "type": "noul",
+        "instructions": "Could the core algorithm of `paper` be re-implemented from scratch in a few hundred lines of "
+                        "Python with numpy/scipy, without the authors' code or another large software package?",
+        "criteria": {
+            "true": "The method is a self-contained algorithm or estimator (e.g. a fitting procedure, a numerical "
+                    "transform, a filtering or unwrapping algorithm) described in enough detail to code.",
+            "false": "The contribution lives inside a large code base (a full Boltzmann solver, an N-body or "
+                     "hydrodynamics simulation, a deep network), or the paper mainly reports results of such code.",
+        },
+    },
+    "synthetic_truth": {
+        "type": "noul",
+        "instructions": "Could a short program simulate input data for the method in `paper` together with the true "
+                        "answer, so that the method's output can be checked against that known truth?",
+    },
+    "numeric_score": {
+        "type": "noul",
+        "instructions": "Does the method in `paper` produce numbers (estimates, reconstructions, spectra, labels) whose "
+                        "accuracy against a known truth can be measured objectively with an error or accuracy metric?",
+    },
+    "graded_steps": {
+        "type": "noul",
+        "instructions": "Does the method in `paper` combine several distinct steps such that leaving out one key step "
+                        "still gives a usable but measurably less accurate result?",
+    },
+    "simple_baseline_worse": {
+        "type": "noul",
+        "instructions": "Is there a simple standard approach to the same problem as `paper` (a textbook or default "
+                        "method) that gives clearly less accurate results than the paper's method?",
+    },
+    "needs_restricted_resources": {
+        "type": "noul",
+        "instructions": "Does reproducing the core computation of `paper` need proprietary or restricted data, a "
+                        "special instrument, a GPU cluster or supercomputer, or many hours of compute?",
+    },
+}
+# Decision (combine_s4): drop when the probability that the paper is task-able is low on a hard requirement.
+# Defaults are conservative, set on e2e-prod-20261109 (111 papers that had passed the rule probe; offline run with
+# real Jev answers, gen/README.md): they drop 9/111 (deep-learning QSM nets, pure theory, a pharmacovigilance study,
+# a DES-Y3 data analysis, a QC-report tool), none of the 3 released or the 9 failed generated tasks.  The failed
+# tasks are NOT separable by these answers (their S4 score is not lower than the released ones'): S4 removes
+# clearly unsuitable papers, the S6B early stops handle the rest.  The soft questions (graded_steps,
+# simple_baseline_worse) only enter the S4 score (recorded, not used for decisions).
+S4_THRESHOLDS = {
+    "core_no": 0.20,           # released task 836a87 (PT extension of CLASS) scored 0.25: keep a margin
+    "synthetic_no": 0.40,      # 0.35-0.38 only on two pure-theory papers; next lowest 0.62
+    "numeric_no": 0.30,
+    "restricted_yes": 0.70,    # 0.76 on a DES-Y3 data analysis; next highest 0.65
+}
+S4_HARD = (("self_contained_core", "core_no", "jev_s4_no_self_contained_core"),
+           ("synthetic_truth", "synthetic_no", "jev_s4_no_synthetic_truth"),
+           ("numeric_score", "numeric_no", "jev_s4_no_numeric_score"))
+
+
+def combine_s4(p: dict, th: dict | None = None) -> dict:
+    """S4 probabilities -> dict(feasible, reasons, score).  A missing answer never drops."""
+    th = dict(S4_THRESHOLDS, **(th or {}))
+    reasons = [why for q, k, why in S4_HARD if p.get(q) is not None and p[q] <= th[k]]
+    if p.get("needs_restricted_resources") is not None and p["needs_restricted_resources"] >= th["restricted_yes"]:
+        reasons.append("jev_s4_needs_restricted_resources")
+    vals = [p.get(q) for q in ("self_contained_core", "synthetic_truth", "numeric_score", "graded_steps",
+                               "simple_baseline_worse")]
+    score = None
+    if all(v is not None for v in vals) and p.get("needs_restricted_resources") is not None:
+        score = 1.0
+        for v in vals:
+            score *= v
+        score = round(score * (1 - p["needs_restricted_resources"]), 4)
+    return dict(feasible=not reasons, reasons=reasons, score=score)
+
+
+def build_s4_state(c: dict, fulltext: str, max_chars: int = 6000) -> dict:
+    """Title + the full text's opening (whitespace collapsed: PDF text has long runs of spaces)."""
+    head = " ".join((fulltext or "")[: max_chars * 3].split())[:max_chars]
+    return {"paper": {"title": c.get("title") or "", "full_text_opening": head}}
+
+
+S4_CACHE = "S4_jev.json"
+
+
+def s4_feasibility(client: "JevClient", it, c: dict, fulltext: str, cfg: dict) -> dict:
+    """Jev S4 record for one item (cached per request key in S4_jev.json; may raise ModelError / BudgetStop)."""
+    from .state import read_json, write_json
+    pj = cfg["probe"].get("jev") or {}
+    state = build_s4_state(c, fulltext, int(pj.get("max_chars", 6000)))
+    rk = request_key(client.name, state, S4_QUESTIONS_VERSION)
+    cache = read_json(it.p(S4_CACHE), {}) or {}
+    if rk in cache:
+        return dict(cache[rk], cached=True)
+    r = client.ask(state, stage="S4", item=it.item_id, questions=S4_QUESTIONS)
+    p = probabilities(r["answers"])
+    dec = combine_s4(p, pj.get("thresholds"))
+    rec = dict(dec, probabilities=p, jev_model=r["model"], questions_version=S4_QUESTIONS_VERSION,
+               input_tokens=r["usage"]["input_tokens"], usd=r.get("usd"), request_key=rk)
+    cache[rk] = rec
+    write_json(it.p(S4_CACHE), cache)
+    return rec
+
+
 # ------------------------------------------------------------------------------------------- thresholds
 # Noul probabilities: >= YES reads as yes, <= NO reads as no, between = not settled.  Start values follow the
 # TypeSafe guidance (0.7 / 0.3) and were not tuned.  The one tuned value is `joint_no`: chosen on the dev half
@@ -221,8 +328,8 @@ def build_state(c: dict, fulltext_head: str | None = None, max_chars: int = 4000
     return {"paper": paper}
 
 
-def request_key(model: str, state: dict) -> str:
-    h = hashlib.sha256(json.dumps([model, QUESTIONS_VERSION, state], sort_keys=True).encode()).hexdigest()
+def request_key(model: str, state: dict, questions_version: str = QUESTIONS_VERSION) -> str:
+    h = hashlib.sha256(json.dumps([model, questions_version, state], sort_keys=True).encode()).hexdigest()
     return h[:16]
 
 
@@ -261,11 +368,13 @@ class JevClient:
             raise ModelError("auth", f"env {self.j.get('key_env')} not set (inject it from your secret store)")
         return k
 
-    def ask(self, state: dict, *, stage: str, item: str = "") -> dict:
+    def ask(self, state: dict, *, stage: str, item: str = "", questions: dict | None = None) -> dict:
         key = self.key()                 # missing key: no ledger row, caller falls back / parks
-        body = json.dumps({"model": self.name, "state": state, "questions": QUESTIONS}).encode()
+        qs = QUESTIONS if questions is None else questions
+        qv = QUESTIONS_VERSION if questions is None else S4_QUESTIONS_VERSION if questions is S4_QUESTIONS else "custom"
+        body = json.dumps({"model": self.name, "state": state, "questions": qs}).encode()
         est = float(self.j.get("est_usd_per_call", 0.001))
-        cid = self.ledger.reserve(self.name, stage, item, True, request_key(self.name, state), est_usd=est)
+        cid = self.ledger.reserve(self.name, stage, item, True, request_key(self.name, state, qv), est_usd=est)
         t0 = time.time()
         hdr = {"Authorization": "Bearer " + key, "Content-Type": "application/json"}
         attempts, max_retries = 0, int(self.j.get("max_retries", 4))
