@@ -60,9 +60,9 @@ def generate(cfg: dict, task: Path, seed: int, out: Path) -> dict:
 TEST_SH = """#!/bin/bash
 set -uo pipefail
 mkdir -p /logs/verifier
-rm -f /logs/verifier/reward.txt
 cd /tests
 python /tests/_metrics.py --reap >/dev/null 2>&1
+rm -rf /logs/verifier/reward.txt /logs/verifier/reward.json /logs/verifier/metrics.jsonl
 python -m pytest -q -p no:cacheprovider /tests/test_outputs.py
 rc=$?
 if ! python /tests/_metrics.py --finalize-reward "$rc"; then
@@ -91,6 +91,10 @@ def metrics_helper_text(cfg: dict, spec: dict | None) -> str:
     src = METRICS_HELPER.read_text()
     if REPEATS_LINE not in src:
         raise RuntimeError("templates_metrics.py: TIMING_REPEATS marker line missing")
+    vt = "VERIFIER_TIMEOUT_SEC = 900.0  # tbsgen:verifier_timeout"
+    if vt not in src:
+        raise RuntimeError("templates_metrics.py: VERIFIER_TIMEOUT_SEC marker line missing")
+    src = src.replace(vt, f"VERIFIER_TIMEOUT_SEC = {float(cfg['package']['verifier_timeout'])!r}  # tbsgen:verifier_timeout")
     return src.replace(REPEATS_LINE, f"TIMING_REPEATS = {timing_repeats(cfg, spec)}  # tbsgen:timing_repeats")
 
 

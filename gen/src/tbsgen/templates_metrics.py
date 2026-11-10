@@ -178,7 +178,10 @@ def _lock_logs(uid):
     for name in os.listdir(LOGS):
         q = os.path.join(LOGS, name)
         qs = os.lstat(q)
-        if qs.st_uid == uid or os.path.islink(q):
+        if qs.st_uid == 0 and not os.path.islink(q) and os.path.isfile(q) and qs.st_nlink == 1:
+            os.chmod(q, qs.st_mode & 0o7755 & ~0o022)        # root's own files (metrics.jsonl): no group/other write
+            continue
+        if qs.st_uid != 0 or os.path.islink(q) or not os.path.isdir(q):
             if os.path.isdir(q) and not os.path.islink(q):
                 import shutil
                 shutil.rmtree(q)
@@ -313,6 +316,8 @@ def _no_new_privs():
 
 
 WRITABLE_ROOTS = ("/app", "/tmp", "/var/tmp", "/dev/shm")
+VERIFIER_TIMEOUT_SEC = 900.0  # tbsgen:verifier_timeout
+_T0 = time.time()
 TIMING_BUDGET_SEC = 300.0     # total wall time of the extra timed runs per verifier session (stays well inside
 _TIMING_SPENT = [0.0]         # the verifier timeout); a set whose repeats would exceed it is timed once
 
@@ -395,7 +400,8 @@ def _leftover_state(before, uid, skip):
     after = _state_snapshot(uid, skip)
     if before is None or after is None:
         return ["state snapshot unavailable"]
-    changed = [q for q, v in after.items() if q in before and before[q] != v]
+    changed = [q for q, v in after.items() if q in before and before[q] != v] + \
+        [q for q in before if q not in after]            # a deleted pre-existing entry: a repeat would see less
     new = [q for q, v in after.items() if q not in before]
     for q in sorted(new, key=len, reverse=True):
         if q.startswith("sysvipc:"):
@@ -507,8 +513,15 @@ def run_solution(timeout_sec, input_dir=HIDDEN, entry=ENTRY):
     rc, err, sec, left = _run_once(entry, input_dir, out, timeout_sec, sb)
     times, why = [sec], None
     if n_rep > 1 and rc == 0 and not left:
-        if _TIMING_SPENT[0] + sec * (n_rep - 1) > TIMING_BUDGET_SEC:
-            why = f"first run {sec:.1f}s: repeats would exceed the {TIMING_BUDGET_SEC:.0f}s timing budget"
+        try:
+            rest = [d for d in hidden_sets() if os.path.abspath(d) != os.path.abspath(input_dir)
+                    and (entry, d) not in _CACHE]
+        except OSError:
+            rest = []
+        need = (time.time() - _T0) + sec * (n_rep - 1) + sec * len(rest) * 1.5    # sets still to run, once each
+        if _TIMING_SPENT[0] + sec * (n_rep - 1) > TIMING_BUDGET_SEC or need > 0.6 * VERIFIER_TIMEOUT_SEC:
+            why = (f"first run {sec:.1f}s: repeats would exceed the timing budget ({TIMING_BUDGET_SEC:.0f}s extra, "
+                   f"60% of the {VERIFIER_TIMEOUT_SEC:.0f}s verifier timeout incl. {len(rest)} sets still to run)")
         elif sb is not None:
             ch = _leftover_state(before, sb[0], skip)
             if ch:

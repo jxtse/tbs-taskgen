@@ -538,3 +538,33 @@ def test_timing_repeats_skip_reused_state(tmp_path):
     runs = [x for x in t["metrics"] if x.get("name") == "_solution_cli_run"]
     assert runs and runs[0]["timing_repeats"] == 1 and runs[0]["timing_repeats_skipped"], runs
 
+
+def test_timing_repeats_skip_when_first_run_deletes_state(tmp_path):
+    """Codex r1: a correct CLI that consumes (deletes) a pre-existing scratch file must not be failed by repeats
+    that no longer find it: deletion counts as a state change -> first run's time only, rc 0."""
+    from tbsgen import runner
+    cfg = load_config(None, {"run": {"root": str(tmp_path)}})
+    cli = ("import os, sys\nos.makedirs(sys.argv[2], exist_ok=True)\np = '/app/output/once.txt'\n"
+           "open(p).read(); os.unlink(p)\nopen(os.path.join(sys.argv[2], 'o.txt'), 'w').write('x')\n")
+    task, gen, ref = _attack_task(tmp_path, cli)
+    (ref / "once.txt").write_text("1")
+    t = runner.test(cfg, task, gen, ref, tmp_path / "work", "del")
+    runs = [x for x in t["metrics"] if x.get("name") == "_solution_cli_run"]
+    assert runs and runs[0]["rc"] == 0 and runs[0]["timing_repeats"] == 1 and runs[0]["timing_repeats_skipped"], runs
+    assert t["reward"] == "1", t["out"][-600:]
+
+
+def test_repeats_cannot_copy_scored_outputs(tmp_path):
+    """Codex r1: a repeat that copies the first run's output dir instead of computing must not be timed as fast:
+    the scored outputs are root-only before the repeats, so the copy fails (outputs differ -> first run only)."""
+    from tbsgen import runner
+    cfg = load_config(None, {"run": {"root": str(tmp_path)}})
+    cli = ("import glob, os, shutil, sys, time\nout = sys.argv[2]\n"
+           "prev = [d for d in glob.glob('/tmp/sol-*') if d != out and os.path.exists(os.path.join(d, 'o.txt'))]\n"
+           "try:\n    shutil.copy(os.path.join(prev[0], 'o.txt'), os.path.join(out, 'o.txt'))\n"
+           "except Exception:\n    time.sleep(1.0)\n    open(os.path.join(out, 'o.txt'), 'w').write('x')\n")
+    task, gen, ref = _attack_task(tmp_path, cli)
+    t = runner.test(cfg, task, gen, ref, tmp_path / "work", "copy")
+    runs = [x for x in t["metrics"] if x.get("name") == "_solution_cli_run"]
+    assert runs and runs[0]["rc"] == 0 and runs[0]["value"] >= 0.9, runs
+

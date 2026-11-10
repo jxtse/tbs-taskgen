@@ -1150,3 +1150,18 @@ def test_exploit_only_repair_path(tmp_path):
     assert gates.exploit_patch_problems(task, {"tests/test_outputs.py": "y"})
     assert gates.exploit_patch_problems(task, {"solution/solve.py": "y"})
     assert gates.exploit_patch_problems(task, {"baselines/mid.py": "y"})
+
+
+def test_delivered_ignores_non_object_metric_lines(tmp_path):
+    """Codex r1: a planted `null` line in metrics.jsonl must not crash calibration ingest."""
+    v = tmp_path / "verifier"
+    v.mkdir()
+    (v / "metrics.jsonl").write_text('null\n[1]\n{"name": "_solution_cli_run", "rc": 0, "entry_exists": true}\n')
+    assert calib.delivered(tmp_path) is True
+
+
+def test_metrics_helper_gets_verifier_timeout():
+    from tbsgen import runner
+    cfg = load_config(None, {"package": {"verifier_timeout": 1200}})
+    assert "VERIFIER_TIMEOUT_SEC = 1200.0  # tbsgen:verifier_timeout" in runner.metrics_helper_text(cfg, None)
+
