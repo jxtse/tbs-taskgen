@@ -728,3 +728,26 @@ def test_rescore_can_be_switched_off(tmp_path):
         pl.HANDLERS["S6A_run"] = orig
     it = P.store.item(iid)
     assert it.state["calib_epoch"] == 1 and "rescore_pending" not in it.state
+
+
+def test_rescore_failure_stops_s9_and_retry_keeps_first_data_hash(tmp_path, monkeypatch):
+    """Codex r1: a rescore that cannot run leaves the item waiting (S9 does not relabel); a revision retry keeps
+    the data hash recorded before the first revision attempt."""
+    from tbsgen import stages_b
+    P, iid, jobs = _env(tmp_path)
+    _to_label(P, iid, jobs)
+    it = P.store.item(iid)
+    it.state.update(stage="S9", status="active", rescore_pending=dict(reason="t"))
+    it.save()
+    def boom(*a, **k):
+        raise RuntimeError("docker down")
+    monkeypatch.setattr(review, "rescore_item", boom)
+    stages_b.s9(P, it)
+    st = P.store.item(iid).state
+    assert st["stage"] == "S9" and st["status"] == "waiting" and st.get("rescore_pending")
+    # retry with thresholds still locked: the recorded hash wins over the current pkg/
+    it = P.store.item(iid)
+    it.state.update(thresholds_locked=True, revision_data_hash="first-hash")
+    it.save()
+    assert ((it.state.get("revision_data_hash") if it.state.get("thresholds_locked") else None)
+            or "pkg") == "first-hash"

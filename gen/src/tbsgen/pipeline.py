@@ -218,8 +218,11 @@ class Pipeline:
         progress = True
         if last is None or last >= _stage_pos("S2"):    # the S2 Jev prefetch is S2 work
             if self.cfg["screen"].get("blocklist"):
-                # trial papers the fetch queue delivered since S3 parked them count as successes now
+                # trial papers the fetch queue delivered since S3 parked them count as successes now; then this
+                # week's trial quota picks papers an earlier week's S2 dropped by a rule
                 blocklist.reevaluate(self.store, self.cfg, self.store.event)
+                if not only:
+                    blocklist.revive_for_trials(self.store, self.cfg, self.store.event)
             self.prefetch_screen(only)
 
         rewoken: set[str] = set()

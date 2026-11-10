@@ -127,7 +127,8 @@ def run_gates(cfg: dict, item_dir: Path, spec: dict, thresholds: dict, attempt: 
                            reward=t.get("reward"), n_checks=t["n_checks"], n_failed=t["n_failed"], failed=t["failed"],
                            out_files=sum(1 for p in od.rglob("*") if p.is_file()) if od.exists() else 0,
                            metrics=[{k: m.get(k) for k in ("name", "value", "threshold", "direction", "passed", "aux",
-                                                            "rc", "wall_times") if k in m}
+                                                            "rc", "wall_times", "gated", "threshold_effective",
+                                                            "speed_ratio") if k in m}
                                     for m in t["metrics"]])
         ref = sd["ref"]
         ok["oracle"] &= ref["passed"] and ref["solve_rc"] == 0
@@ -146,8 +147,9 @@ def run_gates(cfg: dict, item_dir: Path, spec: dict, thresholds: dict, attempt: 
                 continue
             if m.get("gated") is False:
                 continue        # recorded-only resource metric: never decides a run, no margin to demand
-            room = (m["threshold"] - m["value"]) if m["direction"] == "<=" else (m["value"] - m["threshold"])
-            if room < 0.5 * cfg["thresholds"]["min_ref_margin"] * max(abs(m["threshold"]), 1e-12):
+            th = m.get("threshold_effective", m["threshold"])          # machine-speed scaled time threshold
+            room = (th - m["value"]) if m["direction"] == "<=" else (m["value"] - th)
+            if room < 0.5 * cfg["thresholds"]["min_ref_margin"] * max(abs(th), 1e-12):
                 ok["oracle_margin"] = False
         if spec.get("form") == "PROG":
             hid = gen / "tests" / "hidden"

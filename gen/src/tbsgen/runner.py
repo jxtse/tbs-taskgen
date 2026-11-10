@@ -98,6 +98,17 @@ def resource_gating(cfg: dict, spec: dict | None) -> bool:
     return bool((spec or {}).get("resource_metric_gating"))
 
 
+def speed_ratio(cfg: dict, here: float | None, base: float | None) -> float:
+    """The verifier's machine-speed ratio (templates_metrics.check): here / base, 1 within the deadband, clamped to
+    [0.25, 8]; 1 when either is unknown."""
+    if not here or not base or here <= 0 or base <= 0:
+        return 1.0
+    r = float(here) / float(base)
+    if abs(r - 1.0) <= float((cfg.get("thresholds") or {}).get("speed_deadband", 0.1)):
+        return 1.0
+    return min(8.0, max(0.25, r))
+
+
 def resource_metric_kinds(spec: dict | None) -> dict | None:
     """{metric name: "time" | "memory"} for the spec's resource metrics (tbsgen.spec.is_resource_metric), the
     verifier's resource list; None without a spec (the template then applies the same name rule itself)."""
@@ -214,7 +225,9 @@ def speed_bench(cfg: dict, task: Path, gen: Path, work: Path, seed) -> float | N
     logs = work / f"mlogs-bench{seed}"
     logs.mkdir(parents=True, exist_ok=True)
     logs.chmod(0o777)
-    r = sandbox.run(cfg, [(tests, "/src/tests", "ro"), (logs, "/logs/verifier", "rw"),
+    out = work / f"mout-bench{seed}"                  # VERIFIER_PRE copies /src/output: an empty one
+    out.mkdir(parents=True, exist_ok=True)
+    r = sandbox.run(cfg, [(out, "/src/output", "ro"), (tests, "/src/tests", "ro"), (logs, "/logs/verifier", "rw"),
                           (gen / "environment" / "data", "/src/data", "ro")],
                     VERIFIER_PRE + "python /tests/_metrics.py --speed-bench", 300,
                     f"tbsgen-bench-{seed}", root=True)

@@ -111,9 +111,9 @@ def target_share(store, c: dict, rules: list[dict], rule: dict, lifted: set[str]
     n = m = 0
     for it in store.items():
         cc = json.loads(it.p("S1_candidate.json").read_text()) if it.p("S1_candidate.json").exists() else {}
-        if str(cc.get("_target") or cc.get("target") or "") != tgt or not cc.get("doi"):
+        if str(cc.get("_target") or cc.get("target") or "") != tgt:
             continue
-        n += 1
+        n += 1                                                   # every candidate of the target, DOI or not
         r = match(cc, rules, lifted - {rule.get("name")})      # this rule counts even when lifted elsewhere
         if r is not None and (r.get("name") or r.get("doi_prefix")) == (rule.get("name") or rule.get("doi_prefix")):
             m += 1
@@ -148,6 +148,53 @@ def decide(store, cfg: dict, c: dict, rules: list[dict], rule: dict, event) -> d
         return dict(action="trial", share=share)
     save_state(store, st)
     return dict(action="block", share=share)
+
+
+def revive_for_trials(store, cfg: dict, event) -> list[str]:
+    """Weekly re-scheduling: papers S2 dropped by a rule (reason "blocklist:<rule>") in an earlier week are the
+    trial pool.  For every rule that is not lifted and still has quota this ISO week, put up to the remaining quota
+    of them back to S2 (active); S2's decide() then books the trial (share and quota re-checked there)."""
+    rules = (cfg.get("screen") or {}).get("blocklist") or []
+    if not rules:
+        return []
+    rc = (cfg.get("screen") or {}).get("blocklist_recheck") or {}
+    quota = int(rc.get("weekly_quota", 5))
+    st = load_state(store)
+    week = _iso_week()
+    out = []
+    items = None
+    for rule in rules:
+        name = rule.get("name") or rule.get("doi_prefix")
+        r = (st.get("rules") or {}).get(name) or {}
+        if r.get("lifted"):
+            continue
+        left = quota - int((r.get("weeks") or {}).get(week, 0))
+        if left <= 0:
+            continue
+        tried = {t.get("item") for t in r.get("trials") or []}
+        items = items if items is not None else store.items()
+        pool = [it for it in items if it.state.get("status") == "dropped" and it.state.get("stage") == "S2"
+                and it.state.get("reason") == f"blocklist:{name}" and it.item_id not in tried
+                and it.item_id not in out]
+        cache = _SHARE_CACHE.setdefault(id(store), {})
+        lifted = lifted_rules(st)
+        ok_share = []
+        for it in pool:                        # only papers decide() would make a trial (no revive/drop churn)
+            if len(ok_share) >= left:
+                break
+            c = json.loads(it.p("S1_candidate.json").read_text()) if it.p("S1_candidate.json").exists() else {}
+            sh = target_share(store, c, rules, rule, lifted, cache)
+            if sh is not None and sh > float(rc.get("min_share", 0.10)):
+                ok_share.append(it)
+        for it in ok_share:
+            it.state.setdefault("history", []).append(dict(stage="S2", result="blocklist_recheck", rule=name,
+                                                           week=week, ts=time.time()))
+            it.state.update(status="active")
+            it.state.pop("reason", None)
+            it.save()
+            out.append(it.item_id)
+            event("blocklist_revived", rule=name, item=it.item_id, week=week)
+    return out
 
 
 def resolve(store, item, void: str | None = None) -> None:

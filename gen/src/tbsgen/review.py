@@ -312,7 +312,9 @@ def build_task(cfg: dict, item_dir: Path, state: dict, rnd: int, out: Path | Non
     (out / "task.toml").write_text("\n".join(lines) + "\n")
     (out / "instruction.md").write_text(instruction(cfg, item_dir, state, rnd, info))
     (out / "tests").mkdir()
-    (out / "tests" / "s9r_validate.py").write_text(VALIDATOR.replace("{problems}", repr(sorted(PROBLEM_CLASSES))))
+    verdicts = list(VERDICTS) + (list(ALLOWED_HUMAN) if (cfg.get("review") or {}).get("allow_human") else [])
+    (out / "tests" / "s9r_validate.py").write_text(VALIDATOR.replace("{problems}", repr(sorted(PROBLEM_CLASSES)))
+                                                   .replace("{verdicts}", repr(verdicts)))
     (out / "tests" / "test.sh").write_text(TEST_SH)
     (out / "tests" / "test.sh").chmod(0o755)
     (out / "solution").mkdir()
@@ -352,10 +354,11 @@ except Exception as e:
     print("verdict.json missing or not JSON:", e); sys.exit(1)
 errs = []
 PROBLEMS = {problems}
+VERDICTS = {verdicts}
 if not isinstance(v, dict):
     print("verdict.json is not an object"); sys.exit(1)
-if v.get("verdict") not in ("pass", "revise", "drop"):
-    errs.append("verdict must be pass|revise|drop")
+if v.get("verdict") not in VERDICTS:
+    errs.append("verdict must be " + "|".join(VERDICTS))
 if not isinstance(v.get("issues", []), list):
     errs.append("issues must be a list")
 for i, it in enumerate(v.get("issues") or [] if isinstance(v.get("issues", []), list) else []):
@@ -559,6 +562,8 @@ def normalize(raw: dict | None, reward: float | None = None, allow_human: bool =
         return dict(verdict=None, raw_verdict=None, issues=[], blocking=[], minor=[], downgraded=[], escalated=[],
                     label_assessment={}, checklist={}, summary="", problems=["no verdict"])
     rv = raw.get("verdict")
+    if not isinstance(rv, (str, type(None))):
+        rv = repr(rv)[:40]                                     # unhashable / odd type: an unknown verdict
     issues, downgraded, escalated, hard = [], [], [], []      # hard: structural problems -> invalid verdict
     if not isinstance(raw.get("issues", []), list):
         problems.append("issues is not a list")
@@ -589,7 +594,10 @@ def normalize(raw: dict | None, reward: float | None = None, allow_human: bool =
         if it["severity"] == "blocking":
             pc = it.get("problem")
             fk = it.get("fix_kind")
-            if pc in PROBLEM_CLASSES:
+            if not isinstance(pc, (str, type(None))) or not isinstance(fk, (str, type(None))):
+                problems.append(f"{it['id']}: problem / fix_kind must be strings")
+                hard.append(it["id"])
+            elif pc in PROBLEM_CLASSES:
                 if fk is not None and fk != PROBLEM_CLASSES[pc]:
                     problems.append(f"{it['id']}: fix_kind {fk!r} contradicts problem {pc!r} -> "
                                     f"{PROBLEM_CLASSES[pc]}")
@@ -971,8 +979,8 @@ def summary(P, sample_n: int = 3, seed: int = 0) -> dict:
     for it in P.store.items():
         st = it.state
         verdicts = sorted(it.p("review").glob("r*/*.verdict.json")) if it.p("review").exists() else []
-        if not verdicts:
-            continue
+        if not verdicts and not it.p("review", "runs.json").exists():
+            continue                                  # never reviewed
         v = read_json(it.p("review", "verdict.json"), None) or {}
         nv = v.get("_normalized") or {}
         verdict = nv.get("verdict")

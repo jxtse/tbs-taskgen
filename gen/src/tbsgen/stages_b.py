@@ -316,7 +316,8 @@ def _rescore_pending(P, it):
         try:
             res = review.rescore_item(P.cfg, it.dir, runs)
         except Exception as e:                       # sandbox / docker down: not an attempt
-            return it.finish("waiting", f"rescore blocked: {str(e)[:200]}")
+            it.finish("waiting", f"rescore blocked: {str(e)[:200]}")
+            return "stop"
         write_json(it.p("calib", "rescore.json"), dict(pend, keep=res["keep"], checked=res["checked"],
                                                        missing=res["missing"], changed=res["changed"],
                                                        details=res["details"], ts=time.time()))
@@ -326,8 +327,9 @@ def _rescore_pending(P, it):
         if not res["keep"]:
             _archive_calibration(it)
             it.state.pop("calib_label", None)
-            return it.goto("S9", f"rescore: {len(res['missing'])} deliverable(s) missing, "
-                                 f"{len(res['changed'])} outcome(s) changed under the new grader; recalibrating")
+            it.goto("S9", f"rescore: {len(res['missing'])} deliverable(s) missing, "
+                          f"{len(res['changed'])} outcome(s) changed under the new grader; recalibrating")
+            return "stop"
     else:
         it.state.pop("rescore_pending", None)
     return None
@@ -364,9 +366,8 @@ def s9(P, it):
 def _s9(P, it):
     c = P.cfg["calib"]
     if it.state.get("rescore_pending"):
-        r = _rescore_pending(P, it)
-        if r is not None:
-            return r
+        if _rescore_pending(P, it) is not None:
+            return None                     # waiting (sandbox trouble) or sent back to S9 to recalibrate
     runs = read_json(it.p("calib", "runs.json"), [])
     for rec in runs:                                         # reconcile interrupted submissions
         if rec.get("outcome") is None and rec.get("state") in ("intent", "reserved"):
@@ -889,6 +890,8 @@ def _route_review(P, it, rec: dict, rnd: int):
             return it.advance("S9R", "S10", review="pass", round=rnd)
         return it.finish("parked", f"{label} (review r{rnd}: pass)")
     withdraw(P, it.item_id, f"review r{rnd}: {verdict}")
+    if verdict == "human":                  # only reachable behind review.allow_human (explicit opt-in)
+        return it.finish("parked", f"review:human r{rnd} ({','.join(norm.get('blocking') or [])})")
     if verdict == "revise" and int(it.state.get("review_revisions", 0)) >= int(rv.get("max_revisions", 3)):
         return it.finish("dropped", f"review:drop r{rnd} (revision limit {rv.get('max_revisions', 3)}: "
                                     f"{','.join(norm.get('blocking') or [])})")
@@ -1024,7 +1027,10 @@ def _s8_review_locked_(P, it):
             shutil.copy2(task / rel, d / "before" / rel)
     shutil.copy2(it.p("thresholds.json"), d / "thresholds.locked.json")
     # the reviewed package's data / hidden inputs / truth: the revised package must carry the same (PKG checks)
-    data = review.pkg_data_hash(it.p("pkg"))
+    # a retry after a failed revision (thresholds still locked) keeps the hash recorded before the first attempt:
+    # pkg/ may already hold the rejected attempt's data, which must never become the new baseline
+    data = (it.state.get("revision_data_hash") if it.state.get("thresholds_locked") else None) or \
+        review.pkg_data_hash(it.p("pkg"))
     rescore = bool(rv.get("rescore_scoring_only", True)) and review.scoring_only(patch)
     pend = dict(n=n + 1, dir=str(d), round=rnd, epoch=int(it.state.get("calib_epoch", 0)) + 1, data_hash=data,
                 archive=not rescore, files=sorted(patch))
@@ -1054,5 +1060,5 @@ def _finish_revision(P, it, pend: dict):
     it.state.pop("repair_from", None)
     it.state.pop("review_revision_pending", None)
     P.store.event("review_revision_applied", item=it.item_id, round=pend["round"], files=sorted(patch),
-                  calib_epoch=it.state["calib_epoch"], scoring_only=not pend.get("archive", True))
+                  calib_epoch=it.state.get("calib_epoch", 0), scoring_only=not pend.get("archive", True))
     it.goto("S6A_run", f"review revision {pend['n']} (r{pend['round']})")      # one atomic save

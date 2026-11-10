@@ -341,15 +341,28 @@ def _s6b_locked(P, it, spec, meas):
     fresh = set_thresholds(spec, meas, P.cfg)
     cmp_ = review.lock_compare(old["thresholds"], fresh["thresholds"])
     bench = [v for v in (meas.get("speed_bench") or {}).values() if isinstance(v, (int, float))]
-    if bench and old is not None and "speed_bench_sec" not in old:
-        old["speed_bench_sec"] = sorted(bench)[len(bench) // 2]
+    here = sorted(bench)[len(bench) // 2] if bench else None
+    base = old.get("speed_bench_sec") if isinstance(old.get("speed_bench_sec"), (int, float)) else None
+    if here and base is None:
+        old["speed_bench_sec"] = base = here
         old["speed_bench_source"] = "backfilled by the locked re-measurement on this host"
         write_json(it.p("thresholds.json"), old)
+    # the verifier's policy, applied to the re-measurement: resource metrics decide only with
+    # spec.resource_metric_gating, and time thresholds scale with this host's speed (the locked literal stays)
+    kinds = runner.resource_metric_kinds(spec) or {}
+    gating = runner.resource_gating(P.cfg, spec)
+    ratio = runner.speed_ratio(P.cfg, here, base)
     fails = {}
     for k, v in old["thresholds"].items():
+        kind = kinds.get(k)
+        if kind and not gating:
+            continue                                    # recorded only: never fails the revision
+        thr = v["threshold"]
+        if kind == "time":
+            thr = thr * ratio if v["direction"] == "<=" else thr / ratio
         for s, vals in (meas.get("ref") or {}).items():
             x = (vals or {}).get(k)
-            ok = isinstance(x, (int, float)) and (x <= v["threshold"] if v["direction"] == "<=" else x >= v["threshold"])
+            ok = isinstance(x, (int, float)) and (x <= thr if v["direction"] == "<=" else x >= thr)
             if not ok:
                 fails.setdefault(k, {})[s] = x
     write_json(it.p("thresholds.relock.json"), dict(ts=time.time(), locked=old["thresholds"], fresh=fresh["thresholds"],

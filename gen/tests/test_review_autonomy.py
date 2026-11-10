@@ -292,3 +292,52 @@ def test_review_summary_counts_sample_and_alerts(tmp_path):
     kinds = {a["kind"] for a in s["alerts"]}
     assert "drop_rate" in kinds and "contradiction" in kinds                    # ids[3]: pass then revise, same pkg
     assert "blocklist" in s
+
+
+def test_blocklist_weekly_revival_and_share_denominator(tmp_path, monkeypatch):
+    """Papers dropped by a rule in an earlier week are the next week's trial pool; the share counts every
+    candidate of the target (DOI or not)."""
+    P, ids = _bl_env(tmp_path, n_blocked=4, n_other=6, weekly_quota=2)
+    P.run(only=None, max_steps=40)
+    st = blocklist.load_state(P.store)
+    assert len(st["rules"]["sage"]["trials"]) == 2
+    dropped = [i for i in ids[:4] if P.store.item(i).state.get("reason") == "blocklist:sage"]
+    assert len(dropped) == 2
+    monkeypatch.setattr(blocklist, "_iso_week", lambda: "2099-W01")
+    out = blocklist.revive_for_trials(P.store, P.cfg, P.store.event)
+    assert sorted(out) == sorted(dropped) and all(P.store.item(i).state["status"] == "active" for i in out)
+    # no DOI candidates still count in the denominator: 1 blocked of 11 = 9% -> no trial
+    P2, ids2 = _bl_env(tmp_path / "nodoi", n_blocked=1, n_other=0)
+    P2.ingest([dict(title=f"no doi {k}", abstract="a", _target="T") for k in range(10)])
+    sage = next(r for r in P2.cfg["screen"]["blocklist"] if r["name"] == "sage")
+    c = dict(read_json(P2.store.item(ids2[0]).p("S1_candidate.json")), item_id=ids2[0])
+    blocklist._SHARE_CACHE.clear()
+    assert blocklist.decide(P2.store, P2.cfg, c, P2.cfg["screen"]["blocklist"], sage, lambda *a, **k: None)["action"] == "block"
+
+
+def test_s7_margin_uses_effective_threshold_and_skips_ungated():
+    """S7 oracle_margin: a recorded-only resource metric demands no margin; a gated time metric is compared with
+    its machine-scaled threshold (the projection keeps gated / threshold_effective)."""
+    import inspect
+    from tbsgen import gates
+    src = inspect.getsource(gates)
+    assert '"gated", "threshold_effective"' in src and 'm.get("threshold_effective", m["threshold"])' in src
+
+
+def test_locked_s6b_applies_gating_policy_and_speed_ratio():
+    cfg = load_config()
+    assert runner.speed_ratio(cfg, 1.2, 0.3) == 4.0 and runner.speed_ratio(cfg, 1.05, 1.0) == 1.0
+    assert runner.speed_ratio(cfg, 100.0, 1.0) == 8.0 and runner.speed_ratio(cfg, None, 1.0) == 1.0
+
+
+def test_validator_accepts_human_only_when_opted_in(tmp_path):
+    from tbsgen.review import ALLOWED_HUMAN, VERDICTS, VALIDATOR
+    off = VALIDATOR.replace("{problems}", "[]").replace("{verdicts}", repr(list(VERDICTS)))
+    on = VALIDATOR.replace("{problems}", "[]").replace("{verdicts}", repr(list(VERDICTS) + list(ALLOWED_HUMAN)))
+    assert "'human'" not in off.split("VERDICTS = ")[1].splitlines()[0]
+    assert "'human'" in on.split("VERDICTS = ")[1].splitlines()[0]
+    # odd field types never crash normalize(): invalid verdict
+    n = review.normalize(dict(verdict="revise", issues=[dict(id="I1", severity="blocking", problem=["x"],
+                                                              evidence=["long enough evidence"])]))
+    assert n["verdict"] is None
+    assert review.normalize(dict(verdict=["pass"]))["verdict"] is None
