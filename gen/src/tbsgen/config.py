@@ -325,6 +325,8 @@ DEFAULTS: dict[str, Any] = {
                                             # below it gets it as threshold.  0 disables (metrics on a tiny scale)
         "resource_loose_margin": 2.0,       # non-separating resource metrics (runtime/memory, spec.is_resource_metric):
                                             # ref x3 -- run-to-run timing noise (e2e-prod-20261109: 0.58 s -> 0.93 s)
+        "timing_budget_sec": 300,           # extra verifier seconds for those repeats (added to the task's verifier
+                                            # timeout; repeats stop when it is used up)
         "timing_repeats": 3,                # resource metrics: _metrics.run_solution times each hidden set this many
                                             # times and reports the median wall time (tasks with a resource metric
                                             # only; 1 = single run).  Applies to S6A measurement (thresholds), S7

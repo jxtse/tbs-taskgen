@@ -568,3 +568,17 @@ def test_repeats_cannot_copy_scored_outputs(tmp_path):
     runs = [x for x in t["metrics"] if x.get("name") == "_solution_cli_run"]
     assert runs and runs[0]["rc"] == 0 and runs[0]["value"] >= 0.9, runs
 
+
+def test_repeats_cannot_rewrite_scored_output_through_symlink(tmp_path):
+    """Codex r2: a scored output that is a symlink to a writable file (a repeat could write the real answer there
+    while the fast first run is timed) -> no repeats; and a cache in any writable place is a state change."""
+    from tbsgen import runner
+    cfg = load_config(None, {"run": {"root": str(tmp_path)}})
+    cli = ("import os, sys\nout = sys.argv[2]\nos.makedirs(out, exist_ok=True)\n"
+           "os.symlink('/app/output/cache.csv', os.path.join(out, 'o.csv'))\n")
+    task, gen, ref = _attack_task(tmp_path, cli)
+    (ref / "cache.csv").write_text("x")
+    t = runner.test(cfg, task, gen, ref, tmp_path / "work", "lnk")
+    runs = [x for x in t["metrics"] if x.get("name") == "_solution_cli_run"]
+    assert runs and runs[0]["timing_repeats"] == 1 and "links" in runs[0]["timing_repeats_skipped"], runs
+

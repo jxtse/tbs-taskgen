@@ -86,15 +86,21 @@ def timing_repeats(cfg: dict, spec: dict | None) -> int:
     return n
 
 
+def timing_budget(cfg: dict, spec: dict | None) -> float:
+    """Extra verifier seconds for the timed repeats (0 when the task has no resource metric).  package() adds it to
+    the task's verifier timeout and the local verifier gets it too, so the scored runs keep their full timeout."""
+    return float(cfg["thresholds"].get("timing_budget_sec", 300)) if timing_repeats(cfg, spec) > 1 else 0.0
+
+
 def metrics_helper_text(cfg: dict, spec: dict | None) -> str:
     """tests/_metrics.py as copied into a task: the template with TIMING_REPEATS set for this task."""
     src = METRICS_HELPER.read_text()
     if REPEATS_LINE not in src:
         raise RuntimeError("templates_metrics.py: TIMING_REPEATS marker line missing")
-    vt = "VERIFIER_TIMEOUT_SEC = 900.0  # tbsgen:verifier_timeout"
-    if vt not in src:
-        raise RuntimeError("templates_metrics.py: VERIFIER_TIMEOUT_SEC marker line missing")
-    src = src.replace(vt, f"VERIFIER_TIMEOUT_SEC = {float(cfg['package']['verifier_timeout'])!r}  # tbsgen:verifier_timeout")
+    tb = "TIMING_BUDGET_SEC = 300.0  # tbsgen:timing_budget"
+    if tb not in src:
+        raise RuntimeError("templates_metrics.py: TIMING_BUDGET_SEC marker line missing")
+    src = src.replace(tb, f"TIMING_BUDGET_SEC = {timing_budget(cfg, spec)!r}  # tbsgen:timing_budget")
     return src.replace(REPEATS_LINE, f"TIMING_REPEATS = {timing_repeats(cfg, spec)}  # tbsgen:timing_repeats")
 
 
@@ -143,7 +149,8 @@ def measure(cfg: dict, task: Path, gen: Path, outd: Path, work: Path, tag: str) 
     logs.chmod(0o777)
     r = sandbox.run(cfg, [(outd, "/src/output", "ro"), (tests, "/src/tests", "ro"), (logs, "/logs/verifier", "rw"),
                           (gen / "environment" / "data", "/src/data", "ro")],
-                    VERIFIER_PRE + "cd /tests && python /tests/measure.py", cfg["gen"]["test_timeout"],
+                    VERIFIER_PRE + "cd /tests && python /tests/measure.py",
+                    int(cfg["gen"]["test_timeout"] + timing_budget(cfg, task_spec(task))),
                     f"tbsgen-measure-{tag}", root=True)
     vals = {}
     for line in reversed(r["out"].strip().splitlines()):
@@ -171,7 +178,7 @@ def test(cfg: dict, task: Path, gen: Path, outd: Path, work: Path, tag: str) -> 
     r = sandbox.run(cfg, [(outd, "/src/output", "ro"), (tests, "/src/tests", "ro"), (logs, "/logs/verifier", "rw"),
                           (gen / "environment" / "data", "/src/data", "ro")],
                     VERIFIER_PRE + f"cd /tests && bash /tests/test.sh; rc=$?; sleep {settle:g}; exit $rc",
-                    cfg["gen"]["test_timeout"], f"tbsgen-test-{tag}", root=True)
+                    int(cfg["gen"]["test_timeout"] + timing_budget(cfg, task_spec(task))), f"tbsgen-test-{tag}", root=True)
     mf = logs / "metrics.jsonl"
     metrics = []
     if mf.exists():

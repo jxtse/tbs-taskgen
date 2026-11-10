@@ -16,7 +16,7 @@ import shutil
 import tomllib
 from pathlib import Path
 
-from .runner import TEST_SH, metrics_helper_text
+from .runner import TEST_SH, metrics_helper_text, timing_budget
 
 TASK_TOML = """schema_version = "1.0"
 
@@ -140,7 +140,7 @@ def package(cfg: dict, item_dir: Path, gen0: Path, spec: dict, provenance: dict)
         task_id=item_dir.name, desc=_q(spec.get("title", item_dir.name)),
         keywords=json.dumps(spec.get("competencies", [])[:8], ensure_ascii=False),
         domain=_q(spec.get("domain", "")), field=_q(spec.get("field", "")), form=_q(spec.get("form", "")),
-        expert_h=float(spec.get("expert_time_hours", 2.0)), verifier_sec=float(pk["verifier_timeout"]),
+        expert_h=float(spec.get("expert_time_hours", 2.0)), verifier_sec=float(pk["verifier_timeout"]) + timing_budget(cfg, spec),
         agent_sec=float(pk["agent_hours"] * 3600), **network_policy(cfg)))
     (out / "provenance.json").write_text(json.dumps(provenance, indent=1, ensure_ascii=False, default=str))
     for p in (out / "tests" / "test.sh", out / "solution" / "solve.sh"):

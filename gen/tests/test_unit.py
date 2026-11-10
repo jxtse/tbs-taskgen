@@ -1160,8 +1160,12 @@ def test_delivered_ignores_non_object_metric_lines(tmp_path):
     assert calib.delivered(tmp_path) is True
 
 
-def test_metrics_helper_gets_verifier_timeout():
+def test_timing_budget_written_and_added_to_verifier_timeout():
+    """Codex r2: the repeats get their own budget on top of the verifier timeout (the scored runs keep all of it)."""
     from tbsgen import runner
-    cfg = load_config(None, {"package": {"verifier_timeout": 1200}})
-    assert "VERIFIER_TIMEOUT_SEC = 1200.0  # tbsgen:verifier_timeout" in runner.metrics_helper_text(cfg, None)
+    cfg = load_config(None, {"thresholds": {"timing_budget_sec": 120}})
+    res = dict(metrics=[dict(name="hidden_runtime_sec")])
+    assert "TIMING_BUDGET_SEC = 120.0  # tbsgen:timing_budget" in runner.metrics_helper_text(cfg, res)
+    assert "TIMING_BUDGET_SEC = 0.0  # tbsgen:timing_budget" in runner.metrics_helper_text(cfg, dict(metrics=[]))
+    assert runner.timing_budget(cfg, res) == 120.0 and runner.timing_budget(cfg, dict(metrics=[])) == 0.0
 
