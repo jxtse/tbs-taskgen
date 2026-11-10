@@ -79,7 +79,7 @@ items/<item_id>/
 | S9 | `pkg/` | `calib/*.json` 作业配置 + 启动命令；`runs.json` | 不调用（只调度） | 见 §5 |
 | S10 | 标签为 hard/unstable 的题 | `release/manifest.jsonl` | 无 | — |
 
-**S7 机械门**：determinism（同种子两次哈希一致）；oracle（参考解在每个种子上都通过）；oracle_margin（参考解至少留出一半余量）；nop（空交付不过）；naive（每个种子至少 2 项不过）；mid（1–2 项不过，且全部判据都被评估）；exploit（作弊尝试全不过）；hidden_shift（只对 PROG）；thresholds_stated（每个阈值都在题面中出现）；leak；isolation（`environment/` 下没有 tests/truth/generator）；tdm_verbatim（全文来自 Elsevier/Wiley TDM 的论文：题面和 `environment/data` 下的文本文件与全文的最长逐字重合，空白规范化后不超过 200 字符，见 `tdmgate.py`）。
+**S7 机械门**：determinism（同种子两次哈希一致）；oracle（参考解在每个种子上都通过）；oracle_margin（参考解至少留出一半余量）；nop（空交付不过）；naive（每个种子至少 2 项不过）；mid（1–2 项不过，且全部判据都被评估）；exploit（作弊尝试全不过）；exploit_valid（阻断，v2.5：每个作弊基线必须在相同调用方式下真正跑完并产出可评分的输出——解题步骤退出码 0、写出了交付物、PROG 的每次 `solution_cli.py` 调用退出码 0、参考解被评估的判据都被评估、且不是所有指标都等于空交付值；作弊基线崩溃或没产出时它“没通过”不算拦住，送 S8 修复）；hidden_shift（只对 PROG）；thresholds_stated（每个阈值都在题面中出现）；leak；isolation（`environment/` 下没有 tests/truth/generator）；tdm_verbatim（全文来自 Elsevier/Wiley TDM 的论文：题面和 `environment/data` 下的文本文件与全文的最长逐字重合，空白规范化后不超过 200 字符，见 `tdmgate.py`）。
 
 **泄漏门（`leakcheck.py`）**：
 
@@ -234,7 +234,7 @@ S9 打出标签后，**hard / unstable**（`calib.keep_labels`）必须先过审
 - **审核者**：能执行代码的 Claude Code agent（默认 Opus，`review.model` 未设则用 `calib.teacher_model`），全新上下文，在**题目自己的镜像**里运行（审核任务由 `review.build_task` 生成：原 Dockerfile 加 `COPY review /review`，`/tests`、`/solution` 照真实运行装好，可直接 `bash /solution/solve.sh && bash /tests/test.sh` 复现参考解）。网络与教师相同：agent 阶段只能连模型中继（`review.agent_allowed_hosts`，未设沿用教师的），verifier 阶段断网。
 - **能看到**（`/review`）：题包全部文件（含 hidden/truth、参考解）、`extra/`（baselines、generator）、`records/`（thresholds.json、S6A 实测、S6B 决策、S7 门报告、S8 修复记录、spec、阶段历史）、`calibration/`（当前校准轮次每次运行的 result 摘要、verifier 输出与逐项指标、trace 摘要：工具调用序列、助手文字、最后的工具输出和最终消息）。
 - **清单**（写在提示词里，逐项给结论与证据）：a 题面/格式说明/测试/评分一致性；b 缺失条件与测试检查题面未要求的东西；c 阈值是否以参考解为依据、是否合理；d 计时/随机性不稳定；e 捷径与泄漏；f 依赖网络或现成实现；g 结合校准 trace 判断失败/通过是否由题目缺陷或基础设施导致、标签是否可信。
-- **输出** `/app/review_out/verdict.json`：`verdict ∈ {pass, revise, drop, human}`、`checklist`、`issues[]`（类别、`blocking|minor`、证据、修法）、`label_assessment`。`review.normalize` 机械执行契约：**没有证据的 blocking 降为 minor**；revise/drop 必须有 blocking，pass 不能有 blocking，否则改判 human。
+- **输出** `/app/review_out/verdict.json`：`verdict ∈ {pass, revise, drop, human}`、`checklist`、`issues[]`（类别、`blocking|minor`、证据、修法）、`label_assessment`。`review.normalize` 机械执行契约：**没有证据的 blocking 降为 minor**；**泄露真值/答案（任何指标，public 或 hidden）或可篡改评分的问题一律 blocking**（审核在 issue 上标 `"leak": true`，有证据即升为 blocking，不论审核写的 severity；带这类问题的 pass 改判 human）；revise/drop 必须有 blocking，pass 不能有 blocking，否则改判 human。
 - **路由**：pass → S10（minor 写进 manifest 的 `review.minor`）；parked 标签的 pass 仍保持 parked。revise → S8 审核修订（下条）。drop → dropped。human → parked。已在 manifest 里的题若审核非 pass，追加一行 `withdrawn: true`（manifest 只追加，同一题以最后一行为准）。
 - **审核修订**（`review.max_revisions = 1`）：S8 把审核 issues 交给模型，只允许改 `instruction.md`、`tests/test_outputs.py`、`tests/measure.py`、`generator/generate.py`（格式说明由生成器写出）；保工审查（`review.revision_review`）拒绝其他路径、拒绝 `check()` 的指标/阈值/方向有任何变化，并沿用 S8 原有的 diff 审查。修订被拒 → human。通过 → 旧校准记录归档到 `calib/epoch-<k>/`、`calib_epoch+1`、标签清空 → S6A_run 重新实测 → **S6B 锁定阈值**（不重新推导；新推导值只写进 `thresholds.relock.json` 供审核对照；参考解若达不到锁定阈值 → human）→ S6C → S7 → PKG → S9 从 GLM 重新校准（作业名带 `-e<k>`）→ S9R 第 2 轮。第 2 轮仍非 pass → human。
 - **作业生命周期**与 S9 相同（intent → reserved → launched → `calib-ingest` / `calib watch` 回填），受 `calib.allow_submit` 控制；账本阶段记为 `S9R`。没有 verdict 的作业算 `infra`，超过 `review.infra_retries` 次 → parked（`review:infra`）。
@@ -273,6 +273,8 @@ S9 打出标签后，**hard / unstable**（`calib.keep_labels`）必须先过审
 
 ## 6b. 真实论文端到端测试后新增的门与检查
 
+- **评分防篡改**（v2.5，`tests/_metrics.py` 与 `tests/test.sh` 模板）：`run_solution` 让解题程序在独立会话/进程组里以 `nobody` 运行，输出走临时文件；每次调用结束（含超时）后 SIGKILL 整个进程组，再以 `nobody` 身份 `kill(-1)` 并扫描 `/proc` 确认该 uid 无残留进程（仍有残留则该次 rc=-10）。首次运行前把 `/logs/verifier` 改成 `nobody` 不可写（Harbor 挂载为 777）。`test.sh` 先跑 pytest，再由 `python _metrics.py --finalize-reward RC` 最后写 reward：再次清理 `nobody` 进程、锁目录、删除先前的 reward 文件、以 O_EXCL|O_NOFOLLOW 新建 `reward.txt`，有残留则记 0。本地 S7 的 `runner.test` 直接运行同一个 `test.sh`，并在容器里多停 `gen.verifier_settle_sec`（默认 1 s）后读 `reward.txt` 判定通过与否。回归测试：`test_integration.py::test_detached_daemon_cannot_rewrite_reward`（S9R 审核 PoC：解题程序留下脱离的守护进程把 0 改成 1；c4752b1 上失败，reward=1）。
+- **计时取中位数**（v2.5）：题目含资源类指标（`spec.is_resource_metric`）时，`run_solution` 对每个隐藏集计时 `thresholds.timing_repeats` 次（默认 3）取中位数；输出与返回码只取第一次。重复运行用新的 HOME 与输出目录，第一次运行创建在 /app、/tmp、/var/tmp、/dev/shm 下的文件在重复前删除；若第一次改动了已有文件、留下 SysV IPC 对象、重复的输出与计分那次不同，或重复会超出 300 s 的计时预算，就只用第一次的时间（记录在 `_solution_cli_run.timing_repeats_skipped`）。失败的重复记为 +inf。S6A 测量（定阈值）、S7 与打包后的评分用同一个模板，非资源类指标的判定不变。
 - `truth_isolation`（PROG，阻断）：判分时把 `solution_cli.py` 换成探针，探针尝试读 `/tests` 下除隐藏输入外的所有文件。要求探针经 `_metrics.run_solution` 执行，且什么都读不到。本地判分步骤与 Harbor 一致，以 root 运行在容器内副本上（含 `/app/data`）。
 - `cli_contract`（PROG，阻断）：指令必须原样包含 `solution_cli.py <input_dir> <output_dir>`。
 - S6B：

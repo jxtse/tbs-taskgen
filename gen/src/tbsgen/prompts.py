@@ -3,7 +3,7 @@ S8 local repair).  Outputs are machine-parsed: S5 -> one JSON object; S6A/S6C/S8
 "=== FILE: <rel path> ===" ... "=== END ===".  Kept short on purpose: the contract (file layout + rules)
 matters more than prose.  Version strings go into provenance so prompt changes are traceable.
 """
-PROMPT_VERSION = "v2.4-2026-11-09"
+PROMPT_VERSION = "v2.5-2026-11-10"
 
 METRICS_API = """Verifier helper module `_metrics` (provided, importable from tests/; exact signatures):
   check(name: str, value: float, threshold: float, direction: "<=" | ">=") -> None   # records + asserts
@@ -122,7 +122,9 @@ Write (generator, solution and mid/naive baselines already exist and are fixed):
   (module-level cache) and call check(name, value, threshold, direction) once per metric with EXACTLY the
   thresholds above (one test function per metric).  Do not re-implement the metrics.
 - baselines/exploit_*.py: at least one shortcut attempt (constant/default output, public-data echo, skipping the
-  {mid_drop} step entirely).
+  {mid_drop} step entirely).  Each exploit must really run to the end and write every deliverable (for PROG
+  also a working /app/output/solution_cli.py that handles every hidden input layout, e.g. a single case):
+  S7 rejects an exploit that crashes or produces no scorable output, since it tests nothing.
 - instruction.md: the task statement for an expert agent.  States the scientific problem and the data files
   (columns, units); deliverables and file formats exact (must agree with what tests/measure.py reads); for PROG
   include verbatim the line `python /app/output/solution_cli.py <input_dir> <output_dir>` (positional args,

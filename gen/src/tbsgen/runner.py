@@ -52,13 +52,62 @@ def generate(cfg: dict, task: Path, seed: int, out: Path) -> dict:
     return r
 
 
-def _verifier_tests(task: Path, gen: Path, dst: Path, test_file: str | None):
+# The reward is written last, by _metrics.finalize_reward: it kills every process of the sandbox uid the agent
+# program ran as, makes /logs/verifier unwritable for it, removes any reward file written before and creates
+# reward.txt (O_EXCL|O_NOFOLLOW).  Before v2.5 a detached process left by solution_cli.py could rewrite
+# reward.txt after pytest (S9R review of e2e-prod-20261109).
+TEST_SH = """#!/bin/bash
+set -uo pipefail
+mkdir -p /logs/verifier
+rm -f /logs/verifier/reward.txt
+cd /tests
+python -m pytest -q -p no:cacheprovider /tests/test_outputs.py
+rc=$?
+if ! python /tests/_metrics.py --finalize-reward "$rc"; then
+  pkill -KILL -u nobody 2>/dev/null
+  rm -f /logs/verifier/reward.txt
+  echo 0 > /logs/verifier/reward.txt
+fi
+"""
+
+
+REPEATS_LINE = "TIMING_REPEATS = 3  # tbsgen:timing_repeats"
+
+
+def timing_repeats(cfg: dict, spec: dict | None) -> int:
+    """Timed runs per hidden set in _metrics.run_solution (wall time = median): thresholds.timing_repeats for a task
+    with a resource metric (spec.is_resource_metric), 1 otherwise (nothing else depends on the repeats)."""
+    from .spec import is_resource_metric
+    n = max(1, int(cfg["thresholds"].get("timing_repeats", 3)))
+    if spec is not None and not any(is_resource_metric(m) for m in spec.get("metrics", [])):
+        return 1
+    return n
+
+
+def metrics_helper_text(cfg: dict, spec: dict | None) -> str:
+    """tests/_metrics.py as copied into a task: the template with TIMING_REPEATS set for this task."""
+    src = METRICS_HELPER.read_text()
+    if REPEATS_LINE not in src:
+        raise RuntimeError("templates_metrics.py: TIMING_REPEATS marker line missing")
+    return src.replace(REPEATS_LINE, f"TIMING_REPEATS = {timing_repeats(cfg, spec)}  # tbsgen:timing_repeats")
+
+
+def task_spec(task: Path) -> dict | None:
+    p = task.parent / "_spec" / "spec.json"
+    try:
+        return json.loads(p.read_text()) if p.exists() else None
+    except (OSError, ValueError):
+        return None
+
+
+def _verifier_tests(cfg: dict, task: Path, gen: Path, dst: Path, test_file: str | None):
     if dst.exists():
         shutil.rmtree(dst)
     shutil.copytree(task / "tests", dst, ignore=shutil.ignore_patterns("truth", "hidden", "__pycache__"))
     shutil.copytree(gen / "tests" / "truth", dst / "truth")
     shutil.copytree(gen / "tests" / "hidden", dst / "hidden")
-    shutil.copy(METRICS_HELPER, dst / "_metrics.py")
+    (dst / "_metrics.py").write_text(metrics_helper_text(cfg, task_spec(task)))
+    (dst / "test.sh").write_text(TEST_SH)       # the packaged verifier entry point, used as is by test()
 
 
 def solve(cfg: dict, task: Path, gen: Path, prog: str | None, work: Path, tag: str) -> dict:
@@ -82,7 +131,7 @@ def solve(cfg: dict, task: Path, gen: Path, prog: str | None, work: Path, tag: s
 def measure(cfg: dict, task: Path, gen: Path, outd: Path, work: Path, tag: str) -> dict:
     """Run tests/measure.py (no thresholds) -> {metric: value}"""
     tests = work / f"mtests-{tag}"
-    _verifier_tests(task, gen, tests, None)
+    _verifier_tests(cfg, task, gen, tests, None)
     logs = work / f"mlogs-{tag}"
     logs.mkdir(parents=True, exist_ok=True)
     logs.chmod(0o777)
@@ -102,22 +151,34 @@ def measure(cfg: dict, task: Path, gen: Path, outd: Path, work: Path, tag: str) 
 
 
 def test(cfg: dict, task: Path, gen: Path, outd: Path, work: Path, tag: str) -> dict:
+    """The packaged verifier: tests/test.sh (pytest, then _metrics.finalize_reward).  passed = reward.txt reads 1
+    after a settle delay (gen.verifier_settle_sec) during which the container keeps running, as under Harbor where
+    reward.txt is read after test.sh returns: a process the agent program left behind gets the time to act."""
     tests = work / f"tests-{tag}"
-    _verifier_tests(task, gen, tests, "test_outputs.py")
+    _verifier_tests(cfg, task, gen, tests, "test_outputs.py")
     logs = work / f"logs-{tag}"
     if logs.exists():
         shutil.rmtree(logs)
     logs.mkdir(parents=True)
     logs.chmod(0o777)
+    settle = float(cfg["gen"].get("verifier_settle_sec", 1.0))
     r = sandbox.run(cfg, [(outd, "/src/output", "ro"), (tests, "/src/tests", "ro"), (logs, "/logs/verifier", "rw"),
                           (gen / "environment" / "data", "/src/data", "ro")],
-                    VERIFIER_PRE + "cd /tests && python -m pytest -q -p no:cacheprovider /tests/test_outputs.py",
+                    VERIFIER_PRE + f"cd /tests && bash /tests/test.sh; rc=$?; sleep {settle:g}; exit $rc",
                     cfg["gen"]["test_timeout"], f"tbsgen-test-{tag}", root=True)
     mf = logs / "metrics.jsonl"
-    metrics = [json.loads(x) for x in mf.read_text().splitlines() if x.strip()] if mf.exists() else []
-    acc = [m for m in metrics if not m.get("aux")]
-    r.update(passed=r["rc"] == 0, metrics=metrics, n_checks=len(acc), n_failed=sum(not m["passed"] for m in acc),
-             failed=[m["name"] for m in acc if not m["passed"]])
+    metrics = []
+    if mf.exists():
+        for x in mf.read_text().splitlines():
+            try:
+                metrics.append(json.loads(x)) if x.strip() else None
+            except json.JSONDecodeError:
+                continue
+    rf = logs / "reward.txt"
+    reward = rf.read_text().strip() if rf.exists() and not rf.is_symlink() else None
+    acc = [m for m in metrics if not m.get("aux") and "passed" in m]
+    r.update(passed=reward == "1", reward=reward, metrics=metrics, n_checks=len(acc),
+             n_failed=sum(not m["passed"] for m in acc), failed=[m["name"] for m in acc if not m["passed"]])
     return r
 
 
@@ -151,7 +212,7 @@ def truth_probe(cfg: dict, task: Path, gen: Path, ref_out: Path, work: Path, tag
         shutil.rmtree(outd)
     shutil.copytree(ref_out, outd, symlinks=True)
     tests = work / f"tests-{tag}"
-    _verifier_tests(task, gen, tests, "test_outputs.py")
+    _verifier_tests(cfg, task, gen, tests, "test_outputs.py")
     rel = sorted(str(p.relative_to(tests)) for p in tests.rglob("*")
                  if p.is_file() and not str(p.relative_to(tests)).startswith("hidden"))
     truth_rel = sorted(str(p.relative_to(tests / "truth")) for p in (tests / "truth").rglob("*") if p.is_file()) \

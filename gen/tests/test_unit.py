@@ -1001,3 +1001,139 @@ def test_run_until_stops_before_later_stages(tmp_path):
     assert calls == []
     P.run(until="S3")
     assert calls == [1]
+
+
+# ---------------------------------------------------------------- v2.5 grader hardening (unit level)
+def test_exploit_validity_crashing_exploit_is_not_a_pass():
+    """S7: an exploit that crashed under the verifier's invocation (e2e-prod-20261109: single-case hidden dirs)
+    tested nothing -> exploit_valid fails even though the exploit 'did not pass'."""
+    from tbsgen.gates import exploit_validity
+    ref = dict(solve_rc=0, out_files=3, n_checks=3, metrics=[
+        dict(name="_solution_cli_run", aux=True, rc=0), dict(name="a", value=0.1), dict(name="b", value=0.2),
+        dict(name="c", value=0.3)])
+    nop = dict(solve_rc=0, out_files=0, n_checks=3, metrics=[dict(name="_solution_cli_run", aux=True, rc=2),
+                                                             dict(name="a", value=1e6), dict(name="b", value=1e6),
+                                                             dict(name="c", value=1e6)])
+    crashed = dict(solve_rc=0, out_files=2, n_checks=3, metrics=[
+        dict(name="_solution_cli_run", aux=True, rc=1), dict(name="a", value=1e6), dict(name="b", value=1e6),
+        dict(name="c", value=1e6)])
+    v = exploit_validity(crashed, ref, nop, "PROG")
+    assert not v["ok"] and any("exited" in w for w in v["why"]) and any("nop" in w for w in v["why"])
+    real = dict(solve_rc=0, out_files=2, n_checks=3, metrics=[
+        dict(name="_solution_cli_run", aux=True, rc=0), dict(name="a", value=0.9), dict(name="b", value=1e6),
+        dict(name="c", value=0.5)])
+    assert exploit_validity(real, ref, nop, "PROG")["ok"]
+    assert not exploit_validity(dict(real, solve_rc=1), ref, nop, "PROG")["ok"]
+    assert not exploit_validity(dict(real, out_files=0), ref, nop, "PROG")["ok"]
+    partial = dict(real, n_checks=2, metrics=real["metrics"][:3])
+    assert not exploit_validity(partial, ref, nop, "PROG")["ok"]
+    never = dict(real, metrics=[m for m in real["metrics"] if m["name"] != "_solution_cli_run"])
+    assert not exploit_validity(never, ref, nop, "PROG")["ok"]
+    assert exploit_validity(never, ref, nop, "DATA")["ok"]       # non-PROG: no CLI run expected
+
+
+def test_exploit_valid_gate_is_blocking():
+    from tbsgen.gates import _blocking
+    assert "exploit_valid" in _blocking(load_config())
+
+
+def test_s7_crashing_exploit_routes_to_s8(tmp_path, monkeypatch):
+    """S7 with every other gate green but an exploit that crashed: the item goes to S8, never to PKG."""
+    from tbsgen import gates, stages_b
+    from tbsgen.state import write_json
+    cfg = load_config(None, {"run": {"root": str(tmp_path)}})
+    rep = dict(attempt=1, gates=dict(oracle=True, exploit=True, exploit_valid=False), ok=False,
+               blocking=["exploit_valid"], nonblocking=[], details={})
+    monkeypatch.setattr(gates, "run_gates", lambda *a, **k: rep)
+
+    class It:
+        item_id = "x"
+        dir = tmp_path / "items" / "x"
+        state = dict(stage="S7", status="active")
+
+        def p(self, *a):
+            return self.dir.joinpath(*a)
+
+        def bump(self, s):
+            return 1
+
+        def save(self):
+            pass
+
+        def advance(self, a, b, **k):
+            self.went = b
+
+        def goto(self, s, why):
+            self.went = s
+
+        def finish(self, st, why, **k):
+            self.went = st
+    it = It()
+    write_json(it.p("_spec", "spec.json"), dict(form="PROG", metrics=[]))
+    write_json(it.p("thresholds.json"), dict(thresholds={}))
+
+    class P:
+        pass
+    P.cfg = cfg
+    stages_b.s7(P, it)
+    assert it.went == "S8" and it.state["repair_from"] == "gates:exploit_valid"
+
+
+def test_timing_repeats_only_for_resource_tasks():
+    from tbsgen import runner
+    cfg = load_config()
+    assert cfg["thresholds"]["timing_repeats"] == 3
+    res = dict(metrics=[dict(name="hidden_runtime_sec", direction="<=")])
+    acc = dict(metrics=[dict(name="hidden_rmse", direction="<=")])
+    assert runner.timing_repeats(cfg, res) == 3 and runner.timing_repeats(cfg, acc) == 1
+    cfg5 = load_config(None, {"thresholds": {"timing_repeats": 5}})
+    txt = runner.metrics_helper_text(cfg5, res)
+    assert "TIMING_REPEATS = 5  # tbsgen:timing_repeats" in txt
+    assert "TIMING_REPEATS = 1  # tbsgen:timing_repeats" in runner.metrics_helper_text(cfg5, acc)
+
+
+def test_metrics_template_median_and_reward_finalize(tmp_path, monkeypatch):
+    """_median over the timed runs; finalize_reward (non-root) writes the reward last, replacing whatever a
+    process wrote before (incl. a planted symlink), 1 iff pytest passed."""
+    import importlib.util
+    from tbsgen import runner
+    spec_ = importlib.util.spec_from_file_location("_m", runner.METRICS_HELPER)
+    m = importlib.util.module_from_spec(spec_)
+    spec_.loader.exec_module(m)
+    assert m._median([3.0, 1.0, 2.0]) == 2.0 and m._median([1.0, 2.0, 3.0, float("inf")]) == 2.5
+    assert m._median([0.5, float("inf"), float("inf")]) == float("inf")
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    (tmp_path / "elsewhere").write_text("keep")
+    (logs / "reward.txt").symlink_to(tmp_path / "elsewhere")
+    assert m.finalize_reward(1, str(logs / "reward.txt")) == 0
+    assert (logs / "reward.txt").read_text().strip() == "0" and not (logs / "reward.txt").is_symlink()
+    assert (tmp_path / "elsewhere").read_text() == "keep"
+    (logs / "reward.txt").write_text("1")
+    assert m.finalize_reward(0, str(logs / "reward.txt")) == 1
+    assert m.finalize_reward(3, str(logs / "reward.txt")) == 0 and (logs / "reward.txt").read_text() == "0\n"
+
+
+def test_packaged_test_sh_writes_reward_via_finalize():
+    from tbsgen import package, runner
+    assert package.TEST_SH is runner.TEST_SH
+    sh = runner.TEST_SH
+    assert "--finalize-reward" in sh and sh.index("pytest") < sh.index("--finalize-reward")
+    assert "echo 1 > /logs/verifier/reward.txt" not in sh
+
+
+def test_review_leak_issue_is_blocking():
+    """S9R contract: a leak of ground truth / answers is blocking even when the reviewer called it minor."""
+    from tbsgen import review
+    leak = dict(id="I1", category="e", severity="minor", leak=True, title="public truth leaked",
+                evidence=["environment/data/notes.md:12 lists the expected public outputs"], fix="remove")
+    n = review.normalize(dict(verdict="revise", issues=[leak]))
+    assert n["verdict"] == "revise" and n["blocking"] == ["I1"] and n["escalated"] == ["I1"]
+    n = review.normalize(dict(verdict="pass", issues=[leak]))
+    assert n["verdict"] == "human" and any("leak" in p for p in n["problems"])
+    no_ev = dict(leak, evidence=[])
+    n = review.normalize(dict(verdict="pass", issues=[no_ev]))
+    assert n["verdict"] == "pass" and n["blocking"] == []          # no evidence: still only a suspicion
+    import inspect
+    src = inspect.getsource(review)
+    assert "Any leak of ground truth or answers is blocking, never minor" in src

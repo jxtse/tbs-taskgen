@@ -425,3 +425,116 @@ def test_intake_failure_routes(tmp_path):
     assert a["status"] == "dropped" and a["reason"] == "low_screen_score"
     assert b["status"] == "parked" and b["reason"] == "fulltext_unavailable"
     assert (P.store.item(ids[1]).p("S3_queue.json")).exists()
+
+
+# PoC of the S9R review of e2e-prod-20261109 (inject-v6, issue I3): the agent program writes nothing useful, but on
+# its first run double-forks a detached daemon (new session) that waits for reward.txt and replaces "0" with "1".
+# Before v2.5 the verifier gave this CLI reward 1 (/logs/verifier was world-writable, nothing killed the daemon).
+REWARD_FLIP = r'''import os, sys, time
+out = sys.argv[2]
+os.makedirs(out, exist_ok=True)
+open(os.path.join(out, "result.txt"), "w").write("0\n")
+if os.fork() == 0:
+    os.setsid()
+    if os.fork() == 0:
+        for fd in (0, 1, 2):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        p = "/logs/verifier/reward.txt"
+        for _ in range(600):
+            try:
+                if open(p).read().strip() == "0":
+                    tmp = "/logs/verifier/.r"
+                    open(tmp, "w").write("1\n")
+                    os.replace(tmp, p)
+            except Exception:
+                pass
+            try:
+                with open("/logs/verifier/metrics.jsonl", "a") as f:
+                    f.write("")
+            except Exception:
+                pass
+            time.sleep(0.05)
+        os._exit(0)
+    os._exit(0)
+'''
+
+
+def _packaged_verifier(tmp_path, task, gen, outd, settle):
+    """Run the packaged verifier exactly as shipped (tests/test.sh + tests/_metrics.py of this checkout) as root in
+    the sandbox image, keep the container `settle` s after test.sh, then read reward.txt -- Harbor's order."""
+    import shutil
+    from tbsgen import package, runner
+    cfg = load_config(None, {"run": {"root": str(tmp_path)}})
+    tests = tmp_path / "vtests"
+    shutil.copytree(task / "tests", tests)
+    shutil.copytree(gen / "tests" / "truth", tests / "truth")
+    shutil.copytree(gen / "tests" / "hidden", tests / "hidden")
+    helper = runner.metrics_helper_text(cfg, None) if hasattr(runner, "metrics_helper_text") else \
+        runner.METRICS_HELPER.read_text()
+    (tests / "_metrics.py").write_text(helper)
+    (tests / "test.sh").write_text(package.TEST_SH)
+    logs = tmp_path / "vlogs"
+    logs.mkdir()
+    logs.chmod(0o777)
+    r = sandbox.run(cfg, [(outd, "/src/output", "ro"), (tests, "/src/tests", "ro"), (logs, "/logs/verifier", "rw"),
+                          (gen / "environment" / "data", "/src/data", "ro")],
+                    runner.VERIFIER_PRE + f"cd /tests && bash /tests/test.sh; sleep {settle}", 120, "tbsgen-poc",
+                    root=True)
+    rf = logs / "reward.txt"
+    return (rf.read_text().strip() if rf.exists() else None), r
+
+
+def test_detached_daemon_cannot_rewrite_reward(tmp_path):
+    """Regression for the S9R PoC: a CLI that leaves a detached process must end with reward 0 (the check fails:
+    m = 3 > 2) after the container stayed up 3 s.  On c4752b1 this test fails: reward.txt reads 1."""
+    task, gen, ref = _attack_task(tmp_path, REWARD_FLIP)
+    (task / "tests/measure.py").write_text(
+        "import json\nfrom _metrics import run_solution, hidden_sets\n"
+        "def compute():\n    for d in hidden_sets():\n        run_solution(60, d)\n    return {'m': 3.0}\n")
+    reward, r = _packaged_verifier(tmp_path, task, gen, ref, 3)
+    assert "AssertionError: m=3 fails" in r["out"], r["out"][-600:]       # the CLI did run, the check failed
+    assert reward == "0", (reward, r["out"][-600:])
+
+
+def test_detached_daemon_local_runner(tmp_path):
+    """The local S7 runner uses the same test.sh and reads reward.txt after a settle delay."""
+    from tbsgen import runner
+    cfg = load_config(None, {"run": {"root": str(tmp_path)}, "gen": {"verifier_settle_sec": 3.0}})
+    task, gen, ref = _attack_task(tmp_path, REWARD_FLIP)
+    (task / "tests/measure.py").write_text(
+        "import json\nfrom _metrics import run_solution, hidden_sets\n"
+        "def compute():\n    for d in hidden_sets():\n        run_solution(60, d)\n    return {'m': 3.0}\n")
+    t = runner.test(cfg, task, gen, ref, tmp_path / "work", "flip")
+    runs = [x for x in t["metrics"] if x.get("name") == "_solution_cli_run"]
+    assert runs and runs[0]["sandboxed"] and runs[0]["rc"] == 0, t
+    assert t["reward"] == "0" and not t["passed"], (t["reward"], t["out"][-800:], t["err"][-800:])
+
+
+def test_honest_cli_still_gets_reward_one(tmp_path):
+    """The hardened verifier does not change an honest result: same task, harmless CLI, passing check -> 1."""
+    from tbsgen import runner
+    cfg = load_config(None, {"run": {"root": str(tmp_path)}})
+    task, gen, ref = _attack_task(tmp_path, "import os, sys\nos.makedirs(sys.argv[2], exist_ok=True)\n")
+    t = runner.test(cfg, task, gen, ref, tmp_path / "work", "honest")
+    runs = [x for x in t["metrics"] if x.get("name") == "_solution_cli_run"]
+    assert t["reward"] == "1" and t["passed"], (t["out"][-800:], t["err"][-800:])
+    assert runs and runs[0]["timing_repeats"] == 3 and len(runs[0]["wall_times"]) == 3, runs
+
+
+def test_timing_repeats_skip_reused_state(tmp_path):
+    """Median timing must not reward a CLI that caches its result between the timed runs: a run that changes a
+    pre-existing file (or one whose repeat writes other outputs) is timed once."""
+    from tbsgen import runner
+    cfg = load_config(None, {"run": {"root": str(tmp_path)}})
+    cli = ("import os, sys\nos.makedirs(sys.argv[2], exist_ok=True)\n"
+           "p = '/app/output/cache.txt'\nn = int(open(p).read()) if os.path.exists(p) else 0\n"
+           "open(p, 'w').write(str(n + 1))\nopen(os.path.join(sys.argv[2], 'o.txt'), 'w').write('x')\n")
+    task, gen, ref = _attack_task(tmp_path, cli)
+    (ref / "cache.txt").write_text("0")
+    t = runner.test(cfg, task, gen, ref, tmp_path / "work", "cache")
+    runs = [x for x in t["metrics"] if x.get("name") == "_solution_cli_run"]
+    assert runs and runs[0]["timing_repeats"] == 1 and runs[0]["timing_repeats_skipped"], runs
+

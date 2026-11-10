@@ -109,6 +109,12 @@ def _slim(g):
     if isinstance(det, dict):
         out["details"] = {k: det[k] for k in ("determinism", "unstated", "isolation", "runs", "truth_isolation")
                           if k in det}
+        if "exploit_valid" in out.get("blocking", []):
+            out["fix_hint"] = ("an exploit baseline did not really run (details.seeds.<seed>.exploit_*.valid.why): fix "
+                               "baselines/exploit_*.py so it completes under the verifier's exact invocation (PROG: "
+                               "the verifier calls `python /app/output/solution_cli.py <input_dir> <output_dir>` once "
+                               "per hidden set, and a set may hold a single case) and writes every deliverable, "
+                               "still taking the shortcut.  A crashing exploit tests nothing.")
         if "tdm_verbatim" in out.get("blocking", []):
             out["details"]["tdm_verbatim"] = det.get("tdm_verbatim")
             out["fix_hint"] = ("instruction.md / data files copy a passage of the paper's licensed full text verbatim "
@@ -125,7 +131,8 @@ def _slim(g):
         if "leak" in det:
             out["details"]["leak"] = dict(classes=det["leak"].get("classes"), findings=det["leak"].get("findings", [])[:8])
         if "seeds" in det:
-            out["details"]["seeds"] = {s: {w: {k: v.get(k) for k in ("passed", "failed", "solve_rc", "solve_err")}
+            out["details"]["seeds"] = {s: {w: {k: v.get(k) for k in ("passed", "failed", "solve_rc", "solve_err", "valid")
+                                               if k in v}
                                            for w, v in sd.items() if isinstance(v, dict)}
                                        for s, sd in det["seeds"].items()}
     return out
