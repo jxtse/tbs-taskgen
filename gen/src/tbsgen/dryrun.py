@@ -72,8 +72,11 @@ def simulate_harbor(P, item_id: str, outcomes: list[str], review_verdict: str = 
             rec = pend[-1]
             issues = [] if review_verdict == "pass" else [dict(id="I1", category="a", severity="blocking",
                                                                  title="simulated", evidence=["simulated evidence"])]
-            write_json(it.p("review", f"r{rec['n']}", "verdict.json"), dict(verdict=review_verdict, issues=issues,
-                                                                              summary="simulated review"))
+            raw = dict(verdict=review_verdict, issues=issues, summary="simulated review")
+            from . import review as _rv
+            write_json(it.p("review", f"r{rec['n']}", f"{rec['job_name']}.verdict.json"),
+                       dict(raw, _normalized=_rv.normalize(raw), pkg_sha=rec.get("pkg_sha"),
+                            calib_epoch=rec.get("calib_epoch", 0), job=rec["job_name"]))
             rec.update(outcome="done", verdict=review_verdict, trial=dict(simulated=True))
             write_json(it.p("review", "runs.json"), runs)
             it.state["status"] = "active"

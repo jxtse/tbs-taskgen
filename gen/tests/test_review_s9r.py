@@ -332,6 +332,13 @@ def test_revision_rejects_threshold_change_and_disallowed_paths(tmp_path):
     assert not review.revision_review(task, {"tests/test_outputs.py": wrap}, {"nodes": []}, th)["ok"]
     assert review.rebinds_check("import _metrics\n_metrics.check = None\n")
     assert not review.rebinds_check(TEST_OUTPUTS)
+    # parameter binding (codex r3): def test_x(check=relaxed)
+    par = TEST_OUTPUTS + "\ndef relaxed(n, v, t, d):\n    pass\ndef test_z(check=relaxed):\n    check('err', 1, 1.0e-3, '<=')\n"
+    assert review.rebinds_check(par)
+    assert not review.revision_review(task, {"tests/test_outputs.py": par}, {"nodes": []}, th)["ok"]
+    assert review.rebinds_check(TEST_OUTPUTS + "\nf = lambda check: check\n")
+    assert review.rebinds_check(TEST_OUTPUTS + "\nglobals()['check'] = print\n")
+    assert review.rebinds_check(TEST_OUTPUTS.replace("from _metrics import check", "from _metrics import check as c"))
     assert review.revision_review(task, {"tests/measure.py": "COL = 'spectrum_index'\n"}, {"nodes": []}, th)["ok"]
 
 
@@ -514,3 +521,21 @@ def test_non_object_verdict_is_human(tmp_path):
     watch_tick(P, only=[iid])
     st = P.store.item(iid).state
     assert st["status"] == "parked" and st["reason"].startswith("review:human")
+
+
+def test_verdict_of_one_job_cannot_be_routed_for_another(tmp_path):
+    """codex r3: round-level verdict.json overwritten by another job's pass must not release this job's package."""
+    P, iid, jobs = _env(tmp_path)
+    _to_label(P, iid, jobs)
+    rr = _runs(P, iid, "review")
+    _finish(jobs, rr[0]["job_name"], verdict=V("pass"))
+    from tbsgen.stages_b import _route_review
+    it = P.store.item(iid)
+    # a forged / overwritten verdict bound to a different job
+    other = dict(rr[0], job_name="tbsgen-other-job", outcome="done")
+    write_json(it.p("review", "r1", "tbsgen-other-job.verdict.json"),
+               dict(V("pass"), _normalized=review.normalize(V("pass")), pkg_sha="deadbeef", calib_epoch=0,
+                    job="tbsgen-other-job"))
+    _route_review(P, it, other, 1)
+    st = P.store.item(iid).state
+    assert st["status"] == "parked" and "bound to" in st["reason"]

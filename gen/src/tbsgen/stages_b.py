@@ -163,18 +163,18 @@ def pkg(P, it):
 
 def _revision_pkg_problem(it, gate: dict) -> str | None:
     """After a review revision the new package must carry the reviewed package's data / hidden inputs / truth
-    (README notes aside), and the verifier must have applied exactly the locked thresholds at run time (the
-    reference's metrics.jsonl of the passing S7 attempt)."""
+    (README notes aside), and the verifier must have applied exactly the locked thresholds at run time, in every
+    arm's metrics.jsonl of the passing S7 attempt (an arm that stopped before any check may log none)."""
     want = it.state.get("revision_data_hash")
     if want and review.pkg_data_hash(it.p("pkg")) != want:
         return "the revision changed packaged data / hidden inputs / truth; only README format notes may change"
     locked = review.locked_signature(read_json(it.p("thresholds.json"))["thresholds"])
-    logs = sorted(it.p("runs", f"s7-{gate['attempt']}").glob("logs-ref*/metrics.jsonl"))
-    if not logs:
+    logs = sorted(it.p("runs", f"s7-{gate['attempt']}").glob("logs-*/metrics.jsonl"))
+    if not any(m.parent.name.startswith("logs-ref") for m in logs):
         return "no reference verifier log of the S7 attempt to check the thresholds applied at run time"
-    for m in logs:
+    for m in logs:                        # every arm (ref, mid, naive, exploits, nop): what check() applied
         got = review.runtime_thresholds(m)
-        if got != locked:
+        if got and got != locked:
             return f"the verifier applied thresholds {got} != locked {locked} ({m.parent.name})"
     return None
 
@@ -652,9 +652,12 @@ def _ingest_review(P, it, job_dir: str | None = None) -> dict:
         d.mkdir(parents=True, exist_ok=True)
         raw = res["verdict_raw"]
         write_json(d / "verdict.raw.json", raw)
-        write_json(d / "verdict.json", dict(raw if isinstance(raw, dict) else {"_raw": raw},
-                                            _normalized=res["verdict"], pkg_sha=rec.get("pkg_sha"),
-                                            calib_epoch=rec.get("calib_epoch", 0), job=rec["job_name"]))
+        body = dict(raw if isinstance(raw, dict) else {"_raw": raw}, _normalized=res["verdict"],
+                    pkg_sha=rec.get("pkg_sha"), calib_epoch=rec.get("calib_epoch", 0), job=rec["job_name"])
+        jf = d / f"{rec['job_name']}.verdict.json"           # one immutable verdict per job
+        if not jf.exists():
+            write_json(jf, body)
+        write_json(d / "verdict.json", body)                  # latest of the round (records for the next round)
         rec["verdict"] = res["verdict"]["verdict"]
     if rec.get("ledger_call"):
         P.ledger.settle(rec["ledger_call"], res["cost_usd"], kind=res["cost_kind"], usage=res["usage"],
@@ -694,8 +697,12 @@ def _route_review(P, it, rec: dict, rnd: int):
     """pass -> S10 (kept label) / stays parked (parked label); revise -> S8 review revision (max_revisions);
     drop -> dropped; human -> parked.  A non-pass verdict after a revision -> parked for a human."""
     rv = P.cfg.get("review") or {}
-    v = read_json(it.p("review", f"r{rnd}", "verdict.json"), {}) or {}
-    norm = v.get("_normalized") or review.normalize(v)
+    v = read_json(it.p("review", f"r{rnd}", f"{rec.get('job_name')}.verdict.json"), {}) or {}
+    if (v.get("job") != rec.get("job_name") or v.get("pkg_sha") != rec.get("pkg_sha") or
+            int(v.get("calib_epoch") or 0) != int(rec.get("calib_epoch") or 0) or "_normalized" not in v):
+        return it.finish("parked", f"review:human (r{rnd}: verdict of job {rec.get('job_name')} missing or bound to "
+                         "another job / package / epoch)")
+    norm = v["_normalized"]
     verdict = norm["verdict"]
     # the current verdict (S10's review gate checks round, calibration epoch and package hash)
     write_json(it.p("review", "verdict.json"), dict(v, _normalized=norm, round=rnd,
@@ -774,8 +781,11 @@ def _s8_review_locked(P, it):
     if n >= int(rv.get("max_revisions", 1)):
         return it.finish("parked", f"review:human (revision limit {n})")
     rnd = int(it.state.get("review_round") or 1)
-    verdict = read_json(it.p("review", f"r{rnd}", "verdict.json"), {}) or {}
-    norm = verdict.get("_normalized") or review.normalize(verdict)
+    verdict = read_json(it.p("review", "verdict.json"), {}) or {}        # the routed verdict (bound in S9R)
+    norm = verdict.get("_normalized") or {}
+    if verdict.get("round") != rnd or norm.get("verdict") != "revise" or \
+            verdict.get("pkg_sha") != calib.pkg_sha(it.p("pkg")):
+        return it.finish("parked", f"review:human (no routed revise verdict for r{rnd} and the current package)")
     issues = [i for i in norm["issues"] if i["severity"] == "blocking"] + \
              [i for i in norm["issues"] if i["severity"] == "minor"]
     spec = read_json(it.p("_spec", "spec.json"))

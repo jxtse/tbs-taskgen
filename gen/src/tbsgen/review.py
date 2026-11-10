@@ -620,26 +620,48 @@ def check_calls(src: str) -> list[tuple] | None:
 
 
 def rebinds_check(src: str) -> bool:
-    """True when the source binds the name `check` other than by `from _metrics import check` (a wrapper could
-    scale the threshold at run time while the call literals stay the same)."""
+    """True unless the only binding of the name `check` (and the only use of `_metrics`) is the module-level
+    `from _metrics import check`: any other binding — def / class / assignment / parameter / lambda arg / import /
+    alias / global, attribute writes on _metrics — could rescale thresholds at run time while the call literals stay
+    the same."""
     import ast
     try:
         tree = ast.parse(src)
     except SyntaxError:
         return True
+    ok_import = 0
     for n in ast.walk(tree):
-        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and n.name == "check":
+        if isinstance(n, ast.ImportFrom):
+            for a in n.names:
+                if (a.asname or a.name) == "check" or a.name == "check" or a.name == "*":
+                    if n.module == "_metrics" and a.name == "check" and a.asname in (None, "check") and \
+                            n in tree.body:
+                        ok_import += 1
+                    else:
+                        return True
+            if n.module == "_metrics" and any(a.name != "check" for a in n.names):
+                return True
+        elif isinstance(n, ast.Import):
+            if any((a.asname or a.name).split(".")[0] in ("check", "_metrics") or a.name == "_metrics" for a in n.names):
+                return True
+        elif isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and n.name == "check":
             return True
-        if isinstance(n, (ast.Name,)) and n.id == "check" and isinstance(n.ctx, (ast.Store, ast.Del)):
+        elif isinstance(n, ast.arg) and n.arg == "check":
             return True
-        if isinstance(n, ast.Import) and any((a.asname or a.name) == "check" or a.name == "_metrics" for a in n.names):
+        elif isinstance(n, ast.Name) and n.id in ("check", "_metrics") and not isinstance(n.ctx, ast.Load):
             return True
-        if isinstance(n, ast.ImportFrom) and any((a.asname or a.name) == "check" for a in n.names) and \
-                not (n.module == "_metrics" and all(a.asname in (None, "check") for a in n.names if a.name == "check")):
+        elif isinstance(n, ast.Name) and n.id == "_metrics":
             return True
-        if isinstance(n, ast.Attribute) and n.attr == "check" and isinstance(n.ctx, ast.Store):
+        elif isinstance(n, (ast.Global, ast.Nonlocal)) and "check" in n.names:
             return True
-    return False
+        elif isinstance(n, ast.alias) and n.asname == "check" and n.name != "check":
+            return True
+        elif isinstance(n, ast.Attribute) and n.attr == "check" and not isinstance(n.ctx, ast.Load):
+            return True
+        elif isinstance(n, ast.Call) and getattr(n.func, "id", None) in ("setattr", "globals", "exec", "eval",
+                                                                         "__import__", "vars", "locals"):
+            return True
+    return ok_import != 1
 
 
 def runtime_thresholds(metrics_jsonl: Path) -> list[tuple] | None:
