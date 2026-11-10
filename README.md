@@ -51,10 +51,16 @@ Crossref · arXiv · Europe PMC              → S5 spec (teacher) → S6 genera
    "protect" public files only by asking the agent not to read them. L2: truth values in public
    files, including permuted, negated or scaled copies. L3: introspection of public Python objects
    inside Docker. L4a: rank correlation of truth columns with public columns. A `truth_isolation`
-   gate checks that the agent's program cannot read `/tests` during grading.
+   gate checks that the agent's program cannot read `/tests` during grading. The agent's program also cannot
+   tamper with the score: the verifier runs it in its own session as `nobody`, kills its process group and
+   every remaining `nobody` process after each call, keeps `/logs/verifier` unwritable for it, and `test.sh`
+   writes `reward.txt` last (`_metrics.py --finalize-reward`), only after no such process is left.
 4. **Reference and empty-submission checks** (S7). Same seed gives the same output; the reference
    passes every seed with margin; an empty submission (`nop`) fails; the naive baseline fails at
-   least two criteria and the mid baseline one or two; scripted exploit attempts fail; `PROG`
+   least two criteria and the mid baseline one or two; scripted exploit attempts fail *and* each
+   exploit really ran under the verifier's invocation and produced scorable output (`exploit_valid`; a
+   crashing exploit tests nothing and goes to repair); resource metrics (runtime, memory) are timed as the
+   median of `thresholds.timing_repeats` runs (default 3) both when thresholds are set and when grading; `PROG`
    tasks are graded on hidden, distribution-shifted inputs. Pre-release checks: the task image, the
    reference and the baselines must not use the paper's own published implementation, and public
    task files must not copy long passages of a TDM full text. Blocking failures go to a local repair
@@ -69,7 +75,8 @@ Crossref · arXiv · Europe PMC              → S5 spec (teacher) → S6 genera
    threshold and gate records and a digest of every calibration trace, reruns the reference and tests, and
    returns `pass` / `revise` / `drop` / `human` with evidence per checklist item (consistency, missing
    conditions, thresholds, stability, shortcuts and leaks, network / ready-made code, calibration evidence).
-   A blocking issue without evidence is downgraded to minor. Only `pass` releases a task. `revise` sends it
+   A blocking issue without evidence is downgraded to minor; a leak of ground truth or answers (any metric,
+   public or hidden) or a way to tamper with the scoring is always blocking. Only `pass` releases a task. `revise` sends it
    back to one local repair of the statement / format notes / test scripts with **thresholds locked**,
    archives the old calibration, recalibrates from the student, and reviews again; a second non-pass goes to
    a human. Details: [`gen/README.md`](gen/README.md) §5b.

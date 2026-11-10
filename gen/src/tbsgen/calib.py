@@ -579,7 +579,7 @@ def delivered(trial: Path) -> bool | None:
             o = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if o.get("name") != "_solution_cli_run" or o.get("lock_failed"):
+        if not isinstance(o, dict) or o.get("name") != "_solution_cli_run" or o.get("lock_failed"):
             continue
         if "entry_exists" in o:                         # recorded by newer _metrics.run_solution
             seen = (seen or False) or bool(o["entry_exists"])

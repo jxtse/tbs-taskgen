@@ -3,15 +3,25 @@
 
 Injected into every generated task as tests/_metrics.py (dense sub-scores for closeness analysis).
 
+v0.4: run_solution() starts the agent program in its own session and, after every call (and on timeout), kills
+its process group and every remaining process of the sandbox uid, so it cannot leave a detached process behind
+(S9R review of e2e-prod-20261109: a daemon left by the CLI rewrote /logs/verifier/reward.txt to 1 after pytest).
+/logs/verifier is made unwritable for the sandbox uid before the first run; test.sh writes the reward last via
+`python _metrics.py --finalize-reward RC`, after the sandbox uid has no process left.  Wall time = median of
+TIMING_REPEATS runs (outputs and return code of the first run; the repeats only time the program).
 v0.3: run_solution() runs the agent program as `nobody` with tests/truth unreadable (see _sandbox_prepare).
 v0.2 adds run_solution(): the verifier executes the agent's delivered program on hidden, distribution-shifted
 evaluation inputs (/tests/hidden), so tuning only on the public data does not suffice (anti circular validation).
 """
-import json, math, os, subprocess, sys, tempfile, time
+import json, math, os, signal, subprocess, sys, tempfile, time
 
 _PATH = os.environ.get("TBSGEN_METRICS", "/logs/verifier/metrics.jsonl")
 ENTRY = os.environ.get("TBSGEN_ENTRY", "/app/output/solution_cli.py")
 HIDDEN = os.environ.get("TBSGEN_HIDDEN", "/tests/hidden")
+LOGS = os.path.dirname(_PATH)
+# number of timed runs per hidden set (wall time = median); written by the pipeline when it copies this file
+# (config thresholds.timing_repeats for tasks with a resource metric, else 1)
+TIMING_REPEATS = 3  # tbsgen:timing_repeats
 _CACHE = {}
 
 
@@ -146,12 +156,143 @@ def _sandbox_prepare(input_dir, out):
     bad = _unlocked(tests_root, hidden_root)
     if bad:
         raise PermissionError(f"truth lock failed, agent program not run: {bad[:3]}")
+    _lock_logs(pw.pw_uid)
     os.chown(out, pw.pw_uid, pw.pw_gid)
-    home = tempfile.mkdtemp(prefix="solhome-")
-    os.chown(home, pw.pw_uid, pw.pw_gid)
+    home, _hp, _hi = _private_dir("solhome-", (pw.pw_uid, pw.pw_gid))
     env = {k: v for k, v in os.environ.items() if not k.startswith("TBSGEN")}
-    env.update(HOME=home, TMPDIR=home, MPLCONFIGDIR=home)
+    env.update(HOME=home, TMPDIR=home, MPLCONFIGDIR=home, PYTHONDONTWRITEBYTECODE="1")
     return pw.pw_uid, pw.pw_gid, env
+
+
+def _lock_logs(uid):
+    """v0.4: the verifier log dir (reward.txt, metrics.jsonl) must not be writable by the sandbox uid.  Harbor mounts
+    it world-writable (0777, owned by the host user): drop group/other write, keep the owner (the host user must still
+    be able to clean the job dir up); a dir owned by the sandbox uid itself goes to root.  Raises when the sandbox
+    uid could still write there, so the agent program is not run."""
+    os.makedirs(LOGS, exist_ok=True)
+    st = os.lstat(LOGS)
+    if st.st_uid == uid:
+        os.chown(LOGS, 0, 0)
+    os.chmod(LOGS, st.st_mode & 0o7755 & ~0o022)
+    for name in os.listdir(LOGS):
+        q = os.path.join(LOGS, name)
+        qs = os.lstat(q)
+        if qs.st_uid == 0 and not os.path.islink(q) and os.path.isfile(q) and qs.st_nlink == 1:
+            os.chmod(q, qs.st_mode & 0o7755 & ~0o022)        # root's own files (metrics.jsonl): no group/other write
+        elif os.path.isdir(q) and not os.path.islink(q):  # anything else (non-root, links, dirs) is removed
+            import shutil
+            shutil.rmtree(q)
+        else:
+            os.unlink(q)
+    st = os.lstat(LOGS)
+    if st.st_uid == uid or st.st_mode & 0o022:
+        raise PermissionError(f"verifier log dir {LOGS} still writable by the sandbox uid (mode {oct(st.st_mode)})")
+
+
+def _uid_pids(uid):
+    """pids of every process whose real, effective, saved or fs uid is `uid` (/proc scan)"""
+    pids = []
+    for d in os.listdir("/proc") if os.path.isdir("/proc") else []:
+        if not d.isdigit() or int(d) == os.getpid():
+            continue
+        try:
+            with open(f"/proc/{d}/status") as f:
+                for line in f:
+                    if line.startswith("Uid:"):
+                        if str(uid) in line.split()[1:5]:
+                            pids.append(int(d))
+                        break
+        except OSError:
+            continue
+    return pids
+
+
+def _reap_uid(uid, rounds=50):
+    """SIGKILL every process of `uid` (a forked helper drops to `uid` and kill(-1), which also reaches processes
+    that left the session / process group, then the /proc scan confirms).  Returns the pids still alive (zombies
+    of our own children aside, they cannot run).  Root only."""
+    if os.geteuid() != 0 or uid == 0:
+        return []
+    left = []
+    for _ in range(rounds):
+        left = [p for p in _uid_pids(uid) if not _zombie(p)]
+        if not left:
+            return []
+        pid = os.fork()
+        if pid == 0:                                 # helper: become `uid`, kill everything `uid` may signal
+            try:
+                os.setgroups([])
+                os.setgid(os.getgid() if uid == 0 else _gid_of(uid))
+                os.setuid(uid)
+                os.kill(-1, signal.SIGKILL)
+            except Exception:
+                pass
+            os._exit(0)
+        os.waitpid(pid, 0)
+        for p in left:                               # and directly, as root
+            try:
+                os.kill(p, signal.SIGKILL)
+            except OSError:
+                pass
+        time.sleep(0.05)
+    return [p for p in _uid_pids(uid) if not _zombie(p)]
+
+
+def _nonroot_uids():
+    uids = set()
+    for d in os.listdir("/proc") if os.path.isdir("/proc") else []:
+        if not d.isdigit():
+            continue
+        try:
+            with open(f"/proc/{d}/status") as f:
+                for line in f:
+                    if line.startswith("Uid:"):
+                        uids.update(int(x) for x in line.split()[1:5] if x != "0")
+                        break
+        except OSError:
+            continue
+    return uids
+
+
+def _reap_nonroot():
+    """SIGKILL every process running under any non-root uid (the sandbox uid, and e.g. a process the root agent
+    left behind as the uid that owns the Harbor log mount, which keeps write access to /logs/verifier).
+    Returns the pids still alive."""
+    if os.geteuid() != 0:
+        return []
+    left = []
+    for _ in range(3):
+        uids = _nonroot_uids()
+        if not uids:
+            return []
+        left = [q for u in sorted(uids) for q in _reap_uid(u)]
+    return left
+
+
+def _zombie(pid):
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            return f.read().rsplit(")", 1)[1].split()[0] in ("Z", "X")
+    except OSError:
+        return True
+
+
+def _gid_of(uid):
+    import pwd
+    try:
+        return pwd.getpwuid(uid).pw_gid
+    except KeyError:
+        return uid
+
+
+def _sandbox_uid():
+    if os.geteuid() != 0:
+        return None
+    import pwd
+    try:
+        return pwd.getpwnam("nobody").pw_uid
+    except KeyError:
+        return None
 
 
 def hidden_sets():
@@ -171,15 +312,221 @@ def _no_new_privs():
         pass
 
 
+TIMING_BUDGET_SEC = 300.0  # tbsgen:timing_budget
+# Extra wall time the timed repeats may use per verifier session, snapshots included.  The pipeline adds the same
+# amount to the task's verifier timeout, so the scored (first) runs keep the whole original timeout.
+_TIMING_SPENT = [0.0]
+_SNAP_SKIP_TOP = ("/proc", "/sys", "/dev")
+_SNAP_LIMIT = 400000
+
+
+def _skipped(q, skip):
+    return any(q == k or q.startswith(k + os.sep) for k in skip)
+
+
+def _xattrs(q):
+    try:
+        return tuple(sorted((n, os.getxattr(q, n, follow_symlinks=False))
+                            for n in os.listxattr(q, follow_symlinks=False)))
+    except OSError:
+        return ()
+
+
+def _ident(q, st, tmp):
+    """Identity of one entry: (ino, ctime, size, mode, uid) -- ctime moves on any content / mode / owner / xattr
+    change and, for a directory, on any entry added or removed.  The verifier itself (root) creates and deletes
+    temp files only in its temp dir: there ctime is replaced by the xattrs (a sticky world-writable dir: the
+    sandbox uid can add entries -- caught as new paths -- but not set xattrs on it)."""
+    if q == tmp:
+        return (st.st_ino, None, None, st.st_mode, st.st_uid, _xattrs(q))
+    return (st.st_ino, st.st_ctime_ns, st.st_size if not os.path.isdir(q) else None, st.st_mode, st.st_uid)
+
+
+def _state_snapshot(uid, skip, deadline=None):
+    """Whole-filesystem state the agent program could carry from one timed run to the next: {path: identity} for
+    every entry outside /proc, /sys, /dev (but /dev/shm) and the `skip` trees, the SysV IPC objects and kernel
+    key usage of `uid`.  None when the tree is too big or the deadline passes (-> no repeats)."""
+    snap, n = {}, 0
+    tmp = os.path.realpath(tempfile.gettempdir())
+    tops = ["/dev/shm"] if os.path.isdir("/dev/shm") else []
+    tops += [os.path.join("/", d) for d in sorted(os.listdir("/")) if os.path.join("/", d) not in _SNAP_SKIP_TOP]
+    for top in tops:
+        if _skipped(top, skip):
+            continue
+        try:
+            st = os.lstat(top)
+        except OSError:
+            continue
+        snap[top] = _ident(top, st, tmp)
+        if os.path.islink(top) or not os.path.isdir(top):
+            continue
+        for root, dirs, files in os.walk(top, followlinks=False):
+            dirs[:] = [d for d in dirs if not _skipped(os.path.join(root, d), skip)]
+            for name in dirs + files:
+                q = os.path.join(root, name)
+                if _skipped(q, skip):
+                    continue
+                try:
+                    st = os.lstat(q)
+                except OSError:
+                    continue
+                snap[q] = _ident(q, st, tmp)
+                n += 1
+                if n > _SNAP_LIMIT or (deadline is not None and n % 2000 == 0 and time.time() > deadline):
+                    return None
+    for kind in ("shm", "msg", "sem"):
+        try:
+            lines = open(f"/proc/sysvipc/{kind}").read().splitlines()[1:]
+        except OSError:
+            continue
+        for ln in lines:
+            f = ln.split()
+            if len(f) > 8 and str(uid) in f[4:9]:
+                snap[f"sysvipc:{kind}:{f[1]}"] = (0, 0, 0, uid)
+    try:
+        for ln in open("/proc/key-users").read().splitlines():
+            if ln.split(":")[0].strip() == str(uid):
+                snap["key-users"] = ln.strip()
+    except OSError:
+        pass
+    if deadline is not None and time.time() > deadline:
+        return None
+    return snap
+
+
+def _state_changes(before, after):
+    """Entries added, removed or changed between two snapshots (None snapshot -> 'unavailable')."""
+    if before is None or after is None:
+        return ["state snapshot unavailable"]
+    return sorted([q for q in after if q not in before] + [q for q in before if q not in after] +
+                  [q for q, v in after.items() if q in before and before[q] != v])
+
+
+def _private_dir(prefix, sb):
+    """dir owned by the sandbox uid inside a root-owned 0711 parent: the program can use it but cannot rename it
+    or swap it for a symlink (that needs write access to the parent).  Returns (dir, parent, inode)."""
+    parent = tempfile.mkdtemp(prefix=prefix)
+    os.chmod(parent, 0o711)
+    d = os.path.join(parent, "d")
+    os.mkdir(d, 0o755)
+    if sb is not None:
+        os.chown(d, sb[0], sb[1])
+    return d, parent, os.lstat(d).st_ino
+
+
+def _seal_tree(d, ino=None):
+    """After the scored run: its output dir becomes root-owned and private, so a timed repeat can neither read
+    (copy) nor change it.  Returns a reason when that cannot be guaranteed (-> no repeats): the dir itself is not
+    the real directory created for the run, or the tree holds symlinks / hard links / special files (they could
+    point the scored output at a file a repeat may write)."""
+    st = os.lstat(d)
+    if os.path.islink(d) or not os.path.isdir(d) or (ino is not None and st.st_ino != ino):
+        return f"{d} was replaced"
+    bad = []
+    for root, dirs, files in os.walk(d, followlinks=False):
+        for name in dirs + files:
+            q = os.path.join(root, name)
+            qs = os.lstat(q)
+            if os.path.islink(q) or not (os.path.isdir(q) or os.path.isfile(q)) or \
+                    (os.path.isfile(q) and qs.st_nlink != 1):
+                bad.append(q)
+                continue
+            os.lchown(q, 0, 0)
+    fd = os.open(d, os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        if os.fstat(fd).st_ino != st.st_ino:
+            return f"{d} was replaced"
+        os.fchown(fd, 0, 0)
+        os.fchmod(fd, 0o700)
+    finally:
+        os.close(fd)
+    return f"output holds links / special files: {bad[:3]}" if bad else None
+
+
+def _run_once(entry, input_dir, out, timeout_sec, sb, home=None):
+    """One run of the agent program in its own session.  stdout/stderr go to files (a detached child holding a
+    pipe cannot stall the verifier); afterwards the whole process group and every process of the sandbox uid are
+    killed.  Returns (rc, stderr_tail, wall_seconds, leftover_pids)."""
+    if sb is None:
+        kw = dict(env=_thread_env(dict(os.environ)))
+    else:
+        env = dict(sb[2])
+        if home:
+            env.update(HOME=home, TMPDIR=home, MPLCONFIGDIR=home)
+        kw = dict(user=sb[0], group=sb[1], extra_groups=[], env=_thread_env(env), cwd=env["HOME"],
+                  preexec_fn=_no_new_privs)
+    with tempfile.TemporaryFile() as fo, tempfile.TemporaryFile() as fe:
+        t0 = time.time()
+        p = subprocess.Popen([sys.executable, entry, input_dir, out], stdin=subprocess.DEVNULL, stdout=fo, stderr=fe,
+                             start_new_session=True, **kw)
+        try:
+            rc = p.wait(timeout=timeout_sec)
+            err_extra = ""
+        except subprocess.TimeoutExpired:
+            rc, err_extra = -9, f"timeout after {timeout_sec}s"
+        sec = time.time() - t0
+        try:
+            os.killpg(p.pid, signal.SIGKILL)         # the session / process group it started in
+        except OSError:
+            pass
+        left = _reap_uid(sb[0]) if sb is not None else []
+        try:
+            p.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            pass
+        fe.seek(0)
+        err = fe.read()[-4000:].decode("utf-8", "replace") + err_extra
+    return rc, err, sec, left
+
+
+def _tree_digest(d):
+    import hashlib
+    h = hashlib.sha256()
+    for root, dirs, files in os.walk(d, followlinks=False):
+        dirs.sort()
+        for name in sorted(files):
+            q = os.path.join(root, name)
+            h.update(os.path.relpath(q, d).encode() + b"\0")
+            try:
+                if os.path.islink(q):
+                    h.update(b"L" + os.readlink(q).encode())
+                else:
+                    with open(q, "rb") as f:
+                        for b in iter(lambda: f.read(1 << 20), b""):
+                            h.update(b)
+            except OSError:
+                h.update(b"?")
+    return h.hexdigest()
+
+
+def _median(xs):
+    xs = sorted(xs)
+    k = len(xs) // 2
+    return xs[k] if len(xs) % 2 else 0.5 * (xs[k - 1] + xs[k])
+
+
+MAX_SPEEDUP = 1.5   # the repeats may lower the reported time to at most first-run time / MAX_SPEEDUP
+
+
 def run_solution(timeout_sec, input_dir=HIDDEN, entry=ENTRY):
     """Run `python <entry> <input_dir> <out_dir>` once per session; returns (out_dir, wall_seconds, returncode).
     Several hidden sets: call once per set, e.g. `for d in hidden_sets(): out, sec, rc = run_solution(t, d)`.
-    This is the ONLY sanctioned way to execute agent code in the verifier (it drops to `nobody` and locks truth).
-    The wall time is also recorded (not a pass/fail check by itself; tests decide whether to check() it)."""
+    This is the ONLY sanctioned way to execute agent code in the verifier (it drops to `nobody`, locks truth and
+    the verifier logs, and kills everything the program left running).
+    out_dir and returncode are those of the first (scored) run.  wall_seconds is the median over TIMING_REPEATS
+    runs (a failed / timed-out repeat counts as +inf), never below first-run time / MAX_SPEEDUP, when: the first
+    run succeeded; the repeats and their bookkeeping fit the extra TIMING_BUDGET_SEC (absolute: snapshots stop
+    and each repeat's timeout is the budget left; the pipeline adds the budget to the verifier timeout); the
+    scored output dir and HOME (each in a root-owned 0711 parent, so they cannot be swapped) hold only plain files
+    and become root-only 0700 (a repeat cannot copy or change them); and no run changes anything else on the
+    filesystem (whole-FS snapshot outside /proc, /sys, /dev but /dev/shm, by ctime / xattrs; SysV IPC; kernel
+    keys) or writes outputs different from the scored run's.  Otherwise the first run's time alone, with the
+    reason in the record (`timing_repeats_skipped`).  The wall time is also recorded (not a pass/fail check by
+    itself; tests decide whether to check() it)."""
     key = (entry, input_dir)
     if key in _CACHE:
         return _CACHE[key]
-    out = tempfile.mkdtemp(prefix="sol-")
+    out, out_parent, out_ino = _private_dir("sol-", None)
     entry_exists = os.path.isfile(entry)              # calibration tells "no deliverable" from "deliverable failed"
     try:
         sb = _sandbox_prepare(input_dir, out)
@@ -189,19 +536,112 @@ def run_solution(timeout_sec, input_dir=HIDDEN, entry=ENTRY):
                  "sandboxed": False, "lock_failed": True, "entry": entry, "entry_exists": entry_exists})
         _CACHE[key] = (out, 0.0, -1)
         return _CACHE[key]
-    kw = dict(env=_thread_env(dict(os.environ))) if sb is None else \
-        dict(user=sb[0], group=sb[1], extra_groups=[], env=_thread_env(sb[2]), cwd=sb[2]["HOME"],
-             preexec_fn=_no_new_privs)
-    t0 = time.time()
-    try:
-        p = subprocess.run([sys.executable, entry, input_dir, out], capture_output=True, text=True,
-                           timeout=timeout_sec, **kw)
-        rc, err = p.returncode, p.stderr[-2000:]
-    except subprocess.TimeoutExpired:
-        rc, err = -9, f"timeout after {timeout_sec}s"
-    sec = time.time() - t0
-    _record({"name": "_solution_cli_run", "value": sec, "rc": rc, "stderr_tail": err[-500:],
+    import shutil
+
+    def left_budget():
+        return TIMING_BUDGET_SEC - _TIMING_SPENT[0]
+
+    def timed(fn, *a):
+        t = time.time()
+        try:
+            return fn(*a)
+        finally:
+            _TIMING_SPENT[0] += time.time() - t
+
+    n_rep = max(1, int(TIMING_REPEATS))
+    home = sb[2]["HOME"] if sb is not None else None
+    keep = [out_parent, LOGS] + ([os.path.dirname(home)] if home else [])
+    want = n_rep > 1 and sb is not None and left_budget() > 0
+    before = timed(_state_snapshot, sb[0], keep, time.time() + left_budget()) if want else None
+    rc, err, sec, left = _run_once(entry, input_dir, out, timeout_sec, sb)
+    times, why = [sec], None
+    if n_rep > 1 and rc == 0 and not left:
+        if sb is None:
+            why = "not sandboxed (no root): single run"
+        elif before is None or left_budget() < sec * (n_rep - 1) * 1.2:
+            why = f"first run {sec:.1f}s: repeats would exceed the {TIMING_BUDGET_SEC:.0f}s timing budget"
+        else:
+            why = timed(_seal_tree, out, out_ino) or timed(_seal_tree, home)
+            if why is None:
+                ch = _state_changes(before, timed(_state_snapshot, sb[0], keep, time.time() + left_budget()))
+                if ch:
+                    why = f"first run changed state a repeat could reuse: {ch[:3]}"
+        if why is None:
+            ref_digest = timed(_tree_digest, out)
+            for _ in range(n_rep - 1):
+                o2, op2, oi2 = _private_dir("sol-", sb)
+                h2, hp2, _hi2 = _private_dir("solhome-", sb)
+                b2 = timed(_state_snapshot, sb[0], keep + [op2, hp2], time.time() + left_budget())
+                t_rep = left_budget()                                  # absolute cap: never past the budget
+                if b2 is None or t_rep < sec * 1.2:
+                    times, why = [sec], "timing budget exhausted"
+                    shutil.rmtree(op2, ignore_errors=True)
+                    shutil.rmtree(hp2, ignore_errors=True)
+                    break
+                r2, _e2, s2, left = _run_once(entry, input_dir, o2, min(float(timeout_sec), t_rep), sb, home=h2)
+                _TIMING_SPENT[0] += s2
+                same = r2 == 0 and not left and timed(_tree_digest, o2) == ref_digest
+                ch = ["left processes"] if left else \
+                    _state_changes(b2, timed(_state_snapshot, sb[0], keep + [op2, hp2], time.time() + left_budget()))
+                shutil.rmtree(op2, ignore_errors=True)
+                shutil.rmtree(hp2, ignore_errors=True)
+                if left:
+                    break
+                if ch:
+                    times, why = [sec], f"a timed repeat changed state: {ch[:3]}"
+                    break
+                if r2 == 0 and not same:
+                    # a repeat that wrote other outputs was not timing the scored computation: first run only
+                    times, why = [sec], "a timed repeat produced outputs different from the scored run"
+                    break
+                times.append(s2 if r2 == 0 else float("inf"))
+    if left:                                          # could not kill what it left running: no score
+        rc, err = -10, (err + f"\nsandbox processes survived SIGKILL: {left[:5]}")[-2000:]
+    med = max(_median(times), sec / MAX_SPEEDUP)
+    _record({"name": "_solution_cli_run", "value": med, "rc": rc, "stderr_tail": err[-500:],
              "threshold": float(timeout_sec), "direction": "<=", "passed": rc == 0, "aux": True,
-             "sandboxed": sb is not None, "entry": entry, "entry_exists": entry_exists})
-    _CACHE[key] = (out, sec, rc)
+             "sandboxed": sb is not None, "entry": entry, "entry_exists": entry_exists,
+             "wall_times": [round(t, 6) if math.isfinite(t) else None for t in times], "timing_repeats": len(times),
+             "timing_repeats_skipped": why})
+    _CACHE[key] = (out, med, rc)
     return _CACHE[key]
+
+
+def finalize_reward(pytest_rc, path=None):
+    """Called by test.sh after pytest: kill every non-root process (sandbox uid included), make the log dir
+    unwritable for the sandbox uid,
+    remove any reward file written before, then write the reward (1 iff pytest passed and nothing survived).
+    The file is created with O_EXCL|O_NOFOLLOW (never through a planted link)."""
+    path = path or os.path.join(LOGS, "reward.txt")
+    reward = 1 if int(pytest_rc) == 0 else 0
+    uid = _sandbox_uid()
+    if os.geteuid() == 0:
+        if _reap_nonroot():
+            reward = 0
+        if uid is not None:
+            try:
+                _lock_logs(uid)
+            except Exception:
+                reward = 0
+        if _reap_nonroot():
+            reward = 0
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    for name in ("reward.txt", "reward.json"):
+        q = os.path.join(os.path.dirname(path), name)
+        if os.path.lexists(q):
+            if os.path.isdir(q) and not os.path.islink(q):
+                import shutil
+                shutil.rmtree(q)
+            else:
+                os.unlink(q)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o644)
+    with os.fdopen(fd, "w") as f:
+        f.write(f"{reward}\n")
+    return reward
+
+
+if __name__ == "__main__":
+    if len(sys.argv) == 3 and sys.argv[1] == "--finalize-reward":
+        print("reward", finalize_reward(sys.argv[2]))
+    elif len(sys.argv) == 2 and sys.argv[1] == "--reap":
+        print("left", _reap_nonroot())

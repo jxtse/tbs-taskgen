@@ -290,6 +290,8 @@ DEFAULTS: dict[str, Any] = {
     "gen": {
         "seeds": [0, 1],
         "gen_timeout": 300, "solve_timeout": 900, "baseline_timeout": 600, "test_timeout": 900,
+        "verifier_settle_sec": 1.0,         # local verifier: container stays up this long after test.sh before
+                                            # reward.txt is read (a process left by the agent program gets to act)
         "max_public_mb": 50,
         # S6B "mid not separable" -> back to S5 (new spec + all code).  0 since e2e-prod-20261109: back-to-S5 was
         # taken by 5 items and none of them came through (3 dropped not separable again, 2 ref_worse_than_naive),
@@ -323,6 +325,12 @@ DEFAULTS: dict[str, Any] = {
                                             # below it gets it as threshold.  0 disables (metrics on a tiny scale)
         "resource_loose_margin": 2.0,       # non-separating resource metrics (runtime/memory, spec.is_resource_metric):
                                             # ref x3 -- run-to-run timing noise (e2e-prod-20261109: 0.58 s -> 0.93 s)
+        "timing_budget_sec": 300,           # extra verifier seconds for those repeats (added to the task's verifier
+                                            # timeout; repeats stop when it is used up)
+        "timing_repeats": 3,                # resource metrics: _metrics.run_solution times each hidden set this many
+                                            # times and reports the median wall time (tasks with a resource metric
+                                            # only; 1 = single run).  Applies to S6A measurement (thresholds), S7
+                                            # and the packaged verifier alike.  Non-resource metrics are unchanged
         "max_mid_fail": 2, "min_mid_fail": 1,
         "sig_digits": 2,
     },
@@ -332,6 +340,8 @@ DEFAULTS: dict[str, Any] = {
         "l4a_spearman": 0.995,
         "l4b_minutes": 20,                  # cheap-agent inversion (待定, disabled)
         "max_repair_rounds": 2,
+        "max_exploit_repair_rounds": 2,     # S8 rounds when exploit_valid is the only blocking gate: only the broken
+                                            # baselines/exploit_*.py are rewritten (allowed with locked thresholds)
         "blocking": ["oracle", "hidden_shift", "leak", "isolation", "infeasible", "determinism", "truth_isolation",
                      "cli_contract", "tdm_verbatim", "readymade"],
         # readymade (prerelease.readymade_check): the task image installs, or the reference / a baseline imports,

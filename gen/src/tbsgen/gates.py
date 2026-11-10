@@ -8,6 +8,11 @@ gates/attempt-<n>.json = {"gates": {name: bool}, "blocking": [names], "details":
   naive         naive fails >= naive_fail_min checks on every seed
   mid           mid fails 1..2 checks and all checks were evaluated
   exploit       every baselines/exploit_*.py fails
+  exploit_valid every exploit really ran under the same invocation and produced scorable output (v2.5): its solve
+                step exited 0, it wrote something to /app/output, every solution_cli.py run (PROG) exited 0, every
+                check the reference got was evaluated, and not every metric sits at the empty-output (nop) value.
+                An exploit that crashes (e2e-prod-20261109: single-case hidden inputs) tests nothing, so "it failed"
+                is not a pass of the exploit gate (blocking -> S8)
   hidden_shift  PROG: tests/hidden exists, differs from public, >= 2 hidden checks recorded for the reference
   truth_isolation PROG: a probe solution_cli.py (reads every file under /tests except hidden inputs) must be run
                 via _metrics.run_solution and read nothing; catches verifiers that exec agent code themselves
@@ -44,6 +49,50 @@ def numbers_in(text: str) -> set[float]:
     return vals
 
 
+def _same(a, b) -> bool:
+    if a is None or b is None:
+        return a is b
+    if not (math.isfinite(a) and math.isfinite(b)):
+        return a == b or (math.isnan(a) and math.isnan(b))
+    return math.isclose(a, b, rel_tol=1e-9, abs_tol=1e-15)
+
+
+def exploit_validity(sd_exp: dict, sd_ref: dict, sd_nop: dict, form: str | None) -> dict:
+    """Did an exploit baseline really run and get scored?  sd_* = per-seed arm records of run_gates (with
+    solve_rc, out_files, n_checks, metrics incl. aux `_solution_cli_run` rows).  -> {ok, why: [...]}"""
+    why = []
+    if sd_exp.get("solve_rc") != 0:
+        why.append(f"solve step exited {sd_exp.get('solve_rc')}")
+    if not sd_exp.get("out_files"):
+        why.append("wrote nothing to /app/output")
+    runs = [m for m in sd_exp.get("metrics", []) if m.get("name") == "_solution_cli_run"]
+    if form == "PROG":
+        if not runs:
+            why.append("solution_cli.py was never run by the verifier")
+        bad = [m.get("rc") for m in runs if m.get("rc") != 0]
+        if bad:
+            why.append(f"solution_cli.py exited {bad[:3]} under the verifier's invocation")
+    if sd_exp.get("n_checks", 0) < sd_ref.get("n_checks", 0):
+        why.append(f"only {sd_exp.get('n_checks')} of {sd_ref.get('n_checks')} checks evaluated")
+    ev = {m["name"]: m.get("value") for m in sd_exp.get("metrics", []) if not m.get("aux") and "name" in m}
+    nv = {m["name"]: m.get("value") for m in sd_nop.get("metrics", []) if not m.get("aux") and "name" in m}
+    common = [k for k in ev if k in nv]
+    if common and all(_same(ev[k], nv[k]) for k in common):
+        why.append("every metric equals the empty-output (nop) value: no scorable output")
+    return dict(ok=not why, why=why)
+
+
+def exploit_patch_problems(task: Path, patch: dict) -> list[str]:
+    """An exploit-only S8 repair may rewrite existing baselines/exploit_*.py files and nothing else."""
+    bad = []
+    for rel in patch:
+        if not re.fullmatch(r"baselines/exploit_[\w.-]+\.py", rel) or ".." in rel:
+            bad.append(f"not an exploit baseline: {rel}")
+        elif not (task / rel).is_file():
+            bad.append(f"new file: {rel}")
+    return bad
+
+
 def run_gates(cfg: dict, item_dir: Path, spec: dict, thresholds: dict, attempt: int) -> dict:
     task = item_dir / "task"
     work = item_dir / "runs" / f"s7-{attempt}"
@@ -56,7 +105,8 @@ def run_gates(cfg: dict, item_dir: Path, spec: dict, thresholds: dict, attempt: 
         a["hash_tests"] == b["hash_tests"]
     det["determinism"] = dict(a={k: a[k] for k in ("rc", "hash_env", "hash_tests", "err")},
                               b={k: b[k] for k in ("rc", "hash_env", "hash_tests")})
-    ok = dict(oracle=True, nop=True, naive=True, mid=True, exploit=True, hidden_shift=True, oracle_margin=True)
+    ok = dict(oracle=True, nop=True, naive=True, mid=True, exploit=True, exploit_valid=True, hidden_shift=True,
+              oracle_margin=True)
     exploits = sorted(str(p.relative_to(task)) for p in (task / "baselines").glob("exploit_*.py"))
     det["seeds"] = {}
     for s in seeds:
@@ -72,9 +122,12 @@ def run_gates(cfg: dict, item_dir: Path, spec: dict, thresholds: dict, attempt: 
                           ("naive", "baselines/naive.py")] + [(Path(e).stem, e) for e in exploits]:
             sv = runner.solve(cfg, task, gen, prog, work, f"{tag}{s}")
             t = runner.test(cfg, task, gen, Path(sv["outdir"]), work, f"{tag}{s}")
+            od = Path(sv["outdir"])
             sd[tag] = dict(solve_rc=sv["rc"], solve_sec=sv["sec"], solve_err=sv["err"][-300:], passed=t["passed"],
-                           n_checks=t["n_checks"], n_failed=t["n_failed"], failed=t["failed"],
-                           metrics=[{k: m.get(k) for k in ("name", "value", "threshold", "direction", "passed")}
+                           reward=t.get("reward"), n_checks=t["n_checks"], n_failed=t["n_failed"], failed=t["failed"],
+                           out_files=sum(1 for p in od.rglob("*") if p.is_file()) if od.exists() else 0,
+                           metrics=[{k: m.get(k) for k in ("name", "value", "threshold", "direction", "passed", "aux",
+                                                            "rc", "wall_times") if k in m}
                                     for m in t["metrics"]])
         ref = sd["ref"]
         ok["oracle"] &= ref["passed"] and ref["solve_rc"] == 0
@@ -84,6 +137,10 @@ def run_gates(cfg: dict, item_dir: Path, spec: dict, thresholds: dict, attempt: 
         ok["mid"] &= (not sd["mid"]["passed"]) and 1 <= n_mid <= 2 and \
             sd["mid"]["n_checks"] >= ref["n_checks"]
         ok["exploit"] &= all(not sd[Path(e).stem]["passed"] for e in exploits) and bool(exploits)
+        for e in exploits:
+            v = exploit_validity(sd[Path(e).stem], ref, sd["nop"], spec.get("form"))
+            sd[Path(e).stem]["valid"] = v
+            ok["exploit_valid"] &= v["ok"]
         for m in ref["metrics"]:
             if m.get("threshold") is None or m.get("value") is None or m["name"].startswith("_"):
                 continue
@@ -152,4 +209,4 @@ def _blocking(cfg) -> set[str]:
     b = set(cfg["gates"]["blocking"])
     if "oracle" in b:
         b.add("oracle_margin")
-    return b | {"nop", "naive", "mid", "exploit"}
+    return b | {"nop", "naive", "mid", "exploit", "exploit_valid"}

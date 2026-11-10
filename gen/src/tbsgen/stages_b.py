@@ -10,7 +10,7 @@ import shutil
 
 from . import calib, gates, package, repair, review
 from .models import parse_files
-from .prompts import METRICS_API, S6C_TESTS, S8_REPAIR, S8_REVIEW, SYSTEM
+from .prompts import METRICS_API, S6C_TESTS, S8_EXPLOIT, S8_REPAIR, S8_REVIEW, SYSTEM
 from .stages_a import _write_files, chat_files, save_raw
 from .state import read_json, write_json
 
@@ -66,6 +66,8 @@ def s7(P, it):
 def s8(P, it):
     if str(it.state.get("repair_from", "")).startswith("review:") or it.state.get("review_revision_pending"):
         return _s8_review(P, it)
+    if it.state.get("repair_from") == "gates:exploit_valid":
+        return _s8_exploits(P, it)
     if it.state.get("thresholds_locked"):
         # a gate failed after a review revision: the ordinary S8 may change the reference / baselines and is not
         # bound by the revision limit, so a human decides
@@ -101,6 +103,84 @@ def s8(P, it):
     it.goto(back, f"repaired round {rounds + 1}")
 
 
+def regate(P, it, reason: str, recalibrate: bool = False) -> dict:
+    """Re-gate a packaged item after a harness change (the shared verifier template tests/_metrics.py / test.sh, the
+    S7 gates): the statement, scoring script, generator, reference and thresholds stay as they are.
+    Withdraws it from the release manifest, locks the thresholds (S6B never re-derives them; the reference must
+    clear them under the new measurement), records the data hash (PKG checks the data / hidden inputs / truth did
+    not change), and restarts at S6A_run -> S6B (locked) -> S6C (files kept) -> S7 -> PKG.  The calibration epoch
+    and its runs are kept by default (they ran on the same statement, data and thresholds; S9 relabels from them;
+    the operator re-scores the kept deliverables with the new verifier as evidence) -- recalibrate=True archives
+    them and S9 starts again from the student.  The S9R review is bound to the package hash, so the new package is
+    reviewed again before S10."""
+    with item_lock(it):
+        it.load()
+        st = it.state
+        if st.get("stage") not in ("S9", "S9R", "S10") and st.get("status") not in ("done", "parked"):
+            raise ValueError(f"regate: item at {st.get('stage')}/{st.get('status')} is not packaged")
+        if not it.p("pkg").exists() or not it.p("thresholds.json").exists():
+            raise ValueError("regate: no pkg/ or thresholds.json")
+        if any(r.get("outcome") is None for r in read_json(it.p("calib", "runs.json"), []) or []):
+            raise ValueError("regate: a calibration run is still pending")
+        old_sha = calib.pkg_sha(it.p("pkg"))
+        # withdraw first (idempotent): the package must be out of the manifest before the item can run again
+        # and overwrite pkg/; a crash after this line leaves a withdrawn, still finished item -> regate again
+        withdrawn = withdraw(P, it.item_id, f"regate: {reason}")
+        rec = dict(ts=time.time(), reason=reason, from_stage=st.get("stage"), from_status=st.get("status"),
+                   pkg_sha=old_sha, calib_epoch=st.get("calib_epoch", 0), label=st.get("calib_label"))
+        st.setdefault("regates", []).append(rec)
+        st["thresholds_locked"] = True
+        st["revision_data_hash"] = review.pkg_data_hash(it.p("pkg"))
+        if recalibrate:
+            rec["archived_epoch"] = _archive_calibration(it)
+        st.setdefault("history", []).append(dict(stage=st.get("stage"), result="regate", to="S6A_run", reason=reason,
+                                                 ts=time.time()))
+        st.update(stage="S6A_run", status="active")
+        st.pop("reason", None)
+        it.save()
+    P.store.event("regate", item=it.item_id, reason=reason, pkg_sha=old_sha)
+    return dict(item=it.item_id, stage="S6A_run", pkg_sha=old_sha, withdrawn=withdrawn)
+
+
+def _s8_exploits(P, it):
+    """S8 when the only blocking gate is exploit_valid: rewrite the broken exploit baselines and nothing else
+    (gates.exploit_patch_problems).  Exploits are not shipped and do not touch the reference, the tests, the
+    statement or the thresholds, so this repair is allowed with locked thresholds (a released item re-gated after a
+    harness change) and has its own round budget (gates.max_exploit_repair_rounds)."""
+    n = int(it.state.get("exploit_repair_rounds", 0))
+    locked = bool(it.state.get("thresholds_locked"))
+    if n >= int(P.cfg["gates"].get("max_exploit_repair_rounds", 2)):
+        return it.finish("parked" if locked else "dropped", f"exploit_repair_limit:{n}")
+    task = it.p("task")
+    last = sorted(it.p("gates").glob("attempt-*.json"))
+    gate_log = read_json(last[-1]) if last else {}
+    exploits = sorted(str(p.relative_to(task)) for p in (task / "baselines").glob("exploit_*.py"))
+    files = "\n".join(f"=== FILE: {rel} ===\n{(task / rel).read_text()}" for rel in exploits)
+    ctx = "\n".join(f"=== FILE: {rel} ===\n{(task / rel).read_text()[:30000]}"
+                    for rel in ("instruction.md", "tests/measure.py", "solution/solve.py") if (task / rel).exists())
+    user = S8_EXPLOIT.format(gates=json.dumps(_slim(gate_log), default=str)[:20000], metrics_api=METRICS_API,
+                             context=ctx, files=files)
+    r = P.client("repair").chat(SYSTEM, user, stage="S8", item=it.item_id,
+                                max_tokens=P.cfg["gen"].get("s6a_max_tokens"))
+    save_raw(it, "S8", r)
+    patch = parse_files(r.text, truncated=r.stop_reason == "max_tokens")
+    bad = gates.exploit_patch_problems(task, patch) or ([] if patch else ["empty patch"])
+    d = it.p("repair", f"exploit-{n + 1}")
+    d.mkdir(parents=True, exist_ok=True)
+    write_json(d / "review.json", dict(ok=not bad, reasons=bad, files=sorted(patch), method="exploit-only"))
+    it.state["exploit_repair_rounds"] = n + 1
+    it.save()
+    if bad:
+        return it.goto("S8", "exploit_repair_rejected:" + ";".join(bad)[:300])
+    for rel, body in patch.items():
+        (d / "patch" / rel).parent.mkdir(parents=True, exist_ok=True)
+        (d / "patch" / rel).write_text(body)
+        (d / "before" / rel).parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(task / rel, d / "before" / rel)
+    repair.apply(task, patch)
+    it.goto("S7", f"exploit repair round {n + 1}")
+
+
 def _slim(g):
     if not isinstance(g, dict):
         return g
@@ -109,6 +189,12 @@ def _slim(g):
     if isinstance(det, dict):
         out["details"] = {k: det[k] for k in ("determinism", "unstated", "isolation", "runs", "truth_isolation")
                           if k in det}
+        if "exploit_valid" in out.get("blocking", []):
+            out["fix_hint"] = ("an exploit baseline did not really run (details.seeds.<seed>.exploit_*.valid.why): fix "
+                               "baselines/exploit_*.py so it completes under the verifier's exact invocation (PROG: "
+                               "the verifier calls `python /app/output/solution_cli.py <input_dir> <output_dir>` once "
+                               "per hidden set, and a set may hold a single case) and writes every deliverable, "
+                               "still taking the shortcut.  A crashing exploit tests nothing.")
         if "tdm_verbatim" in out.get("blocking", []):
             out["details"]["tdm_verbatim"] = det.get("tdm_verbatim")
             out["fix_hint"] = ("instruction.md / data files copy a passage of the paper's licensed full text verbatim "
@@ -125,7 +211,8 @@ def _slim(g):
         if "leak" in det:
             out["details"]["leak"] = dict(classes=det["leak"].get("classes"), findings=det["leak"].get("findings", [])[:8])
         if "seeds" in det:
-            out["details"]["seeds"] = {s: {w: {k: v.get(k) for k in ("passed", "failed", "solve_rc", "solve_err")}
+            out["details"]["seeds"] = {s: {w: {k: v.get(k) for k in ("passed", "failed", "solve_rc", "solve_err", "valid")
+                                               if k in v}
                                            for w, v in sd.items() if isinstance(v, dict)}
                                        for s, sd in det["seeds"].items()}
     return out

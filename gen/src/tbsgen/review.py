@@ -13,8 +13,10 @@ The agent writes /app/review_out/verdict.json:
      "issues": [{"id", "category", "severity": "blocking"|"minor", "title", "evidence": [...], "fix"}],
      "label_assessment": {"label": ..., "trustworthy": true|false|null, "reason": ...},
      "summary": "..."}
-normalize() enforces the contract mechanically: a blocking issue without evidence is downgraded to minor; only
-blocking issues may lead to revise/drop; an inconsistent or malformed verdict becomes "human".
+normalize() enforces the contract mechanically: a blocking issue without evidence is downgraded to minor; an issue
+marked "leak": true (ground truth / answers readable or copyable, or scoring tamperable) with evidence is blocking
+whatever severity the reviewer gave it (so "pass" with such an issue becomes "human"); only blocking issues may
+lead to revise/drop; an inconsistent or malformed verdict becomes "human".
 
 Routing (stages_b.s9r): pass -> S10 (minor issues in the manifest) for kept labels / stays parked for the parked
 ones; revise -> S8 review revision (review.max_revisions, default 1; thresholds locked) -> S6A_run/S6B/S6C/S7/PKG ->
@@ -409,6 +411,8 @@ d. **Stability.**  Timing gates with a small margin over the reference (measure 
    count, nondeterminism or seeds.
 e. **Shortcuts and leaks.**  Can the task be passed without doing the work (hard-coding, reading test files or
    truth, echoing inputs, bypassing the computation)?  Does the statement or data leak the answer or key constants?
+   Can the agent program tamper with the scoring (e.g. leave a process running that rewrites
+   `/logs/verifier/reward.txt` or `metrics.jsonl`)?
 f. **Network / ready-made code.**  Does solving it need the internet or the paper's published implementation?
 g. **Calibration evidence.**  Using the traces: did failures come from the task's difficulty, from a task defect
    (ambiguity, contradiction), or from the harness / infrastructure (timeouts from a slow model, crashes, API
@@ -426,6 +430,12 @@ and see what the verifier says; compare the reference's convention with an alter
   exploitable by design, it needs the internet).
 - `human`: you cannot decide with the evidence available.
 - **blocking** = would make a correct, careful solver fail (or let a non-solver pass), or makes the label wrong.
+- **Any leak of ground truth or answers is blocking, never minor** — on public or hidden data alike: a file, the
+  statement, a data note or an object in the image from which the expected answer of *any* scored metric (or a
+  value that can be copied to get its score) can be read or reconstructed without doing the work.  "It only
+  affects a public metric" does not make it minor: every check counts toward the reward.  The same holds for any
+  way to tamper with the verifier's scoring (reward.txt, metrics.jsonl).  Mark such an issue `"leak": true`
+  (category e); a leak issue with evidence is always counted as blocking.
   Every blocking issue needs concrete evidence: file + line numbers, a command you ran and its output, or a quoted
   trace excerpt.  A suspicion without such evidence is **minor**.  Do not inflate severity.
 
@@ -446,7 +456,7 @@ Write `{verdict_path}` (JSON, exactly these keys) and optionally `/app/review_ou
     "g_calibration": {{"status": "...", "note": "..."}}
   }},
   "issues": [
-    {{"id": "I1", "category": "a|b|c|d|e|f|g", "severity": "blocking | minor", "title": "...",
+    {{"id": "I1", "category": "a|b|c|d|e|f|g", "severity": "blocking | minor", "leak": false, "title": "...",
       "evidence": ["instruction.md:53 says ... ; tests/measure.py:42 reads ...", "ran X -> output Y"],
       "fix": "the smallest edit that fixes it (which file, what change)"}}
   ],
@@ -481,7 +491,7 @@ def normalize(raw: dict | None, reward: float | None = None) -> dict:
         return dict(verdict="human", raw_verdict=None, issues=[], blocking=[], minor=[], downgraded=[],
                     label_assessment={}, checklist={}, summary="", problems=["no verdict"])
     rv = raw.get("verdict")
-    issues, downgraded = [], []
+    issues, downgraded, escalated = [], [], []
     if not isinstance(raw.get("issues", []), list):
         problems.append("issues is not a list")
     for i, it in enumerate(raw.get("issues") or [] if isinstance(raw.get("issues"), list) else []):
@@ -498,6 +508,13 @@ def normalize(raw: dict | None, reward: float | None = None) -> dict:
             it["severity"] = "minor"
             it["downgraded"] = "blocking without evidence"
             downgraded.append(it["id"])
+        if it.get("leak") is True and it["severity"] != "blocking" and _has_evidence(it.get("evidence")) and \
+                sev in SEVERITIES:
+            # a leak of ground truth / answers (any metric, public or hidden) or a way to tamper with the scoring
+            # is blocking by contract (S9R validation of e2e-prod-20261109: a public-truth leak was rated minor)
+            it["severity"] = "blocking"
+            it["escalated"] = "leak is blocking"
+            escalated.append(it["id"])
         issues.append(it)
     if reward is not None and reward != 1:
         problems.append(f"review verifier reward {reward} (verdict.json failed the structure check)")
@@ -509,11 +526,12 @@ def normalize(raw: dict | None, reward: float | None = None) -> dict:
     elif v in ("revise", "drop") and not blocking:
         problems.append(f"verdict {v} without a (evidenced) blocking issue")
     elif v == "pass" and blocking:
-        problems.append("verdict pass with blocking issues")
+        problems.append("verdict pass with blocking issues" + (f" (leak issues {escalated} are blocking)"
+                                                               if escalated else ""))
     if problems:
         v = "human"
     return dict(verdict=v, raw_verdict=rv, issues=issues, blocking=blocking, minor=minor, downgraded=downgraded,
-                label_assessment=raw.get("label_assessment") or {}, checklist=raw.get("checklist") or {},
+                escalated=escalated, label_assessment=raw.get("label_assessment") or {}, checklist=raw.get("checklist") or {},
                 reference_check=raw.get("reference_check") or {}, summary=str(raw.get("summary") or "")[:2000],
                 problems=problems)
 

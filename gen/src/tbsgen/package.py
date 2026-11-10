@@ -16,7 +16,7 @@ import shutil
 import tomllib
 from pathlib import Path
 
-from .runner import METRICS_HELPER
+from .runner import TEST_SH, metrics_helper_text, timing_budget
 
 TASK_TOML = """schema_version = "1.0"
 
@@ -100,16 +100,6 @@ def dockerfile(cfg: dict, mode: str | None = None) -> str:
     return DOCKERFILE_LOCAL.format(image=cfg["sandbox"]["image"], offline=off)
 
 
-TEST_SH = """#!/bin/bash
-set -uo pipefail
-mkdir -p /logs/verifier
-cd /tests
-if python -m pytest -q -p no:cacheprovider /tests/test_outputs.py; then
-  echo 1 > /logs/verifier/reward.txt
-else
-  echo 0 > /logs/verifier/reward.txt
-fi
-"""
 
 SOLVE_SH = """#!/bin/bash
 set -euo pipefail
@@ -138,7 +128,7 @@ def package(cfg: dict, item_dir: Path, gen0: Path, spec: dict, provenance: dict)
     shutil.copytree(gen0 / "tests" / "truth", out / "tests" / "truth")
     if any((gen0 / "tests" / "hidden").rglob("*")):
         shutil.copytree(gen0 / "tests" / "hidden", out / "tests" / "hidden")
-    shutil.copy(METRICS_HELPER, out / "tests" / "_metrics.py")
+    (out / "tests" / "_metrics.py").write_text(metrics_helper_text(cfg, spec))
     (out / "tests" / "test.sh").write_text(TEST_SH)
     (out / "solution").mkdir()
     shutil.copy(task / "solution" / "solve.py", out / "solution" / "solve.py")
@@ -150,7 +140,7 @@ def package(cfg: dict, item_dir: Path, gen0: Path, spec: dict, provenance: dict)
         task_id=item_dir.name, desc=_q(spec.get("title", item_dir.name)),
         keywords=json.dumps(spec.get("competencies", [])[:8], ensure_ascii=False),
         domain=_q(spec.get("domain", "")), field=_q(spec.get("field", "")), form=_q(spec.get("form", "")),
-        expert_h=float(spec.get("expert_time_hours", 2.0)), verifier_sec=float(pk["verifier_timeout"]),
+        expert_h=float(spec.get("expert_time_hours", 2.0)), verifier_sec=float(pk["verifier_timeout"]) + timing_budget(cfg, spec),
         agent_sec=float(pk["agent_hours"] * 3600), **network_policy(cfg)))
     (out / "provenance.json").write_text(json.dumps(provenance, indent=1, ensure_ascii=False, default=str))
     for p in (out / "tests" / "test.sh", out / "solution" / "solve.sh"):

@@ -539,3 +539,60 @@ def test_verdict_of_one_job_cannot_be_routed_for_another(tmp_path):
     _route_review(P, it, other, 1)
     st = P.store.item(iid).state
     assert st["status"] == "parked" and "bound to" in st["reason"]
+
+
+def test_regate_released_item_withdraws_locks_and_rereviews(tmp_path):
+    """A harness change (verifier template): regate withdraws the released item, locks thresholds and data, goes
+    back to S6A_run; calibration runs kept by default; the S10 review gate then demands a new review because the
+    package hash changed."""
+    from tbsgen.stages_b import _released, regate, review_gate
+    P, iid, jobs = _env(tmp_path)
+    _to_label(P, iid, jobs)
+    _finish(jobs, _runs(P, iid, "review")[0]["job_name"], verdict=V("pass"))
+    watch_tick(P, only=[iid])
+    P.run(only=[iid])
+    it = P.store.item(iid)
+    assert it.state["status"] == "done" and _released(P, iid)
+    out = regate(P, it, "grader template v2.5")
+    it = P.store.item(iid)
+    assert out["withdrawn"] and not _released(P, iid)
+    assert it.state["stage"] == "S6A_run" and it.state["status"] == "active" and it.state["thresholds_locked"]
+    assert it.state["revision_data_hash"] and it.state["regates"][0]["reason"] == "grader template v2.5"
+    assert len(_runs(P, iid)) == 2 and it.state.get("calib_epoch", 0) == 0
+    it.p("pkg", "tests", "_metrics.py").write_text("# new template\n")      # what the new PKG step changes
+    it.state.update(stage="S10", status="active")
+    assert review_gate(P, it) == "package changed after the review"
+
+
+def test_regate_recalibrate_archives_epoch(tmp_path):
+    from tbsgen.stages_b import regate
+    P, iid, jobs = _env(tmp_path)
+    _to_label(P, iid, jobs)
+    it = P.store.item(iid)
+    it.state.update(stage="S10", status="done")
+    it.save()
+    regate(P, it, "x", recalibrate=True)
+    it = P.store.item(iid)
+    assert it.state["calib_epoch"] == 1 and _runs(P, iid) == [] and "calib_label" not in it.state
+
+
+def test_regate_withdraws_before_the_item_can_run(tmp_path, monkeypatch):
+    """Codex r3: if the withdrawal fails, the item must stay finished (not runnable) and regate can be retried."""
+    import pytest
+    from tbsgen import stages_b
+    P, iid, jobs = _env(tmp_path)
+    _to_label(P, iid, jobs)
+    it = P.store.item(iid)
+    it.state.update(stage="S10", status="done")
+    it.save()
+
+    def boom(*a, **k):
+        raise OSError("disk full")
+    monkeypatch.setattr(stages_b, "withdraw", boom)
+    with pytest.raises(OSError):
+        stages_b.regate(P, it, "x")
+    it = P.store.item(iid)
+    assert it.state["status"] == "done" and not it.state.get("thresholds_locked")
+    monkeypatch.undo()
+    assert stages_b.regate(P, it, "x")["stage"] == "S6A_run"
+
