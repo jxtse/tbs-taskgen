@@ -158,8 +158,7 @@ def _sandbox_prepare(input_dir, out):
         raise PermissionError(f"truth lock failed, agent program not run: {bad[:3]}")
     _lock_logs(pw.pw_uid)
     os.chown(out, pw.pw_uid, pw.pw_gid)
-    home = tempfile.mkdtemp(prefix="solhome-")
-    os.chown(home, pw.pw_uid, pw.pw_gid)
+    home, _hp, _hi = _private_dir("solhome-", (pw.pw_uid, pw.pw_gid))
     env = {k: v for k, v in os.environ.items() if not k.startswith("TBSGEN")}
     env.update(HOME=home, TMPDIR=home, MPLCONFIGDIR=home, PYTHONDONTWRITEBYTECODE="1")
     return pw.pw_uid, pw.pw_gid, env
@@ -325,24 +324,41 @@ def _skipped(q, skip):
     return any(q == k or q.startswith(k + os.sep) for k in skip)
 
 
-def _state_snapshot(uid, skip):
+def _xattrs(q):
+    try:
+        return tuple(sorted((n, os.getxattr(q, n, follow_symlinks=False))
+                            for n in os.listxattr(q, follow_symlinks=False)))
+    except OSError:
+        return ()
+
+
+def _ident(q, st, tmp):
+    """Identity of one entry: (ino, ctime, size, mode, uid) -- ctime moves on any content / mode / owner / xattr
+    change and, for a directory, on any entry added or removed.  The verifier itself (root) creates and deletes
+    temp files only in its temp dir: there ctime is replaced by the xattrs (a sticky world-writable dir: the
+    sandbox uid can add entries -- caught as new paths -- but not set xattrs on it)."""
+    if q == tmp:
+        return (st.st_ino, None, None, st.st_mode, st.st_uid, _xattrs(q))
+    return (st.st_ino, st.st_ctime_ns, st.st_size if not os.path.isdir(q) else None, st.st_mode, st.st_uid)
+
+
+def _state_snapshot(uid, skip, deadline=None):
     """Whole-filesystem state the agent program could carry from one timed run to the next: {path: identity} for
-    every entry outside /proc, /sys, /dev (but /dev/shm) and the `skip` trees -- regular files by (ino, ctime,
-    size), directories by (ino, mode, owner) (their own times move when root creates temp files), plus the SysV
-    IPC objects of `uid`.  None when the tree is too big to compare (-> no repeats)."""
+    every entry outside /proc, /sys, /dev (but /dev/shm) and the `skip` trees, the SysV IPC objects and kernel
+    key usage of `uid`.  None when the tree is too big or the deadline passes (-> no repeats)."""
     snap, n = {}, 0
+    tmp = os.path.realpath(tempfile.gettempdir())
     tops = ["/dev/shm"] if os.path.isdir("/dev/shm") else []
     tops += [os.path.join("/", d) for d in sorted(os.listdir("/")) if os.path.join("/", d) not in _SNAP_SKIP_TOP]
     for top in tops:
-        if _skipped(top, skip) or os.path.islink(top):
+        if _skipped(top, skip):
             continue
         try:
             st = os.lstat(top)
         except OSError:
             continue
-        snap[top] = (st.st_ino, None, st.st_mode, st.st_uid) if os.path.isdir(top) else \
-            (st.st_ino, st.st_ctime_ns, st.st_size, st.st_uid)
-        if not os.path.isdir(top):
+        snap[top] = _ident(top, st, tmp)
+        if os.path.islink(top) or not os.path.isdir(top):
             continue
         for root, dirs, files in os.walk(top, followlinks=False):
             dirs[:] = [d for d in dirs if not _skipped(os.path.join(root, d), skip)]
@@ -354,10 +370,9 @@ def _state_snapshot(uid, skip):
                     st = os.lstat(q)
                 except OSError:
                     continue
-                snap[q] = (st.st_ino, None, st.st_mode, st.st_uid) if os.path.isdir(q) and not os.path.islink(q) \
-                    else (st.st_ino, st.st_ctime_ns, st.st_size, st.st_uid)
+                snap[q] = _ident(q, st, tmp)
                 n += 1
-                if n > _SNAP_LIMIT:
+                if n > _SNAP_LIMIT or (deadline is not None and n % 2000 == 0 and time.time() > deadline):
                     return None
     for kind in ("shm", "msg", "sem"):
         try:
@@ -368,6 +383,14 @@ def _state_snapshot(uid, skip):
             f = ln.split()
             if len(f) > 8 and str(uid) in f[4:9]:
                 snap[f"sysvipc:{kind}:{f[1]}"] = (0, 0, 0, uid)
+    try:
+        for ln in open("/proc/key-users").read().splitlines():
+            if ln.split(":")[0].strip() == str(uid):
+                snap["key-users"] = ln.strip()
+    except OSError:
+        pass
+    if deadline is not None and time.time() > deadline:
+        return None
     return snap
 
 
@@ -379,22 +402,44 @@ def _state_changes(before, after):
                   [q for q, v in after.items() if q in before and before[q] != v])
 
 
-def _seal_tree(d):
+def _private_dir(prefix, sb):
+    """dir owned by the sandbox uid inside a root-owned 0711 parent: the program can use it but cannot rename it
+    or swap it for a symlink (that needs write access to the parent).  Returns (dir, parent, inode)."""
+    parent = tempfile.mkdtemp(prefix=prefix)
+    os.chmod(parent, 0o711)
+    d = os.path.join(parent, "d")
+    os.mkdir(d, 0o755)
+    if sb is not None:
+        os.chown(d, sb[0], sb[1])
+    return d, parent, os.lstat(d).st_ino
+
+
+def _seal_tree(d, ino=None):
     """After the scored run: its output dir becomes root-owned and private, so a timed repeat can neither read
-    (copy) nor change it.  Returns a reason when the tree holds anything but plain files / dirs (a symlink or a
-    hard link could point the scored output at a file a repeat may write) -> no repeats."""
+    (copy) nor change it.  Returns a reason when that cannot be guaranteed (-> no repeats): the dir itself is not
+    the real directory created for the run, or the tree holds symlinks / hard links / special files (they could
+    point the scored output at a file a repeat may write)."""
+    st = os.lstat(d)
+    if os.path.islink(d) or not os.path.isdir(d) or (ino is not None and st.st_ino != ino):
+        return f"{d} was replaced"
     bad = []
     for root, dirs, files in os.walk(d, followlinks=False):
         for name in dirs + files:
             q = os.path.join(root, name)
-            st = os.lstat(q)
+            qs = os.lstat(q)
             if os.path.islink(q) or not (os.path.isdir(q) or os.path.isfile(q)) or \
-                    (os.path.isfile(q) and st.st_nlink != 1):
+                    (os.path.isfile(q) and qs.st_nlink != 1):
                 bad.append(q)
                 continue
             os.lchown(q, 0, 0)
-    os.chown(d, 0, 0)
-    os.chmod(d, 0o700)
+    fd = os.open(d, os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        if os.fstat(fd).st_ino != st.st_ino:
+            return f"{d} was replaced"
+        os.fchown(fd, 0, 0)
+        os.fchmod(fd, 0o700)
+    finally:
+        os.close(fd)
     return f"output holds links / special files: {bad[:3]}" if bad else None
 
 
@@ -460,23 +505,28 @@ def _median(xs):
     return xs[k] if len(xs) % 2 else 0.5 * (xs[k - 1] + xs[k])
 
 
+MAX_SPEEDUP = 1.5   # the repeats may lower the reported time to at most first-run time / MAX_SPEEDUP
+
+
 def run_solution(timeout_sec, input_dir=HIDDEN, entry=ENTRY):
     """Run `python <entry> <input_dir> <out_dir>` once per session; returns (out_dir, wall_seconds, returncode).
     Several hidden sets: call once per set, e.g. `for d in hidden_sets(): out, sec, rc = run_solution(t, d)`.
     This is the ONLY sanctioned way to execute agent code in the verifier (it drops to `nobody`, locks truth and
     the verifier logs, and kills everything the program left running).
     out_dir and returncode are those of the first (scored) run.  wall_seconds is the median over TIMING_REPEATS
-    runs (a failed / timed-out repeat counts as +inf) when: the first run succeeded; the repeats fit the extra
-    TIMING_BUDGET_SEC (absolute: each repeat's timeout is the budget left; the pipeline adds the budget to the
-    verifier timeout); the scored output and HOME hold only plain files and become root-only 0700 (a repeat cannot
-    copy or change them); and no run changes anything else on the filesystem (whole-FS snapshot outside /proc,
-    /sys, /dev but /dev/shm; SysV IPC) or writes outputs different from the scored run's.  Otherwise the first
-    run's time alone, with the reason in the record (`timing_repeats_skipped`).  The
-    wall time is also recorded (not a pass/fail check by itself; tests decide whether to check() it)."""
+    runs (a failed / timed-out repeat counts as +inf), never below first-run time / MAX_SPEEDUP, when: the first
+    run succeeded; the repeats and their bookkeeping fit the extra TIMING_BUDGET_SEC (absolute: snapshots stop
+    and each repeat's timeout is the budget left; the pipeline adds the budget to the verifier timeout); the
+    scored output dir and HOME (each in a root-owned 0711 parent, so they cannot be swapped) hold only plain files
+    and become root-only 0700 (a repeat cannot copy or change them); and no run changes anything else on the
+    filesystem (whole-FS snapshot outside /proc, /sys, /dev but /dev/shm, by ctime / xattrs; SysV IPC; kernel
+    keys) or writes outputs different from the scored run's.  Otherwise the first run's time alone, with the
+    reason in the record (`timing_repeats_skipped`).  The wall time is also recorded (not a pass/fail check by
+    itself; tests decide whether to check() it)."""
     key = (entry, input_dir)
     if key in _CACHE:
         return _CACHE[key]
-    out = tempfile.mkdtemp(prefix="sol-")
+    out, out_parent, out_ino = _private_dir("sol-", None)
     entry_exists = os.path.isfile(entry)              # calibration tells "no deliverable" from "deliverable failed"
     try:
         sb = _sandbox_prepare(input_dir, out)
@@ -486,51 +536,55 @@ def run_solution(timeout_sec, input_dir=HIDDEN, entry=ENTRY):
                  "sandboxed": False, "lock_failed": True, "entry": entry, "entry_exists": entry_exists})
         _CACHE[key] = (out, 0.0, -1)
         return _CACHE[key]
+    import shutil
+
+    def left_budget():
+        return TIMING_BUDGET_SEC - _TIMING_SPENT[0]
+
+    def timed(fn, *a):
+        t = time.time()
+        try:
+            return fn(*a)
+        finally:
+            _TIMING_SPENT[0] += time.time() - t
+
     n_rep = max(1, int(TIMING_REPEATS))
-    t_snap = time.time()
-    keep = ([out, sb[2]["HOME"]] if sb is not None else [out]) + [LOGS]   # LOGS: locked for the sandbox uid
-    before = _state_snapshot(sb[0], keep) if sb is not None and n_rep > 1 else None
-    _TIMING_SPENT[0] += time.time() - t_snap
+    home = sb[2]["HOME"] if sb is not None else None
+    keep = [out_parent, LOGS] + ([os.path.dirname(home)] if home else [])
+    want = n_rep > 1 and sb is not None and left_budget() > 0
+    before = timed(_state_snapshot, sb[0], keep, time.time() + left_budget()) if want else None
     rc, err, sec, left = _run_once(entry, input_dir, out, timeout_sec, sb)
     times, why = [sec], None
     if n_rep > 1 and rc == 0 and not left:
         if sb is None:
             why = "not sandboxed (no root): single run"
-        elif _TIMING_SPENT[0] + sec * (n_rep - 1) * 1.2 > TIMING_BUDGET_SEC:
+        elif before is None or left_budget() < sec * (n_rep - 1) * 1.2:
             why = f"first run {sec:.1f}s: repeats would exceed the {TIMING_BUDGET_SEC:.0f}s timing budget"
         else:
-            t_snap = time.time()
-            why = _seal_tree(out) or _seal_tree(sb[2]["HOME"])
+            why = timed(_seal_tree, out, out_ino) or timed(_seal_tree, home)
             if why is None:
-                ch = _state_changes(before, _state_snapshot(sb[0], keep))
+                ch = _state_changes(before, timed(_state_snapshot, sb[0], keep, time.time() + left_budget()))
                 if ch:
                     why = f"first run changed state a repeat could reuse: {ch[:3]}"
-            _TIMING_SPENT[0] += time.time() - t_snap
         if why is None:
-            import shutil
-            ref_digest = _tree_digest(out)
+            ref_digest = timed(_tree_digest, out)
             for _ in range(n_rep - 1):
-                o2 = tempfile.mkdtemp(prefix="sol-")
-                h2 = tempfile.mkdtemp(prefix="solhome-")
-                os.chown(o2, sb[0], sb[1])
-                os.chown(h2, sb[0], sb[1])
-                t_snap = time.time()
-                b2 = _state_snapshot(sb[0], keep + [o2, h2])
-                _TIMING_SPENT[0] += time.time() - t_snap
-                t_rep = TIMING_BUDGET_SEC - _TIMING_SPENT[0]          # absolute cap: never past the budget
-                if t_rep < sec * 1.2:
+                o2, op2, oi2 = _private_dir("sol-", sb)
+                h2, hp2, _hi2 = _private_dir("solhome-", sb)
+                b2 = timed(_state_snapshot, sb[0], keep + [op2, hp2], time.time() + left_budget())
+                t_rep = left_budget()                                  # absolute cap: never past the budget
+                if b2 is None or t_rep < sec * 1.2:
                     times, why = [sec], "timing budget exhausted"
-                    shutil.rmtree(o2, ignore_errors=True)
-                    shutil.rmtree(h2, ignore_errors=True)
+                    shutil.rmtree(op2, ignore_errors=True)
+                    shutil.rmtree(hp2, ignore_errors=True)
                     break
                 r2, _e2, s2, left = _run_once(entry, input_dir, o2, min(float(timeout_sec), t_rep), sb, home=h2)
                 _TIMING_SPENT[0] += s2
-                t_snap = time.time()
-                same = r2 == 0 and not left and _tree_digest(o2) == ref_digest
-                shutil.rmtree(o2, ignore_errors=True)
-                shutil.rmtree(h2, ignore_errors=True)
-                ch = _state_changes(b2, _state_snapshot(sb[0], keep)) if not left else ["left processes"]
-                _TIMING_SPENT[0] += time.time() - t_snap
+                same = r2 == 0 and not left and timed(_tree_digest, o2) == ref_digest
+                ch = ["left processes"] if left else \
+                    _state_changes(b2, timed(_state_snapshot, sb[0], keep + [op2, hp2], time.time() + left_budget()))
+                shutil.rmtree(op2, ignore_errors=True)
+                shutil.rmtree(hp2, ignore_errors=True)
                 if left:
                     break
                 if ch:
@@ -543,7 +597,7 @@ def run_solution(timeout_sec, input_dir=HIDDEN, entry=ENTRY):
                 times.append(s2 if r2 == 0 else float("inf"))
     if left:                                          # could not kill what it left running: no score
         rc, err = -10, (err + f"\nsandbox processes survived SIGKILL: {left[:5]}")[-2000:]
-    med = _median(times)
+    med = max(_median(times), sec / MAX_SPEEDUP)
     _record({"name": "_solution_cli_run", "value": med, "rc": rc, "stderr_tail": err[-500:],
              "threshold": float(timeout_sec), "direction": "<=", "passed": rc == 0, "aux": True,
              "sandboxed": sb is not None, "entry": entry, "entry_exists": entry_exists,

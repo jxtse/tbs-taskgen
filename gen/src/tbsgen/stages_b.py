@@ -123,6 +123,9 @@ def regate(P, it, reason: str, recalibrate: bool = False) -> dict:
         if any(r.get("outcome") is None for r in read_json(it.p("calib", "runs.json"), []) or []):
             raise ValueError("regate: a calibration run is still pending")
         old_sha = calib.pkg_sha(it.p("pkg"))
+        # withdraw first (idempotent): the package must be out of the manifest before the item can run again
+        # and overwrite pkg/; a crash after this line leaves a withdrawn, still finished item -> regate again
+        withdrawn = withdraw(P, it.item_id, f"regate: {reason}")
         rec = dict(ts=time.time(), reason=reason, from_stage=st.get("stage"), from_status=st.get("status"),
                    pkg_sha=old_sha, calib_epoch=st.get("calib_epoch", 0), label=st.get("calib_label"))
         st.setdefault("regates", []).append(rec)
@@ -135,7 +138,6 @@ def regate(P, it, reason: str, recalibrate: bool = False) -> dict:
         st.update(stage="S6A_run", status="active")
         st.pop("reason", None)
         it.save()
-    withdrawn = withdraw(P, it.item_id, f"regate: {reason}")
     P.store.event("regate", item=it.item_id, reason=reason, pkg_sha=old_sha)
     return dict(item=it.item_id, stage="S6A_run", pkg_sha=old_sha, withdrawn=withdrawn)
 

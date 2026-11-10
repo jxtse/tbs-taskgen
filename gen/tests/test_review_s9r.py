@@ -574,3 +574,25 @@ def test_regate_recalibrate_archives_epoch(tmp_path):
     regate(P, it, "x", recalibrate=True)
     it = P.store.item(iid)
     assert it.state["calib_epoch"] == 1 and _runs(P, iid) == [] and "calib_label" not in it.state
+
+
+def test_regate_withdraws_before_the_item_can_run(tmp_path, monkeypatch):
+    """Codex r3: if the withdrawal fails, the item must stay finished (not runnable) and regate can be retried."""
+    import pytest
+    from tbsgen import stages_b
+    P, iid, jobs = _env(tmp_path)
+    _to_label(P, iid, jobs)
+    it = P.store.item(iid)
+    it.state.update(stage="S10", status="done")
+    it.save()
+
+    def boom(*a, **k):
+        raise OSError("disk full")
+    monkeypatch.setattr(stages_b, "withdraw", boom)
+    with pytest.raises(OSError):
+        stages_b.regate(P, it, "x")
+    it = P.store.item(iid)
+    assert it.state["status"] == "done" and not it.state.get("thresholds_locked")
+    monkeypatch.undo()
+    assert stages_b.regate(P, it, "x")["stage"] == "S6A_run"
+

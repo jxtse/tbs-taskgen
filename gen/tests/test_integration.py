@@ -560,7 +560,7 @@ def test_repeats_cannot_copy_scored_outputs(tmp_path):
     from tbsgen import runner
     cfg = load_config(None, {"run": {"root": str(tmp_path)}})
     cli = ("import glob, os, shutil, sys, time\nout = sys.argv[2]\n"
-           "prev = [d for d in glob.glob('/tmp/sol-*') if d != out and os.path.exists(os.path.join(d, 'o.txt'))]\n"
+           "prev = [d for d in glob.glob('/tmp/sol-*') + glob.glob('/tmp/sol-*/d') if d != out and os.path.exists(os.path.join(d, 'o.txt'))]\n"
            "try:\n    shutil.copy(os.path.join(prev[0], 'o.txt'), os.path.join(out, 'o.txt'))\n"
            "except Exception:\n    time.sleep(1.0)\n    open(os.path.join(out, 'o.txt'), 'w').write('x')\n")
     task, gen, ref = _attack_task(tmp_path, cli)
@@ -581,4 +581,22 @@ def test_repeats_cannot_rewrite_scored_output_through_symlink(tmp_path):
     t = runner.test(cfg, task, gen, ref, tmp_path / "work", "lnk")
     runs = [x for x in t["metrics"] if x.get("name") == "_solution_cli_run"]
     assert runs and runs[0]["timing_repeats"] == 1 and "links" in runs[0]["timing_repeats_skipped"], runs
+
+
+def test_repeats_cannot_swap_output_dir_or_cache_in_xattr(tmp_path):
+    """Codex r3: the output dir sits in a root-owned parent (cannot be swapped for a symlink), and a cache kept in
+    a directory xattr (ctime moves) is a state change -> first run only.  The reported time is never below the
+    first run's / MAX_SPEEDUP."""
+    from tbsgen import runner
+    cfg = load_config(None, {"run": {"root": str(tmp_path)}})
+    cli = ("import os, sys\nout = sys.argv[2]\n"
+           "try:\n    os.rename(out, out + '.x'); os.symlink(out + '.x', out); print('SWAPPED', file=sys.stderr)\n"
+           "except OSError:\n    pass\n"
+           "try:\n    os.setxattr('/app/output', 'user.cache', b'1')\nexcept OSError:\n    pass\n"
+           "open(os.path.join(out, 'o.txt'), 'w').write('x')\n")
+    task, gen, ref = _attack_task(tmp_path, cli)
+    t = runner.test(cfg, task, gen, ref, tmp_path / "work", "swap")
+    runs = [x for x in t["metrics"] if x.get("name") == "_solution_cli_run"]
+    assert runs and runs[0]["rc"] == 0 and "SWAPPED" not in runs[0]["stderr_tail"], runs
+    assert runs[0]["value"] >= min(w for w in runs[0]["wall_times"] if w) / 1.5 - 1e-9
 
