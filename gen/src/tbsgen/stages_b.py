@@ -347,6 +347,31 @@ def _cap_reached(P) -> float | None:
     return None
 
 
+def running_jobs(P) -> list[str]:
+    """Harbor jobs (S9 calibration and S9R review, every item of the run) that were launched and have no outcome
+    yet, plus reserved ones whose job already exists."""
+    out = []
+    for it in P.store.items():
+        for rf in (("calib", "runs.json"), ("review", "runs.json")):
+            for r in read_json(it.p(*rf), []) or []:
+                if r.get("outcome") is None and (r.get("state") == "launched" or
+                                                 (r.get("state") == "reserved" and calib.job_started(r))):
+                    out.append(r.get("job_name") or "?")
+    return out
+
+
+def _slots_full(P) -> str | None:
+    """calib.max_concurrent_jobs (None = no limit): a new S9 / S9R job waits while that many are running; the
+    waiting item is stepped again by the next `run` / `calib watch` (reschedulable)."""
+    n = P.cfg["calib"].get("max_concurrent_jobs")
+    if n is None:
+        return None
+    cur = running_jobs(P)
+    if len(cur) >= int(n):
+        return f"slots full: {len(cur)}/{int(n)} jobs running ({', '.join(cur[:3])})"
+    return None
+
+
 def _save_run(it, rec):
     runs = read_json(it.p("calib", "runs.json"), [])
     for i, r in enumerate(runs):
@@ -389,6 +414,9 @@ def _s9(P, it):
                     _save_run(it, rec)
                 return it.finish("paused", f"budget:run_total_actual ({calib.actual_spend(P.ledger):.2f} >= {cap})",
                                  paused_stage="S9")
+            full = _slots_full(P) if rec["state"] == "intent" and not calib.job_started(rec) else None
+            if full:
+                return it.finish("waiting", f"calib {rec['job_name']} queued: {full}")
             if rec["state"] == "intent" and not calib.job_started(rec) and c.get("prepare_command") and \
                     calib.prepared_dir(P.cfg, rec["who"]):
                 prep = calib.ensure_prepared(P.cfg, it.dir, rec["who"])    # an intent written before the hook ran
@@ -428,6 +456,10 @@ def _s9(P, it):
             return it.advance("S9", "S10", label=what)
         return it.finish("done", f"label:{what} (not kept; S9b variants off)")
     n = sum(1 for r in runs if r["who"] == what) + 1
+    full = _slots_full(P) if c.get("allow_submit") else None
+    if full:
+        # checked before anything is prepared or persisted: the next step starts this run from scratch (same n)
+        return it.finish("waiting", f"calib {what} run {n} queued: {full}")
     if c.get("prepare_command") and calib.prepared_dir(P.cfg, what):
         # environment-preparation hook: build the run-ready copy of pkg/ before the job config points at it
         prep = calib.ensure_prepared(P.cfg, it.dir, what)
@@ -708,6 +740,9 @@ def _s9r(P, it):
                     save(rec)
                 return it.finish("paused", f"budget:run_total_actual ({calib.actual_spend(P.ledger):.2f} >= {cap})",
                                  paused_stage="S9R")
+            full = _slots_full(P) if rec["state"] == "intent" and not calib.job_started(rec) else None
+            if full:
+                return it.finish("waiting", f"review {rec['job_name']} queued: {full}")
             rec = calib.launch(rcfg, rec, P.ledger, save)
             if rec.get("blocked") and rec["state"] == "intent":
                 return it.finish("waiting", f"review blocked: {rec['blocked']}")
@@ -751,6 +786,10 @@ def _s9r(P, it):
                 return it.finish("parked", f"review:human ({why})")
             return it.finish("dropped", f"review:invalid {why}")
         return it.finish("parked", f"review:infra ({n_infra} infra, {n_invalid} invalid verdicts)")
+    full = _slots_full(P) if c.get("allow_submit") else None
+    if full:
+        # checked before the review task is built or anything persisted: the next step starts it from scratch
+        return it.finish("waiting", f"review round {rnd} queued: {full}")
     task = review.build_task(P.cfg, it.dir, it.state, rnd)
     rec = review.prepare(P.cfg, it.dir, task, rnd, len(all_rnd) + 1, epoch=epoch)
     if rec.get("blocked"):

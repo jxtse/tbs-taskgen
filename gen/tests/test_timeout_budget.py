@@ -5,6 +5,7 @@ import importlib.util
 import json
 import sys
 import time
+from pathlib import Path
 
 from tbsgen import package, runner
 from tbsgen.config import load_config
@@ -17,6 +18,9 @@ def _helper(tmp_path, cfg, spec, name="m"):
     m = importlib.util.module_from_spec(s)
     s.loader.exec_module(m)
     m._PATH = str(tmp_path / f"{name}.jsonl")
+    # offline unit tests: never touch the host's users / dirs even when pytest runs as root (Codex r1); the
+    # root/nobody path is covered by the Docker integration tests
+    m._sandbox_prepare = lambda input_dir, out: None
     return m
 
 
@@ -109,3 +113,67 @@ def test_run_solution_fast_program_unaffected(tmp_path):
     _o, sec, rc = m.run_solution(1800, str(d), entry=str(entry))
     assert rc == 0 and sec < 30
     assert m._SCORED_SPENT[0] > 0
+
+
+def test_scored_budget_rejects_negative_or_nonfinite_overhead():
+    for ov in (-120, float("nan"), float("inf")):
+        cfg = load_config(None, {"package": {"verifier_overhead_sec": ov}})
+        try:
+            runner.scored_budget(cfg)
+        except ValueError:
+            continue
+        raise AssertionError(ov)
+    assert package.verifier_time_errors(Path("/nonexistent"), 120)          # unreadable package -> error
+
+
+def test_validate_pkg_with_cfg_runs_the_time_check(tmp_path):
+    cfg = load_config(None)
+    pkg = _pkg(tmp_path, cfg, RES, 500)
+    for r in package.REQUIRED:
+        q = pkg / r
+        if not q.exists():
+            q.parent.mkdir(parents=True, exist_ok=True)
+            if not r.endswith("/"):
+                q.write_text("x\n")
+    (pkg / "task.toml").write_text('[task]\n[agent]\n[environment]\nnetwork_mode = "no-network"\n'
+                                   '[verifier]\ntimeout_sec = 500\n')
+    v = package.validate_pkg(pkg, cfg)
+    assert not v["ok"] and any("> verifier timeout" in e for e in v.get("errors", [])), v
+    assert not any("verifier time" in e for e in package.validate_pkg(pkg).get("errors", []))  # no cfg: structural
+
+
+def test_nan_timeout_cannot_disable_the_cap(tmp_path):
+    cfg = load_config(None)
+    m = _helper(tmp_path, cfg, ACC, "nan")
+    m.SCORED_BUDGET_SEC = 1.5
+    entry = tmp_path / "cli.py"
+    entry.write_text("import time\ntime.sleep(30)\n")
+    d = tmp_path / "h"
+    d.mkdir()
+    t0 = time.time()
+    _o, _sec, rc = m.run_solution(float("nan"), str(d), entry=str(entry))
+    assert rc != 0 and time.time() - t0 < 15
+
+
+def test_budget_is_shared_across_hidden_sets(tmp_path):
+    """Two 1 s runs under a 1.6 s budget: the first runs fully, the second gets the 0.6 s left and times out."""
+    cfg = load_config(None)
+    m = _helper(tmp_path, cfg, ACC, "shared")
+    m.SCORED_BUDGET_SEC = 1.6
+    entry = tmp_path / "cli.py"
+    entry.write_text("import os, sys, time\ntime.sleep(1.0)\nos.makedirs(sys.argv[2], exist_ok=True)\n")
+    d1, d2 = tmp_path / "h1", tmp_path / "h2"
+    d1.mkdir()
+    d2.mkdir()
+    assert m.run_solution(600, str(d1), entry=str(entry))[2] == 0
+    _o, _s, rc2 = m.run_solution(600, str(d2), entry=str(entry))
+    assert rc2 != 0
+    runs = [json.loads(x) for x in open(m._PATH) if '"_solution_cli_run"' in x]
+    assert 0 < runs[1]["timeout_effective"] < 0.7, runs[1]
+
+
+def test_resource_task_repeats_capped_by_clamped_first_timeout():
+    """Static check of the template: a timed repeat's timeout is min(clamped first timeout, timing budget left),
+    never the raw timeout_sec measure.py asked for."""
+    src = (Path(runner.__file__).parent / "templates_metrics.py").read_text()
+    assert "min(t_first, t_rep)" in src and "min(float(timeout_sec), t_rep)" not in src

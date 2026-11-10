@@ -665,6 +665,8 @@ def run_solution(timeout_sec, input_dir=HIDDEN, entry=ENTRY):
             _TIMING_SPENT[0] += time.time() - t
 
     t_first = float(timeout_sec)
+    if t_first != t_first:                            # NaN: never a timeout that cannot expire
+        t_first = float("inf")
     if SCORED_BUDGET_SEC is not None:
         t_first = min(t_first, float(SCORED_BUDGET_SEC) - _SCORED_SPENT[0])
     if t_first <= 0:                                  # verifier time for the scored runs used up: a timeout
@@ -680,7 +682,7 @@ def run_solution(timeout_sec, input_dir=HIDDEN, entry=ENTRY):
     keep = [out_parent, LOGS] + ([os.path.dirname(home)] if home else [])
     want = n_rep > 1 and sb is not None and left_budget() > 0
     before = timed(_state_snapshot, sb[0], keep, time.time() + left_budget()) if want else None
-    rc, err, sec, left = _run_once(entry, input_dir, out, t_first, sb)
+    rc, err, sec, left = _run_once(entry, input_dir, out, t_first if math.isfinite(t_first) else None, sb)
     _SCORED_SPENT[0] += sec
     times, why = [sec], None
     if n_rep > 1 and rc == 0 and not left:
@@ -727,7 +729,7 @@ def run_solution(timeout_sec, input_dir=HIDDEN, entry=ENTRY):
         rc, err = -10, (err + f"\nsandbox processes survived SIGKILL: {left[:5]}")[-2000:]
     med = max(_median(times), sec / MAX_SPEEDUP)
     _record({"name": "_solution_cli_run", "value": med, "rc": rc, "stderr_tail": err[-500:],
-             "threshold": float(timeout_sec), "timeout_effective": round(t_first, 3), "direction": "<=",
+             "threshold": float(timeout_sec), "timeout_effective": round(t_first, 3) if math.isfinite(t_first) else None, "direction": "<=",
              "passed": rc == 0, "aux": True, "sandboxed": sb is not None, "entry": entry, "entry_exists": entry_exists,
              "wall_times": [round(t, 6) if math.isfinite(t) else None for t in times], "timing_repeats": len(times),
              "timing_repeats_skipped": why})

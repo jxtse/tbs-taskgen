@@ -411,6 +411,10 @@ DEFAULTS: dict[str, Any] = {
         "timeout_no_output": "fail",
         "timeout_no_output_retries": 1,
         "watch_interval_s": 120,            # `tbsgen calib watch` poll interval
+        # At most this many Harbor jobs (S9 calibration + S9R review, all items of the run) running at once; a new
+        # job waits (status waiting, "queued: slots full") and is stepped again by the next run / calib watch.
+        # None = no limit.
+        "max_concurrent_jobs": None,
         # Hosts the agent may reach while it works when the task's agent phase is an allowlist
         # (package.network.mode = "agent-allowlist"): the model endpoint(s).  Written to the job config as
         # agents[].extra_allowed_hosts (= harbor run --allow-agent-host).  Empty with an allowlisted task: S9 does

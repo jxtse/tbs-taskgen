@@ -96,9 +96,14 @@ def scored_budget(cfg: dict) -> float:
     """Total wall seconds the scored (first) runs of the agent program may use in one verifier session
     (_metrics.SCORED_BUDGET_SEC): the smaller of the packaged verifier timeout and the local test timeout, minus
     package.verifier_overhead_sec.  With timing_budget() on top it always ends before the verifier timeout."""
+    import math
     pk = cfg.get("package") or {}
     base = min(float(pk.get("verifier_timeout", 900)), float((cfg.get("gen") or {}).get("test_timeout", 900)))
-    b = base - float(pk.get("verifier_overhead_sec", 120))
+    ov = float(pk.get("verifier_overhead_sec", 120))
+    if not (math.isfinite(base) and math.isfinite(ov)) or ov < 0:
+        raise ValueError(f"verifier timeout / package.verifier_overhead_sec must be finite, overhead >= 0 "
+                         f"(got {base}, {ov})")
+    b = base - ov
     if b <= 0:
         raise ValueError(f"package.verifier_overhead_sec leaves no time for the scored runs (verifier {base:.0f}s)")
     return b

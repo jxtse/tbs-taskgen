@@ -673,3 +673,37 @@ def test_launcher_exit_without_job_records_not_launched_cost(tmp_path):
     watch_tick(P)
     r = _runs(P, iid)[0]
     assert r["state"] == "launch_failed" and r["cost_kind"] == "not_launched" and r["cost_usd"] == 0.0
+
+
+
+# ------------------------------------------------------------------ calib.max_concurrent_jobs
+def test_max_concurrent_jobs_queues_extra_items_and_starts_them_when_a_slot_frees(tmp_path):
+    """3 S9 items, max 2 jobs: two launch, the third waits (nothing persisted, no ledger reservation); once a job
+    finishes, the next watch pass ingests it and starts the queued item -- never more than 2 running."""
+    from tbsgen import stages_b as B
+    P, ids, counter, jobs = _env(tmp_path, n_items=3, max_concurrent_jobs=2)
+    P.run()
+    assert counter.read_text().count("x") == 2
+    assert len(B.running_jobs(P)) == 2
+    queued = [i for i in ids if not P.store.item(i).p("calib", "runs.json").exists()]
+    assert len(queued) == 1
+    q = P.store.item(queued[0])
+    assert q.state["status"] == "waiting" and "slots full: 2/2" in q.state["reason"]
+    assert B.reschedulable(P.cfg, q)
+    P.run()                                                                     # still full: no new launch
+    assert counter.read_text().count("x") == 2
+    first = next(i for i in ids if i not in queued)
+    _finish(jobs, _runs(P, first)[0]["job_name"], reward=1.0, cost=2.0)       # GLM pass -> its glm2 takes the slot
+    watch_tick(P)
+    assert counter.read_text().count("x") == 3 and len(B.running_jobs(P)) == 2
+    assert not P.store.item(queued[0]).p("calib", "runs.json").exists()
+    _finish(jobs, _runs(P, first)[1]["job_name"], reward=1.0, cost=2.0)       # 2/2 pass -> label, slot frees
+    watch_tick(P)
+    assert counter.read_text().count("x") == 4 and len(B.running_jobs(P)) == 2
+    assert _runs(P, queued[0])[0]["state"] == "launched"
+
+
+def test_max_concurrent_jobs_none_keeps_old_behaviour(tmp_path):
+    P, ids, counter, jobs = _env(tmp_path, n_items=3)
+    P.run()
+    assert counter.read_text().count("x") == 3

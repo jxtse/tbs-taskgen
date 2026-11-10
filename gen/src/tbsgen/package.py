@@ -172,10 +172,15 @@ def verifier_time_errors(pkg: Path, overhead: float) -> list[str]:
         src = (pkg / "tests" / "_metrics.py").read_text()
     except Exception as e:  # noqa: BLE001
         return [f"verifier time: {e}"]
+    import math
+    if not math.isfinite(overhead) or overhead < 0:
+        return [f"verifier time: package.verifier_overhead_sec must be finite and >= 0 (got {overhead})"]
+    if not math.isfinite(vt):
+        return [f"verifier time: [verifier].timeout_sec must be finite (got {vt})"]
     sc, tb = _helper_const(src, "SCORED_BUDGET_SEC"), _helper_const(src, "TIMING_BUDGET_SEC")
-    if not isinstance(sc, (int, float)) or isinstance(sc, bool) or sc <= 0:
+    if not isinstance(sc, (int, float)) or isinstance(sc, bool) or not math.isfinite(sc) or sc <= 0:
         return ["verifier time: tests/_metrics.py has no SCORED_BUDGET_SEC cap (old helper template)"]
-    if not isinstance(tb, (int, float)) or isinstance(tb, bool) or tb < 0:
+    if not isinstance(tb, (int, float)) or isinstance(tb, bool) or not math.isfinite(tb) or tb < 0:
         return ["verifier time: tests/_metrics.py has no TIMING_BUDGET_SEC"]
     if sc + tb + overhead > vt + 1e-6:
         return [f"verifier time: scored {sc:.0f}s + timing repeats {tb:.0f}s + overhead {overhead:.0f}s "
