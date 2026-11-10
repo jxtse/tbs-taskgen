@@ -148,7 +148,42 @@ def package(cfg: dict, item_dir: Path, gen0: Path, spec: dict, provenance: dict)
     return out
 
 
-def validate_pkg(pkg: Path) -> dict:
+def _helper_const(src: str, name: str):
+    """Value of a pipeline-written `NAME = <literal>  # tbsgen:...` line of tests/_metrics.py (None if absent)."""
+    import ast
+    import re
+    m = re.search(rf"^{name} = (.+?)  # tbsgen:", src, re.M)
+    if not m:
+        return None
+    try:
+        return ast.literal_eval(m.group(1))
+    except (ValueError, SyntaxError):
+        return None
+
+
+def verifier_time_errors(pkg: Path, overhead: float) -> list[str]:
+    """The agent program's verifier time must fit the task's verifier timeout: the scored runs' cap
+    (_metrics.SCORED_BUDGET_SEC) + the timed repeats' budget (TIMING_BUDGET_SEC) + `overhead` seconds for the rest
+    of the verifier <= [verifier].timeout_sec.  Otherwise Harbor kills the verifier mid-run (no reward) instead of
+    the helper failing the program like a timeout (review of e2e-batch2: run_solution(1800) under 1200 s)."""
+    try:
+        t = tomllib.loads((pkg / "task.toml").read_text())
+        vt = float((t.get("verifier") or {})["timeout_sec"])
+        src = (pkg / "tests" / "_metrics.py").read_text()
+    except Exception as e:  # noqa: BLE001
+        return [f"verifier time: {e}"]
+    sc, tb = _helper_const(src, "SCORED_BUDGET_SEC"), _helper_const(src, "TIMING_BUDGET_SEC")
+    if not isinstance(sc, (int, float)) or isinstance(sc, bool) or sc <= 0:
+        return ["verifier time: tests/_metrics.py has no SCORED_BUDGET_SEC cap (old helper template)"]
+    if not isinstance(tb, (int, float)) or isinstance(tb, bool) or tb < 0:
+        return ["verifier time: tests/_metrics.py has no TIMING_BUDGET_SEC"]
+    if sc + tb + overhead > vt + 1e-6:
+        return [f"verifier time: scored {sc:.0f}s + timing repeats {tb:.0f}s + overhead {overhead:.0f}s "
+                f"> verifier timeout {vt:.0f}s"]
+    return []
+
+
+def validate_pkg(pkg: Path, cfg: dict | None = None) -> dict:
     missing = [r for r in REQUIRED if not (pkg / r).exists()]
     errs = []
     try:
@@ -160,6 +195,8 @@ def validate_pkg(pkg: Path) -> dict:
             errs.append("task.toml [environment] needs network_mode")
     except Exception as e:  # noqa: BLE001
         errs.append(f"task.toml: {e}")
+    if cfg is not None and not missing:
+        errs += verifier_time_errors(pkg, float((cfg.get("package") or {}).get("verifier_overhead_sec", 120)))
     leaked = [str(p.relative_to(pkg)) for p in (pkg / "environment").rglob("*")
               if p.is_file() and any(s in p.parts for s in ("tests", "truth", "generator", "solution"))]
     if leaked:

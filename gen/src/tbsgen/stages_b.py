@@ -245,7 +245,7 @@ def pkg(P, it):
                 thresholds=read_json(it.p("thresholds.json"))["thresholds"],
                 model_cost=P.item_cost(it.item_id), packaged=time.time())
     out = package.package(P.cfg, it.dir, gen0, spec, prov)
-    v = package.validate_pkg(out)
+    v = package.validate_pkg(out, P.cfg)
     # the packaged image (Dockerfile written here, not by the model) gets the same ready-made check
     rm = prerelease.readymade_check(out, cand, spec)
     if not rm["ok"]:

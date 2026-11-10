@@ -3,14 +3,16 @@ S8 local repair).  Outputs are machine-parsed: S5 -> one JSON object; S6A/S6C/S8
 "=== FILE: <rel path> ===" ... "=== END ===".  Kept short on purpose: the contract (file layout + rules)
 matters more than prose.  Version strings go into provenance so prompt changes are traceable.
 """
-PROMPT_VERSION = "v2.5-2026-11-10"
+PROMPT_VERSION = "v2.6-2026-11-11"
 
 METRICS_API = """Verifier helper module `_metrics` (provided, importable from tests/; exact signatures):
   check(name: str, value: float, threshold: float, direction: "<=" | ">=") -> None   # records + asserts
   hidden_sets() -> list[str]          # absolute dirs: subdirectories of /tests/hidden, or [/tests/hidden]
   run_solution(timeout_sec: float, input_dir: str = "/tests/hidden") -> tuple[str, float, int]
       # runs `python /app/output/solution_cli.py <input_dir> <out_dir>` as user nobody with /tests/truth locked;
-      # returns (out_dir, wall_seconds, returncode); cached per input_dir
+      # returns (out_dir, wall_seconds, returncode); cached per input_dir.  All calls of one verifier session
+      # share a fixed total time cap (the verifier's own timeout): a larger timeout_sec is clamped to what is
+      # left, and a call with no time left returns rc -9 / wall_seconds inf like a timeout
 Example (PROG):  for d in hidden_sets(): out_dir, sec, rc = run_solution(600, d)"""
 
 

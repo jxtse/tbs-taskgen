@@ -462,6 +462,12 @@ DEFAULTS: dict[str, Any] = {
         "dockerfile_mode": "selfcontained",  # "selfcontained" (pip in Dockerfile, portable) | "local_base"
         "agent_hours": 2,
         "verifier_timeout": 900,
+        # verifier seconds kept for everything but the agent program's scored runs (image start, pytest, speed
+        # benchmark, metric computation).  The scored runs of one verifier session get at most
+        # min(verifier_timeout, gen.test_timeout) - verifier_overhead_sec in total (_metrics.SCORED_BUDGET_SEC),
+        # whatever timeout tests/measure.py passes; the timed repeats get thresholds.timing_budget_sec on top, which
+        # is added to the task's verifier timeout.  PKG checks scored + repeats + overhead <= the verifier timeout.
+        "verifier_overhead_sec": 120,
         # Network of the packaged task (prerelease.py).  "agent-allowlist": no internet while the agent works
         # except `agent_hosts` + the model endpoint added per run (calib.agent_allowed_hosts / --allow-agent-host);
         # agent setup runs before that with network (installs the agent CLI); the verifier is offline.

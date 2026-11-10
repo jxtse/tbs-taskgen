@@ -425,6 +425,13 @@ TIMING_BUDGET_SEC = 300.0  # tbsgen:timing_budget
 # Extra wall time the timed repeats may use per verifier session, snapshots included.  The pipeline adds the same
 # amount to the task's verifier timeout, so the scored (first) runs keep the whole original timeout.
 _TIMING_SPENT = [0.0]
+# Total wall time all scored (first) runs of one verifier session may use, whatever timeout tests/measure.py
+# passes: each call's timeout is clamped to what is left, and a call with nothing left fails like a timeout
+# (rc -9, wall time inf).  Written by the pipeline: package.verifier_timeout - package.verifier_overhead_sec, so
+# scored runs + TIMING_BUDGET_SEC always end before the verifier timeout (e2e-prod review: run_solution(1800)
+# under a 1200 s verifier timeout).  None = no cap (a standalone copy).
+SCORED_BUDGET_SEC = None  # tbsgen:scored_budget
+_SCORED_SPENT = [0.0]
 _SNAP_SKIP_TOP = ("/proc", "/sys", "/dev")
 _SNAP_LIMIT = 400000
 
@@ -657,12 +664,24 @@ def run_solution(timeout_sec, input_dir=HIDDEN, entry=ENTRY):
         finally:
             _TIMING_SPENT[0] += time.time() - t
 
+    t_first = float(timeout_sec)
+    if SCORED_BUDGET_SEC is not None:
+        t_first = min(t_first, float(SCORED_BUDGET_SEC) - _SCORED_SPENT[0])
+    if t_first <= 0:                                  # verifier time for the scored runs used up: a timeout
+        _record({"name": "_solution_cli_run", "value": float("inf"), "rc": -9,
+                 "stderr_tail": f"not run: the {SCORED_BUDGET_SEC:.0f}s verifier budget of the scored runs is used up",
+                 "threshold": float(timeout_sec), "timeout_effective": 0.0, "direction": "<=", "passed": False,
+                 "aux": True, "sandboxed": sb is not None, "entry": entry, "entry_exists": entry_exists,
+                 "budget_exhausted": True})
+        _CACHE[key] = (out, float("inf"), -9)
+        return _CACHE[key]
     n_rep = max(1, int(TIMING_REPEATS))
     home = sb[2]["HOME"] if sb is not None else None
     keep = [out_parent, LOGS] + ([os.path.dirname(home)] if home else [])
     want = n_rep > 1 and sb is not None and left_budget() > 0
     before = timed(_state_snapshot, sb[0], keep, time.time() + left_budget()) if want else None
-    rc, err, sec, left = _run_once(entry, input_dir, out, timeout_sec, sb)
+    rc, err, sec, left = _run_once(entry, input_dir, out, t_first, sb)
+    _SCORED_SPENT[0] += sec
     times, why = [sec], None
     if n_rep > 1 and rc == 0 and not left:
         if sb is None:
@@ -687,7 +706,7 @@ def run_solution(timeout_sec, input_dir=HIDDEN, entry=ENTRY):
                     shutil.rmtree(op2, ignore_errors=True)
                     shutil.rmtree(hp2, ignore_errors=True)
                     break
-                r2, _e2, s2, left = _run_once(entry, input_dir, o2, min(float(timeout_sec), t_rep), sb, home=h2)
+                r2, _e2, s2, left = _run_once(entry, input_dir, o2, min(t_first, t_rep), sb, home=h2)
                 _TIMING_SPENT[0] += s2
                 same = r2 == 0 and not left and timed(_tree_digest, o2) == ref_digest
                 ch = ["left processes"] if left else \
@@ -708,8 +727,8 @@ def run_solution(timeout_sec, input_dir=HIDDEN, entry=ENTRY):
         rc, err = -10, (err + f"\nsandbox processes survived SIGKILL: {left[:5]}")[-2000:]
     med = max(_median(times), sec / MAX_SPEEDUP)
     _record({"name": "_solution_cli_run", "value": med, "rc": rc, "stderr_tail": err[-500:],
-             "threshold": float(timeout_sec), "direction": "<=", "passed": rc == 0, "aux": True,
-             "sandboxed": sb is not None, "entry": entry, "entry_exists": entry_exists,
+             "threshold": float(timeout_sec), "timeout_effective": round(t_first, 3), "direction": "<=",
+             "passed": rc == 0, "aux": True, "sandboxed": sb is not None, "entry": entry, "entry_exists": entry_exists,
              "wall_times": [round(t, 6) if math.isfinite(t) else None for t in times], "timing_repeats": len(times),
              "timing_repeats_skipped": why})
     _CACHE[key] = (out, med, rc)

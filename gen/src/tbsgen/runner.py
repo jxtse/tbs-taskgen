@@ -92,6 +92,18 @@ def timing_budget(cfg: dict, spec: dict | None) -> float:
     return float(cfg["thresholds"].get("timing_budget_sec", 300)) if timing_repeats(cfg, spec) > 1 else 0.0
 
 
+def scored_budget(cfg: dict) -> float:
+    """Total wall seconds the scored (first) runs of the agent program may use in one verifier session
+    (_metrics.SCORED_BUDGET_SEC): the smaller of the packaged verifier timeout and the local test timeout, minus
+    package.verifier_overhead_sec.  With timing_budget() on top it always ends before the verifier timeout."""
+    pk = cfg.get("package") or {}
+    base = min(float(pk.get("verifier_timeout", 900)), float((cfg.get("gen") or {}).get("test_timeout", 900)))
+    b = base - float(pk.get("verifier_overhead_sec", 120))
+    if b <= 0:
+        raise ValueError(f"package.verifier_overhead_sec leaves no time for the scored runs (verifier {base:.0f}s)")
+    return b
+
+
 def resource_gating(cfg: dict, spec: dict | None) -> bool:
     """Whether resource metrics (wall time / memory) decide a run for this task (spec.resource_metric_gating,
     default false: recorded but never deciding — only speed-contribution papers gate on them)."""
@@ -175,6 +187,10 @@ def metrics_helper_text(cfg: dict, spec: dict | None, item_dir: Path | None = No
     src = src.replace(db, f"SPEED_DEADBAND = {dead!r}  # tbsgen:speed_deadband")
     src = src.replace(rg, f"RESOURCE_GATING = {resource_gating(cfg, spec)!s}  # tbsgen:resource_gating")
     src = src.replace(tb, f"TIMING_BUDGET_SEC = {timing_budget(cfg, spec)!r}  # tbsgen:timing_budget")
+    sc = "SCORED_BUDGET_SEC = None  # tbsgen:scored_budget"
+    if sc not in src:
+        raise RuntimeError("templates_metrics.py: SCORED_BUDGET_SEC marker line missing")
+    src = src.replace(sc, f"SCORED_BUDGET_SEC = {scored_budget(cfg)!r}  # tbsgen:scored_budget")
     return src.replace(REPEATS_LINE, f"TIMING_REPEATS = {timing_repeats(cfg, spec)}  # tbsgen:timing_repeats")
 
 
