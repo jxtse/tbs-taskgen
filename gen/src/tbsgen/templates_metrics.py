@@ -317,6 +317,38 @@ TIMING_BUDGET_SEC = 300.0     # total wall time of the extra timed runs per veri
 _TIMING_SPENT = [0.0]         # the verifier timeout); a set whose repeats would exceed it is timed once
 
 
+_WROOTS = []
+
+
+def _writable_roots(uid):
+    """Directories the sandbox uid can create entries in (world-writable or owned by it), outermost only, found
+    once per session by walking / (not /proc, /sys, the verifier's own /tests and /logs); WRITABLE_ROOTS always."""
+    if _WROOTS:
+        return _WROOTS
+    found = set(r for r in WRITABLE_ROOTS if os.path.isdir(r))
+    skip_top = ("/proc", "/sys", "/tests", "/src", "/logs")
+    for root, dirs, files in os.walk("/", followlinks=False):
+        if root == "/":
+            dirs[:] = [d for d in dirs if "/" + d not in skip_top]
+        keep = []
+        for d in dirs:
+            q = os.path.join(root, d)
+            try:
+                st = os.lstat(q)
+            except OSError:
+                continue
+            if os.path.islink(q):
+                continue
+            if st.st_mode & 0o002 or st.st_uid == uid:
+                found.add(q)
+            else:
+                keep.append(d)
+        dirs[:] = keep
+    roots = sorted(found)
+    _WROOTS.extend(r for r in roots if not any(r != o and r.startswith(o + os.sep) for o in roots))
+    return _WROOTS
+
+
 def _skipped(q, skip):
     return any(q == k or q.startswith(k + os.sep) for k in skip)
 
@@ -325,7 +357,7 @@ def _state_snapshot(uid, skip, limit=200000):
     """{path: (ino, ctime_ns, size)} of every entry under WRITABLE_ROOTS (no symlink following), skipping `skip`
     prefixes; plus the SysV IPC objects of `uid`.  None when the tree is too big to compare."""
     snap, n = {}, 0
-    for top in WRITABLE_ROOTS:
+    for top in (_writable_roots(uid) if os.geteuid() == 0 else WRITABLE_ROOTS):
         if not os.path.isdir(top):
             continue
         for root, dirs, files in os.walk(top, followlinks=False):
@@ -452,8 +484,9 @@ def run_solution(timeout_sec, input_dir=HIDDEN, entry=ENTRY):
     out_dir and returncode are those of the first run.  wall_seconds is the median over TIMING_REPEATS runs (a
     failed / timed-out repeat counts as +inf; a repeat whose outputs differ from the scored run's -> first run's
     time only) when the first run succeeded, the repeats fit TIMING_BUDGET_SEC, and the first
-    run left no state a repeat could reuse (fresh HOME per run; files it created under /app, /tmp, /var/tmp,
-    /dev/shm are removed between runs; a changed pre-existing file or a SysV IPC object -> first run only).  The
+    run left no state a repeat could reuse (the scored output dir becomes root-only 0700; fresh HOME and output dir
+    per run; files it created in any directory it can write to are removed between runs; a changed pre-existing
+    file or a SysV IPC object -> first run only).  The
     wall time is also recorded (not a pass/fail check by itself; tests decide whether to check() it)."""
     key = (entry, input_dir)
     if key in _CACHE:
@@ -483,6 +516,13 @@ def run_solution(timeout_sec, input_dir=HIDDEN, entry=ENTRY):
         if why is None:
             import shutil
             ref_digest = _tree_digest(out)
+            if sb is not None:
+                # the scored outputs become root-only before any repeat: a repeat cannot copy them
+                for root, dirs, files in os.walk(out, followlinks=False):
+                    for name in dirs + files:
+                        os.lchown(os.path.join(root, name), 0, 0)
+                os.chown(out, 0, 0)
+                os.chmod(out, 0o700)
             for _ in range(n_rep - 1):
                 o2 = tempfile.mkdtemp(prefix="sol-")
                 h2 = tempfile.mkdtemp(prefix="solhome-")

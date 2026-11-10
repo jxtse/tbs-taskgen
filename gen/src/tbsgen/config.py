@@ -338,6 +338,8 @@ DEFAULTS: dict[str, Any] = {
         "l4a_spearman": 0.995,
         "l4b_minutes": 20,                  # cheap-agent inversion (待定, disabled)
         "max_repair_rounds": 2,
+        "max_exploit_repair_rounds": 2,     # S8 rounds when exploit_valid is the only blocking gate: only the broken
+                                            # baselines/exploit_*.py are rewritten (allowed with locked thresholds)
         "blocking": ["oracle", "hidden_shift", "leak", "isolation", "infeasible", "determinism", "truth_isolation",
                      "cli_contract", "tdm_verbatim", "readymade"],
         # readymade (prerelease.readymade_check): the task image installs, or the reference / a baseline imports,

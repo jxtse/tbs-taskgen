@@ -82,6 +82,17 @@ def exploit_validity(sd_exp: dict, sd_ref: dict, sd_nop: dict, form: str | None)
     return dict(ok=not why, why=why)
 
 
+def exploit_patch_problems(task: Path, patch: dict) -> list[str]:
+    """An exploit-only S8 repair may rewrite existing baselines/exploit_*.py files and nothing else."""
+    bad = []
+    for rel in patch:
+        if not re.fullmatch(r"baselines/exploit_[\w.-]+\.py", rel) or ".." in rel:
+            bad.append(f"not an exploit baseline: {rel}")
+        elif not (task / rel).is_file():
+            bad.append(f"new file: {rel}")
+    return bad
+
+
 def run_gates(cfg: dict, item_dir: Path, spec: dict, thresholds: dict, attempt: int) -> dict:
     task = item_dir / "task"
     work = item_dir / "runs" / f"s7-{attempt}"

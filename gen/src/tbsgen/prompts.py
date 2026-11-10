@@ -122,9 +122,11 @@ Write (generator, solution and mid/naive baselines already exist and are fixed):
   (module-level cache) and call check(name, value, threshold, direction) once per metric with EXACTLY the
   thresholds above (one test function per metric).  Do not re-implement the metrics.
 - baselines/exploit_*.py: at least one shortcut attempt (constant/default output, public-data echo, skipping the
-  {mid_drop} step entirely).  Each exploit must really run to the end and write every deliverable (for PROG
-  also a working /app/output/solution_cli.py that handles every hidden input layout, e.g. a single case):
-  S7 rejects an exploit that crashes or produces no scorable output, since it tests nothing.
+  {mid_drop} step entirely).  Each exploit is run ALONE like the baselines (`python baselines/exploit_x.py`,
+  no arguments, only its own file mounted: no imports of other task files) and must have the same I/O as
+  solve.py: read /app/data, write every deliverable to /app/output (PROG: also a self-contained
+  /app/output/solution_cli.py taking <input_dir> <output_dir> that handles every hidden input layout, e.g. a
+  single case).  S7 rejects an exploit that crashes or produces no scorable output, since it tests nothing.
 - instruction.md: the task statement for an expert agent.  States the scientific problem and the data files
   (columns, units); deliverables and file formats exact (must agree with what tests/measure.py reads); for PROG
   include verbatim the line `python /app/output/solution_cli.py <input_dir> <output_dir>` (positional args,
@@ -143,6 +145,24 @@ Current files:
 {files}
 Return ONLY the files you change (same paths; no new files, no deleted criteria, thresholds unchanged unless the
 gate log says they were re-derived).  Format: === FILE: <path> === blocks, then === END ==="""
+
+
+S8_EXPLOIT = """S7 found exploit baselines that did not really run, so they tested nothing (details per seed: solve_rc,
+solve_err, valid.why):
+{gates}
+{metrics_api}
+How S7 runs an exploit: `cd /app && python /sol/exploit_x.py` -- no arguments, only that one file mounted at /sol,
+public data at /app/data (read-only), deliverables to /app/output.  Then the verifier (tests/measure.py) scores
+/app/output; for PROG it calls `python /app/output/solution_cli.py <input_dir> <output_dir>` once per hidden set
+(hidden_sets(); a set may hold a single case), so the exploit must also write a self-contained solution_cli.py.
+Context (read-only, do not return these): the statement, the scoring script and the reference solution:
+{context}
+Exploit baselines to fix:
+{files}
+Rewrite each listed exploit so it runs to the end under exactly that invocation and writes every deliverable in the
+right format, while still taking its shortcut (it must stay a cheat that should fail the thresholds, not become a
+real solution).  Return ONLY the exploit files you change (same paths).  Format: === FILE: <path> === blocks, then
+=== END ==="""
 
 
 S8_REVIEW = """An independent reviewer audited the packaged task after calibration and asked for a revision.  Blocking issues

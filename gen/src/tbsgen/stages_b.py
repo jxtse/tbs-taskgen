@@ -10,7 +10,7 @@ import shutil
 
 from . import calib, gates, package, repair, review
 from .models import parse_files
-from .prompts import METRICS_API, S6C_TESTS, S8_REPAIR, S8_REVIEW, SYSTEM
+from .prompts import METRICS_API, S6C_TESTS, S8_EXPLOIT, S8_REPAIR, S8_REVIEW, SYSTEM
 from .stages_a import _write_files, chat_files, save_raw
 from .state import read_json, write_json
 
@@ -66,6 +66,8 @@ def s7(P, it):
 def s8(P, it):
     if str(it.state.get("repair_from", "")).startswith("review:") or it.state.get("review_revision_pending"):
         return _s8_review(P, it)
+    if it.state.get("repair_from") == "gates:exploit_valid":
+        return _s8_exploits(P, it)
     if it.state.get("thresholds_locked"):
         # a gate failed after a review revision: the ordinary S8 may change the reference / baselines and is not
         # bound by the revision limit, so a human decides
@@ -99,6 +101,45 @@ def s8(P, it):
     repair.apply(task, patch)
     back = "S6A_run" if not str(it.state.get("repair_from", "")).startswith("gates:") else "S7"
     it.goto(back, f"repaired round {rounds + 1}")
+
+
+def _s8_exploits(P, it):
+    """S8 when the only blocking gate is exploit_valid: rewrite the broken exploit baselines and nothing else
+    (gates.exploit_patch_problems).  Exploits are not shipped and do not touch the reference, the tests, the
+    statement or the thresholds, so this repair is allowed with locked thresholds (a released item re-gated after a
+    harness change) and has its own round budget (gates.max_exploit_repair_rounds)."""
+    n = int(it.state.get("exploit_repair_rounds", 0))
+    locked = bool(it.state.get("thresholds_locked"))
+    if n >= int(P.cfg["gates"].get("max_exploit_repair_rounds", 2)):
+        return it.finish("parked" if locked else "dropped", f"exploit_repair_limit:{n}")
+    task = it.p("task")
+    last = sorted(it.p("gates").glob("attempt-*.json"))
+    gate_log = read_json(last[-1]) if last else {}
+    exploits = sorted(str(p.relative_to(task)) for p in (task / "baselines").glob("exploit_*.py"))
+    files = "\n".join(f"=== FILE: {rel} ===\n{(task / rel).read_text()}" for rel in exploits)
+    ctx = "\n".join(f"=== FILE: {rel} ===\n{(task / rel).read_text()[:30000]}"
+                    for rel in ("instruction.md", "tests/measure.py", "solution/solve.py") if (task / rel).exists())
+    user = S8_EXPLOIT.format(gates=json.dumps(_slim(gate_log), default=str)[:20000], metrics_api=METRICS_API,
+                             context=ctx, files=files)
+    r = P.client("repair").chat(SYSTEM, user, stage="S8", item=it.item_id,
+                                max_tokens=P.cfg["gen"].get("s6a_max_tokens"))
+    save_raw(it, "S8", r)
+    patch = parse_files(r.text, truncated=r.stop_reason == "max_tokens")
+    bad = gates.exploit_patch_problems(task, patch) or ([] if patch else ["empty patch"])
+    d = it.p("repair", f"exploit-{n + 1}")
+    d.mkdir(parents=True, exist_ok=True)
+    write_json(d / "review.json", dict(ok=not bad, reasons=bad, files=sorted(patch), method="exploit-only"))
+    it.state["exploit_repair_rounds"] = n + 1
+    it.save()
+    if bad:
+        return it.goto("S8", "exploit_repair_rejected:" + ";".join(bad)[:300])
+    for rel, body in patch.items():
+        (d / "patch" / rel).parent.mkdir(parents=True, exist_ok=True)
+        (d / "patch" / rel).write_text(body)
+        (d / "before" / rel).parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(task / rel, d / "before" / rel)
+    repair.apply(task, patch)
+    it.goto("S7", f"exploit repair round {n + 1}")
 
 
 def _slim(g):

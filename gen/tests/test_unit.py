@@ -1137,3 +1137,16 @@ def test_review_leak_issue_is_blocking():
     import inspect
     src = inspect.getsource(review)
     assert "Any leak of ground truth or answers is blocking, never minor" in src
+
+
+def test_exploit_only_repair_path(tmp_path):
+    """S8 for exploit_valid alone rewrites only existing baselines/exploit_*.py, also with locked thresholds."""
+    from tbsgen import gates
+    task = tmp_path / "task"
+    (task / "baselines").mkdir(parents=True)
+    (task / "baselines/exploit_zero.py").write_text("x")
+    assert gates.exploit_patch_problems(task, {"baselines/exploit_zero.py": "y"}) == []
+    assert gates.exploit_patch_problems(task, {"baselines/exploit_new.py": "y"})
+    assert gates.exploit_patch_problems(task, {"tests/test_outputs.py": "y"})
+    assert gates.exploit_patch_problems(task, {"solution/solve.py": "y"})
+    assert gates.exploit_patch_problems(task, {"baselines/mid.py": "y"})
