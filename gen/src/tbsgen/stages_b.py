@@ -6,6 +6,8 @@ import json
 import time
 from pathlib import Path
 
+import shutil
+
 from . import calib, gates, package, repair, review
 from .models import parse_files
 from .prompts import METRICS_API, S6C_TESTS, S8_REPAIR, S8_REVIEW, SYSTEM
@@ -62,8 +64,12 @@ def s7(P, it):
 
 
 def s8(P, it):
-    if str(it.state.get("repair_from", "")).startswith("review:"):
+    if str(it.state.get("repair_from", "")).startswith("review:") or it.state.get("review_revision_pending"):
         return _s8_review(P, it)
+    if it.state.get("thresholds_locked"):
+        # a gate failed after a review revision: the ordinary S8 may change the reference / baselines and is not
+        # bound by the revision limit, so a human decides
+        return it.finish("parked", f"review:human (after the review revision: {it.state.get('repair_from')})")
     rounds = it.state.get("repair_rounds", 0)
     if rounds >= P.cfg["gates"]["max_repair_rounds"]:
         return it.finish("dropped", f"repair_limit:{it.state.get('repair_from')}")
@@ -266,6 +272,9 @@ def _s9(P, it):
         if not prep.get("ok"):
             return it.finish("waiting", f"calib blocked: prepare_command failed ({(prep.get('error') or '')[:120]}); "
                                         "fix and run `tbsgen calib prepare --item ID`")
+    stale = calib.stale_prepared(P.cfg, it.dir, what, int(it.state.get("calib_epoch", 0)))
+    if stale:
+        return it.finish("waiting", f"calib blocked: {stale}")
     rec = calib.prepare(P.cfg, it.dir, what, n, epoch=int(it.state.get("calib_epoch", 0)))
     if rec.get("blocked"):
         return it.finish("waiting", f"calib blocked: {rec['blocked']}")
@@ -341,18 +350,41 @@ def _ingest(P, it, job_dir: str | None = None) -> dict:
     return t
 
 
+def review_gate(P, it) -> str | None:
+    """Why S10 must not release this item yet (None = may release): with review on and a reviewable label, the
+    current package, calibration epoch and review round need a recorded pass."""
+    if not review.reviewable(P.cfg, it.state.get("calib_label")):
+        return None
+    v = read_json(it.p("review", "verdict.json"), None)
+    if not v:
+        return "no review verdict"
+    norm = v.get("_normalized") or {}
+    if norm.get("verdict") != "pass":
+        return f"review verdict {norm.get('verdict')}"
+    if v.get("round") != it.state.get("review_round") or v.get("calib_epoch", 0) != it.state.get("calib_epoch", 0):
+        return "review verdict of another round / calibration epoch"
+    if v.get("pkg_sha") != calib.pkg_sha(it.p("pkg")):
+        return "package changed after the review"
+    return None
+
+
 def s10(P, it):
+    why = review_gate(P, it)
+    if why:
+        it.state["review_round"] = int(it.state.get("review_revisions", 0)) + 1
+        return it.goto("S9R", f"S10 review gate: {why}")
     rel = P.store.root / "release"
     rel.mkdir(exist_ok=True)
     with (rel / "manifest.jsonl").open("a") as f:
         runs = read_json(it.p("calib", "runs.json"), [])
         summ = [x for x in calib.run_summary(runs) if x["outcome"] is not None]
         rv = read_json(it.p("review", "verdict.json"), None)
+        nv = (rv or {}).get("_normalized") or {}
         rev = None if rv is None else dict(
-            verdict=rv.get("verdict"), round=it.state.get("review_round"), revisions=it.state.get("review_revisions", 0),
+            verdict=nv.get("verdict"), round=it.state.get("review_round"), revisions=it.state.get("review_revisions", 0),
             minor=[dict(id=i.get("id"), category=i.get("category"), title=i.get("title"))
-                   for i in rv.get("issues") or [] if i.get("severity") == "minor"],
-            label_trustworthy=(rv.get("label_assessment") or {}).get("trustworthy"))
+                   for i in nv.get("issues") or [] if i.get("severity") == "minor"],
+            label_trustworthy=(nv.get("label_assessment") or {}).get("trustworthy"))
         f.write(json.dumps(dict(item_id=it.item_id, pkg=str(it.p("pkg")), label=it.state.get("calib_label"),
                                 calib_runs=summ, result_types=[x["result_type"] for x in summ],
                                 calib_epoch=it.state.get("calib_epoch", 0), review=rev,
@@ -443,14 +475,15 @@ def watch_tick(P, only: list[str] | None = None, max_steps: int = 50) -> dict:
                 it.state["status"] = "active"       # s9() / s9r() reconcile the dead launch
                 it.save()
             did.append(dict(item=it.item_id, action=kind, job=rec["job_name"]))
-    s9 = [i.item_id for i in P.store.items() if i.state.get("stage") in ("S9", "S9R") and
-          (not only or i.item_id in only)]
+    s9 = [i.item_id for i in P.store.items() if (not only or i.item_id in only) and
+          (i.state.get("stage") in ("S9", "S9R") or
+           (i.state.get("review_revisions") and i.state.get("status") == "active"))]
     if s9:
         P.run(max_steps=max_steps, only=s9)
     open_ = {}
     for i in P.store.items():
-        if (not only or i.item_id in only) and i.state.get("stage") in ("S9", "S9R") and \
-                i.state.get("status") in ("waiting", "active"):
+        if (not only or i.item_id in only) and i.state.get("status") in ("waiting", "active") and \
+                (i.state.get("stage") in ("S9", "S9R") or i.state.get("review_revisions")):
             open_[i.item_id] = dict(stage=i.state["stage"], status=i.state["status"], reason=i.state.get("reason"))
     done = {i.item_id: dict(stage=i.state["stage"], status=i.state["status"], label=i.state.get("calib_label"))
             for i in P.store.items() if i.item_id in s9 and i.item_id not in open_}
@@ -514,9 +547,16 @@ def _s9r(P, it):
                 rec.update(state="launch_failed", outcome="infra", cost_usd=0.0, cost_kind="not_launched", error=why)
                 save(rec)
             elif calib.launcher_died(rec, c):
-                rec.update(state="died", outcome="infra", error="review job ended without finished_at")
+                try:
+                    trials = calib.collect(Path(rec["job_dir"]), rec.get("model"), P.cfg["models"].get("prices", {}))
+                except (OSError, ValueError):
+                    trials = []
+                usd, kind, usage = calib.job_cost(trials) if trials else (None, "reservation", None)
+                rec.update(state="died", outcome="infra", cost_usd=usd, cost_kind=kind,
+                           error="review job ended without finished_at")
                 if rec.get("ledger_call"):
-                    P.ledger.settle(rec["ledger_call"], None, status="error", note="review job died")
+                    P.ledger.settle(rec["ledger_call"], usd, status="error", kind=kind, usage=usage,
+                                    note="review job ended without finished_at")
                 save(rec)
     runs = [r for r in read_json(it.p("review", "runs.json"), []) if r.get("n") == rnd]
     pending = [r for r in runs if r.get("outcome") is None]
@@ -622,7 +662,10 @@ def _route_review(P, it, rec: dict, rnd: int):
     v = read_json(it.p("review", f"r{rnd}", "verdict.json"), {}) or {}
     norm = v.get("_normalized") or review.normalize(v)
     verdict = norm["verdict"]
-    write_json(it.p("review", "verdict.json"), dict(v, round=rnd))      # the current verdict (S10 reads it)
+    # the current verdict (S10's review gate checks round, calibration epoch and package hash)
+    write_json(it.p("review", "verdict.json"), dict(v, _normalized=norm, round=rnd,
+                                                    calib_epoch=it.state.get("calib_epoch", 0),
+                                                    pkg_sha=calib.pkg_sha(it.p("pkg")), job=rec.get("job_name")))
     label = it.state.get("calib_label") or ""
     kept = label in P.cfg["calib"]["keep_labels"]
     it.state["review_verdict"] = verdict
@@ -648,7 +691,6 @@ def _route_review(P, it, rec: dict, rnd: int):
 def _archive_calibration(it) -> int:
     """Close the current calibration epoch: its records move to calib/epoch-<k>/ (job dirs stay where they are);
     the next S9 starts from GLM with job names suffixed -e<k+1>."""
-    import shutil
     e = int(it.state.get("calib_epoch", 0))
     d = it.p("calib", f"epoch-{e}")
     d.mkdir(parents=True, exist_ok=True)
@@ -665,11 +707,14 @@ def _archive_calibration(it) -> int:
 
 def _s8_review(P, it):
     """S8 for a review verdict "revise": one local edit of the statement / format notes (via the generator) /
-    test and scoring scripts.  Thresholds and the reference are locked (review.revision_review); the old
+    test and scoring scripts.  Thresholds and the reference are locked (review.revision_review; S6B keeps
+    thresholds.json; the regenerated data must hash the same as before apart from README* notes); the old
     calibration is archived and the item goes back to S6A_run (re-measure) -> S6B (locked) -> S6C -> S7 -> PKG ->
-    S9 (from GLM) -> S9R."""
-    import shutil
+    S9 (from GLM) -> S9R.  Crash-safe: an accepted patch is saved before it is applied, and a pending revision is
+    completed (idempotently) on resume without another model call."""
     rv = P.cfg.get("review") or {}
+    if it.state.get("review_revision_pending"):
+        return _finish_revision(P, it, it.state["review_revision_pending"])
     n = int(it.state.get("review_revisions", 0))
     if n >= int(rv.get("max_revisions", 1)):
         return it.finish("parked", f"review:human (revision limit {n})")
@@ -689,27 +734,55 @@ def _s8_review(P, it):
                                 max_tokens=P.cfg["gen"].get("s6a_max_tokens"))
     save_raw(it, "S8", r)
     patch = parse_files(r.text, truncated=r.stop_reason == "max_tokens")
-    chk = review.revision_review(task, patch, spec["depgraph"])
+    chk = review.revision_review(task, patch, spec["depgraph"], th)
     d = it.p("repair", f"review-{n + 1}")
     d.mkdir(parents=True, exist_ok=True)
+    write_json(d / "patch.json", patch)                  # never written as files before the paths are checked
     write_json(d / "review.json", dict(chk, review_round=rnd, issues=[i.get("id") for i in issues]))
-    for rel, body in patch.items():
+    if not chk["ok"] or not patch:
+        it.state["review_revisions"] = n + 1
+        it.save()
+        return it.finish("parked", "review:human (revision rejected: " +
+                         "; ".join(chk["reasons"] or ["empty patch"])[:300] + ")")
+    for rel, body in patch.items():                      # paths are in review.REVISION_PATHS here
         (d / "patch" / rel).parent.mkdir(parents=True, exist_ok=True)
         (d / "patch" / rel).write_text(body)
         if (task / rel).exists():
             (d / "before" / rel).parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(task / rel, d / "before" / rel)
-    it.state["review_revisions"] = n + 1
-    it.save()
-    if not chk["ok"] or not patch:
-        return it.finish("parked", "review:human (revision rejected: " +
-                         "; ".join(chk["reasons"] or ["empty patch"])[:300] + ")")
-    repair.apply(task, patch)
     shutil.copy2(it.p("thresholds.json"), d / "thresholds.locked.json")
-    _archive_calibration(it)
-    it.state["thresholds_locked"] = True
-    it.state.pop("repair_from", None)
+    data = {}
+    if "generator/generate.py" in patch:
+        for s_ in P.cfg["gen"]["seeds"]:
+            data[str(s_)] = review.data_hash(it.p("runs", "s6", f"gen{s_}"))
+        if not all(data.values()):
+            it.state["review_revisions"] = n + 1
+            it.save()
+            return it.finish("parked", "review:human (generator revision without a previous generation to compare)")
+    pend = dict(n=n + 1, dir=str(d), round=rnd, epoch=int(it.state.get("calib_epoch", 0)) + 1, data_hash=data)
+    it.state["review_revision_pending"] = pend
     it.save()
-    P.store.event("review_revision_applied", item=it.item_id, round=rnd, files=sorted(patch),
+    return _finish_revision(P, it, pend)
+
+
+def _finish_revision(P, it, pend: dict):
+    d = Path(pend["dir"])
+    patch = read_json(d / "patch.json", {}) or {}
+    repair.apply(it.p("task"), patch)                   # idempotent (whole-file writes)
+    if int(it.state.get("calib_epoch", 0)) < pend["epoch"]:
+        _archive_calibration(it)
+    else:                                               # crashed after the epoch moved: finish moving the files
+        dd = it.p("calib", f"epoch-{pend['epoch'] - 1}")
+        for p in sorted(it.p("calib").iterdir()) if it.p("calib").exists() else []:
+            if p.is_file() and p.name != ".lock":
+                dd.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(p), str(dd / p.name))
+    it.state["thresholds_locked"] = True
+    it.state["review_revisions"] = pend["n"]
+    it.state["revision_data_hash"] = pend.get("data_hash") or {}
+    it.state.pop("repair_from", None)
+    it.state.pop("review_revision_pending", None)
+    it.save()
+    P.store.event("review_revision_applied", item=it.item_id, round=pend["round"], files=sorted(patch),
                   calib_epoch=it.state["calib_epoch"])
-    it.goto("S6A_run", f"review revision {n + 1} (r{rnd})")
+    it.goto("S6A_run", f"review revision {pend['n']} (r{pend['round']})")

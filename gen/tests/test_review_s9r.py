@@ -78,7 +78,9 @@ def _runs(P, iid, sub="calib"):
     return read_json(P.store.item(iid).p(sub, "runs.json"), [])
 
 
-def _finish(jobs, job_name, reward=0.0, cost=5.0, verdict=None, name="trial__a"):
+def _finish(jobs, job_name, reward=None, cost=5.0, verdict=None, name="trial__a"):
+    if reward is None:
+        reward = 1.0 if verdict is not None else 0.0     # a review job with a well-formed verdict has reward 1
     jd = jobs / job_name
     t = jd / name
     (t / "verifier").mkdir(parents=True, exist_ok=True)
@@ -130,6 +132,11 @@ def test_normalize_contract():
     assert review.normalize(None)["verdict"] == "human"
     n = review.normalize(V("revise", [dict(BLOCK, severity="critical")]))
     assert n["verdict"] == "human" and n["issues"][0]["severity"] == "minor"
+    # strict: a structural problem can never yield pass
+    assert review.normalize(V("pass", [dict(MINOR, severity="critical")]))["verdict"] == "human"
+    assert review.normalize(V("pass", ["not an object"]))["verdict"] == "human"
+    assert review.normalize(V("pass"), reward=0.0)["verdict"] == "human"
+    assert review.normalize(V("pass"), reward=1.0)["verdict"] == "pass"
 
 
 def test_reviewable_labels():
@@ -287,6 +294,7 @@ def test_revision_applies_archives_calibration_and_locks_thresholds(tmp_path):
     assert it.state["review_revisions"] == 1 and it.state["calib_epoch"] == 1 and "calib_label" not in it.state
     assert "spectrum" in it.p("task", "instruction.md").read_text()
     assert it.p("repair", "review-1", "before", "instruction.md").read_text().startswith("Write out.csv with column spec.")
+    assert "review_revision_pending" not in it.state
     assert (it.p("repair", "review-1", "thresholds.locked.json")).exists()
     assert not it.p("calib", "runs.json").exists() and it.p("calib", "epoch-0", "runs.json").exists()
     assert it.state["calib_history"][0]["label"] == "hard"
@@ -305,12 +313,66 @@ def test_revision_rejects_threshold_change_and_disallowed_paths(tmp_path):
     assert st["status"] == "parked" and "threshold" in st["reason"]
     assert "1.0e-3" in P.store.item(iid).p("task", "tests", "test_outputs.py").read_text()   # not applied
     task = P.store.item(iid).p("task")
-    rv = review.revision_review(task, {"solution/solve.py": "x"}, {"nodes": []})
+    th = read_json(P.store.item(iid).p("thresholds.json"))["thresholds"]
+    rv = review.revision_review(task, {"solution/solve.py": "x"}, {"nodes": []}, th)
     assert not rv["ok"] and "not allowed" in rv["reasons"][0]
     # direction flip is a change too, even with the same literals
     flip = TEST_OUTPUTS.replace('"score", 0.5, 0.9, ">="', '"score", 0.5, 0.9, "<="')
-    assert not review.revision_review(task, {"tests/test_outputs.py": flip}, {"nodes": []})["ok"]
-    assert review.revision_review(task, {"tests/measure.py": "COL = 'spectrum_index'\n"}, {"nodes": []})["ok"]
+    assert not review.revision_review(task, {"tests/test_outputs.py": flip}, {"nodes": []}, th)["ok"]
+    # an indirection (named constant) cannot be verified -> rejected
+    ind = "THR = 1.0e-2\n" + TEST_OUTPUTS.replace('"err", 0.5, 1.0e-3,', '"err", 0.5, THR,')
+    assert not review.revision_review(task, {"tests/test_outputs.py": ind}, {"nodes": []}, th)["ok"]
+    # same literal text, different value from the locked record -> rejected
+    th2 = dict(th, err=dict(th["err"], threshold=5e-4))
+    assert not review.revision_review(task, {"tests/test_outputs.py": TEST_OUTPUTS}, {"nodes": []}, th2)["ok"]
+    assert review.revision_review(task, {"tests/test_outputs.py": TEST_OUTPUTS}, {"nodes": []}, th)["ok"]
+    assert review.revision_review(task, {"tests/measure.py": "COL = 'spectrum_index'\n"}, {"nodes": []}, th)["ok"]
+
+
+def test_revision_bad_path_writes_nothing(tmp_path):
+    P, iid, jobs = _env(tmp_path)
+    _to_label(P, iid, jobs)
+    _finish(jobs, _runs(P, iid, "review")[0]["job_name"], verdict=V("revise", [BLOCK]))
+    _revise_client(P, {"../../thresholds.json": "{}", "instruction.md": "x\n"})
+    watch_tick(P, only=[iid])
+    it = P.store.item(iid)
+    assert it.state["status"] == "parked" and "not allowed" in it.state["reason"]
+    assert read_json(it.p("thresholds.json"))["thresholds"]["err"]["threshold"] == 1.0e-3
+    assert not it.p("repair", "review-1", "patch").exists() and it.p("repair", "review-1", "patch.json").exists()
+    assert it.p("task", "instruction.md").read_text().startswith("Write out.csv")
+
+
+def test_gate_failure_after_revision_goes_to_human_not_ordinary_s8(tmp_path):
+    from tbsgen import stages_b
+    P, iid, _ = _env(tmp_path)
+    it = P.store.item(iid)
+    it.state.update(stage="S8", status="active", thresholds_locked=True, review_revisions=1,
+                    repair_from="gates:oracle")
+    it.save()
+    stages_b.s8(P, it)
+    st = P.store.item(iid).state
+    assert st["status"] == "parked" and st["reason"].startswith("review:human (after the review revision")
+
+
+def test_s10_gate_sends_unreviewed_hard_item_to_review(tmp_path):
+    from tbsgen import stages_b
+    P, iid, _ = _env(tmp_path)
+    it = P.store.item(iid)
+    it.state.update(stage="S10", status="active", calib_label="hard")
+    it.save()
+    stages_b.s10(P, it)
+    st = P.store.item(iid).state
+    assert st["stage"] == "S9R" and not (P.store.root / "release" / "manifest.jsonl").exists()
+
+
+def test_stale_prepared_copy_blocks_recalibration(tmp_path):
+    from tbsgen import calib
+    P, iid, _ = _env(tmp_path, prepared_tasks_dir=str(tmp_path / "prep"))
+    it = P.store.item(iid)
+    assert calib.stale_prepared(P.cfg, it.dir, "glm", 0) is None
+    assert "predate" in calib.stale_prepared(P.cfg, it.dir, "glm", 1)
+    write_json(it.p("calib", "prepare.json"), dict(ok=True, pkg_sha=calib.pkg_sha(it.p("pkg"))))
+    assert calib.stale_prepared(P.cfg, it.dir, "glm", 1) is None
 
 
 def test_second_review_not_pass_goes_to_human(tmp_path):
@@ -381,8 +443,9 @@ def test_remote_alias_task_identity(tmp_path):
 
 
 def test_check_signature_and_trace_digest(tmp_path):
-    sig = review.check_signature(TEST_OUTPUTS)
-    assert sig == sorted([('"err"', "1.0e-3", '"<="'), ('"score"', "0.9", '">="')])
+    sig = review.check_calls(TEST_OUTPUTS)
+    assert sig == sorted([("err", 1.0e-3, "<="), ("score", 0.9, ">=")])
+    assert review.check_calls("check('a', v, X, '<=')") is None
     t = tmp_path / "trial"
     (t / "agent").mkdir(parents=True)
     (t / "agent" / "claude-code.txt").write_text("\n".join(json.dumps(x) for x in [

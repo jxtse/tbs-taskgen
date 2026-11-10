@@ -25,7 +25,6 @@ from __future__ import annotations
 
 import copy
 import json
-import re
 import shutil
 import time
 from pathlib import Path
@@ -183,6 +182,14 @@ def write_bundle(item_dir: Path, dest: Path, state: dict, digest_kb: int = 150) 
         (rec / "s8_repairs").mkdir()
         for r in reps:
             shutil.copy2(r, rec / "s8_repairs" / f"{r.parent.name}-review.json")
+    revs = sorted((item_dir / "repair").glob("review-*")) if (item_dir / "repair").exists() else []
+    for r in revs:                       # earlier review revisions: what changed (before / patch) and why
+        shutil.copytree(r, rec / "review_revisions" / r.name)
+    prev = sorted((item_dir / "review").glob("r*/verdict.json")) if (item_dir / "review").exists() else []
+    for p in prev:
+        if p.parent.name != f"r{state.get('review_round', 1)}":
+            (rec / "previous_reviews").mkdir(exist_ok=True)
+            shutil.copy2(p, rec / "previous_reviews" / f"{p.parent.name}-verdict.json")
     hist = [{k: h.get(k) for k in ("stage", "result", "to", "reason") if h.get(k) is not None}
             for h in state.get("history") or []]
     (rec / "pipeline_history.json").write_text(json.dumps(dict(
@@ -306,7 +313,7 @@ if v.get("verdict") not in ("pass", "revise", "drop", "human"):
     errs.append("verdict must be pass|revise|drop|human")
 if not isinstance(v.get("issues", []), list):
     errs.append("issues must be a list")
-for i, it in enumerate(v.get("issues") or []):
+for i, it in enumerate(v.get("issues") or [] if isinstance(v.get("issues", []), list) else []):
     if not isinstance(it, dict) or it.get("severity") not in ("blocking", "minor"):
         errs.append(f"issues[{i}].severity must be blocking|minor")
 json.dump(v, open(dst, "w"), indent=1)
@@ -339,8 +346,10 @@ def instruction(cfg: dict, item_dir: Path, state: dict, rnd: int, info: dict) ->
                      f"minutes={None if r.get('minutes') is None else round(r['minutes'], 1)}")
     prev = ""
     if rnd > 1:
-        prev = ("\nThis is review round {rnd}: the task was revised after an earlier review (records/pipeline_history.json"
-                ", records/s8_repairs/) and recalibrated from scratch.  Judge the task as it is now.\n").format(rnd=rnd)
+        prev = ("\nThis is review round {rnd}: the task was revised after an earlier review (records/previous_reviews/, "
+                "records/review_revisions/<n>/{{before,patch}}/, records/thresholds.relock.json) and recalibrated from "
+                "scratch.  Check that the revision fixed the earlier blocking issues without loosening the task, and "
+                "judge the task as it is now.\n").format(rnd=rnd)
     return REVIEW_PROMPT.format(item=item_dir.name, label=label, rnd=rnd, prev=prev,
                                 runs="\n".join(lines) or "- (no calibration runs recorded)",
                                 thresholds=_fmt_thresholds(item_dir), verdict_path=VERDICT_PATH,
@@ -462,16 +471,20 @@ def _has_evidence(ev) -> bool:
     return False
 
 
-def normalize(raw: dict | None) -> dict:
+def normalize(raw: dict | None, reward: float | None = None) -> dict:
     """Apply the contract to a raw verdict: returns {verdict, raw_verdict, issues, blocking, minor, downgraded,
-    label_assessment, checklist, summary, problems}."""
+    label_assessment, checklist, summary, problems}.  Strict: any structural problem (unknown verdict or severity,
+    non-object issue, verifier reward != 1 when known) makes the verdict "human"; the only silent rewrite is the
+    contract's own rule that a blocking issue without evidence counts as minor."""
     problems = []
     if not isinstance(raw, dict):
         return dict(verdict="human", raw_verdict=None, issues=[], blocking=[], minor=[], downgraded=[],
                     label_assessment={}, checklist={}, summary="", problems=["no verdict"])
     rv = raw.get("verdict")
     issues, downgraded = [], []
-    for i, it in enumerate(raw.get("issues") or []):
+    if not isinstance(raw.get("issues", []), list):
+        problems.append("issues is not a list")
+    for i, it in enumerate(raw.get("issues") or [] if isinstance(raw.get("issues"), list) else []):
         if not isinstance(it, dict):
             problems.append(f"issues[{i}] not an object")
             continue
@@ -479,24 +492,25 @@ def normalize(raw: dict | None) -> dict:
         it.setdefault("id", f"I{i + 1}")
         sev = it.get("severity")
         if sev not in SEVERITIES:
-            problems.append(f"{it['id']}: severity {sev!r} -> minor")
+            problems.append(f"{it['id']}: severity {sev!r} not blocking|minor")
             it["severity"] = "minor"
-        if it["severity"] == "blocking" and not _has_evidence(it.get("evidence")):
+        elif sev == "blocking" and not _has_evidence(it.get("evidence")):
             it["severity"] = "minor"
             it["downgraded"] = "blocking without evidence"
             downgraded.append(it["id"])
         issues.append(it)
+    if reward is not None and reward != 1:
+        problems.append(f"review verifier reward {reward} (verdict.json failed the structure check)")
     blocking = [i["id"] for i in issues if i["severity"] == "blocking"]
     minor = [i["id"] for i in issues if i["severity"] == "minor"]
     v = rv if rv in VERDICTS else None
     if v is None:
         problems.append(f"verdict {rv!r} not one of {VERDICTS}")
-        v = "human"
     elif v in ("revise", "drop") and not blocking:
         problems.append(f"verdict {v} without a (evidenced) blocking issue")
-        v = "human"
     elif v == "pass" and blocking:
         problems.append("verdict pass with blocking issues")
+    if problems:
         v = "human"
     return dict(verdict=v, raw_verdict=rv, issues=issues, blocking=blocking, minor=minor, downgraded=downgraded,
                 label_assessment=raw.get("label_assessment") or {}, checklist=raw.get("checklist") or {},
@@ -525,8 +539,13 @@ def classify(job_dir: Path, model: str | None, prices: dict) -> dict:
         if v is not None:
             raw, trial = v, t
     last = trials[-1] if trials else {}
+    reward = None
+    if trial is not None:
+        rw = ((json.loads((trial / "result.json").read_text()).get("verifier_result") or {}).get("rewards") or {})
+        reward = rw.get("reward")
+        reward = float(reward) if isinstance(reward, (int, float)) else 0.0
     return dict(outcome="done" if raw is not None else "infra", verdict_raw=raw,
-                verdict=normalize(raw) if raw is not None else None, trial=dict(last, job_dir=str(Path(job_dir).resolve()),
+                verdict=normalize(raw, reward) if raw is not None else None, trial=dict(last, job_dir=str(Path(job_dir).resolve()),
                                                                                  verdict_trial=trial.name if trial else None),
                 minutes=last.get("minutes"), cost_usd=usd, cost_kind=kind, usage=usage, n_trials=len(trials))
 
@@ -553,6 +572,11 @@ def prepare(cfg: dict, item_dir: Path, task: Path, rnd: int, attempt: int) -> di
                job_dir=str(Path(c["jobs_dir"]) / name), task=str(task.resolve()), outcome=None,
                ledger_stage="S9R")
     why = calib.network_problem(rc, task, conf)
+    src = cfg["calib"]
+    if not why and not (cfg.get("review") or {}).get("environment") and calib.role(src, "teacher", "prepared_tasks_dir"):
+        why = ("the review route would inherit the teacher's environment, which runs prepared task copies "
+               "(calib.teacher_prepared_tasks_dir / prepared_tasks_dir); a review task is built per round and has none: "
+               "set review.environment / review.launcher / review.harbor_root to a route that builds the Dockerfile")
     if why:
         rec["blocked" if c.get("allow_submit") else "warning"] = why
     if c.get("allow_submit") and not (launcher and root):
@@ -561,33 +585,79 @@ def prepare(cfg: dict, item_dir: Path, task: Path, rnd: int, attempt: int) -> di
 
 
 # ------------------------------------------------------------------ S8 review revision
-_CHECK_ARGS = re.compile(r"\bcheck\s*\(([^()]*(?:\([^()]*\)[^()]*)*)\)")
-
-
-def check_signature(src: str) -> list[tuple]:
-    """(name, threshold, direction) literals of every check(name, value, threshold, direction) call."""
+def check_calls(src: str) -> list[tuple] | None:
+    """(metric, threshold, direction) of every check(...) call in test_outputs.py, each a literal; None when any
+    check() argument for name / threshold / direction is not a literal (cannot be proven unchanged) or the source
+    does not parse."""
+    import ast
+    try:
+        tree = ast.parse(src)
+    except SyntaxError:
+        return None
     out = []
-    for m in _CHECK_ARGS.finditer(src):
-        parts = [p.strip() for p in re.split(r",(?![^()]*\))", m.group(1))]
-        if len(parts) >= 4:
-            out.append((parts[0], parts[2], parts[3]))
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Call) and getattr(n.func, "id", getattr(n.func, "attr", None)) == "check":
+            if len(n.args) < 4:
+                return None
+            vals = []
+            for a in (n.args[0], n.args[2], n.args[3]):
+                try:
+                    vals.append(ast.literal_eval(a))
+                except ValueError:
+                    return None
+            name, thr, d = vals
+            if not isinstance(name, str) or not isinstance(thr, (int, float)) or d not in ("<=", ">="):
+                return None
+            out.append((name, float(thr), d))
     return sorted(out)
 
 
-def revision_review(task: Path, patch: dict[str, str], depgraph: dict) -> dict:
-    """Mechanical preservation review of a review-driven revision: the S8 rules (repair.review) plus: only
-    REVISION_PATHS may change, and the (metric, threshold, direction) set of test_outputs.py is identical."""
+def locked_signature(thresholds: dict) -> list[tuple]:
+    return sorted((k, float(v["threshold"]), v["direction"]) for k, v in thresholds.items())
+
+
+def revision_review(task: Path, patch: dict[str, str], depgraph: dict, thresholds: dict | None = None) -> dict:
+    """Mechanical preservation review of a review-driven revision.  Paths are checked first (nothing is written for
+    a patch with a bad path); then the S8 rules (repair.review); then: only REVISION_PATHS may change, and the
+    check() calls of the revised test_outputs.py must be literal and equal to the locked thresholds.json, metric by
+    metric (threshold value and direction)."""
     from . import repair
-    rv = repair.review(task, patch, depgraph)
-    reasons = list(rv["reasons"])
+    reasons = []
     for rel in patch:
         if rel not in REVISION_PATHS:
-            reasons.append(f"path not allowed in a review revision: {rel}")
+            reasons.append(f"path not allowed in a review revision: {rel!r}")
+    if reasons:
+        return dict(ok=False, reasons=reasons, files=sorted(patch), method="review-revision-v2")
+    rv = repair.review(task, patch, depgraph)
+    reasons = list(rv["reasons"])
     t = "tests/test_outputs.py"
-    if t in patch and (task / t).exists():
-        if check_signature(patch[t]) != check_signature((task / t).read_text()):
+    if t in patch:
+        sig = check_calls(patch[t])
+        if sig is None:
+            reasons.append("test_outputs.py check() arguments are not all literals (thresholds cannot be verified)")
+        elif thresholds is not None and sig != locked_signature(thresholds):
+            reasons.append("test_outputs.py check() metrics/thresholds/directions differ from the locked thresholds")
+        elif thresholds is None and (task / t).exists() and sig != check_calls((task / t).read_text()):
             reasons.append("test_outputs.py check() metrics/thresholds/directions changed")
-    return dict(rv, ok=not reasons, reasons=reasons, method="review-revision-v1")
+    return dict(rv, ok=not reasons, reasons=reasons, method="review-revision-v2")
+
+
+def data_hash(gen_dir: Path) -> str | None:
+    """Hash of a generator output tree (environment/ + tests/) WITHOUT the README* format notes: a review revision
+    may rewrite the notes the generator writes, never the data, hidden inputs or truth."""
+    import hashlib
+    if not gen_dir.is_dir():
+        return None
+    h = hashlib.sha256()
+    for sub in ("environment", "tests"):
+        root = gen_dir / sub
+        for p in sorted(root.rglob("*")) if root.exists() else []:
+            if p.is_file() and not p.name.startswith("README"):
+                h.update(str(p.relative_to(gen_dir)).encode())
+                h.update(b"\0")
+                h.update(p.read_bytes())
+                h.update(b"\0")
+    return h.hexdigest()[:16]
 
 
 def files_for_revision(item_dir: Path, max_chars: int = 90000) -> str:

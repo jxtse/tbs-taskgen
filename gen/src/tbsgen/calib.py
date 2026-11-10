@@ -271,6 +271,22 @@ def _unprepared(cfg: dict, who: str, task: str) -> bool:
     return bool(d) and not Path(task).resolve().is_relative_to(Path(d).resolve())
 
 
+def stale_prepared(cfg: dict, item_dir: Path, who: str, epoch: int) -> str | None:
+    """After a review revision (epoch > 0) a prepared copy must be one made from the current pkg/ (recorded by
+    ensure_prepared with the pkg hash); a copy prepared by hand before the revision would calibrate the old task."""
+    if not epoch or not prepared_dir(cfg, who):
+        return None
+    recp = item_dir / "calib" / ("prepare.json" if who == "glm" else f"prepare-{who}.json")
+    try:
+        prev = json.loads(recp.read_text())
+    except (OSError, ValueError):
+        prev = {}
+    if prev.get("ok") and prev.get("pkg_sha") == pkg_sha(item_dir / "pkg"):
+        return None
+    return (f"the prepared {who} copy may predate the review revision (no calib/{recp.name} for the current pkg/): "
+            "set calib.prepare_command (S9 re-prepares) or prepare it and run `tbsgen calib prepare --item ID`")
+
+
 def remote_alias(job_dir: Path) -> dict:
     """Marker a remote launcher leaves in the local job dir (tbsgen-remote.json: host, local_task, remote_task,
     remote_job_dir): the job ran on another host from a synced copy of the task, so Harbor's config.json names the
