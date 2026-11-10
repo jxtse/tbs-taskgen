@@ -325,13 +325,8 @@ def _s6b_locked(P, it, spec, meas):
             ok = isinstance(x, (int, float)) and (x <= v["threshold"] if v["direction"] == "<=" else x >= v["threshold"])
             if not ok:
                 fails.setdefault(k, {})[s] = x
-    want = it.state.get("revision_data_hash") or {}
-    changed = sorted(s for s, h in want.items() if review.data_hash(it.p("runs", "s6", f"gen{s}")) != h)
     write_json(it.p("thresholds.relock.json"), dict(ts=time.time(), locked=old["thresholds"], fresh=fresh["thresholds"],
-                                                    compare=cmp_, ref_fails_locked=fails, data_changed_seeds=changed))
-    if changed:
-        return it.finish("parked", "review:human (the revised generator changed data / hidden inputs / truth for "
-                         f"seeds {changed}; only the README format notes may change)")
+                                                    compare=cmp_, ref_fails_locked=fails))
     log = read_json(it.p("S6B_decisions.json"), []) or []
     log.append(dict(ts=time.time(), status="locked", action="S6C" if not fails else "parked", rule="thresholds_locked",
                     reason="review revision: thresholds kept", detail=dict(ref_fails_locked=fails)))

@@ -153,8 +153,30 @@ def pkg(P, it):
     write_json(it.p("PKG_check.json"), v)
     if not v["ok"]:
         return it.finish("parked", "package_invalid")
+    if it.state.get("thresholds_locked"):
+        why = _revision_pkg_problem(it, gate)
+        if why:
+            return it.finish("parked", f"review:human ({why})")
     it.state.pop("thresholds_locked", None)     # a review revision's lock ends with the new package
     it.advance("PKG", "S9")
+
+
+def _revision_pkg_problem(it, gate: dict) -> str | None:
+    """After a review revision the new package must carry the reviewed package's data / hidden inputs / truth
+    (README notes aside), and the verifier must have applied exactly the locked thresholds at run time (the
+    reference's metrics.jsonl of the passing S7 attempt)."""
+    want = it.state.get("revision_data_hash")
+    if want and review.pkg_data_hash(it.p("pkg")) != want:
+        return "the revision changed packaged data / hidden inputs / truth; only README format notes may change"
+    locked = review.locked_signature(read_json(it.p("thresholds.json"))["thresholds"])
+    logs = sorted(it.p("runs", f"s7-{gate['attempt']}").glob("logs-ref*/metrics.jsonl"))
+    if not logs:
+        return "no reference verifier log of the S7 attempt to check the thresholds applied at run time"
+    for m in logs:
+        got = review.runtime_thresholds(m)
+        if got != locked:
+            return f"the verifier applied thresholds {got} != locked {locked} ({m.parent.name})"
+    return None
 
 
 def _sha_file(p: Path) -> str:
@@ -476,18 +498,22 @@ def watch_tick(P, only: list[str] | None = None, max_steps: int = 50) -> dict:
                 it.save()
             did.append(dict(item=it.item_id, action=kind, job=rec["job_name"]))
     s9 = [i.item_id for i in P.store.items() if (not only or i.item_id in only) and
-          (i.state.get("stage") in ("S9", "S9R") or
-           (i.state.get("review_revisions") and i.state.get("status") == "active"))]
+          (i.state.get("stage") in ("S9", "S9R") or (_in_revision(i) and i.state.get("status") == "active"))]
     if s9:
         P.run(max_steps=max_steps, only=s9)
     open_ = {}
     for i in P.store.items():
         if (not only or i.item_id in only) and i.state.get("status") in ("waiting", "active") and \
-                (i.state.get("stage") in ("S9", "S9R") or i.state.get("review_revisions")):
+                (i.state.get("stage") in ("S9", "S9R") or _in_revision(i)):
             open_[i.item_id] = dict(stage=i.state["stage"], status=i.state["status"], reason=i.state.get("reason"))
     done = {i.item_id: dict(stage=i.state["stage"], status=i.state["status"], label=i.state.get("calib_label"))
             for i in P.store.items() if i.item_id in s9 and i.item_id not in open_}
     return dict(actions=did, open=open_, settled=done, ts=time.time())
+
+
+def _in_revision(it) -> bool:
+    return bool(it.state.get("review_revisions") or it.state.get("thresholds_locked") or
+                it.state.get("review_revision_pending") or str(it.state.get("repair_from", "")).startswith("review:"))
 
 
 def rf_stage(rf: tuple) -> str:
@@ -527,6 +553,9 @@ def _s9r(P, it):
         if rec.get("outcome") is None and rec.get("state") in ("intent", "reserved"):
             if not c.get("allow_submit"):
                 return it.finish("waiting", f"review {rec['job_name']} in state {rec['state']}; submit disabled")
+            why = review.route_problem(P.cfg) if not calib.job_started(rec) else None
+            if why:
+                return it.finish("waiting", f"review blocked: {why}")
             cap = None if calib.job_started(rec) else _cap_reached(P)
             if cap is not None:
                 if rec["state"] == "reserved" and rec.get("ledger_call"):
@@ -558,10 +587,13 @@ def _s9r(P, it):
                     P.ledger.settle(rec["ledger_call"], usd, status="error", kind=kind, usage=usage,
                                     note="review job ended without finished_at")
                 save(rec)
-    runs = [r for r in read_json(it.p("review", "runs.json"), []) if r.get("n") == rnd]
-    pending = [r for r in runs if r.get("outcome") is None]
+    all_rnd = [r for r in read_json(it.p("review", "runs.json"), []) if r.get("n") == rnd]
+    pending = [r for r in all_rnd if r.get("outcome") is None]
     if pending:
         return it.finish("waiting", f"awaiting review run {pending[-1]['job_name']}")
+    sha, epoch = calib.pkg_sha(it.p("pkg")), int(it.state.get("calib_epoch", 0))
+    # a verdict counts only for the package and calibration epoch it was submitted with
+    runs = [r for r in all_rnd if r.get("pkg_sha") == sha and int(r.get("calib_epoch") or 0) == epoch]
     done = [r for r in runs if r.get("outcome") == "done"]
     if done:
         return _route_review(P, it, done[-1], rnd)
@@ -569,7 +601,7 @@ def _s9r(P, it):
     if n_infra > int(rv.get("infra_retries", 2)):
         return it.finish("parked", "review:infra")
     task = review.build_task(P.cfg, it.dir, it.state, rnd)
-    rec = review.prepare(P.cfg, it.dir, task, rnd, n_infra + 1)
+    rec = review.prepare(P.cfg, it.dir, task, rnd, len(all_rnd) + 1, epoch=epoch)
     if rec.get("blocked"):
         return it.finish("waiting", f"review blocked: {rec['blocked']}")
     if not c.get("allow_submit"):
@@ -618,8 +650,11 @@ def _ingest_review(P, it, job_dir: str | None = None) -> dict:
     if res["verdict"] is not None:
         d = it.p("review", f"r{rec['n']}")
         d.mkdir(parents=True, exist_ok=True)
-        write_json(d / "verdict.raw.json", res["verdict_raw"])
-        write_json(d / "verdict.json", dict(res["verdict_raw"], **{"_normalized": res["verdict"]}))
+        raw = res["verdict_raw"]
+        write_json(d / "verdict.raw.json", raw)
+        write_json(d / "verdict.json", dict(raw if isinstance(raw, dict) else {"_raw": raw},
+                                            _normalized=res["verdict"], pkg_sha=rec.get("pkg_sha"),
+                                            calib_epoch=rec.get("calib_epoch", 0), job=rec["job_name"]))
         rec["verdict"] = res["verdict"]["verdict"]
     if rec.get("ledger_call"):
         P.ledger.settle(rec["ledger_call"], res["cost_usd"], kind=res["cost_kind"], usage=res["usage"],
@@ -664,8 +699,8 @@ def _route_review(P, it, rec: dict, rnd: int):
     verdict = norm["verdict"]
     # the current verdict (S10's review gate checks round, calibration epoch and package hash)
     write_json(it.p("review", "verdict.json"), dict(v, _normalized=norm, round=rnd,
-                                                    calib_epoch=it.state.get("calib_epoch", 0),
-                                                    pkg_sha=calib.pkg_sha(it.p("pkg")), job=rec.get("job_name")))
+                                                    calib_epoch=int(rec.get("calib_epoch") or 0),
+                                                    pkg_sha=rec.get("pkg_sha"), job=rec.get("job_name")))
     label = it.state.get("calib_label") or ""
     kept = label in P.cfg["calib"]["keep_labels"]
     it.state["review_verdict"] = verdict
@@ -681,11 +716,25 @@ def _route_review(P, it, rec: dict, rnd: int):
         return it.finish("parked", f"review:human (r{rnd} {verdict} after {it.state.get('review_revisions', 0)} revision(s))")
     if verdict == "revise":
         it.state["repair_from"] = f"review:r{rnd}"
-        it.save()
         return it.goto("S8", f"review r{rnd}: revise ({','.join(norm.get('blocking') or [])})")
     if verdict == "drop":
         return it.finish("dropped", f"review:drop r{rnd} ({','.join(norm.get('blocking') or [])})")
     return it.finish("parked", f"review:human r{rnd}")
+
+
+def _move_records(src: Path, dst: Path) -> None:
+    """Move the calibration record files of src into dst; never overwrite (a clash keeps both, suffixed)."""
+    if not src.exists():
+        return
+    dst.mkdir(parents=True, exist_ok=True)
+    for p in sorted(src.iterdir()):
+        if p.is_file() and p.name != ".lock":
+            t = dst / p.name
+            k = 1
+            while t.exists():
+                t = dst / f"{p.name}.{k}"
+                k += 1
+            shutil.move(str(p), str(t))
 
 
 def _archive_calibration(it) -> int:
@@ -694,9 +743,7 @@ def _archive_calibration(it) -> int:
     e = int(it.state.get("calib_epoch", 0))
     d = it.p("calib", f"epoch-{e}")
     d.mkdir(parents=True, exist_ok=True)
-    for p in sorted(it.p("calib").iterdir()):
-        if p.is_file() and p.name != ".lock":
-            shutil.move(str(p), str(d / p.name))
+    _move_records(it.p("calib"), d)
     it.state.setdefault("calib_history", []).append(dict(
         epoch=e, label=it.state.get("calib_label"), review_verdict=it.state.get("review_verdict"),
         review_round=it.state.get("review_round"), archived=str(d), ts=time.time()))
@@ -712,6 +759,14 @@ def _s8_review(P, it):
     calibration is archived and the item goes back to S6A_run (re-measure) -> S6B (locked) -> S6C -> S7 -> PKG ->
     S9 (from GLM) -> S9R.  Crash-safe: an accepted patch is saved before it is applied, and a pending revision is
     completed (idempotently) on resume without another model call."""
+    with item_lock(it):
+        it.load()
+        if it.state.get("stage") != "S8" or it.state.get("status") != "active":
+            return None
+        return _s8_review_locked(P, it)
+
+
+def _s8_review_locked(P, it):
     rv = P.cfg.get("review") or {}
     if it.state.get("review_revision_pending"):
         return _finish_revision(P, it, it.state["review_revision_pending"])
@@ -751,14 +806,8 @@ def _s8_review(P, it):
             (d / "before" / rel).parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(task / rel, d / "before" / rel)
     shutil.copy2(it.p("thresholds.json"), d / "thresholds.locked.json")
-    data = {}
-    if "generator/generate.py" in patch:
-        for s_ in P.cfg["gen"]["seeds"]:
-            data[str(s_)] = review.data_hash(it.p("runs", "s6", f"gen{s_}"))
-        if not all(data.values()):
-            it.state["review_revisions"] = n + 1
-            it.save()
-            return it.finish("parked", "review:human (generator revision without a previous generation to compare)")
+    # the reviewed package's data / hidden inputs / truth: the revised package must carry the same (PKG checks)
+    data = review.pkg_data_hash(it.p("pkg"))
     pend = dict(n=n + 1, dir=str(d), round=rnd, epoch=int(it.state.get("calib_epoch", 0)) + 1, data_hash=data)
     it.state["review_revision_pending"] = pend
     it.save()
@@ -772,17 +821,12 @@ def _finish_revision(P, it, pend: dict):
     if int(it.state.get("calib_epoch", 0)) < pend["epoch"]:
         _archive_calibration(it)
     else:                                               # crashed after the epoch moved: finish moving the files
-        dd = it.p("calib", f"epoch-{pend['epoch'] - 1}")
-        for p in sorted(it.p("calib").iterdir()) if it.p("calib").exists() else []:
-            if p.is_file() and p.name != ".lock":
-                dd.mkdir(parents=True, exist_ok=True)
-                shutil.move(str(p), str(dd / p.name))
+        _move_records(it.p("calib"), it.p("calib", f"epoch-{pend['epoch'] - 1}"))
     it.state["thresholds_locked"] = True
     it.state["review_revisions"] = pend["n"]
-    it.state["revision_data_hash"] = pend.get("data_hash") or {}
+    it.state["revision_data_hash"] = pend.get("data_hash")
     it.state.pop("repair_from", None)
     it.state.pop("review_revision_pending", None)
-    it.save()
     P.store.event("review_revision_applied", item=it.item_id, round=pend["round"], files=sorted(patch),
                   calib_epoch=it.state["calib_epoch"])
-    it.goto("S6A_run", f"review revision {pend['n']} (r{pend['round']})")
+    it.goto("S6A_run", f"review revision {pend['n']} (r{pend['round']})")      # one atomic save

@@ -551,11 +551,23 @@ def classify(job_dir: Path, model: str | None, prices: dict) -> dict:
 
 
 # ------------------------------------------------------------------ run records
+def route_problem(cfg: dict) -> str | None:
+    """A review route that inherits a teacher environment running prepared task copies cannot run a review task
+    (built per round from the Dockerfile, never prepared)."""
+    src = cfg["calib"]
+    if not (cfg.get("review") or {}).get("environment") and calib.role(src, "teacher", "prepared_tasks_dir"):
+        return ("the review route would inherit the teacher's environment, which runs prepared task copies "
+                "(calib.teacher_prepared_tasks_dir / prepared_tasks_dir); a review task is built per round and has "
+                "none: set review.environment / review.launcher / review.harbor_root to a route that builds the "
+                "Dockerfile")
+    return None
+
+
 def job_name(item_id: str, rnd: int, attempt: int) -> str:
     return f"tbsgen-{item_id}-review{rnd}" + (f"-a{attempt}" if attempt > 1 else "")
 
 
-def prepare(cfg: dict, item_dir: Path, task: Path, rnd: int, attempt: int) -> dict:
+def prepare(cfg: dict, item_dir: Path, task: Path, rnd: int, attempt: int, epoch: int = 0) -> dict:
     """Intent record for one review run (job config written next to the review task)."""
     rc = review_cfg(cfg)
     c = rc["calib"]
@@ -570,13 +582,8 @@ def prepare(cfg: dict, item_dir: Path, task: Path, rnd: int, attempt: int) -> di
     rec = dict(who="review", n=rnd, attempt=attempt, item=item_dir.name, model=c["teacher_model"], job_name=name,
                config=str(p), command=command, state="intent", submitted=False, ts=time.time(),
                job_dir=str(Path(c["jobs_dir"]) / name), task=str(task.resolve()), outcome=None,
-               ledger_stage="S9R")
-    why = calib.network_problem(rc, task, conf)
-    src = cfg["calib"]
-    if not why and not (cfg.get("review") or {}).get("environment") and calib.role(src, "teacher", "prepared_tasks_dir"):
-        why = ("the review route would inherit the teacher's environment, which runs prepared task copies "
-               "(calib.teacher_prepared_tasks_dir / prepared_tasks_dir); a review task is built per round and has none: "
-               "set review.environment / review.launcher / review.harbor_root to a route that builds the Dockerfile")
+               ledger_stage="S9R", pkg_sha=calib.pkg_sha(item_dir / "pkg"), calib_epoch=epoch)
+    why = calib.network_problem(rc, task, conf) or route_problem(cfg)
     if why:
         rec["blocked" if c.get("allow_submit") else "warning"] = why
     if c.get("allow_submit") and not (launcher and root):
@@ -612,6 +619,57 @@ def check_calls(src: str) -> list[tuple] | None:
     return sorted(out)
 
 
+def rebinds_check(src: str) -> bool:
+    """True when the source binds the name `check` other than by `from _metrics import check` (a wrapper could
+    scale the threshold at run time while the call literals stay the same)."""
+    import ast
+    try:
+        tree = ast.parse(src)
+    except SyntaxError:
+        return True
+    for n in ast.walk(tree):
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and n.name == "check":
+            return True
+        if isinstance(n, (ast.Name,)) and n.id == "check" and isinstance(n.ctx, (ast.Store, ast.Del)):
+            return True
+        if isinstance(n, ast.Import) and any((a.asname or a.name) == "check" or a.name == "_metrics" for a in n.names):
+            return True
+        if isinstance(n, ast.ImportFrom) and any((a.asname or a.name) == "check" for a in n.names) and \
+                not (n.module == "_metrics" and all(a.asname in (None, "check") for a in n.names if a.name == "check")):
+            return True
+        if isinstance(n, ast.Attribute) and n.attr == "check" and isinstance(n.ctx, ast.Store):
+            return True
+    return False
+
+
+def runtime_thresholds(metrics_jsonl: Path) -> list[tuple] | None:
+    """(metric, threshold, direction) as the verifier's check() recorded them at run time (non-aux lines)."""
+    try:
+        rows = [json.loads(x) for x in metrics_jsonl.read_text().splitlines() if x.strip()]
+    except (OSError, ValueError):
+        return None
+    return sorted({(r["name"], float(r["threshold"]), r["direction"]) for r in rows
+                   if not r.get("aux") and "threshold" in r})
+
+
+def pkg_data_hash(pkg: Path) -> str | None:
+    """Hash of the packaged data, hidden inputs and truth (environment/data, tests/hidden, tests/truth) without
+    README* format notes: a review revision may rewrite the notes, never the data."""
+    import hashlib
+    if not pkg.is_dir():
+        return None
+    h = hashlib.sha256()
+    for sub in ("environment/data", "tests/hidden", "tests/truth"):
+        root = pkg / sub
+        for p in sorted(root.rglob("*")) if root.exists() else []:
+            if p.is_file() and not p.name.startswith("README"):
+                h.update(str(p.relative_to(pkg)).encode())
+                h.update(b"\0")
+                h.update(p.read_bytes())
+                h.update(b"\0")
+    return h.hexdigest()[:16]
+
+
 def locked_signature(thresholds: dict) -> list[tuple]:
     return sorted((k, float(v["threshold"]), v["direction"]) for k, v in thresholds.items())
 
@@ -631,6 +689,8 @@ def revision_review(task: Path, patch: dict[str, str], depgraph: dict, threshold
     rv = repair.review(task, patch, depgraph)
     reasons = list(rv["reasons"])
     t = "tests/test_outputs.py"
+    if t in patch and rebinds_check(patch[t]):
+        reasons.append("test_outputs.py defines, wraps or re-imports check (only `from _metrics import check`)")
     if t in patch:
         sig = check_calls(patch[t])
         if sig is None:
@@ -640,24 +700,6 @@ def revision_review(task: Path, patch: dict[str, str], depgraph: dict, threshold
         elif thresholds is None and (task / t).exists() and sig != check_calls((task / t).read_text()):
             reasons.append("test_outputs.py check() metrics/thresholds/directions changed")
     return dict(rv, ok=not reasons, reasons=reasons, method="review-revision-v2")
-
-
-def data_hash(gen_dir: Path) -> str | None:
-    """Hash of a generator output tree (environment/ + tests/) WITHOUT the README* format notes: a review revision
-    may rewrite the notes the generator writes, never the data, hidden inputs or truth."""
-    import hashlib
-    if not gen_dir.is_dir():
-        return None
-    h = hashlib.sha256()
-    for sub in ("environment", "tests"):
-        root = gen_dir / sub
-        for p in sorted(root.rglob("*")) if root.exists() else []:
-            if p.is_file() and not p.name.startswith("README"):
-                h.update(str(p.relative_to(gen_dir)).encode())
-                h.update(b"\0")
-                h.update(p.read_bytes())
-                h.update(b"\0")
-    return h.hexdigest()[:16]
 
 
 def files_for_revision(item_dir: Path, max_chars: int = 90000) -> str:

@@ -326,6 +326,12 @@ def test_revision_rejects_threshold_change_and_disallowed_paths(tmp_path):
     th2 = dict(th, err=dict(th["err"], threshold=5e-4))
     assert not review.revision_review(task, {"tests/test_outputs.py": TEST_OUTPUTS}, {"nodes": []}, th2)["ok"]
     assert review.revision_review(task, {"tests/test_outputs.py": TEST_OUTPUTS}, {"nodes": []}, th)["ok"]
+    # a wrapper that rescales the threshold at run time is rejected
+    wrap = "from _metrics import check as _c\ndef check(n, v, t, d):\n    _c(n, v, t * 10, d)\n" + \
+        TEST_OUTPUTS.replace("from _metrics import check\n", "")
+    assert not review.revision_review(task, {"tests/test_outputs.py": wrap}, {"nodes": []}, th)["ok"]
+    assert review.rebinds_check("import _metrics\n_metrics.check = None\n")
+    assert not review.rebinds_check(TEST_OUTPUTS)
     assert review.revision_review(task, {"tests/measure.py": "COL = 'spectrum_index'\n"}, {"nodes": []}, th)["ok"]
 
 
@@ -457,3 +463,54 @@ def test_check_signature_and_trace_digest(tmp_path):
         {"type": "result", "subtype": "success", "num_turns": 3, "result": "final words"}]))
     d = review.trace_digest(t)
     assert d.count("Plan: read data") == 1 and "Write: /app/s.py (3 chars)" in d and "final words" in d
+
+
+def test_stale_pass_is_not_rebound_to_a_changed_package(tmp_path):
+    P, iid, jobs = _env(tmp_path)
+    _to_label(P, iid, jobs)
+    _finish(jobs, _runs(P, iid, "review")[0]["job_name"], verdict=V("pass"))
+    watch_tick(P, only=[iid])
+    assert P.store.item(iid).state["stage"] == "S10"
+    # package changes after the pass (e.g. by hand), item is put back before S10
+    it = P.store.item(iid)
+    it.p("pkg", "instruction.md").write_text("changed\n")
+    it.state.update(stage="S10", status="active")
+    it.save()
+    P.run(only=[iid])
+    it = P.store.item(iid)
+    rr = _runs(P, iid, "review")
+    assert it.state["stage"] == "S9R" and len(rr) == 2 and rr[1]["outcome"] is None      # a new review job
+    assert rr[1]["pkg_sha"] != rr[0]["pkg_sha"]
+
+
+def test_revision_pkg_checks_runtime_thresholds_and_data(tmp_path):
+    from tbsgen.stages_b import _revision_pkg_problem
+    P, iid, _ = _env(tmp_path)
+    it = P.store.item(iid)
+    it.state["revision_data_hash"] = review.pkg_data_hash(it.p("pkg"))
+    m = it.p("runs", "s7-1", "logs-ref0", "metrics.jsonl")
+    m.parent.mkdir(parents=True)
+    rows = [dict(name="err", value=1e-4, threshold=1.0e-3, direction="<="),
+            dict(name="score", value=0.95, threshold=0.9, direction=">="),
+            dict(name="_solution_cli_run", value=1.0, threshold=1800.0, direction="<=", aux=True)]
+    m.write_text("\n".join(json.dumps(r) for r in rows))
+    assert _revision_pkg_problem(it, dict(attempt=1)) is None
+    rows[0]["threshold"] = 1.0e-2
+    m.write_text("\n".join(json.dumps(r) for r in rows))
+    assert "applied thresholds" in _revision_pkg_problem(it, dict(attempt=1))
+    rows[0]["threshold"] = 1.0e-3
+    m.write_text("\n".join(json.dumps(r) for r in rows))
+    (it.p("pkg", "environment", "data", "x.npy")).write_text("new data")
+    assert "changed packaged data" in _revision_pkg_problem(it, dict(attempt=1))
+    (it.p("pkg", "environment", "data", "x.npy")).unlink()
+    (it.p("pkg", "environment", "data", "README.md")).write_text("better notes")
+    assert _revision_pkg_problem(it, dict(attempt=1)) is None
+
+
+def test_non_object_verdict_is_human(tmp_path):
+    P, iid, jobs = _env(tmp_path)
+    _to_label(P, iid, jobs)
+    _finish(jobs, _runs(P, iid, "review")[0]["job_name"], verdict=42, reward=0.0)
+    watch_tick(P, only=[iid])
+    st = P.store.item(iid).state
+    assert st["status"] == "parked" and st["reason"].startswith("review:human")
