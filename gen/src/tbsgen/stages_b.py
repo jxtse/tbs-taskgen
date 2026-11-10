@@ -69,9 +69,10 @@ def s8(P, it):
     if it.state.get("repair_from") == "gates:exploit_valid":
         return _s8_exploits(P, it)
     if it.state.get("thresholds_locked"):
-        # a gate failed after a review revision: the ordinary S8 may change the reference / baselines and is not
-        # bound by the revision limit, so a human decides
-        return it.finish("parked", f"review:human (after the review revision: {it.state.get('repair_from')})")
+        # a gate failed after a review revision or a regate: the ordinary S8 may change the reference / baselines
+        # and is not bound by the revision limit, so it must not run — the review revision is retried (feedback)
+        # while rounds remain, else the item is dropped (review.allow_human restores the old park)
+        return _revision_retry(P, it, f"after the review revision: {it.state.get('repair_from')}")
     rounds = it.state.get("repair_rounds", 0)
     if rounds >= P.cfg["gates"]["max_repair_rounds"]:
         return it.finish("dropped", f"repair_limit:{it.state.get('repair_from')}")
@@ -131,8 +132,13 @@ def regate(P, it, reason: str, recalibrate: bool = False) -> dict:
         st.setdefault("regates", []).append(rec)
         st["thresholds_locked"] = True
         st["revision_data_hash"] = review.pkg_data_hash(it.p("pkg"))
+        st["post_regate"] = True
         if recalibrate:
             rec["archived_epoch"] = _archive_calibration(it)
+        elif not st.get("rescore_pending"):
+            # the shared verifier template changed: the kept calibration stands until S9 re-scores the saved
+            # deliverables with the new grader (review.rescore_item), as the reference re-measurement does
+            st["rescore_pending"] = dict(reason="regate", files=["tests/_metrics.py", "tests/test.sh"], ts=time.time())
         st.setdefault("history", []).append(dict(stage=st.get("stage"), result="regate", to="S6A_run", reason=reason,
                                                  ts=time.time()))
         st.update(stage="S6A_run", status="active")
@@ -150,7 +156,9 @@ def _s8_exploits(P, it):
     n = int(it.state.get("exploit_repair_rounds", 0))
     locked = bool(it.state.get("thresholds_locked"))
     if n >= int(P.cfg["gates"].get("max_exploit_repair_rounds", 2)):
-        return it.finish("parked" if locked else "dropped", f"exploit_repair_limit:{n}")
+        if locked and (P.cfg.get("review") or {}).get("allow_human"):
+            return it.finish("parked", f"exploit_repair_limit:{n}")
+        return it.finish("dropped", f"exploit_repair_limit:{n}")
     task = it.p("task")
     last = sorted(it.p("gates").glob("attempt-*.json"))
     gate_log = read_json(last[-1]) if last else {}
@@ -239,12 +247,19 @@ def pkg(P, it):
         v = dict(v, ok=False, errors=list(v.get("errors") or []) + [f"readymade: {rm['findings'][:3]}"])
     write_json(it.p("PKG_check.json"), v)
     if not v["ok"]:
+        raw = v.get("errors")
+        errs = [str(x) for x in (raw if isinstance(raw, (list, tuple)) else []) if x]
+        if it.state.get("thresholds_locked"):
+            # the package the review revision produced is broken: retry the revision (feedback) / drop
+            return _revision_retry(P, it, "package_invalid: " + "; ".join(errs)[:200])
         return it.finish("parked", "package_invalid")
     if it.state.get("thresholds_locked"):
         why = _revision_pkg_problem(it, gate)
         if why:
-            return it.finish("parked", f"review:human ({why})")
+            return _revision_retry(P, it, why)
     it.state.pop("thresholds_locked", None)     # a review revision's lock ends with the new package
+    it.state.pop("post_revision", None)
+    it.state.pop("post_regate", None)
     it.advance("PKG", "S9")
 
 
@@ -287,6 +302,37 @@ def item_lock(it):
             fcntl.flock(fh, fcntl.LOCK_UN)
 
 
+def _rescore_pending(P, it):
+    """S9 entry with a pending re-score (a scoring-only review revision, or a shared-verifier regate): re-run the
+    packaged verifier on every decisive run's saved deliverable (calib/deliverables/<job>/; a run that produced no
+    deliverable at all keeps its fail outcome — the S7 nop gate proves the new grader fails an empty output).  All
+    outcomes unchanged -> the calibration stands (S9 relabels from the kept runs).  Any outcome changed, or a
+    decisive run without a saved deliverable -> archive the epoch and recalibrate from GLM.  A sandbox failure
+    waits (infrastructure, not an attempt)."""
+    pend = it.state.get("rescore_pending") or {}
+    runs = read_json(it.p("calib", "runs.json"), []) or []
+    decisive = [r for r in runs if r.get("outcome") in ("pass", "fail")]
+    if decisive:
+        try:
+            res = review.rescore_item(P.cfg, it.dir, runs)
+        except Exception as e:                       # sandbox / docker down: not an attempt
+            return it.finish("waiting", f"rescore blocked: {str(e)[:200]}")
+        write_json(it.p("calib", "rescore.json"), dict(pend, keep=res["keep"], checked=res["checked"],
+                                                       missing=res["missing"], changed=res["changed"],
+                                                       details=res["details"], ts=time.time()))
+        P.store.event("review_rescore", item=it.item_id, reason=pend.get("reason"), keep=res["keep"],
+                      checked=res["checked"], missing=res["missing"], changed=res["changed"])
+        it.state.pop("rescore_pending", None)
+        if not res["keep"]:
+            _archive_calibration(it)
+            it.state.pop("calib_label", None)
+            return it.goto("S9", f"rescore: {len(res['missing'])} deliverable(s) missing, "
+                                 f"{len(res['changed'])} outcome(s) changed under the new grader; recalibrating")
+    else:
+        it.state.pop("rescore_pending", None)
+    return None
+
+
 def _cap_reached(P) -> float | None:
     cap = P.cfg["budget"].get("run_usd_total")
     if cap is not None and calib.actual_spend(P.ledger) >= float(cap):
@@ -317,6 +363,10 @@ def s9(P, it):
 
 def _s9(P, it):
     c = P.cfg["calib"]
+    if it.state.get("rescore_pending"):
+        r = _rescore_pending(P, it)
+        if r is not None:
+            return r
     runs = read_json(it.p("calib", "runs.json"), [])
     for rec in runs:                                         # reconcile interrupted submissions
         if rec.get("outcome") is None and rec.get("state") in ("intent", "reserved"):
@@ -685,8 +735,9 @@ def _s9r(P, it):
     if done:
         return _route_review(P, it, done[-1], rnd)
     n_infra = sum(1 for r in runs if r.get("outcome") == "infra")
-    if n_infra > int(rv.get("infra_retries", 2)):
-        return it.finish("parked", "review:infra")
+    n_invalid = sum(1 for r in runs if r.get("outcome") == "invalid")
+    if n_infra + n_invalid > int(rv.get("infra_retries", 2)):
+        return it.finish("parked", f"review:infra ({n_infra} infra, {n_invalid} invalid verdicts)")
     task = review.build_task(P.cfg, it.dir, it.state, rnd)
     rec = review.prepare(P.cfg, it.dir, task, rnd, len(all_rnd) + 1, epoch=epoch)
     if rec.get("blocked"):
@@ -731,8 +782,11 @@ def _ingest_review(P, it, job_dir: str | None = None) -> dict:
         ident["task"] = want["task"]
     if ident != want:
         raise ValueError(f"job identity mismatch: job {ident} vs pending review run {want}")
-    res = review.classify(jd, rec.get("model"), P.cfg["models"].get("prices", {}))
-    rec.update(outcome=res["outcome"], minutes=res["minutes"], cost_usd=res["cost_usd"], cost_kind=res["cost_kind"],
+    res = review.classify(jd, rec.get("model"), P.cfg["models"].get("prices", {}),
+                          allow_human=bool((P.cfg.get("review") or {}).get("allow_human")))
+    rec.update(outcome="invalid" if (res["outcome"] == "done" and (res["verdict"] or {}).get("verdict") is None)
+               else res["outcome"],
+               minutes=res["minutes"], cost_usd=res["cost_usd"], cost_kind=res["cost_kind"],
                trial=res["trial"], n_trials=res["n_trials"], usage=res["usage"])
     if res["verdict"] is not None:
         d = it.p("review", f"r{rec['n']}")
@@ -780,17 +834,39 @@ def withdraw(P, item_id: str, reason: str) -> bool:
     return True
 
 
+def _revision_retry(P, it, why: str):
+    """A review revision failed to clear a locked-threshold gate (S6B reference / S7 gate / PKG checks): retry the
+    revision with the failure fed back while revision rounds remain; otherwise drop the item.  review.allow_human
+    (off by default) restores the old operator park instead."""
+    rv = P.cfg.get("review") or {}
+    if rv.get("allow_human"):
+        return it.finish("parked", f"review:human ({why})")
+    n = int(it.state.get("review_revisions", 0))
+    rnd = int(it.state.get("review_round") or 1)
+    verdict = read_json(it.p("review", "verdict.json"), {}) or {}
+    routed = verdict.get("round") == rnd and (verdict.get("_normalized") or {}).get("verdict") == "revise"
+    if it.state.get("post_revision") and n < int(rv.get("max_revisions", 3)) and routed:
+        it.state["revision_feedback"] = str(why)[:500]
+        it.state["repair_from"] = f"review:r{rnd}"
+        return it.goto("S8", f"review revision retry: {why[:160]}")
+    return it.finish("dropped", f"review:gate_failed ({why[:300]})")
+
+
 def _route_review(P, it, rec: dict, rnd: int):
-    """pass -> S10 (kept label) / stays parked (parked label); revise -> S8 review revision (max_revisions);
-    drop -> dropped; human -> parked.  A non-pass verdict after a revision -> parked for a human."""
+    """pass -> S10 (kept label) / stays parked (parked label); revise -> S8 review revision while rounds remain
+    (review.max_revisions, default 3; after that drop); drop -> dropped.  An invalid verdict (malformed, blocking
+    issue without a fix_kind, bound to another job / package / epoch) re-runs the review within the round, up to
+    review.infra_retries invalid verdicts; after that the item is dropped (or parked behind review.allow_human)."""
     rv = P.cfg.get("review") or {}
     v = read_json(it.p("review", f"r{rnd}", f"{rec.get('job_name')}.verdict.json"), {}) or {}
     if (v.get("job") != rec.get("job_name") or v.get("pkg_sha") != rec.get("pkg_sha") or
             int(v.get("calib_epoch") or 0) != int(rec.get("calib_epoch") or 0) or "_normalized" not in v):
-        return it.finish("parked", f"review:human (r{rnd}: verdict of job {rec.get('job_name')} missing or bound to "
-                         "another job / package / epoch)")
+        return _review_invalid(P, it, rnd, rec, f"verdict of job {rec.get('job_name')} missing or bound to "
+                                                 f"another job / package / epoch")
     norm = v["_normalized"]
     verdict = norm["verdict"]
+    if verdict is None:
+        return _review_invalid(P, it, rnd, rec, "; ".join(norm.get("problems") or ["invalid verdict"])[:400])
     # the current verdict (S10's review gate checks round, calibration epoch and package hash)
     write_json(it.p("review", "verdict.json"), dict(v, _normalized=norm, round=rnd,
                                                     calib_epoch=int(rec.get("calib_epoch") or 0),
@@ -799,21 +875,34 @@ def _route_review(P, it, rec: dict, rnd: int):
     kept = label in P.cfg["calib"]["keep_labels"]
     it.state["review_verdict"] = verdict
     P.store.event("review_verdict", item=it.item_id, round=rnd, verdict=verdict, raw=norm.get("raw_verdict"),
-                  blocking=norm.get("blocking"), minor=norm.get("minor"), label=label)
+                  blocking=norm.get("blocking"), minor=norm.get("minor"), label=label,
+                  problems=(norm.get("problems") or [])[:6])
     if verdict == "pass":
         if kept:
             return it.advance("S9R", "S10", review="pass", round=rnd)
         return it.finish("parked", f"{label} (review r{rnd}: pass)")
-    if verdict != "pass":
-        withdraw(P, it.item_id, f"review r{rnd}: {verdict}")
-    if rnd > 1 or (verdict == "revise" and int(it.state.get("review_revisions", 0)) >= int(rv.get("max_revisions", 1))):
-        return it.finish("parked", f"review:human (r{rnd} {verdict} after {it.state.get('review_revisions', 0)} revision(s))")
+    withdraw(P, it.item_id, f"review r{rnd}: {verdict}")
+    if verdict == "revise" and int(it.state.get("review_revisions", 0)) >= int(rv.get("max_revisions", 3)):
+        return it.finish("dropped", f"review:drop r{rnd} (revision limit {rv.get('max_revisions', 3)}: "
+                                    f"{','.join(norm.get('blocking') or [])})")
     if verdict == "revise":
         it.state["repair_from"] = f"review:r{rnd}"
         return it.goto("S8", f"review r{rnd}: revise ({','.join(norm.get('blocking') or [])})")
-    if verdict == "drop":
-        return it.finish("dropped", f"review:drop r{rnd} ({','.join(norm.get('blocking') or [])})")
-    return it.finish("parked", f"review:human r{rnd}")
+    return it.finish("dropped", f"review:drop r{rnd} ({','.join(norm.get('blocking') or [])})")
+
+
+def _review_invalid(P, it, rnd: int, rec: dict, why: str) -> dict:
+    """An invalid verdict is not a judgment about the task: re-run the review within the round.  After
+    review.infra_retries invalid verdicts the item is dropped (review.allow_human parks it for an operator)."""
+    rv = P.cfg.get("review") or {}
+    n_bad = sum(1 for r in read_json(it.p("review", "runs.json"), [])
+                if r.get("n") == rnd and r.get("outcome") == "invalid")
+    if n_bad + 1 > int(rv.get("infra_retries", 2)):
+        if rv.get("allow_human"):
+            return it.finish("parked", f"review:human (r{rnd}: {n_bad + 1} invalid verdicts; last: {why[:200]})")
+        return it.finish("dropped", f"review:invalid r{rnd} ({n_bad + 1} invalid verdicts; last: {why[:200]})")
+    P.store.event("review_verdict_invalid", item=it.item_id, round=rnd, job=rec.get("job_name"), why=why[:400])
+    return it.goto("S9R", f"review r{rnd} verdict invalid ({why[:160]}); re-running")
 
 
 def _move_records(src: Path, dst: Path) -> None:
@@ -849,39 +938,49 @@ def _archive_calibration(it) -> int:
 def _s8_review(P, it):
     """S8 for a review verdict "revise": one local edit of the statement / format notes (via the generator) /
     test and scoring scripts.  Thresholds and the reference are locked (review.revision_review; S6B keeps
-    thresholds.json; the regenerated data must hash the same as before apart from README* notes); the old
-    calibration is archived and the item goes back to S6A_run (re-measure) -> S6B (locked) -> S6C -> S7 -> PKG ->
-    S9 (from GLM) -> S9R.  Crash-safe: an accepted patch is saved before it is applied, and a pending revision is
-    completed (idempotently) on resume without another model call."""
+    thresholds.json; the regenerated data must hash the same as before apart from README* notes).  A revision that
+    changes only the grader (tests/test_outputs.py, tests/measure.py) is scoring-only: the calibration is kept and
+    re-scored with the new grader at S9 (review.rescore_pending) instead of being archived; anything else archives
+    it and goes back to S6A_run (re-measure) -> S6B (locked) -> S6C -> S7 -> PKG -> S9 (from GLM) -> S9R.
+    Crash-safe: an accepted patch is saved before it is applied, and a pending revision is completed (idempotently)
+    on resume without another model call."""
     with item_lock(it):
         it.load()
         if it.state.get("stage") != "S8" or it.state.get("status") != "active":
             return None
-        return _s8_review_locked(P, it)
+        return _s8_review_locked_(P, it)
 
 
-def _s8_review_locked(P, it):
+def _s8_review_locked_(P, it):
     rv = P.cfg.get("review") or {}
     if it.state.get("review_revision_pending"):
         return _finish_revision(P, it, it.state["review_revision_pending"])
     n = int(it.state.get("review_revisions", 0))
-    if n >= int(rv.get("max_revisions", 1)):
-        return it.finish("parked", f"review:human (revision limit {n})")
+    if n >= int(rv.get("max_revisions", 3)):
+        if rv.get("allow_human"):
+            return it.finish("parked", f"review:human (revision limit {n})")
+        return it.finish("dropped", f"review:drop (revision limit {n}: {rv.get('max_revisions', 3)})")
     rnd = int(it.state.get("review_round") or 1)
     verdict = read_json(it.p("review", "verdict.json"), {}) or {}        # the routed verdict (bound in S9R)
     norm = verdict.get("_normalized") or {}
-    if verdict.get("round") != rnd or norm.get("verdict") != "revise" or \
-            verdict.get("pkg_sha") != calib.pkg_sha(it.p("pkg")):
-        return it.finish("parked", f"review:human (no routed revise verdict for r{rnd} and the current package)")
+    # the package hash may differ from the reviewed one after a failed gate forced a rebuild (S6B/S7/PKG checks);
+    # the round and the routed revise verdict still bind the revision, and PKG checks the data hash
+    if verdict.get("round") != rnd or norm.get("verdict") != "revise":
+        return it.finish("parked", f"review:error (no routed revise verdict for r{rnd} and the current package)")
     issues = [i for i in norm["issues"] if i["severity"] == "blocking"] + \
              [i for i in norm["issues"] if i["severity"] == "minor"]
+    feedback = it.state.pop("revision_feedback", None)
+    if feedback:
+        issues = [dict(id="IF", category="c", severity="blocking", fix_kind="local", title="the last revision failed",
+                       evidence=[feedback], fix="fix the failure it caused (see the S6B/S7/PKG records)")] + issues
     spec = read_json(it.p("_spec", "spec.json"))
     task = it.p("task")
     th = read_json(it.p("thresholds.json"))["thresholds"]
     user = S8_REVIEW.format(issues=json.dumps(issues, indent=1, ensure_ascii=False)[:30000],
                             thresholds=json.dumps({k: {"direction": v["direction"], "threshold": v["threshold"]}
                                                    for k, v in th.items()}),
-                            files=review.files_for_revision(it.dir), allowed=", ".join(review.REVISION_PATHS))
+                            files=review.files_for_revision(it.dir), allowed=", ".join(review.REVISION_PATHS)
+                                                                     + ", baselines/exploit_*.py")
     r = P.client("repair").chat(SYSTEM, user, stage="S8", item=it.item_id,
                                 max_tokens=P.cfg["gen"].get("s6a_max_tokens"))
     save_raw(it, "S8", r)
@@ -890,12 +989,22 @@ def _s8_review_locked(P, it):
     d = it.p("repair", f"review-{n + 1}")
     d.mkdir(parents=True, exist_ok=True)
     write_json(d / "patch.json", patch)                  # never written as files before the paths are checked
-    write_json(d / "review.json", dict(chk, review_round=rnd, issues=[i.get("id") for i in issues]))
+    write_json(d / "review.json", dict(chk, review_round=rnd, issues=[i.get("id") for i in issues],
+                                       gate_feedback=feedback))
     if not chk["ok"] or not patch:
+        # a rejected patch spends its revision round: retry while rounds remain, else drop (allow_human parks)
         it.state["review_revisions"] = n + 1
+        it.state["revision_feedback"] = "the last revision patch was rejected: " + \
+            "; ".join(chk["reasons"] or ["empty patch"])[:400]
+        it.state["repair_from"] = f"review:r{rnd}"
         it.save()
-        return it.finish("parked", "review:human (revision rejected: " +
-                         "; ".join(chk["reasons"] or ["empty patch"])[:300] + ")")
+        if n + 1 >= int(rv.get("max_revisions", 3)):
+            if rv.get("allow_human"):
+                return it.finish("parked", "review:human (revision rejected: " +
+                                 "; ".join(chk["reasons"] or ["empty patch"])[:300] + ")")
+            return it.finish("dropped", "review:drop (revision rejected: " +
+                             "; ".join(chk["reasons"] or ["empty patch"])[:300] + ")")
+        return it.goto("S8", f"review r{rnd}: revision rejected, retrying")
     for rel, body in patch.items():                      # paths are in review.REVISION_PATHS here
         (d / "patch" / rel).parent.mkdir(parents=True, exist_ok=True)
         (d / "patch" / rel).write_text(body)
@@ -905,7 +1014,8 @@ def _s8_review_locked(P, it):
     shutil.copy2(it.p("thresholds.json"), d / "thresholds.locked.json")
     # the reviewed package's data / hidden inputs / truth: the revised package must carry the same (PKG checks)
     data = review.pkg_data_hash(it.p("pkg"))
-    pend = dict(n=n + 1, dir=str(d), round=rnd, epoch=int(it.state.get("calib_epoch", 0)) + 1, data_hash=data)
+    pend = dict(n=n + 1, dir=str(d), round=rnd, epoch=int(it.state.get("calib_epoch", 0)) + 1, data_hash=data,
+                archive=not review.scoring_only(patch), files=sorted(patch))
     it.state["review_revision_pending"] = pend
     it.save()
     return _finish_revision(P, it, pend)
@@ -915,15 +1025,22 @@ def _finish_revision(P, it, pend: dict):
     d = Path(pend["dir"])
     patch = read_json(d / "patch.json", {}) or {}
     repair.apply(it.p("task"), patch)                   # idempotent (whole-file writes)
-    if int(it.state.get("calib_epoch", 0)) < pend["epoch"]:
-        _archive_calibration(it)
-    else:                                               # crashed after the epoch moved: finish moving the files
-        _move_records(it.p("calib"), it.p("calib", f"epoch-{pend['epoch'] - 1}"))
+    if pend.get("archive", True):
+        if int(it.state.get("calib_epoch", 0)) < pend["epoch"]:
+            _archive_calibration(it)
+        else:                                           # crashed after the epoch moved: finish moving the files
+            _move_records(it.p("calib"), it.p("calib", f"epoch-{pend['epoch'] - 1}"))
+    elif not it.state.get("rescore_pending"):
+        # scoring-only revision: the statement, data, thresholds and reference are untouched, so the calibration
+        # stands until S9 re-scores the saved deliverables with the new grader (review.rescore_item)
+        it.state["rescore_pending"] = dict(reason="scoring-only revision", round=pend["round"], n=pend["n"],
+                                           files=pend.get("files") or sorted(patch), ts=time.time())
     it.state["thresholds_locked"] = True
     it.state["review_revisions"] = pend["n"]
     it.state["revision_data_hash"] = pend.get("data_hash")
+    it.state["post_revision"] = True
     it.state.pop("repair_from", None)
     it.state.pop("review_revision_pending", None)
     P.store.event("review_revision_applied", item=it.item_id, round=pend["round"], files=sorted(patch),
-                  calib_epoch=it.state["calib_epoch"])
+                  calib_epoch=it.state["calib_epoch"], scoring_only=not pend.get("archive", True))
     it.goto("S6A_run", f"review revision {pend['n']} (r{pend['round']})")      # one atomic save

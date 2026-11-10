@@ -128,7 +128,7 @@ def package(cfg: dict, item_dir: Path, gen0: Path, spec: dict, provenance: dict)
     shutil.copytree(gen0 / "tests" / "truth", out / "tests" / "truth")
     if any((gen0 / "tests" / "hidden").rglob("*")):
         shutil.copytree(gen0 / "tests" / "hidden", out / "tests" / "hidden")
-    (out / "tests" / "_metrics.py").write_text(metrics_helper_text(cfg, spec))
+    (out / "tests" / "_metrics.py").write_text(metrics_helper_text(cfg, spec, item_dir))
     (out / "tests" / "test.sh").write_text(TEST_SH)
     (out / "solution").mkdir()
     shutil.copy(task / "solution" / "solve.py", out / "solution" / "solve.py")

@@ -85,6 +85,17 @@ DEFAULTS: dict[str, Any] = {
             {"name": "asce", "doi_prefix": "10.1061", "why": "Cloudflare-walled, no TDM; 1/4"},
             {"name": "spie", "doi_prefix": "10.1117", "why": "mostly proceedings, no TDM/OA; 1/4"},
         ],
+        # Blocklist auto-recheck: a rule that blocks more than `min_share` of any target's candidates is given a
+        # small weekly trial quota — that many of its papers go through the normal S2 screen -> S3 fetch path
+        # (nothing else changes).  Once a rule has `min_trials` decided trials its success rate decides: >=
+        # `lift_rate` -> the rule is lifted (recorded; `tbsgen review summary` shows it), else it stays and the
+        # weekly quota keeps probing.  Every trial / lift / keep is an event and lands in the review summary.
+        "blocklist_recheck": {
+            "min_share": 0.10,             # min blocked share of a target's candidates for trials
+            "weekly_quota": 5,             # trial papers per rule per ISO week
+            "min_trials": 5,               # decided trials before a lift decision
+            "lift_rate": 0.6,              # full-text success rate that lifts a rule
+        },
         "jev": {
             "model": "jev-1.14.0",          # pinned version (thresholds were set on it); "jev-latest" = alias
             "url": "https://api.typesafe.ai/v1/systemone",
@@ -136,9 +147,10 @@ DEFAULTS: dict[str, Any] = {
                "europepmc_last": True,
                "last_hosts": ["www.ebi.ac.uk", "europepmc.org"],
                "server_error_streak": 5, "server_error_cooldown_s": 1800},
-        "elsevier": {"enabled": False, "prefixes": ["10.1016/"], "key_env": "ELSEVIER_API_KEY",
-                     "insttoken_env": "ELSEVIER_INSTTOKEN"},
-        "wiley": {"enabled": False, "prefixes": ["10.1002/", "10.1111/"], "token_env": "WILEY_TDM_TOKEN"},
+        "elsevier": {"enabled": False, "prefixes": ["10.1016/", "10.1006/", "10.1053/", "10.1067/"],
+                     "key_env": "ELSEVIER_API_KEY", "insttoken_env": "ELSEVIER_INSTTOKEN"},
+        "wiley": {"enabled": False, "prefixes": ["10.1002/", "10.1111/", "10.1029/", "10.1113/"],
+                  "token_env": "WILEY_TDM_TOKEN"},
         # Publisher PDF URLs the institution's IP range is entitled to, e.g.
         # {prefix = "10.1007/", url = "https://link.springer.com/content/pdf/{doi}.pdf"}.  Empty by default.
         "inst": {"enabled": False, "routes": []},
@@ -331,6 +343,8 @@ DEFAULTS: dict[str, Any] = {
                                             # times and reports the median wall time (tasks with a resource metric
                                             # only; 1 = single run).  Applies to S6A measurement (thresholds), S7
                                             # and the packaged verifier alike.  Non-resource metrics are unchanged
+        "speed_deadband": 0.1,              # machine-speed ratio within ±10% of 1 -> 1: same-host noise never
+                                            # moves a time threshold.  The ratio itself is clamped to [0.25, 8]
         "max_mid_fail": 2, "min_mid_fail": 1,
         "sig_digits": 2,
     },
@@ -412,9 +426,14 @@ DEFAULTS: dict[str, Any] = {
     # ---------------------------------------------------------------- task review (S9R, after S9, before S10)
     "review": {
         # A Claude Code agent (fresh context, inside the task's own image, model endpoint only) audits every task
-        # S9 would keep (calib.keep_labels) and, as a diagnosis, the labels in review_parked.  Verdict pass ->
-        # S10; revise -> one S8 review revision (thresholds locked) -> S6A_run..PKG -> S9 from GLM -> S9R again;
-        # drop -> dropped; human (or a second non-pass) -> parked.  Jobs follow calib.allow_submit like S9 runs.
+        # S9 would keep (calib.keep_labels) and, as a diagnosis, the labels in review_parked.  Verdicts pass /
+        # revise / drop (the verdict is derived from the blocking issues' fix_kinds: any fundamental -> drop, only
+        # local ones -> revise, none -> pass); there is no human exit.  pass -> S10; revise -> S8 review revision
+        # (thresholds locked) -> S6A_run..PKG -> S9 -> S9R again, up to max_revisions, then drop; drop -> dropped.
+        # An invalid verdict (malformed / unbound / blocking issue without a fix_kind) re-runs the review within
+        # the round, up to infra_retries, then drops.  allow_human=True (off by default) restores the old
+        # operator park at every one of those exits.  A scoring-only revision re-scores the kept calibration with
+        # the new grader (calib/deliverables/<job>/) instead of archiving it.
         "enabled": True,
         "model": None,                      # None = calib.teacher_model (Opus)
         "agent": None,                      # None = calib.teacher_agent
@@ -425,10 +444,13 @@ DEFAULTS: dict[str, Any] = {
         "jobs_dir": None,                   # None = calib.jobs_dir
         "est_usd_per_run": None,            # ledger reservation (stage S9R); None = calib.est_usd_per_run
         "timeout_sec": 3600,                # agent timeout of the review task
-        "max_revisions": 1,                 # review revisions per item; a second non-pass review -> human
+        "max_revisions": 3,                 # review revisions per item; after the limit -> drop
+        "allow_human": False,               # explicit opt-in: park for an operator instead of dropping
         "review_parked": ["parked:teacher_failed"],   # also reviewed (diagnosis only; never released by S9R)
-        "infra_retries": 2,                 # review jobs without a verdict (infra) before parking
+        "infra_retries": 2,                 # review runs without a usable verdict (infra + invalid) before drop
         "trace_digest_kb": 150,             # per calibration run, in the review bundle
+        # `tbsgen review summary` anomaly alerts: drop rate over this (and other structural warnings)
+        "summary_alerts": {"drop_rate": 0.5},
     },
     "package": {
         "dockerfile_mode": "selfcontained",  # "selfcontained" (pip in Dockerfile, portable) | "local_base"

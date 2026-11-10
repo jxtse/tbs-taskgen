@@ -92,14 +92,36 @@ def timing_budget(cfg: dict, spec: dict | None) -> float:
     return float(cfg["thresholds"].get("timing_budget_sec", 300)) if timing_repeats(cfg, spec) > 1 else 0.0
 
 
-def metrics_helper_text(cfg: dict, spec: dict | None) -> str:
-    """tests/_metrics.py as copied into a task: the template with TIMING_REPEATS set for this task."""
+def resource_gating(cfg: dict, spec: dict | None) -> bool:
+    """Whether resource metrics (wall time / memory) decide a run for this task (spec.resource_metric_gating,
+    default false: recorded but never deciding — only speed-contribution papers gate on them)."""
+    return bool((spec or {}).get("resource_metric_gating"))
+
+
+def metrics_helper_text(cfg: dict, spec: dict | None, item_dir: Path | None = None) -> str:
+    """tests/_metrics.py as copied into a task: the template with TIMING_REPEATS, the machine-speed reference
+    (thresholds.speed_bench_sec of this item, when thresholds exist) and the resource-metric gating flag set for
+    this task."""
     src = METRICS_HELPER.read_text()
     if REPEATS_LINE not in src:
         raise RuntimeError("templates_metrics.py: TIMING_REPEATS marker line missing")
     tb = "TIMING_BUDGET_SEC = 300.0  # tbsgen:timing_budget"
     if tb not in src:
         raise RuntimeError("templates_metrics.py: TIMING_BUDGET_SEC marker line missing")
+    sb = "SPEED_BASE = None  # tbsgen:speed_base"
+    rg = "RESOURCE_GATING = False  # tbsgen:resource_gating"
+    if sb not in src or rg not in src:
+        raise RuntimeError("templates_metrics.py: SPEED_BASE / RESOURCE_GATING marker lines missing")
+    base = None
+    if item_dir is not None:
+        try:
+            th = json.loads((item_dir / "thresholds.json").read_text())
+        except (OSError, ValueError):
+            th = {}
+        b = (th or {}).get("speed_bench_sec")
+        base = float(b) if isinstance(b, (int, float)) and b > 0 else None
+    src = src.replace(sb, f"SPEED_BASE = {base!r}  # tbsgen:speed_base")
+    src = src.replace(rg, f"RESOURCE_GATING = {resource_gating(cfg, spec)!s}  # tbsgen:resource_gating")
     src = src.replace(tb, f"TIMING_BUDGET_SEC = {timing_budget(cfg, spec)!r}  # tbsgen:timing_budget")
     return src.replace(REPEATS_LINE, f"TIMING_REPEATS = {timing_repeats(cfg, spec)}  # tbsgen:timing_repeats")
 
@@ -118,7 +140,7 @@ def _verifier_tests(cfg: dict, task: Path, gen: Path, dst: Path, test_file: str 
     shutil.copytree(task / "tests", dst, ignore=shutil.ignore_patterns("truth", "hidden", "__pycache__"))
     shutil.copytree(gen / "tests" / "truth", dst / "truth")
     shutil.copytree(gen / "tests" / "hidden", dst / "hidden")
-    (dst / "_metrics.py").write_text(metrics_helper_text(cfg, task_spec(task)))
+    (dst / "_metrics.py").write_text(metrics_helper_text(cfg, task_spec(task), task.parent))
     (dst / "test.sh").write_text(TEST_SH)       # the packaged verifier entry point, used as is by test()
 
 
@@ -163,6 +185,25 @@ def measure(cfg: dict, task: Path, gen: Path, outd: Path, work: Path, tag: str) 
     return r
 
 
+def speed_bench(cfg: dict, task: Path, gen: Path, work: Path, seed) -> float | None:
+    """The machine-speed reference measured inside the task's own sandbox image (the same environment the
+    thresholds are measured and applied in): median fixed-computation time from tests/_metrics.py."""
+    tests = work / f"mtests-bench{seed}"
+    _verifier_tests(cfg, task, gen, tests, None)
+    logs = work / f"mlogs-bench{seed}"
+    logs.mkdir(parents=True, exist_ok=True)
+    logs.chmod(0o777)
+    r = sandbox.run(cfg, [(tests, "/src/tests", "ro"), (logs, "/logs/verifier", "rw"),
+                          (gen / "environment" / "data", "/src/data", "ro")],
+                    VERIFIER_PRE + "python /tests/_metrics.py --speed-bench", 300,
+                    f"tbsgen-bench-{seed}", root=True)
+    try:
+        d = json.loads(r["out"].strip().splitlines()[-1])
+        return float(d.get("speed_bench_sec")) if d.get("speed_bench_sec") else None
+    except (json.JSONDecodeError, IndexError, TypeError, ValueError):
+        return None
+
+
 def test(cfg: dict, task: Path, gen: Path, outd: Path, work: Path, tag: str) -> dict:
     """The packaged verifier: tests/test.sh (pytest, then _metrics.finalize_reward).  passed = reward.txt reads 1
     after a settle delay (gen.verifier_settle_sec) during which the container keeps running, as under Harbor where
@@ -189,7 +230,7 @@ def test(cfg: dict, task: Path, gen: Path, outd: Path, work: Path, tag: str) -> 
                 continue
     rf = logs / "reward.txt"
     reward = rf.read_text().strip() if rf.exists() and not rf.is_symlink() else None
-    acc = [m for m in metrics if not m.get("aux") and "passed" in m]
+    acc = [m for m in metrics if not m.get("aux") and "passed" in m and m.get("gated", True)]
     r.update(passed=reward == "1", reward=reward, metrics=metrics, n_checks=len(acc),
              n_failed=sum(not m["passed"] for m in acc), failed=[m["name"] for m in acc if not m["passed"]])
     return r

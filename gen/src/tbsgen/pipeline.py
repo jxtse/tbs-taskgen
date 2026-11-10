@@ -166,7 +166,8 @@ class Pipeline:
     def order(self, items: list) -> list:
         """Items in stepping order (schedule.order): with a daily model-call cap only the first papers in this order
         reach S5 on a given day.  round_robin: targets take turns (target with the best paper first), within a
-        target best S2 score first and near-duplicate titles (schedule.similar_title_jaccard) moved to the end."""
+        target the S4 Jev feasibility score first when there is one (roles.probe=jev), else the S2 score;
+        near-duplicate titles (schedule.similar_title_jaccard) move to the end."""
         sc = self.cfg.get("schedule") or {}
         mode = sc.get("order", "round_robin")
         if mode == "id":
@@ -174,9 +175,10 @@ class Pipeline:
         info = {}
         for it in items:
             c = read_json(it.p("S1_candidate.json"), {}) or {}
+            s4 = (read_json(it.p("S4_probe.json"), {}) or {}).get("jev", {}).get("score")
             s = (read_json(it.p("S2_screen.json"), {}) or {}).get("score")
-            info[it.item_id] = (c.get("_target") or "", s if isinstance(s, (int, float)) else float("-inf"),
-                                c.get("title") or "")
+            s = s4 if isinstance(s4, (int, float)) else (s if isinstance(s, (int, float)) else float("-inf"))
+            info[it.item_id] = (c.get("_target") or "", s, c.get("title") or "")
         by_score = sorted(items, key=lambda i: (-info[i.item_id][1], i.item_id))
         if mode == "score":
             return by_score

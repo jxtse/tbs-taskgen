@@ -144,6 +144,8 @@ def run_gates(cfg: dict, item_dir: Path, spec: dict, thresholds: dict, attempt: 
         for m in ref["metrics"]:
             if m.get("threshold") is None or m.get("value") is None or m["name"].startswith("_"):
                 continue
+            if m.get("gated") is False:
+                continue        # recorded-only resource metric: never decides a run, no margin to demand
             room = (m["threshold"] - m["value"]) if m["direction"] == "<=" else (m["value"] - m["threshold"])
             if room < 0.5 * cfg["thresholds"]["min_ref_margin"] * max(abs(m["threshold"]), 1e-12):
                 ok["oracle_margin"] = False
