@@ -92,8 +92,19 @@ def save_state(store, st: dict) -> None:
     state_path(store).write_text(json.dumps(st, indent=1, sort_keys=True))
 
 
-# per-process cache of target shares (never persisted: its keys are tuples and it is only valid for one run)
-_SHARE_CACHE: dict[int, dict] = {}
+# per-process cache of target shares, per run directory; dropped whenever the run's item count changes (new
+# candidates change every share).  Never persisted.
+_SHARE_CACHE: dict[str, dict] = {}
+
+
+def _share_cache(store) -> dict:
+    root = str(Path(store.root).resolve())
+    d = Path(store.root) / "items"
+    n = sum(1 for _ in d.iterdir()) if d.exists() else 0
+    c = _SHARE_CACHE.get(root)
+    if c is None or c.get("_n") != n:
+        c = _SHARE_CACHE[root] = {"_n": n}
+    return c
 
 
 def lifted_rules(st: dict) -> set[str]:
@@ -137,7 +148,7 @@ def decide(store, cfg: dict, c: dict, rules: list[dict], rule: dict, event) -> d
     week = _iso_week()
     r.setdefault("weeks", {})
     used = int(r["weeks"].get(week, 0))
-    share = target_share(store, c, rules, rule, lifted_rules(st), _SHARE_CACHE.setdefault(id(store), {}))
+    share = target_share(store, c, rules, rule, lifted_rules(st), _share_cache(store))
     if share is not None and share > float(rc.get("min_share", 0.10)) and used < quota:
         r["weeks"][week] = used + 1
         r["trials"].append(dict(item=c.get("item_id"), doi=_norm_doi(c.get("doi")), ts=time.time(),
@@ -188,7 +199,7 @@ def revive_for_trials(store, cfg: dict, event) -> list[str]:
         pool = [it for it in items if it.state.get("status") == "dropped" and it.state.get("stage") == "S2"
                 and it.state.get("reason") == f"blocklist:{name}" and it.item_id not in tried
                 and it.item_id not in out]
-        cache = _SHARE_CACHE.setdefault(id(store), {})
+        cache = _share_cache(store)
         lifted = lifted_rules(st)
         ok_share = []
         for it in pool:                        # only papers decide() would make a trial (no revive/drop churn)
