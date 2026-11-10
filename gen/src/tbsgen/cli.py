@@ -11,10 +11,14 @@
   tbsgen report  --run DIR [--day YYYY-MM-DD]
   tbsgen ledger  --run DIR                                       spend summary (all days)
   tbsgen breaker --run DIR --model M --reset
-  tbsgen calib-ingest --run DIR --item ID --job-dir JOBDIR      attach Harbor results to the pending S9 run
+  tbsgen calib-ingest --run DIR --item ID --job-dir JOBDIR      attach Harbor results to the pending S9 run (or the
+                                                                 pending S9R review run of an item at S9R)
   tbsgen calib watch --run DIR [--only ID,..] [--once] [--interval S] [--max-hours H]
-                                                                 poll submitted S9 jobs: ingest finished ones, step S9
-                                                                 (label, or launch the next run GLM -> teacher)
+                                                                 poll submitted S9 / S9R jobs: ingest finished ones,
+                                                                 step S9 (label, or launch the next run GLM ->
+                                                                 teacher) and S9R (launch the review, route verdict)
+  tbsgen review build --run DIR --item ID [--round K] [--out DIR] build the S9R review task of an item (no launch;
+                                                                 for replays / manual runs)
   tbsgen calib prepare --run DIR --item ID [--who glm|teacher]   run calib.prepare_command for one item (retries a
                                                                  failed preparation)
   tbsgen ping    --run DIR --calls N                             real teacher-model connectivity check (needs budget)
@@ -69,7 +73,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser(prog="tbsgen")
     sub = ap.add_subparsers(dest="cmd", required=True)
     for name in ("ingest", "run", "resume", "status", "report", "ledger", "breaker", "calib-ingest", "ping", "reset",
-                 "harbor-local", "fetch", "remote", "fulltext", "calib"):
+                 "harbor-local", "fetch", "remote", "fulltext", "calib", "review"):
         s = sub.add_parser(name)
         s.add_argument("--run", required=True)
         s.add_argument("--config", default=None)
@@ -93,6 +97,11 @@ def main(argv=None):
             s.add_argument("--max-hours", type=float, default=None, help="watch: stop after this long")
             s.add_argument("--item", default=None, help="prepare: item id")
             s.add_argument("--who", default="glm", choices=["glm", "teacher"])
+        if name == "review":
+            s.add_argument("action", choices=["build"])
+            s.add_argument("--item", required=True)
+            s.add_argument("--round", type=int, default=None)
+            s.add_argument("--out", default=None)
         if name == "report":
             s.add_argument("--day", default=None)
         if name == "breaker":
@@ -162,6 +171,12 @@ def main(argv=None):
                          ensure_ascii=False))
     elif a.cmd == "calib":
         return _calib(P, a)
+    elif a.cmd == "review":
+        from . import review
+        it = P.store.item(a.item)
+        rnd = a.round or int(it.state.get("review_round") or 1)
+        out = review.build_task(P.cfg, it.dir, it.state, rnd, Path(a.out) if a.out else None)
+        print(json.dumps(dict(item=a.item, round=rnd, task=str(out))))
     elif a.cmd == "status":
         print(json.dumps(P.status(), indent=1, ensure_ascii=False))
     elif a.cmd == "report":
@@ -237,7 +252,8 @@ def _calib(P: Pipeline, a) -> int:
 
 
 def _running(P: Pipeline, item_id: str) -> bool:
-    runs = read_json(P.store.item(item_id).p("calib", "runs.json"), []) or []
+    it = P.store.item(item_id)
+    runs = read_json(it.p("review" if it.state.get("stage") == "S9R" else "calib", "runs.json"), []) or []
     return any(r.get("outcome") is None and r.get("state", "launched") == "launched" for r in runs)
 
 

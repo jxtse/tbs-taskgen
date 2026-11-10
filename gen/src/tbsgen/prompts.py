@@ -143,6 +143,22 @@ Return ONLY the files you change (same paths; no new files, no deleted criteria,
 gate log says they were re-derived).  Format: === FILE: <path> === blocks, then === END ==="""
 
 
+S8_REVIEW = """An independent reviewer audited the packaged task after calibration and asked for a revision.  Blocking issues
+come first, minor ones after (fix a minor one only if the same edit fixes it for free):
+{issues}
+Thresholds (FIXED: never change, loosen or remove any of them; check() calls keep the same metric, threshold and
+direction): {thresholds}
+Current files (the reference solution is shown read-only; it must not change):
+{files}
+Fix the blocking issues with the smallest local edit of the statement, the data format notes, or the test /
+scoring scripts.  Files you may change: {allowed}.  The data format notes in environment/data/ (README*) are written
+by generator/generate.py: edit the text there.  Make the statement, the format notes, measure.py and the reference
+agree (when they disagree, follow what the reference solution actually does and what measure.py scores), and state
+any convention the reference relies on that a careful solver needs (ranges, boundary handling, units, names).  Never
+reveal the reference's algorithm, hidden-truth values or constants it is supposed to derive.
+Return ONLY the files you change (same paths; no new files).  Format: === FILE: <path> === blocks, then === END ==="""
+
+
 S6M_MID = """Specification:
 {spec}
 Reference solution (fixed):
