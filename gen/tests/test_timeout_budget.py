@@ -228,3 +228,13 @@ def test_budget_exhausted_record_counts_as_delivered_failure(tmp_path):
     (t / "verifier").mkdir(parents=True)
     (t / "verifier" / "metrics.jsonl").write_text(open(m._PATH).read())
     assert calib.delivered(t) is True
+
+
+def test_nonpositive_timeout_without_cap_does_not_crash(tmp_path):
+    """Standalone helper (SCORED_BUDGET_SEC None): timeout 0 fails like a timeout instead of raising (Codex r3)."""
+    cfg = load_config(None)
+    m = _helper(tmp_path, cfg, ACC, "zero")
+    m.SCORED_BUDGET_SEC = None
+    d = tmp_path / "h"
+    d.mkdir()
+    assert m.run_solution(0, str(d), entry=str(tmp_path / "cli.py"))[2] == -9

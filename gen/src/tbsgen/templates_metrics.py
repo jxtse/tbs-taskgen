@@ -671,7 +671,8 @@ def run_solution(timeout_sec, input_dir=HIDDEN, entry=ENTRY):
         t_first = min(t_first, float(SCORED_BUDGET_SEC) - _SCORED_SPENT[0])
     if t_first <= 0:                                  # verifier time for the scored runs used up: a timeout
         _record({"name": "_solution_cli_run", "value": float("inf"), "rc": -9,
-                 "stderr_tail": f"not run: the {SCORED_BUDGET_SEC:.0f}s verifier budget of the scored runs is used up",
+                 "stderr_tail": (f"not run: the {SCORED_BUDGET_SEC:.0f}s verifier budget of the scored runs is used up"
+                                 if SCORED_BUDGET_SEC is not None else f"not run: timeout {timeout_sec}s <= 0"),
                  "threshold": float(timeout_sec), "timeout_effective": 0.0, "direction": "<=", "passed": False,
                  "aux": True, "sandboxed": sb is not None, "entry": entry, "entry_exists": entry_exists,
                  "budget_exhausted": True})

@@ -2,6 +2,7 @@
 S9 intents, resume --only/--stage), cost of runs without a Harbor cost (token estimate vs unknown), result types,
 `tbsgen calib watch`, teacher-only routing.  No Docker, no network, no real jobs."""
 import json
+import time
 import sqlite3
 from pathlib import Path
 
@@ -733,3 +734,39 @@ def test_max_concurrent_jobs_counts_reserved_and_review_runs_by_stage(tmp_path):
     assert not counter.exists() or counter.read_text().count("x") == 0
     assert "slots full: 1/1" in P.store.item(ids[0]).state["reason"]
     assert P.ledger.summary(__import__("tbsgen.budget", fromlist=["today"]).today())["calls_total"] == 0
+
+
+
+def test_slot_admission_waits_for_the_run_wide_lock(tmp_path):
+    """Another process holding <run>/.calib-slots.lock (mid-admission) blocks this process's admission until it
+    releases; after release the slot check sees its launched job and the item queues instead of launching."""
+    import subprocess
+    import sys
+    import threading
+    from tbsgen import stages_b as B
+    P, ids, counter, jobs = _env(tmp_path, n_items=1, max_concurrent_jobs=1)
+    lockf = tmp_path / "run" / ".calib-slots.lock"
+    holder = subprocess.Popen([sys.executable, "-c",
+                               "import fcntl,sys,time\nf=open(sys.argv[1],'a')\nfcntl.flock(f,fcntl.LOCK_EX)\n"
+                               "print('held',flush=True)\nsys.stdin.readline()\n", str(lockf)],
+                              stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+    assert holder.stdout.readline().strip() == "held"
+    done = threading.Event()
+    th = threading.Thread(target=lambda: (P.run(only=ids), done.set()))
+    th.start()
+    time.sleep(1.5)
+    assert not done.is_set() and not counter.exists()          # blocked inside the admission lock
+    # the other process "launched" a job meanwhile (its record is live at S9 of a second item)
+    other = P.store.item(P.ingest([dict(doi="10.1/s9-other", title="o", abstract="algorithm estimation")])[0])
+    other.p("calib").mkdir(parents=True, exist_ok=True)
+    other.p("calib", "runs.json").write_text(json.dumps([dict(job_name="jo", who="glm", state="launched",
+                                                              outcome=None, job_dir=str(jobs / "jo"))]))
+    other.state.update(stage="S9", status="waiting")
+    other.save()
+    holder.stdin.write("\n")
+    holder.stdin.flush()
+    holder.wait(10)
+    th.join(20)
+    assert done.is_set() and not counter.exists()
+    assert "slots full: 1/1" in P.store.item(ids[0]).state["reason"]
+    assert B.running_jobs(P) == ["jo"]
