@@ -103,6 +103,43 @@ def s8(P, it):
     it.goto(back, f"repaired round {rounds + 1}")
 
 
+def regate(P, it, reason: str, recalibrate: bool = False) -> dict:
+    """Re-gate a packaged item after a harness change (the shared verifier template tests/_metrics.py / test.sh, the
+    S7 gates): the statement, scoring script, generator, reference and thresholds stay as they are.
+    Withdraws it from the release manifest, locks the thresholds (S6B never re-derives them; the reference must
+    clear them under the new measurement), records the data hash (PKG checks the data / hidden inputs / truth did
+    not change), and restarts at S6A_run -> S6B (locked) -> S6C (files kept) -> S7 -> PKG.  The calibration epoch
+    and its runs are kept by default (they ran on the same statement, data and thresholds; S9 relabels from them;
+    the operator re-scores the kept deliverables with the new verifier as evidence) -- recalibrate=True archives
+    them and S9 starts again from the student.  The S9R review is bound to the package hash, so the new package is
+    reviewed again before S10."""
+    with item_lock(it):
+        it.load()
+        st = it.state
+        if st.get("stage") not in ("S9", "S9R", "S10") and st.get("status") not in ("done", "parked"):
+            raise ValueError(f"regate: item at {st.get('stage')}/{st.get('status')} is not packaged")
+        if not it.p("pkg").exists() or not it.p("thresholds.json").exists():
+            raise ValueError("regate: no pkg/ or thresholds.json")
+        if any(r.get("outcome") is None for r in read_json(it.p("calib", "runs.json"), []) or []):
+            raise ValueError("regate: a calibration run is still pending")
+        old_sha = calib.pkg_sha(it.p("pkg"))
+        rec = dict(ts=time.time(), reason=reason, from_stage=st.get("stage"), from_status=st.get("status"),
+                   pkg_sha=old_sha, calib_epoch=st.get("calib_epoch", 0), label=st.get("calib_label"))
+        st.setdefault("regates", []).append(rec)
+        st["thresholds_locked"] = True
+        st["revision_data_hash"] = review.pkg_data_hash(it.p("pkg"))
+        if recalibrate:
+            rec["archived_epoch"] = _archive_calibration(it)
+        st.setdefault("history", []).append(dict(stage=st.get("stage"), result="regate", to="S6A_run", reason=reason,
+                                                 ts=time.time()))
+        st.update(stage="S6A_run", status="active")
+        st.pop("reason", None)
+        it.save()
+    withdrawn = withdraw(P, it.item_id, f"regate: {reason}")
+    P.store.event("regate", item=it.item_id, reason=reason, pkg_sha=old_sha)
+    return dict(item=it.item_id, stage="S6A_run", pkg_sha=old_sha, withdrawn=withdrawn)
+
+
 def _s8_exploits(P, it):
     """S8 when the only blocking gate is exploit_valid: rewrite the broken exploit baselines and nothing else
     (gates.exploit_patch_problems).  Exploits are not shipped and do not touch the reference, the tests, the
