@@ -50,8 +50,8 @@ def build(out: Path, fake_kw: dict | None = None, budget: dict | None = None):
     return P
 
 
-def simulate_harbor(P, item_id: str, outcomes: list[str]):
-    """Feed fake Harbor trial results into S9 (no jobs launched)."""
+def simulate_harbor(P, item_id: str, outcomes: list[str], review_verdict: str = "pass"):
+    """Feed fake Harbor trial results into S9 (no jobs launched), then (S9R) a fake review verdict."""
     from .state import read_json, write_json
     it = P.store.item(item_id)
     for oc in outcomes:
@@ -65,6 +65,24 @@ def simulate_harbor(P, item_id: str, outcomes: list[str]):
         it.save()
         P.run()
         it = P.store.item(item_id)
+    if it.state.get("stage") == "S9R" and review_verdict:
+        runs = read_json(it.p("review", "runs.json"), [])
+        pend = [r for r in runs if r.get("outcome") is None]
+        if pend:
+            rec = pend[-1]
+            issues = [] if review_verdict == "pass" else [dict(id="I1", category="a", severity="blocking",
+                                                                 title="simulated", evidence=["simulated evidence"])]
+            raw = dict(verdict=review_verdict, issues=issues, summary="simulated review")
+            from . import review as _rv
+            write_json(it.p("review", f"r{rec['n']}", f"{rec['job_name']}.verdict.json"),
+                       dict(raw, _normalized=_rv.normalize(raw), pkg_sha=rec.get("pkg_sha"),
+                            calib_epoch=rec.get("calib_epoch", 0), job=rec["job_name"]))
+            rec.update(outcome="done", verdict=review_verdict, trial=dict(simulated=True))
+            write_json(it.p("review", "runs.json"), runs)
+            it.state["status"] = "active"
+            it.save()
+            P.run()
+            it = P.store.item(item_id)
     return it.state
 
 

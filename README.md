@@ -34,7 +34,8 @@ Crossref · arXiv · Europe PMC              → S5 spec (teacher) → S6 genera
                                              from measured reference / mid / naive scores
   → dedup → RRF fusion → rule prefilter    → S7 mechanical gates, incl. 4-layer leak check
   → ranked candidate papers  ──────────▶   → S8 bounded local repair → PKG Harbor package
-                                           → S9 difficulty calibration → S10 release manifest
+                                           → S9 difficulty calibration → S9R task review
+                                           → S10 release manifest
 ```
 
 1. **Multi-source literature retrieval** (`retrieval/`). Sources are queried in parallel; results
@@ -62,6 +63,16 @@ Crossref · arXiv · Europe PMC              → S5 spec (teacher) → S6 genera
    teacher agent tries. A task is kept if it is *unstable* (the student passes one of two runs) or
    *hard* (the student fails and the teacher passes). By default S9 only writes job configs and
    launch commands; submitting jobs must be enabled explicitly.
+5b. **Task review** (S9R). Every task S9 would keep, and every task whose teacher runs all failed (as a
+   diagnosis), is audited by a fresh code-executing agent (Claude Code, Opus by default) inside the task's own
+   image, with the model endpoint as its only network. It sees the whole package, baselines, generator,
+   threshold and gate records and a digest of every calibration trace, reruns the reference and tests, and
+   returns `pass` / `revise` / `drop` / `human` with evidence per checklist item (consistency, missing
+   conditions, thresholds, stability, shortcuts and leaks, network / ready-made code, calibration evidence).
+   A blocking issue without evidence is downgraded to minor. Only `pass` releases a task. `revise` sends it
+   back to one local repair of the statement / format notes / test scripts with **thresholds locked**,
+   archives the old calibration, recalibrates from the student, and reviews again; a second non-pass goes to
+   a human. Details: [`gen/README.md`](gen/README.md) §5b.
 6. **Packaging** (PKG, S10). Harbor task layout with a self-contained Dockerfile and a network
    policy that keeps the agent off the internet while it works (see
    [Network of packaged tasks](#network-of-packaged-tasks)); kept tasks are appended to
@@ -146,9 +157,10 @@ becomes due again when the earliest of those limits lifts. `tbsgen fetch --only 
 idents) processes just those entries, due or not. Only one `tbsgen fetch` drains a queue at a time, and only one
 process at a time uses a browser TaskSpace (a second one skips the browser channel). With full text, a teacher endpoint and a
 budget in `my.toml` (see below), `tbsgen run` continues into the model stages. The other commands
-(`resume`, `reset`, `breaker`, `calib-ingest`, `calib watch`, `calib prepare`, `harbor-local`, `ping`) are documented in
-[`gen/README.md`](gen/README.md) §3; calibrating only some items, the environment-preparation hook
-(`calib.prepare_command`) and teacher-only routing (`calib.teacher_*`) are in §4–§5 there.
+(`resume`, `reset`, `breaker`, `calib-ingest`, `calib watch`, `calib prepare`, `review build`, `harbor-local`, `ping`)
+are documented in [`gen/README.md`](gen/README.md) §3; calibrating only some items, the environment-preparation hook
+(`calib.prepare_command`), teacher-only routing (`calib.teacher_*`) and the S9R review settings (`review.*`, on by
+default; routed like the teacher unless set) are in §4–§5b there.
 
 ## Configuration
 

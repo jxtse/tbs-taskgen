@@ -46,7 +46,8 @@ def _env(tmp_path, n_items=1, **calib_kw):
     cal.update(calib_kw)
     cfg = load_config(None, {"run": {"root": str(tmp_path / "run")}, "calib": cal,
                              "budget": {"daily_usd_total": 1000.0, "run_usd_total": 500.0},
-                             "models": {"prices": PRICES}})
+                             "models": {"prices": PRICES},
+                             "review": {"enabled": False}})     # S9R has its own tests (test_review_s9r.py)
     P = Pipeline(cfg, clients={})
     ids = P.ingest([dict(doi=f"10.1/s9-{k}", title=f"t{k}", abstract="algorithm estimation") for k in range(n_items)])
     for iid in ids:

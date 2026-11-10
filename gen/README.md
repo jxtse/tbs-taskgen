@@ -29,6 +29,7 @@ src/tbsgen/
   package.py       PKG：打包为 Harbor 任务 + 结构校验（含网络策略）
   prerelease.py    上线前检查：现成实现检查（S7 `readymade` 门）+ 打包任务网络策略说明
   calib.py         S9：GLM 顺序校准 + Opus 教师分支的调度规则、Harbor 作业配置、结果收集
+  review.py        S9R：校准后的审核 agent（审核任务构建、审核清单提示词、裁决契约、修订保工审查）
   report.py        日报（Markdown）
   stages_a.py, stages_b.py   各阶段处理函数
   cli.py           命令行 tbsgen
@@ -52,10 +53,12 @@ items/<item_id>/
   runs/                      沙箱运行产物
   S6A_measure.json thresholds.json gates/attempt-<n>.json repair/round-<n>/
   pkg/                       Harbor 任务（只有这个目录交给 Harbor）
-  calib/runs.json + 作业配置  S9
+  calib/runs.json + 作业配置  S9（修订后旧校准归档到 calib/epoch-<k>/）
+  review/runs.json r<k>/{task,verdict.json} verdict.json      S9R
+  repair/review-<n>/{patch,before,review.json,thresholds.locked.json}   S9R 退回的修订
 ```
 
-条目状态：`active`（还有下一阶段）、`waiting`（S9 等校准结果）、`paused`（预算或熔断暂停，`resume` 后从原阶段继续）、`done`、`dropped`（带原因码）、`parked`（需要人工处理）。每个阶段先写完产物，再原子地更新 `state.json`；进程在阶段中途被杀，重跑时从该阶段重新开始。
+条目状态：`active`（还有下一阶段）、`waiting`（S9 等校准结果 / S9R 等审核结果）、`paused`（预算或熔断暂停，`resume` 后从原阶段继续）、`done`、`dropped`（带原因码）、`parked`（需要人工处理）。每个阶段先写完产物，再原子地更新 `state.json`；进程在阶段中途被杀，重跑时从该阶段重新开始。
 
 ## 2. 各阶段输入输出
 
@@ -123,6 +126,7 @@ uv run tbsgen calib watch --run runs/R --config config.toml [--only ID,..] [--on
                                                                     # 校准监控：回填已结束的作业 → 推进 S9（打标签或提交下一次：GLM → 教师）；
                                                                     # 前台循环，无未结束的 S9 条目时退出；allow_submit=false 且无运行中作业时也退出
 uv run tbsgen calib prepare --run runs/R --config config.toml --item ID [--who teacher]  # 手动运行环境准备钩子（失败后重试）
+uv run tbsgen review build --run runs/R --config config.toml --item ID [--round K] [--out DIR]  # 只生成 S9R 审核任务（回放/手动运行）
 uv run tbsgen harbor-local --run runs/R [--item ID]                  # 本机 Harbor oracle/nop（换本地基础镜像）
 uv run tbsgen run    --run runs/R --until S4                      # 只跑到 S4（不启动模型阶段，不留 model:config 暂停）
 uv run tbsgen reset  --run runs/R --item ID --stage S6B [--regen]    # 管线修复后让条目从某阶段重来（记入 history）
@@ -222,6 +226,32 @@ hard 和 unstable 保留。reward=1 一律算通过，即使之后报了 API 错
 远端沙箱不执行 Dockerfile：提交前要为每题建好模板（可用"共享基础镜像 + 数据层"的薄镜像方式），并把准备好的任务副本目录配到 `calib.prepared_tasks_dir`；配 `calib.prepare_command` 后由 S9 对每题自动调用你的准备脚本。在 `allow_submit=false` 时写出的作业意图（指向 `pkg/`）在准备副本就绪后提交时会自动改指向准备副本。
 
 **只校准部分题**：把 `calib.allow_submit` 改为 true 后，`tbsgen run --only ID1,ID2`（或 `tbsgen calib watch --only ID1,ID2`）会推进这些 S9 waiting 且没有运行中作业的条目（未提交的意图、准备失败、提交被拒）；运行中的作业不会被重复提交，未列出的条目和其他暂停条目不受影响。预算/熔断暂停的条目用 `tbsgen resume --only ...` 单独恢复。之后用 `tbsgen calib watch --only ...` 等待作业结束、回填并推进（GLM → 教师 → 标签）。
+
+## 5b. S9R 审核（校准之后、发布之前）
+
+S9 打出标签后，**hard / unstable**（`calib.keep_labels`）必须先过审核才进 S10；**parked:teacher_failed** 也审核（`review.review_parked`，只作诊断，不会因此放行）；easy 不审。
+
+- **审核者**：能执行代码的 Claude Code agent（默认 Opus，`review.model` 未设则用 `calib.teacher_model`），全新上下文，在**题目自己的镜像**里运行（审核任务由 `review.build_task` 生成：原 Dockerfile 加 `COPY review /review`，`/tests`、`/solution` 照真实运行装好，可直接 `bash /solution/solve.sh && bash /tests/test.sh` 复现参考解）。网络与教师相同：agent 阶段只能连模型中继（`review.agent_allowed_hosts`，未设沿用教师的），verifier 阶段断网。
+- **能看到**（`/review`）：题包全部文件（含 hidden/truth、参考解）、`extra/`（baselines、generator）、`records/`（thresholds.json、S6A 实测、S6B 决策、S7 门报告、S8 修复记录、spec、阶段历史）、`calibration/`（当前校准轮次每次运行的 result 摘要、verifier 输出与逐项指标、trace 摘要：工具调用序列、助手文字、最后的工具输出和最终消息）。
+- **清单**（写在提示词里，逐项给结论与证据）：a 题面/格式说明/测试/评分一致性；b 缺失条件与测试检查题面未要求的东西；c 阈值是否以参考解为依据、是否合理；d 计时/随机性不稳定；e 捷径与泄漏；f 依赖网络或现成实现；g 结合校准 trace 判断失败/通过是否由题目缺陷或基础设施导致、标签是否可信。
+- **输出** `/app/review_out/verdict.json`：`verdict ∈ {pass, revise, drop, human}`、`checklist`、`issues[]`（类别、`blocking|minor`、证据、修法）、`label_assessment`。`review.normalize` 机械执行契约：**没有证据的 blocking 降为 minor**；revise/drop 必须有 blocking，pass 不能有 blocking，否则改判 human。
+- **路由**：pass → S10（minor 写进 manifest 的 `review.minor`）；parked 标签的 pass 仍保持 parked。revise → S8 审核修订（下条）。drop → dropped。human → parked。已在 manifest 里的题若审核非 pass，追加一行 `withdrawn: true`（manifest 只追加，同一题以最后一行为准）。
+- **审核修订**（`review.max_revisions = 1`）：S8 把审核 issues 交给模型，只允许改 `instruction.md`、`tests/test_outputs.py`、`tests/measure.py`、`generator/generate.py`（格式说明由生成器写出）；保工审查（`review.revision_review`）拒绝其他路径、拒绝 `check()` 的指标/阈值/方向有任何变化，并沿用 S8 原有的 diff 审查。修订被拒 → human。通过 → 旧校准记录归档到 `calib/epoch-<k>/`、`calib_epoch+1`、标签清空 → S6A_run 重新实测 → **S6B 锁定阈值**（不重新推导；新推导值只写进 `thresholds.relock.json` 供审核对照；参考解若达不到锁定阈值 → human）→ S6C → S7 → PKG → S9 从 GLM 重新校准（作业名带 `-e<k>`）→ S9R 第 2 轮。第 2 轮仍非 pass → human。
+- **作业生命周期**与 S9 相同（intent → reserved → launched → `calib-ingest` / `calib watch` 回填），受 `calib.allow_submit` 控制；账本阶段记为 `S9R`。没有 verdict 的作业算 `infra`，超过 `review.infra_retries` 次 → parked（`review:infra`）。
+- **远程启动器**：作业配置里的任务路径是本机路径；在另一台主机上跑时，启动器把任务同步过去并在本机作业目录写 `tbsgen-remote.json`（`local_task` / `remote_task`），回填时据此接受远端路径。
+
+| 配置 | 默认 | 说明 |
+|---|---|---|
+| `review.enabled` | true | 关闭后 S9 标签直接按原规则走 |
+| `review.model / agent / environment / agent_allowed_hosts / harbor_root / launcher / jobs_dir` | None（沿用教师路由） | 审核作业的模型、agent、Harbor 环境、agent 阶段放行主机、启动脚本目录与脚本、作业目录 |
+| `review.est_usd_per_run` | None（= `calib.est_usd_per_run`） | 账本预留 |
+| `review.timeout_sec` | 3600 | 审核任务的 agent 超时 |
+| `review.max_revisions` | 1 | 每题最多修订轮数 |
+| `review.review_parked` | `["parked:teacher_failed"]` | 也要审核的暂存标签 |
+| `review.infra_retries` | 2 | 无裁决的审核作业重试次数 |
+| `review.trace_digest_kb` | 150 | 每次校准运行 trace 摘要的大小上限 |
+
+`tbsgen review build --run DIR --item ID [--round K] [--out DIR]` 只生成审核任务（不提交），用于回放或手动运行。
 
 ## 6. 已验证 / 未验证
 

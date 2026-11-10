@@ -399,6 +399,27 @@ DEFAULTS: dict[str, Any] = {
         "infra_retries": 2,                 # API quota / sandbox errors do not count as attempts
         "variant_depth": 0,                 # S9b harder variants; 待定 (e.g. <=2); 0 = off in MVP
     },
+    # ---------------------------------------------------------------- task review (S9R, after S9, before S10)
+    "review": {
+        # A Claude Code agent (fresh context, inside the task's own image, model endpoint only) audits every task
+        # S9 would keep (calib.keep_labels) and, as a diagnosis, the labels in review_parked.  Verdict pass ->
+        # S10; revise -> one S8 review revision (thresholds locked) -> S6A_run..PKG -> S9 from GLM -> S9R again;
+        # drop -> dropped; human (or a second non-pass) -> parked.  Jobs follow calib.allow_submit like S9 runs.
+        "enabled": True,
+        "model": None,                      # None = calib.teacher_model (Opus)
+        "agent": None,                      # None = calib.teacher_agent
+        "environment": None,                # None = the teacher's (calib.teacher_environment or environment)
+        "agent_allowed_hosts": None,        # None = the teacher's
+        "harbor_root": None,                # None = the teacher's launcher root
+        "launcher": None,                   # None = calib.teacher_launcher
+        "jobs_dir": None,                   # None = calib.jobs_dir
+        "est_usd_per_run": None,            # ledger reservation (stage S9R); None = calib.est_usd_per_run
+        "timeout_sec": 3600,                # agent timeout of the review task
+        "max_revisions": 1,                 # review revisions per item; a second non-pass review -> human
+        "review_parked": ["parked:teacher_failed"],   # also reviewed (diagnosis only; never released by S9R)
+        "infra_retries": 2,                 # review jobs without a verdict (infra) before parking
+        "trace_digest_kb": 150,             # per calibration run, in the review bundle
+    },
     "package": {
         "dockerfile_mode": "selfcontained",  # "selfcontained" (pip in Dockerfile, portable) | "local_base"
         "agent_hours": 2,

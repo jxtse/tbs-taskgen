@@ -271,6 +271,8 @@ def s6b(P, it):
     is appended to S6B_decisions.json; an early stop (decision.rule set) is also an `early_stop` event."""
     spec = read_json(it.p("_spec", "spec.json"))
     meas = read_json(it.p("S6A_measure.json"))
+    if it.state.get("thresholds_locked"):
+        return _s6b_locked(P, it, spec, meas)
     th = set_thresholds(spec, meas, P.cfg)
     dec = s6b_decision(th, meas, P.cfg, it.state)
     th["decision"] = dec
@@ -306,6 +308,33 @@ def s6b(P, it):
         # already spent stay spent (gates.max_repair_rounds is per item)
         return it.goto("S6A", dec["reason"])
     return it.finish("dropped", dec["reason"], early_stop=dec["rule"])
+
+
+def _s6b_locked(P, it, spec, meas):
+    """S6B after an S9R review revision: the thresholds stay those of thresholds.json (never re-derived, never
+    loosened).  The fresh derivation from the new measurement is recorded next to them (thresholds.relock.json)
+    for the reviewer; the reference must still clear every locked threshold on every seed, else a human decides."""
+    from . import review
+    old = read_json(it.p("thresholds.json"))
+    fresh = set_thresholds(spec, meas, P.cfg)
+    cmp_ = review.lock_compare(old["thresholds"], fresh["thresholds"])
+    fails = {}
+    for k, v in old["thresholds"].items():
+        for s, vals in (meas.get("ref") or {}).items():
+            x = (vals or {}).get(k)
+            ok = isinstance(x, (int, float)) and (x <= v["threshold"] if v["direction"] == "<=" else x >= v["threshold"])
+            if not ok:
+                fails.setdefault(k, {})[s] = x
+    write_json(it.p("thresholds.relock.json"), dict(ts=time.time(), locked=old["thresholds"], fresh=fresh["thresholds"],
+                                                    compare=cmp_, ref_fails_locked=fails))
+    log = read_json(it.p("S6B_decisions.json"), []) or []
+    log.append(dict(ts=time.time(), status="locked", action="S6C" if not fails else "parked", rule="thresholds_locked",
+                    reason="review revision: thresholds kept", detail=dict(ref_fails_locked=fails)))
+    write_json(it.p("S6B_decisions.json"), log)
+    if fails:
+        return it.finish("parked", "review:human (reference fails a locked threshold after the revision: "
+                         + ",".join(sorted(fails)) + ")")
+    return it.advance("S6B", "S6C", locked=True)
 
 
 def s6m(P, it):

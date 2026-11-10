@@ -228,15 +228,17 @@ def network_problem(cfg: dict, task: Path, conf: dict) -> str | None:
     return None
 
 
-def job_name_for(item_dir: Path, who: str, n: int) -> str:
-    """Stable per (item, who, attempt): a re-run after a crash finds the same job instead of starting another."""
-    return f"tbsgen-{item_dir.name}-{who}{n}"
+def job_name_for(item_dir: Path, who: str, n: int, epoch: int = 0) -> str:
+    """Stable per (item, who, attempt, calibration epoch): a re-run after a crash finds the same job instead of
+    starting another.  epoch > 0 = recalibration after an S9R review revision (the archived epoch's job dirs keep
+    their names)."""
+    return f"tbsgen-{item_dir.name}-{who}{n}" + (f"-e{epoch}" if epoch else "")
 
 
-def prepare(cfg: dict, item_dir: Path, who: str, n: int) -> dict:
+def prepare(cfg: dict, item_dir: Path, who: str, n: int, epoch: int = 0) -> dict:
     """Intent record for attempt n (no side effects outside item_dir).  Persist it BEFORE reserve/launch."""
     c = cfg["calib"]
-    job_name = job_name_for(item_dir, who, n)
+    job_name = job_name_for(item_dir, who, n, epoch)
     conf = job_config(cfg, task_path(cfg, item_dir, who), who, job_name)
     p = item_dir / "calib" / f"{job_name}.json"
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -249,7 +251,7 @@ def prepare(cfg: dict, item_dir: Path, who: str, n: int) -> dict:
     rec = dict(who=who, n=n, item=item_dir.name, model=model, job_name=job_name, config=str(p),
                command=command, state="intent", submitted=False,
                ts=time.time(), job_dir=str(Path(c["jobs_dir"]) / job_name), task=conf["tasks"][0]["path"],
-               outcome=None)
+               outcome=None, epoch=epoch)
     if _unprepared(cfg, who, rec["task"]):
         # remote sandbox backends cannot build a Dockerfile: a missing prepared template means the run would die
         # at environment start (e2e-iter1: FileUploadException, no model use) -> do not launch
@@ -269,6 +271,40 @@ def _unprepared(cfg: dict, who: str, task: str) -> bool:
     return bool(d) and not Path(task).resolve().is_relative_to(Path(d).resolve())
 
 
+def stale_prepared(cfg: dict, item_dir: Path, who: str, epoch: int) -> str | None:
+    """After a review revision (epoch > 0) a prepared copy must be one made from the current pkg/ (recorded by
+    ensure_prepared with the pkg hash); a copy prepared by hand before the revision would calibrate the old task."""
+    if not epoch or not prepared_dir(cfg, who):
+        return None
+    recp = item_dir / "calib" / ("prepare.json" if who == "glm" else f"prepare-{who}.json")
+    try:
+        prev = json.loads(recp.read_text())
+    except (OSError, ValueError):
+        prev = {}
+    if prev.get("ok") and prev.get("pkg_sha") == pkg_sha(item_dir / "pkg"):
+        return None
+    return (f"the prepared {who} copy may predate the review revision (no calib/{recp.name} for the current pkg/): "
+            "set calib.prepare_command (S9 re-prepares) or prepare it and run `tbsgen calib prepare --item ID`")
+
+
+def remote_alias(job_dir: Path) -> dict:
+    """Marker a remote launcher leaves in the local job dir (tbsgen-remote.json: host, local_task, remote_task,
+    remote_job_dir): the job ran on another host from a synced copy of the task, so Harbor's config.json names the
+    remote path.  ingest() accepts that path only when the marker maps it to the run's own local task."""
+    try:
+        m = json.loads((Path(job_dir) / "tbsgen-remote.json").read_text())
+    except (OSError, ValueError):
+        return {}
+    return m if isinstance(m, dict) else {}
+
+
+def task_matches(job_dir: Path, job_task: str | None, want_task: str | None) -> bool:
+    if job_task == want_task:
+        return True
+    m = remote_alias(job_dir)
+    return bool(m) and m.get("remote_task") == job_task and m.get("local_task") == want_task
+
+
 def job_started(rec: dict) -> bool:
     """Harbor created the job dir (or the launcher wrote its start marker): the job exists, never relaunch."""
     jd = Path(rec["job_dir"])
@@ -285,7 +321,7 @@ def launch(cfg: dict, rec: dict, ledger, save) -> dict:
     if rec["state"] == "intent" and job_started(rec):
         # its printed command was already run (by hand): take the job over as it is (task, config, identity
         # unchanged); no preparation, path rewrite or pre-submit check applies to a job that exists
-        rec["ledger_call"] = ledger.reserve(rec["model"], "S9", rec["item"], True,
+        rec["ledger_call"] = ledger.reserve(rec["model"], rec.get("ledger_stage", "S9"), rec["item"], True,
                                             est_usd=float(c["est_usd_per_run"])) if ledger is not None else None
         rec.update(state="launched", submitted=True, recovered=True)
         save(rec)
@@ -328,7 +364,7 @@ def launch(cfg: dict, rec: dict, ledger, save) -> dict:
             save(rec)
             return rec
         rec.pop("blocked", None)
-        rec["ledger_call"] = ledger.reserve(rec["model"], "S9", rec["item"], True,
+        rec["ledger_call"] = ledger.reserve(rec["model"], rec.get("ledger_stage", "S9"), rec["item"], True,
                                             est_usd=float(c["est_usd_per_run"])) if ledger is not None else None
         rec["state"] = "reserved"
         save(rec)
