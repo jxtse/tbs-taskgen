@@ -98,11 +98,12 @@ def scored_budget(cfg: dict) -> float:
     package.verifier_overhead_sec.  With timing_budget() on top it always ends before the verifier timeout."""
     import math
     pk = cfg.get("package") or {}
-    base = min(float(pk.get("verifier_timeout", 900)), float((cfg.get("gen") or {}).get("test_timeout", 900)))
+    vt, tt = float(pk.get("verifier_timeout", 900)), float((cfg.get("gen") or {}).get("test_timeout", 900))
     ov = float(pk.get("verifier_overhead_sec", 120))
-    if not (math.isfinite(base) and math.isfinite(ov)) or ov < 0:
-        raise ValueError(f"verifier timeout / package.verifier_overhead_sec must be finite, overhead >= 0 "
-                         f"(got {base}, {ov})")
+    if not all(math.isfinite(x) and x > 0 for x in (vt, tt)) or not math.isfinite(ov) or ov < 0:
+        raise ValueError(f"package.verifier_timeout / gen.test_timeout must be finite and > 0, "
+                         f"package.verifier_overhead_sec finite and >= 0 (got {vt}, {tt}, {ov})")
+    base = min(vt, tt)
     b = base - ov
     if b <= 0:
         raise ValueError(f"package.verifier_overhead_sec leaves no time for the scored runs (verifier {base:.0f}s)")

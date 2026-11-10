@@ -116,13 +116,16 @@ def test_run_solution_fast_program_unaffected(tmp_path):
 
 
 def test_scored_budget_rejects_negative_or_nonfinite_overhead():
-    for ov in (-120, float("nan"), float("inf")):
-        cfg = load_config(None, {"package": {"verifier_overhead_sec": ov}})
+    bad = [{"package": {"verifier_overhead_sec": ov}} for ov in (-120, float("nan"), float("inf"))] + \
+        [{"gen": {"test_timeout": t}} for t in (float("nan"), float("inf"), 0)] + \
+        [{"package": {"verifier_timeout": t}} for t in (float("nan"), float("inf"), -5)]
+    for o in bad:
+        cfg = load_config(None, o)
         try:
             runner.scored_budget(cfg)
         except ValueError:
             continue
-        raise AssertionError(ov)
+        raise AssertionError(o)
     assert package.verifier_time_errors(Path("/nonexistent"), 120)          # unreadable package -> error
 
 
@@ -177,3 +180,51 @@ def test_resource_task_repeats_capped_by_clamped_first_timeout():
     never the raw timeout_sec measure.py asked for."""
     src = (Path(runner.__file__).parent / "templates_metrics.py").read_text()
     assert "min(t_first, t_rep)" in src and "min(float(timeout_sec), t_rep)" not in src
+
+
+def test_repeats_get_the_clamped_timeout_and_share_accounting(tmp_path, monkeypatch):
+    """Resource task (3 repeats) with the sandbox branch mocked: the first run's timeout is the scored budget left,
+    each repeat's is min(that, timing budget left); the scored spend counts only the first run."""
+    cfg = load_config(None)
+    m = _helper(tmp_path, cfg, RES, "rep")
+    m.SCORED_BUDGET_SEC, m.TIMING_BUDGET_SEC = 50.0, 1000.0
+    m._SCORED_SPENT[0] = 20.0                                   # an earlier hidden set used 20 s
+    calls = []
+    out_dir = tmp_path / "o"
+    out_dir.mkdir()
+
+    def fake_run_once(entry, input_dir, out, timeout_sec, sb, home=None):
+        calls.append(timeout_sec)
+        return 0, "", 2.0, []
+    m._sandbox_prepare = lambda input_dir, out: ("nobody", "nogroup", {"HOME": str(tmp_path / "home" / "h")})
+    m._run_once = fake_run_once
+    m._state_snapshot = lambda *a, **k: {}
+    m._state_changes = lambda a, b: []
+    m._seal_tree = lambda *a, **k: None
+    m._tree_digest = lambda d: "same"
+    m._private_dir = lambda prefix, sb: (str(out_dir), str(tmp_path), 0)
+    d = tmp_path / "h"
+    d.mkdir()
+    _o, sec, rc = m.run_solution(1800, str(d), entry=str(tmp_path / "cli.py"))
+    assert rc == 0 and calls[0] == 30.0 and calls[1:] == [30.0, 30.0], calls
+    assert m._SCORED_SPENT[0] == 22.0 and m._TIMING_SPENT[0] >= 4.0
+    rec = [json.loads(x) for x in open(m._PATH) if '"_solution_cli_run"' in x][-1]
+    assert rec["timeout_effective"] == 30.0 and rec["timing_repeats"] == 3 and rec["threshold"] == 1800.0
+
+
+def test_budget_exhausted_record_counts_as_delivered_failure(tmp_path):
+    """calib.delivered: an exhausted-budget record of an existing entry is a failed deliverable, not "no output"."""
+    from tbsgen import calib
+    cfg = load_config(None)
+    m = _helper(tmp_path, cfg, ACC, "exh")
+    m.SCORED_BUDGET_SEC = 1.0
+    m._SCORED_SPENT[0] = 1.0
+    entry = tmp_path / "cli.py"
+    entry.write_text("pass\n")
+    d = tmp_path / "h"
+    d.mkdir()
+    assert m.run_solution(600, str(d), entry=str(entry))[2] == -9
+    t = tmp_path / "trial"
+    (t / "verifier").mkdir(parents=True)
+    (t / "verifier" / "metrics.jsonl").write_text(open(m._PATH).read())
+    assert calib.delivered(t) is True

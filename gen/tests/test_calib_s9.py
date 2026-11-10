@@ -707,3 +707,29 @@ def test_max_concurrent_jobs_none_keeps_old_behaviour(tmp_path):
     P, ids, counter, jobs = _env(tmp_path, n_items=3)
     P.run()
     assert counter.read_text().count("x") == 3
+
+
+
+def test_max_concurrent_jobs_counts_reserved_and_review_runs_by_stage(tmp_path):
+    """A reserved (not yet started) run holds its slot; a pending review run counts while the item is at S9R and
+    stops counting once the item left S9R (e.g. regate --recalibrate), so it can never pin a slot forever."""
+    from tbsgen import stages_b as B
+    P, ids, counter, jobs = _env(tmp_path, n_items=2, max_concurrent_jobs=1)
+    a, b = (P.store.item(i) for i in ids)
+    a.p("calib").mkdir(parents=True, exist_ok=True)
+    a.p("calib", "runs.json").write_text(json.dumps([dict(job_name="ja", who="glm", state="reserved", outcome=None,
+                                                         job_dir=str(jobs / "ja"))]))
+    assert B.running_jobs(P) == ["ja"]
+    assert B._slots_full(P) and B._slots_full(P, own="ja") is None
+    b.p("review").mkdir(parents=True, exist_ok=True)
+    b.p("review", "runs.json").write_text(json.dumps([dict(job_name="rb", state="launched", outcome=None, n=1,
+                                                          job_dir=str(jobs / "rb"))]))
+    assert sorted(B.running_jobs(P)) == ["ja"]                       # b is at S9: its review record is not live
+    b.state.update(stage="S9R", status="waiting")
+    b.save()
+    assert sorted(B.running_jobs(P)) == ["ja", "rb"]
+    a.p("calib", "runs.json").write_text("[]")
+    P.run(only=[ids[0]])                                              # rb holds the only slot: a waits, no launch
+    assert not counter.exists() or counter.read_text().count("x") == 0
+    assert "slots full: 1/1" in P.store.item(ids[0]).state["reason"]
+    assert P.ledger.summary(__import__("tbsgen.budget", fromlist=["today"]).today())["calls_total"] == 0
