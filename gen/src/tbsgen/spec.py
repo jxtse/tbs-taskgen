@@ -118,6 +118,13 @@ def set_thresholds(spec: dict, measure: dict, cfg: dict) -> dict:
         name, d = m["name"], m["direction"]
         r_vals = [v.get(name) for v in measure["ref"].values()]
         m_vals = [v.get(name) for v in measure["mid"].values()]
+        if name in ungated and any(x is None or not math.isfinite(x) for x in r_vals):
+            fin = [x for x in r_vals if x is not None and math.isfinite(x)]
+            if not fin:                     # recorded-only: no value at all -> no threshold, decides nothing
+                out[name] = dict(direction=d, threshold=None, error="reference metric missing/non-finite",
+                                 ungated=True)
+                continue
+            r_vals = fin
         if any(x is None or not math.isfinite(x) for x in r_vals):
             out[name] = dict(direction=d, threshold=None, error="reference metric missing/non-finite")
             continue
@@ -128,7 +135,7 @@ def set_thresholds(spec: dict, measure: dict, cfg: dict) -> dict:
         nop_vals = [v.get(name) for v in measure.get("nop", {}).values()]
         hit = [x for x in r_vals for nv in nop_vals if nv is not None and math.isfinite(nv) and
                math.isclose(x, nv, rel_tol=1e-12, abs_tol=1e-15)]
-        if hit:
+        if hit and name not in ungated:      # a recorded-only resource value may equal nop's (e.g. same RSS)
             out[name] = dict(direction=d, threshold=None,
                              error=f"reference value {hit[0]:g} equals the empty-output value of this metric")
             continue
@@ -224,11 +231,12 @@ def set_thresholds(spec: dict, measure: dict, cfg: dict) -> dict:
                 ref_worse.append(name)
     lo, hi = tc["min_mid_fail"], tc["max_mid_fail"]
     status = "ok"
-    if any(t.get("threshold") is None for t in out.values()):
+    decides = {k: t for k, t in out.items() if k not in ungated}     # recorded-only metrics decide nothing
+    if any(t.get("threshold") is None for t in decides.values()):
         status = "ref_metric_missing"
     elif ref_worse:
         status = "ref_worse_than_naive"
-    elif not all(t["ref_passes"] for t in out.values()):
+    elif not all(t["ref_passes"] for t in decides.values()):
         status = "ref_fails"
     elif not mid_fail or not all(lo <= n <= hi for n in mid_fail.values()):
         status = "not_separable"

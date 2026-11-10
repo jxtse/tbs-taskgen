@@ -35,7 +35,7 @@ RESOURCE_GATING = False  # tbsgen:resource_gating
 RESOURCE_METRICS = None  # tbsgen:resource_metrics
 _RESOURCE_NAME = re.compile(r"(?:^|_)(?:runtime|wall_?time|walltime|cpu_time|peak_memory|peak_rss|max_rss|peak_mem)"
                             r"(?:_|$)", re.I)
-_MEMORY_NAME = re.compile(r"(?:^|_)(?:peak_memory|peak_rss|max_rss|peak_mem|memory|rss)(?:_|$)", re.I)
+_MEMORY_NAME = re.compile(r"(?:^|_)(?:peak_memory|peak_rss|max_rss|peak_mem|memory|rss|mem|mb|mib|bytes)(?:_|$)", re.I)
 
 
 def resource_kind(name):
@@ -44,7 +44,10 @@ def resource_kind(name):
         return RESOURCE_METRICS.get(name)
     if not _RESOURCE_NAME.search(name):
         return None
-    return "memory" if _MEMORY_NAME.search(name) else "time"
+    if _MEMORY_NAME.search(name):
+        return "memory"
+    # only an unmistakable time name is speed-scaled; anything else is treated like memory (never scaled)
+    return "time" if re.search(r"runtime|wall_?time|walltime|cpu_?time", name, re.I) else "memory"
 SPEED_MIN, SPEED_MAX = 0.25, 8.0
 # |ratio - 1| <= deadband -> ratio 1: same-host noise never moves a threshold (config thresholds.speed_deadband)
 SPEED_DEADBAND = 0.1  # tbsgen:speed_deadband

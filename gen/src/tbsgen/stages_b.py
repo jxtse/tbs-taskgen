@@ -994,7 +994,9 @@ def _s8_review_locked_(P, it):
                             thresholds=json.dumps({k: {"direction": v["direction"], "threshold": v["threshold"]}
                                                    for k, v in th.items()}),
                             files=review.files_for_revision(it.dir), allowed=", ".join(review.REVISION_PATHS)
-                                                                     + ", baselines/exploit_*.py")
+                                                                     + ", baselines/exploit_*.py, "
+                                                                     + review.GATING_PATH,
+                            gating=json.dumps(bool(spec.get("resource_metric_gating"))))
     r = P.client("repair").chat(SYSTEM, user, stage="S8", item=it.item_id,
                                 max_tokens=P.cfg["gen"].get("s6a_max_tokens"))
     save_raw(it, "S8", r)
@@ -1042,6 +1044,11 @@ def _s8_review_locked_(P, it):
 def _finish_revision(P, it, pend: dict):
     d = Path(pend["dir"])
     patch = read_json(d / "patch.json", {}) or {}
+    gating = patch.pop(review.GATING_PATH, None)
+    if gating is not None:                              # spec flag, never a task file (idempotent)
+        spec = read_json(it.p("_spec", "spec.json"))
+        spec["resource_metric_gating"] = gating.strip().lower() == "true"
+        write_json(it.p("_spec", "spec.json"), spec)
     repair.apply(it.p("task"), patch)                   # idempotent (whole-file writes)
     if pend.get("archive", True):
         if int(it.state.get("calib_epoch", 0)) < pend["epoch"]:

@@ -167,6 +167,18 @@ def revive_for_trials(store, cfg: dict, event) -> list[str]:
         name = rule.get("name") or rule.get("doi_prefix")
         r = (st.get("rules") or {}).get(name) or {}
         if r.get("lifted"):
+            # a lifted rule blocks nothing any more: every paper it dropped at S2 goes back to S2
+            items = items if items is not None else store.items()
+            for it in items:
+                if it.state.get("status") == "dropped" and it.state.get("stage") == "S2" and \
+                        it.state.get("reason") == f"blocklist:{name}" and it.item_id not in out:
+                    it.state.setdefault("history", []).append(dict(stage="S2", result="blocklist_lifted", rule=name,
+                                                                   ts=time.time()))
+                    it.state.update(status="active")
+                    it.state.pop("reason", None)
+                    it.save()
+                    out.append(it.item_id)
+                    event("blocklist_revived", rule=name, item=it.item_id, lifted=True)
             continue
         left = quota - int((r.get("weeks") or {}).get(week, 0))
         if left <= 0:

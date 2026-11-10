@@ -116,9 +116,29 @@ def resource_metric_kinds(spec: dict | None) -> dict | None:
         return None
     import re as _re
     from .spec import is_resource_metric
-    mem = _re.compile(r"(?:^|_)(?:peak_memory|peak_rss|max_rss|peak_mem|memory)(?:_|$)", _re.I)
-    return {m["name"]: ("memory" if mem.search(m["name"]) else "time")
-            for m in spec.get("metrics") or [] if isinstance(m, dict) and m.get("name") and is_resource_metric(m)}
+    out = {}
+    for m in spec.get("metrics") or []:
+        if isinstance(m, dict) and m.get("name") and is_resource_metric(m):
+            out[m["name"]] = resource_kind_of(m["name"], m.get("resource_kind"))
+    return out
+
+
+_TIME_TOKENS = r"runtime|wall_?time|walltime|cpu_?time|time|sec|secs|seconds|latency|elapsed|duration|ms"
+_MEM_TOKENS = r"rss|mem|memory|bytes|kb|kib|mb|mib|gb|gib"
+
+
+def resource_kind_of(name: str, declared: str | None = None) -> str:
+    """"time" only for a name with a time token and no memory token (or declared resource_kind="time"); anything
+    else is "memory", which is never speed-scaled: an unrecognised resource metric must not get a looser
+    threshold on a slow machine."""
+    import re as _re
+    if declared in ("time", "memory"):
+        return declared
+    toks = set(_re.split(r"[^a-z0-9]+", name.lower()))
+    if toks & set(_MEM_TOKENS.split("|")) or _re.search(r"peak_?(rss|mem)|max_?rss", name, _re.I):
+        return "memory"
+    return "time" if toks & set(_TIME_TOKENS.replace("_?", "_").split("|")) or \
+        _re.search(r"wall_?time|cpu_?time|runtime", name, _re.I) else "memory"
 
 
 def metrics_helper_text(cfg: dict, spec: dict | None, item_dir: Path | None = None) -> str:

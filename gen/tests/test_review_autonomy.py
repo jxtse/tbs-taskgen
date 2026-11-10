@@ -341,3 +341,35 @@ def test_validator_accepts_human_only_when_opted_in(tmp_path):
                                                               evidence=["long enough evidence"])]))
     assert n["verdict"] is None
     assert review.normalize(dict(verdict=["pass"]))["verdict"] is None
+
+
+def test_codex_r2_memory_never_scaled_and_ungated_never_decides_s6b():
+    from tbsgen.spec import set_thresholds
+    assert runner.resource_metric_kinds(dict(metrics=[dict(name="hidden_rss_mb", kind="resource"),
+                                                      dict(name="hidden_runtime_sec", direction="<="),
+                                                      dict(name="solver_cost", kind="resource")])) == \
+        {"hidden_rss_mb": "memory", "hidden_runtime_sec": "time", "solver_cost": "memory"}
+    cfg = load_config()
+    spec = dict(metrics=[dict(name="err", direction="<="), dict(name="hidden_peak_rss", direction="<=")])
+    meas = dict(ref={"0": dict(err=0.1, hidden_peak_rss=50.0)}, mid={"0": dict(err=1.0, hidden_peak_rss=50.0)},
+                naive={"0": dict(err=5.0, hidden_peak_rss=50.0)}, nop={"0": dict(err=1e6, hidden_peak_rss=50.0)})
+    th = set_thresholds(spec, meas, cfg)
+    assert th["status"] == "ok", th                 # ref RSS == nop RSS: recorded only, decides nothing
+    meas["ref"]["0"]["hidden_peak_rss"] = float("nan")
+    assert set_thresholds(spec, meas, cfg)["status"] == "ok"
+    assert set_thresholds(dict(spec, resource_metric_gating=True), meas, cfg)["status"] == "ref_metric_missing"
+
+
+def test_codex_r2_corrupt_verdict_is_invalid_and_gating_revision(tmp_path):
+    trial = tmp_path / "t"
+    (trial / "verifier").mkdir(parents=True)
+    (trial / "verifier" / "verdict.json").write_text("{not json")
+    raw = review.read_verdict(trial)
+    assert raw is not None and review.normalize(raw)["verdict"] is None
+    # a timing_gate fix flips spec.resource_metric_gating through the pseudo-path, scoring-only
+    task = tmp_path / "task"
+    task.mkdir()
+    ok = review.revision_review(task, {review.GATING_PATH: "true"}, {})
+    assert ok["ok"] and review.scoring_only({review.GATING_PATH: "false"})
+    assert not review.revision_review(task, {review.GATING_PATH: "maybe"}, {})["ok"]
+    assert "fail_no_output" in review.NO_OUTPUT_TYPES

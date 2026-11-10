@@ -181,6 +181,9 @@ by generator/generate.py: edit the text there.  Make the statement, the format n
 agree (when they disagree, follow what the reference solution actually does and what measure.py scores), and state
 any convention the reference relies on that a careful solver needs (ranges, boundary handling, units, names).  Never
 reveal the reference's algorithm, hidden-truth values or constants it is supposed to derive.
+Timing / memory metrics decide a run only when the spec's resource_metric_gating is true (now: {gating}); a timing
+issue (should the runtime gate at all?) is fixed by returning the pseudo-file _spec/resource_metric_gating with the
+single word true or false (thresholds stay as they are).
 Return ONLY the files you change (same paths; no new files).  Format: === FILE: <path> === blocks, then === END ==="""
 
 

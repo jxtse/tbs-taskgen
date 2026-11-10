@@ -76,11 +76,17 @@ REVISION_BASELINES = ("baselines/exploit_",)        # prefix: existing exploit_*
 GRADER_PATHS = ("tests/test_outputs.py", "tests/measure.py")
 # run record result types that produced no deliverable at all: no re-scoring can change them (the S7 nop gate
 # proves the new grader fails an empty output)
-NO_OUTPUT_TYPES = ("timeout_no_output", "no_output")
+NO_OUTPUT_TYPES = ("timeout_no_output", "fail_no_output", "no_output")
+
+
+# a timing_gate issue is fixed by flipping spec.resource_metric_gating (thresholds, data and reference stay locked):
+# the revision names this pseudo-path with the body "true" / "false"; it is applied to _spec/spec.json, never to
+# the task tree, and makes the revision a full one (re-measure, recalibrate)
+GATING_PATH = "_spec/resource_metric_gating"
 
 
 def revision_path_ok(rel: str) -> bool:
-    if rel in REVISION_PATHS:
+    if rel in REVISION_PATHS or rel == GATING_PATH:
         return True
     return rel.startswith(REVISION_BASELINES) and ".." not in rel and rel.endswith(".py")
 
@@ -644,8 +650,12 @@ def read_verdict(trial: Path) -> dict | None:
         if p.exists():
             try:
                 return json.loads(p.read_text())
-            except ValueError:
+            except (ValueError, UnicodeDecodeError, OSError):
                 continue
+    if any((trial / "verifier" / n).exists() for n in ("verdict.json", "verdict.raw.json")):
+        # a verdict file was written but cannot be parsed: a (broken) judgment, not missing infrastructure ->
+        # normalize() makes it invalid and the review is re-run, then dropped
+        return {"_corrupt": "verdict file is not valid JSON"}
     return None
 
 
@@ -830,6 +840,12 @@ def revision_review(task: Path, patch: dict[str, str], depgraph: dict, threshold
             reasons.append(f"path not allowed in a review revision: {rel!r}")
     if reasons:
         return dict(ok=False, reasons=reasons, files=sorted(patch), method="review-revision-v2")
+    if GATING_PATH in patch and patch[GATING_PATH].strip().lower() not in ("true", "false"):
+        return dict(ok=False, reasons=[f"{GATING_PATH} must be exactly true or false"], files=sorted(patch),
+                    method="review-revision-v2")
+    patch = {k: v for k, v in patch.items() if k != GATING_PATH}
+    if not patch:                                   # only the gating flag: nothing for the S8 code rules to check
+        return dict(ok=True, reasons=[], files=[GATING_PATH], method="review-revision-v2")
     rv = repair.review(task, patch, depgraph)
     reasons = list(rv["reasons"])
     t = "tests/test_outputs.py"
@@ -884,7 +900,8 @@ def scoring_only(patch: dict) -> bool:
     """True when a review revision (or a shared-verifier regate) changed only the grader: the statement, the data,
     the thresholds and the reference solution are untouched, so the kept calibration can be re-scored with the
     new grader instead of being archived (the deliverables do not depend on the grader)."""
-    return bool(patch) and all(rel in GRADER_PATHS for rel in patch)
+    # the resource-metric gating flag only changes how the verifier decides (tests/_metrics.py), not the task
+    return bool(patch) and all(rel in GRADER_PATHS or rel == GATING_PATH for rel in patch)
 
 
 def save_deliverable(item_dir: Path, job_name: str, src: Path, note: str = "") -> Path:
