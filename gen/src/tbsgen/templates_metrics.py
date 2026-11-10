@@ -238,6 +238,37 @@ def _reap_uid(uid, rounds=50):
     return [p for p in _uid_pids(uid) if not _zombie(p)]
 
 
+def _nonroot_uids():
+    uids = set()
+    for d in os.listdir("/proc") if os.path.isdir("/proc") else []:
+        if not d.isdigit():
+            continue
+        try:
+            with open(f"/proc/{d}/status") as f:
+                for line in f:
+                    if line.startswith("Uid:"):
+                        uids.update(int(x) for x in line.split()[1:5] if x != "0")
+                        break
+        except OSError:
+            continue
+    return uids
+
+
+def _reap_nonroot():
+    """SIGKILL every process running under any non-root uid (the sandbox uid, and e.g. a process the root agent
+    left behind as the uid that owns the Harbor log mount, which keeps write access to /logs/verifier).
+    Returns the pids still alive."""
+    if os.geteuid() != 0:
+        return []
+    left = []
+    for _ in range(3):
+        uids = _nonroot_uids()
+        if not uids:
+            return []
+        left = [q for u in sorted(uids) for q in _reap_uid(u)]
+    return left
+
+
 def _zombie(pid):
     try:
         with open(f"/proc/{pid}/stat") as f:
@@ -487,21 +518,22 @@ def run_solution(timeout_sec, input_dir=HIDDEN, entry=ENTRY):
 
 
 def finalize_reward(pytest_rc, path=None):
-    """Called by test.sh after pytest: kill every process of the sandbox uid, make the log dir unwritable for it,
+    """Called by test.sh after pytest: kill every non-root process (sandbox uid included), make the log dir
+    unwritable for the sandbox uid,
     remove any reward file written before, then write the reward (1 iff pytest passed and nothing survived).
     The file is created with O_EXCL|O_NOFOLLOW (never through a planted link)."""
     path = path or os.path.join(LOGS, "reward.txt")
     reward = 1 if int(pytest_rc) == 0 else 0
     uid = _sandbox_uid()
-    if uid is not None:
-        left = _reap_uid(uid)
-        if left:
+    if os.geteuid() == 0:
+        if _reap_nonroot():
             reward = 0
-        try:
-            _lock_logs(uid)
-        except Exception:
-            reward = 0
-        if _reap_uid(uid):
+        if uid is not None:
+            try:
+                _lock_logs(uid)
+            except Exception:
+                reward = 0
+        if _reap_nonroot():
             reward = 0
     os.makedirs(os.path.dirname(path), exist_ok=True)
     for name in ("reward.txt", "reward.json"):
@@ -522,5 +554,4 @@ if __name__ == "__main__":
     if len(sys.argv) == 3 and sys.argv[1] == "--finalize-reward":
         print("reward", finalize_reward(sys.argv[2]))
     elif len(sys.argv) == 2 and sys.argv[1] == "--reap":
-        u = _sandbox_uid()
-        print("left", _reap_uid(u) if u is not None else [])
+        print("left", _reap_nonroot())

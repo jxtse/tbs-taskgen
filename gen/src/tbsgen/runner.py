@@ -52,15 +52,17 @@ def generate(cfg: dict, task: Path, seed: int, out: Path) -> dict:
     return r
 
 
-# The reward is written last, by _metrics.finalize_reward: it kills every process of the sandbox uid the agent
-# program ran as, makes /logs/verifier unwritable for it, removes any reward file written before and creates
-# reward.txt (O_EXCL|O_NOFOLLOW).  Before v2.5 a detached process left by solution_cli.py could rewrite
+# Non-root processes left by the agent phase are killed before pytest.  The reward is written last, by
+# _metrics.finalize_reward: it kills every non-root process (the agent program ran as `nobody`), makes
+# /logs/verifier unwritable for `nobody`, removes any reward file written before and creates reward.txt
+# (O_EXCL|O_NOFOLLOW).  Before v2.5 a detached process left by solution_cli.py could rewrite
 # reward.txt after pytest (S9R review of e2e-prod-20261109).
 TEST_SH = """#!/bin/bash
 set -uo pipefail
 mkdir -p /logs/verifier
 rm -f /logs/verifier/reward.txt
 cd /tests
+python /tests/_metrics.py --reap >/dev/null 2>&1
 python -m pytest -q -p no:cacheprovider /tests/test_outputs.py
 rc=$?
 if ! python /tests/_metrics.py --finalize-reward "$rc"; then
