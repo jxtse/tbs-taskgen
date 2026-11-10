@@ -135,7 +135,7 @@ def regate(P, it, reason: str, recalibrate: bool = False) -> dict:
         st["post_regate"] = True
         if recalibrate:
             rec["archived_epoch"] = _archive_calibration(it)
-        elif not st.get("rescore_pending"):
+        elif not st.get("rescore_pending") and (P.cfg.get("review") or {}).get("rescore_scoring_only", True):
             # the shared verifier template changed: the kept calibration stands until S9 re-scores the saved
             # deliverables with the new grader (review.rescore_item), as the reference re-measurement does
             st["rescore_pending"] = dict(reason="regate", files=["tests/_metrics.py", "tests/test.sh"], ts=time.time())
@@ -737,6 +737,9 @@ def _s9r(P, it):
     n_infra = sum(1 for r in runs if r.get("outcome") == "infra")
     n_invalid = sum(1 for r in runs if r.get("outcome") == "invalid")
     if n_infra + n_invalid > int(rv.get("infra_retries", 2)):
+        if n_invalid and not rv.get("allow_human"):
+            # the reviewer kept breaking the verdict contract: no usable judgment -> drop (no operator exit)
+            return it.finish("dropped", f"review:invalid r{rnd} ({n_infra} infra, {n_invalid} invalid verdicts)")
         return it.finish("parked", f"review:infra ({n_infra} infra, {n_invalid} invalid verdicts)")
     task = review.build_task(P.cfg, it.dir, it.state, rnd)
     rec = review.prepare(P.cfg, it.dir, task, rnd, len(all_rnd) + 1, epoch=epoch)
@@ -895,8 +898,12 @@ def _review_invalid(P, it, rnd: int, rec: dict, why: str) -> dict:
     """An invalid verdict is not a judgment about the task: re-run the review within the round.  After
     review.infra_retries invalid verdicts the item is dropped (review.allow_human parks it for an operator)."""
     rv = P.cfg.get("review") or {}
+    if rec.get("outcome") == "done":
+        # mark the run itself invalid, so S9R does not route the same verdict again (and the retry budget counts)
+        rec = dict(rec, outcome="invalid", invalid_why=why[:300])
+        _save_review(it, rec)
     n_bad = sum(1 for r in read_json(it.p("review", "runs.json"), [])
-                if r.get("n") == rnd and r.get("outcome") == "invalid")
+                if r.get("n") == rnd and r.get("outcome") == "invalid" and r.get("job_name") != rec.get("job_name"))
     if n_bad + 1 > int(rv.get("infra_retries", 2)):
         if rv.get("allow_human"):
             return it.finish("parked", f"review:human (r{rnd}: {n_bad + 1} invalid verdicts; last: {why[:200]})")
@@ -1014,8 +1021,9 @@ def _s8_review_locked_(P, it):
     shutil.copy2(it.p("thresholds.json"), d / "thresholds.locked.json")
     # the reviewed package's data / hidden inputs / truth: the revised package must carry the same (PKG checks)
     data = review.pkg_data_hash(it.p("pkg"))
+    rescore = bool(rv.get("rescore_scoring_only", True)) and review.scoring_only(patch)
     pend = dict(n=n + 1, dir=str(d), round=rnd, epoch=int(it.state.get("calib_epoch", 0)) + 1, data_hash=data,
-                archive=not review.scoring_only(patch), files=sorted(patch))
+                archive=not rescore, files=sorted(patch))
     it.state["review_revision_pending"] = pend
     it.save()
     return _finish_revision(P, it, pend)

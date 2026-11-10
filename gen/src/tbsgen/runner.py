@@ -98,6 +98,18 @@ def resource_gating(cfg: dict, spec: dict | None) -> bool:
     return bool((spec or {}).get("resource_metric_gating"))
 
 
+def resource_metric_kinds(spec: dict | None) -> dict | None:
+    """{metric name: "time" | "memory"} for the spec's resource metrics (tbsgen.spec.is_resource_metric), the
+    verifier's resource list; None without a spec (the template then applies the same name rule itself)."""
+    if not spec:
+        return None
+    import re as _re
+    from .spec import is_resource_metric
+    mem = _re.compile(r"(?:^|_)(?:peak_memory|peak_rss|max_rss|peak_mem|memory)(?:_|$)", _re.I)
+    return {m["name"]: ("memory" if mem.search(m["name"]) else "time")
+            for m in spec.get("metrics") or [] if isinstance(m, dict) and m.get("name") and is_resource_metric(m)}
+
+
 def metrics_helper_text(cfg: dict, spec: dict | None, item_dir: Path | None = None) -> str:
     """tests/_metrics.py as copied into a task: the template with TIMING_REPEATS, the machine-speed reference
     (thresholds.speed_bench_sec of this item, when thresholds exist) and the resource-metric gating flag set for
@@ -120,7 +132,16 @@ def metrics_helper_text(cfg: dict, spec: dict | None, item_dir: Path | None = No
             th = {}
         b = (th or {}).get("speed_bench_sec")
         base = float(b) if isinstance(b, (int, float)) and b > 0 else None
+    rm = "RESOURCE_METRICS = None  # tbsgen:resource_metrics"
+    if rm not in src:
+        raise RuntimeError("templates_metrics.py: RESOURCE_METRICS marker line missing")
+    src = src.replace(rm, f"RESOURCE_METRICS = {resource_metric_kinds(spec)!r}  # tbsgen:resource_metrics")
     src = src.replace(sb, f"SPEED_BASE = {base!r}  # tbsgen:speed_base")
+    db = "SPEED_DEADBAND = 0.1  # tbsgen:speed_deadband"
+    if db not in src:
+        raise RuntimeError("templates_metrics.py: SPEED_DEADBAND marker line missing")
+    dead = float((cfg.get("thresholds") or {}).get("speed_deadband", 0.1))
+    src = src.replace(db, f"SPEED_DEADBAND = {dead!r}  # tbsgen:speed_deadband")
     src = src.replace(rg, f"RESOURCE_GATING = {resource_gating(cfg, spec)!s}  # tbsgen:resource_gating")
     src = src.replace(tb, f"TIMING_BUDGET_SEC = {timing_budget(cfg, spec)!r}  # tbsgen:timing_budget")
     return src.replace(REPEATS_LINE, f"TIMING_REPEATS = {timing_repeats(cfg, spec)}  # tbsgen:timing_repeats")

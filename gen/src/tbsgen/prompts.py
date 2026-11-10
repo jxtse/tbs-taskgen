@@ -55,6 +55,9 @@ Write the task specification as ONE JSON object with keys:
    "mid_drop": [one key derive node], "naive_drop": [>=2 nodes],
    "difficulty_knobs": {{"derive_nodes": int, "chain_len": int, "files_crossed": int, "nonstd_tool": bool}}}},
 - "metrics": [{{"name", "direction": "<=" or ">=", "on": "public|hidden", "desc"}}]  (3-8 metrics, no thresholds yet),
+- "resource_metric_gating": false, or true ONLY when speed / memory itself is the paper's contribution (wall time
+  and memory metrics are then asserted at a machine-speed-scaled threshold; otherwise they are recorded only and
+  never decide a run, so they cannot be the metric that separates mid or naive),
 - "public_files": [..], "hidden_files": [..], "truth_files": [..],
 - "hidden_shift": str (PROG only), "why_naive_fails": str, "mid_missing_step": str,
 - "expected_separation": {{"<metric name>": "ref passes / mid fails / naive fails", ...}} for every metric: which

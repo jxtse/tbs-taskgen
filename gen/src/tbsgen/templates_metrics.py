@@ -28,12 +28,26 @@ SPEED_BASE = None  # tbsgen:speed_base
 # resource-metric policy (spec.resource_metric_gating): false = wall time / memory are recorded but never decide
 # a run; true = they are asserted at the machine-scaled threshold
 RESOURCE_GATING = False  # tbsgen:resource_gating
-# time-like resource metrics scale with this machine's speed_bench() / SPEED_BASE (clamped); memory-like resource
-# metrics (peak RSS) do not (they do not track CPU speed)
-_TIME_METRIC = re.compile(r"runtime|wall_?time|walltime|cpu_?time|latency|seconds?_per|_sec$|time_", re.I)
-_RESOURCE_METRIC = re.compile(r"runtime|wall_?time|cpu_?time|latency|peak_?(rss|mem)|memory|_sec$|seconds?_per|time_", re.I)
+# the task's resource metrics {name: "time" | "memory"} (spec: name-based tbsgen.spec.RESOURCE_METRIC or
+# kind="resource"); written by the pipeline.  None (a standalone copy) -> the same name rule as tbsgen.spec.
+# Time-like ones scale with this machine's speed_bench() / SPEED_BASE (clamped); memory-like ones (peak RSS) do not
+# (they do not track CPU speed).  Any other metric is checked exactly as before.
+RESOURCE_METRICS = None  # tbsgen:resource_metrics
+_RESOURCE_NAME = re.compile(r"(?:^|_)(?:runtime|wall_?time|walltime|cpu_time|peak_memory|peak_rss|max_rss|peak_mem)"
+                            r"(?:_|$)", re.I)
+_MEMORY_NAME = re.compile(r"(?:^|_)(?:peak_memory|peak_rss|max_rss|peak_mem|memory|rss)(?:_|$)", re.I)
+
+
+def resource_kind(name):
+    """"time" | "memory" for a resource metric, None for any other metric."""
+    if RESOURCE_METRICS is not None:
+        return RESOURCE_METRICS.get(name)
+    if not _RESOURCE_NAME.search(name):
+        return None
+    return "memory" if _MEMORY_NAME.search(name) else "time"
 SPEED_MIN, SPEED_MAX = 0.25, 8.0
-SPEED_DEADBAND = 0.1      # |ratio - 1| <= deadband -> ratio 1: same-host noise never moves a threshold
+# |ratio - 1| <= deadband -> ratio 1: same-host noise never moves a threshold (config thresholds.speed_deadband)
+SPEED_DEADBAND = 0.1  # tbsgen:speed_deadband
 _CACHE = {}
 
 
@@ -41,12 +55,15 @@ _CACHE = {}
 # reference for the time-threshold scaling.  Deterministic, pure CPU, a few hundred ms.
 _BENCH_CODE = r'''
 import json, time
+try:
+    import numpy as np          # imported before the clock starts: interpreter / import I/O is not CPU speed
+except Exception:
+    np = None
 t0 = time.perf_counter()
 x = 0.0
 for i in range(400000):
     x += (i % 7) * 0.5 - (i % 3)
 try:
-    import numpy as np
     a = np.linspace(0.0, 1.0, 65536)
     for _ in range(48):
         a = (np.fft.irfft(np.fft.rfft(a * 0.5))[: a.size] * 0.5) + 0.1
@@ -97,9 +114,10 @@ def check(name, value, threshold, direction):
     pipeline's lock checks compare it (runner / review.runtime_thresholds); the effective one is recorded next to
     it.  Non-resource metrics are asserted at the literal threshold as before."""
     value = float(value)
-    if _RESOURCE_METRIC.search(name):
+    kind = resource_kind(name)
+    if kind:
         ratio = 1.0
-        if _TIME_METRIC.search(name) and SPEED_BASE:
+        if kind == "time" and SPEED_BASE:
             b = speed_bench()
             if b and b > 0:
                 ratio = b / float(SPEED_BASE)

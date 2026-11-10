@@ -60,7 +60,10 @@ DEFAULT_LIMITS: dict[str, dict] = {
     # breaker only trips on many block signals and never on a run of failures.
     "oa":       dict(daily_ok=300, daily_attempts=500, hourly_ok=60, gap_s=4.0, jitter_s=3.0,
                      host_daily_attempts=60, host_hourly_attempts=30,
-                     breaker_blocks_per_day=10, breaker_consecutive_fail=0),
+                     breaker_blocks_per_day=10, breaker_consecutive_fail=0,
+                     # the OA breaker counts distinct blocked sites, not block rows: one site that keeps
+                     # blocking is already handled by its own 24 h cooldown
+                     breaker_count_hosts=True),
     "elsevier": dict(daily_ok=200, daily_attempts=300, hourly_ok=60, gap_s=3.0, jitter_s=2.0,
                      host_daily_attempts=300, host_hourly_attempts=80),
     "wiley":    dict(daily_ok=150, daily_attempts=200, hourly_ok=40, gap_s=10.0, jitter_s=4.0,   # Wiley: 10 s
@@ -227,10 +230,13 @@ class DownloadLedger:
     def breaker(self, channel: str, day: str | None = None) -> str | None:
         lim = self.limits.get(channel, {})
         max_blocks = lim.get("breaker_blocks_per_day", self.g["breaker_blocks_per_day"])
-        n_blocks = self.db.execute("select count(*) from blocks where day=? and channel=?",
+        by_host = bool(lim.get("breaker_count_hosts", False))
+        n_blocks = self.db.execute("select count(distinct host) from blocks where day=? and channel=?" if by_host
+                                   else "select count(*) from blocks where day=? and channel=?",
                                    (day or self.today(), channel)).fetchone()[0]
         if max_blocks and n_blocks >= max_blocks:
-            return f"{channel} breaker open: {n_blocks} block signals today"
+            return (f"{channel} breaker open: {n_blocks} " + ("blocked sites" if by_host else "block signals")
+                    + " today")
         k = int(lim.get("breaker_consecutive_fail", self.g["breaker_consecutive_fail"]) or 0)
         rows = self.db.execute("select status from attempts where day=? and channel=? and status in ('ok','fail') "
                                "and note not like 'cancelled%' and note not like 'not_entitled%' "

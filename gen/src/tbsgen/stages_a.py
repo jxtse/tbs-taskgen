@@ -63,7 +63,8 @@ def s2(P, it):
         return
     write_json(it.p("S2_screen.json"), rec)
     if not rec["keep"]:
-        blocklist.resolve(P.store, it)
+        if it.state.get("blocklist_trial"):
+            blocklist.resolve(P.store, it, void=f"S2 screen: {rec['reason']}")   # never reached the download
         return it.finish("dropped", rec["reason"])
     it.advance("S2", "S3", score=rec["score"], screen=rec["method"], uncertain=bool(rec.get("uncertain")))
 

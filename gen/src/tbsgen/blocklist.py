@@ -92,6 +92,10 @@ def save_state(store, st: dict) -> None:
     state_path(store).write_text(json.dumps(st, indent=1, sort_keys=True))
 
 
+# per-process cache of target shares (never persisted: its keys are tuples and it is only valid for one run)
+_SHARE_CACHE: dict[int, dict] = {}
+
+
 def lifted_rules(st: dict) -> set[str]:
     return {k for k, v in (st.get("rules") or {}).items() if v.get("lifted")}
 
@@ -127,12 +131,14 @@ def decide(store, cfg: dict, c: dict, rules: list[dict], rule: dict, event) -> d
     r = st.setdefault("rules", {}).setdefault(name, dict(trials=[], lifted=False))
     if r.get("lifted"):
         return dict(action="block", lifted=True)          # caller should not have matched it; block is stale
+    if c.get("item_id") and any(t.get("item") == c.get("item_id") for t in r.get("trials") or []):
+        return dict(action="trial", repeat=True)          # S2 re-run of a trial paper: no second quota slot
     quota = int(rc.get("weekly_quota", 5))
     week = _iso_week()
     r.setdefault("weeks", {})
     used = int(r["weeks"].get(week, 0))
-    share = target_share(store, c, rules, rule, lifted_rules(st), st.setdefault("_share_cache", {}))
-    if share is not None and share >= float(rc.get("min_share", 0.10)) and used < quota:
+    share = target_share(store, c, rules, rule, lifted_rules(st), _SHARE_CACHE.setdefault(id(store), {}))
+    if share is not None and share > float(rc.get("min_share", 0.10)) and used < quota:
         r["weeks"][week] = used + 1
         r["trials"].append(dict(item=c.get("item_id"), doi=_norm_doi(c.get("doi")), ts=time.time(),
                                 outcome="pending"))
@@ -144,17 +150,20 @@ def decide(store, cfg: dict, c: dict, rules: list[dict], rule: dict, event) -> d
     return dict(action="block", share=share)
 
 
-def resolve(store, item) -> None:
-    """Settle this item's pending trial: ok when its full text exists (S3 delivered), fail when it is parked
-    fulltext_unavailable (still queued papers stay pending until the fetch queue delivers or gives up)."""
+def resolve(store, item, void: str | None = None) -> None:
+    """Settle this item's pending trial: ok when its full text exists (S3 delivered), fail when S3 parked it
+    fulltext_unavailable (a later delivery by the fetch queue upgrades it to ok in reevaluate()); `void`: the paper
+    never reached the download (e.g. the S2 screen dropped it) -> the trial does not count either way."""
     st = load_state(store)
-    st.pop("_share_cache", None)
     changed = False
     for name, r in (st.get("rules") or {}).items():
         for t in r.get("trials") or []:
             if t.get("outcome") != "pending" or t.get("item") != item.item_id:
                 continue
-            if item.p("fulltext.txt").exists():
+            if void:
+                t["outcome"], t["settled"], t["void"] = "void", time.time(), str(void)[:200]
+                changed = True
+            elif item.p("fulltext.txt").exists():
                 t["outcome"], t["settled"] = "ok", time.time()
                 changed = True
             elif item.state.get("stage") == "S3" and item.state.get("status") == "parked" and \
@@ -190,6 +199,9 @@ def reevaluate(store, cfg: dict, event) -> dict:
             continue
         dec = [t for t in (r.get("trials") or []) if t.get("outcome") in ("ok", "fail")]
         if len(dec) < min_trials:
+            continue
+        if (r.get("kept") or [{}])[-1].get("n") == len(dec) and not upgraded:
+            out[name] = "kept"                            # nothing new since the last decision: no new event
             continue
         ok = sum(1 for t in dec if t["outcome"] == "ok")
         rate = ok / len(dec)

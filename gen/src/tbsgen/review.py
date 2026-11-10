@@ -20,9 +20,10 @@ whatever severity the reviewer gave it.  Every blocking issue carries a fix_kind
 statement, the format notes, the test / scoring scripts, or an exploit baseline, without loosening a threshold and
 without touching the reference) or "fundamental" (the reference itself is wrong, the truth must be regenerated, or
 the task's core does not hold).  The final verdict is derived from the blocking issues, not taken from the reviewer:
-any "fundamental" blocking issue -> drop; only "local" ones -> revise; none -> pass.  A malformed / inconsistent
-verdict (unknown verdict, blocking issue without a fix_kind, verdict disagreeing with its blocking issues in a way
-the code cannot resolve) is invalid and the review run is retried (review.infra_retries), not routed anywhere.
+any "fundamental" blocking issue -> drop; only "local" ones -> revise; none -> pass.  Each blocking issue names its
+problem class (PROBLEM_CLASSES); the class, not the reviewer's own fix_kind, decides local vs fundamental.  A
+malformed verdict (unknown verdict or problem class, blocking issue without a class, verifier reward != 1) is
+invalid and the review run is retried (review.infra_retries), not routed anywhere.
 
 Routing (stages_b.s9r): pass -> S10 (minor issues in the manifest) for kept labels / stays parked for the parked
 ones; revise -> S8 review revision (review.max_revisions, default 3; thresholds locked) -> S6A_run/S6B/S6C/S7/PKG ->
@@ -39,11 +40,27 @@ import time
 from pathlib import Path
 
 from . import calib
+from .state import read_json
 
 VERDICTS = ("pass", "revise", "drop")
 ALLOWED_HUMAN = ("human",)          # accepted only behind review.allow_human (legacy verdicts stay readable)
 SEVERITIES = ("blocking", "minor")
 FIX_KINDS = ("local", "fundamental")
+# what a blocking issue is about (issue["problem"]): local problems a review revision can fix -> revise;
+# fundamental ones it cannot -> drop.  The code derives fix_kind from the problem class and the verdict from the
+# blocking issues, so a "revise" whose blocking issues are all fundamental is routed as drop.
+PROBLEM_CLASSES = {
+    "statement": "local",           # wording / missing or contradictory condition in instruction.md
+    "format_notes": "local",        # the data format notes (generator README)
+    "grader_io": "local",           # the scoring scripts' inputs / outputs (paths, columns, which file is read)
+    "exploit_baseline": "local",    # an exploit / cheating baseline is missing or wrong
+    "test_gap": "local",            # the tests miss a check (or check something the statement does not ask)
+    "timing_gate": "local",         # resource-metric policy / timing margin (thresholds stay locked)
+    "reference_wrong": "fundamental",   # the reference solution itself is wrong
+    "truth_regen": "fundamental",       # the truth / data must be regenerated
+    "core_invalid": "fundamental",      # the task's core does not hold (not separable, ill-posed, ...)
+    "calibration": "fundamental",       # the label cannot be trusted and no local edit changes that
+}
 CHECKLIST = ("a_consistency", "b_missing_conditions", "c_thresholds", "d_stability", "e_shortcuts_leaks",
              "f_network_readymade", "g_calibration", "h_timing_gate")
 CATEGORIES = {"a": "consistency", "b": "missing_conditions", "c": "thresholds", "d": "stability",
@@ -295,7 +312,7 @@ def build_task(cfg: dict, item_dir: Path, state: dict, rnd: int, out: Path | Non
     (out / "task.toml").write_text("\n".join(lines) + "\n")
     (out / "instruction.md").write_text(instruction(cfg, item_dir, state, rnd, info))
     (out / "tests").mkdir()
-    (out / "tests" / "s9r_validate.py").write_text(VALIDATOR)
+    (out / "tests" / "s9r_validate.py").write_text(VALIDATOR.replace("{problems}", repr(sorted(PROBLEM_CLASSES))))
     (out / "tests" / "test.sh").write_text(TEST_SH)
     (out / "tests" / "test.sh").chmod(0o755)
     (out / "solution").mkdir()
@@ -334,6 +351,9 @@ try:
 except Exception as e:
     print("verdict.json missing or not JSON:", e); sys.exit(1)
 errs = []
+PROBLEMS = {problems}
+if not isinstance(v, dict):
+    print("verdict.json is not an object"); sys.exit(1)
 if v.get("verdict") not in ("pass", "revise", "drop"):
     errs.append("verdict must be pass|revise|drop")
 if not isinstance(v.get("issues", []), list):
@@ -341,8 +361,8 @@ if not isinstance(v.get("issues", []), list):
 for i, it in enumerate(v.get("issues") or [] if isinstance(v.get("issues", []), list) else []):
     if not isinstance(it, dict) or it.get("severity") not in ("blocking", "minor"):
         errs.append(f"issues[{i}].severity must be blocking|minor")
-    elif it.get("severity") == "blocking" and it.get("fix_kind") not in ("local", "fundamental"):
-        errs.append(f"issues[{i}].fix_kind must be local|fundamental on a blocking issue")
+    elif it.get("severity") == "blocking" and it.get("problem") not in PROBLEMS:
+        errs.append(f"issues[{i}].problem must be one of {sorted(PROBLEMS)} on a blocking issue")
 json.dump(v, open(dst, "w"), indent=1)
 print("\n".join(errs) or "ok")
 sys.exit(1 if errs else 0)
@@ -378,6 +398,7 @@ def instruction(cfg: dict, item_dir: Path, state: dict, rnd: int, info: dict) ->
                 "scratch.  Check that the revision fixed the earlier blocking issues without loosening the task, and "
                 "judge the task as it is now.\n").format(rnd=rnd)
     return REVIEW_PROMPT.format(item=item_dir.name, label=label, rnd=rnd, prev=prev,
+                                max_revisions=int((cfg.get("review") or {}).get("max_revisions", 3)),
                                 runs="\n".join(lines) or "- (no calibration runs recorded)",
                                 thresholds=_fmt_thresholds(item_dir), verdict_path=VERDICT_PATH,
                                 digests=", ".join(info.get("digests") or []) or "none")
@@ -455,10 +476,20 @@ and see what the verifier says; compare the reference's convention with an alter
 - `pass`: no blocking issue.  Minor issues are fine and are recorded.
 - `revise`: at least one **blocking** issue that a local edit of the statement, the format notes, the test /
   scoring scripts or an exploit baseline can fix *without loosening any threshold and without changing the
-  reference solution* — mark such an issue `fix_kind: "local"`.
-- `drop`: a blocking issue that such an edit cannot fix — the reference itself is wrong, the truth must be
-  regenerated, or the task's core does not hold — mark it `fix_kind: "fundamental"`.  Any fundamental blocking
-  issue means drop, whatever the rest says.
+  reference solution or the data*.  Up to {max_revisions} revision rounds are allowed per task; prefer revise
+  whenever a local fix exists.
+- `drop`: a blocking issue that such an edit cannot fix.  Any fundamental blocking issue means drop, whatever the
+  rest says.
+- Every blocking issue carries a `problem` class; the pipeline derives `fix_kind` and the routed verdict from it
+  (a `revise` whose blocking issues are all fundamental is routed as drop):
+  - local (-> revise): `statement` (wording, a missing or contradictory condition in instruction.md),
+    `format_notes` (the data format notes), `grader_io` (what the scoring scripts read / write: paths, columns,
+    which file is trusted), `exploit_baseline` (a cheating baseline missing or wrong), `test_gap` (the tests miss
+    a check or check something not asked), `timing_gate` (resource-metric policy or timing margin; thresholds
+    stay locked);
+  - fundamental (-> drop): `reference_wrong` (the reference solution itself is wrong), `truth_regen` (the truth
+    or data must be regenerated), `core_invalid` (the task's core does not hold), `calibration` (the label cannot
+    be trusted and no local edit changes that).
 - **blocking** = would make a correct, careful solver fail (or let a non-solver pass), or makes the label wrong.
 - **Any leak of ground truth or answers is blocking, never minor** — on public or hidden data alike: a file, the
   statement, a data note or an object in the image from which the expected answer of *any* scored metric (or a
@@ -487,7 +518,8 @@ Write `{verdict_path}` (JSON, exactly these keys) and optionally `/app/review_ou
     "h_timing_gate": {{"status": "...", "note": "..."}}
   }},
   "issues": [
-    {{"id": "I1", "category": "a|b|c|d|e|f|g|h", "severity": "blocking | minor", "fix_kind": "local | fundamental",
+    {{"id": "I1", "category": "a|b|c|d|e|f|g|h", "severity": "blocking | minor",
+      "problem": "statement | format_notes | grader_io | exploit_baseline | test_gap | timing_gate | reference_wrong | truth_regen | core_invalid | calibration",
       "leak": false, "title": "...",
       "evidence": ["instruction.md:53 says ... ; tests/measure.py:42 reads ...", "ran X -> output Y"],
       "fix": "the smallest edit that fixes it (which file, what change)"}}
@@ -527,18 +559,21 @@ def normalize(raw: dict | None, reward: float | None = None, allow_human: bool =
         return dict(verdict=None, raw_verdict=None, issues=[], blocking=[], minor=[], downgraded=[], escalated=[],
                     label_assessment={}, checklist={}, summary="", problems=["no verdict"])
     rv = raw.get("verdict")
-    issues, downgraded, escalated = [], [], []
+    issues, downgraded, escalated, hard = [], [], [], []      # hard: structural problems -> invalid verdict
     if not isinstance(raw.get("issues", []), list):
         problems.append("issues is not a list")
+        hard.append("issues")
     for i, it in enumerate(raw.get("issues") or [] if isinstance(raw.get("issues"), list) else []):
         if not isinstance(it, dict):
             problems.append(f"issues[{i}] not an object")
+            hard.append(f"issues[{i}]")
             continue
         it = dict(it)
         it.setdefault("id", f"I{i + 1}")
         sev = it.get("severity")
         if sev not in SEVERITIES:
             problems.append(f"{it['id']}: severity {sev!r} not blocking|minor")
+            hard.append(it["id"])
             it["severity"] = "minor"
         elif sev == "blocking" and not _has_evidence(it.get("evidence")):
             it["severity"] = "minor"
@@ -552,17 +587,35 @@ def normalize(raw: dict | None, reward: float | None = None, allow_human: bool =
             it["escalated"] = "leak is blocking"
             escalated.append(it["id"])
         if it["severity"] == "blocking":
+            pc = it.get("problem")
             fk = it.get("fix_kind")
-            if fk not in FIX_KINDS:
-                problems.append(f"{it['id']}: blocking issue without fix_kind local|fundamental")
+            if pc in PROBLEM_CLASSES:
+                if fk is not None and fk != PROBLEM_CLASSES[pc]:
+                    problems.append(f"{it['id']}: fix_kind {fk!r} contradicts problem {pc!r} -> "
+                                    f"{PROBLEM_CLASSES[pc]}")
+                it["fix_kind"] = PROBLEM_CLASSES[pc]       # the class decides fixability, not the label
+            elif pc is not None:
+                problems.append(f"{it['id']}: problem {pc!r} not one of {sorted(PROBLEM_CLASSES)}")
+                hard.append(it["id"])
+            elif fk not in FIX_KINDS:
+                problems.append(f"{it['id']}: blocking issue without a problem class (or fix_kind)")
+                hard.append(it["id"])
         issues.append(it)
     if reward is not None and reward != 1:
         problems.append(f"review verifier reward {reward} (verdict.json failed the structure check)")
+        hard.append("reward")
     blocking = [i for i in issues if i["severity"] == "blocking"]
     if rv not in VERDICTS and not (allow_human and rv in ALLOWED_HUMAN):
         problems.append(f"verdict {rv!r} not one of {VERDICTS}")
         v = None
-    elif problems:
+    elif hard:
+        v = None
+    elif allow_human and rv in ALLOWED_HUMAN:
+        v = "human"
+    elif rv in ("revise", "drop") and not blocking:
+        # the reviewer judged a defect but no blocking issue survives the contract (none, or all without
+        # evidence): never turned into a pass by the code -> invalid, the review runs again
+        problems.append(f"raw verdict {rv!r} without an evidenced blocking issue")
         v = None
     else:
         # the verdict follows from the blocking issues, not from the reviewer's label
@@ -858,7 +911,7 @@ def rescore_run(cfg: dict, item_dir: Path, run: dict) -> dict:
     logs.chmod(0o777)
     settle = float(cfg["gen"].get("verifier_settle_sec", 1.0))
     from .spec import is_resource_metric
-    spec = task_spec(item_dir / "task") or {}
+    spec = runner.task_spec(item_dir / "task") or {}
     budget = runner.timing_budget(cfg, spec)
     r = runner.sandbox.run(cfg, [(d, "/src/output", "ro"), (tests, "/src/tests", "ro"),
                                  (logs, "/logs/verifier", "rw"),
@@ -867,6 +920,9 @@ def rescore_run(cfg: dict, item_dir: Path, run: dict) -> dict:
                            int(cfg["gen"]["test_timeout"] + budget), f"tbsgen-rescore-{run['job_name']}", root=True)
     rf = logs / "reward.txt"
     reward = rf.read_text().strip() if rf.exists() and not rf.is_symlink() else None
+    if reward is None:                  # the verifier never finished (sandbox / docker trouble): not a re-score
+        return dict(ok=False, why=f"verifier wrote no reward (rc {r.get('rc')})", reward=None, passed=None,
+                    rc=r.get("rc"), err=(r.get("err") or "")[-300:])
     return dict(ok=True, reward=reward, passed=reward == "1", rc=r.get("rc"), err=(r.get("err") or "")[-300:])
 
 
@@ -907,7 +963,7 @@ def summary(P, sample_n: int = 3, seed: int = 0) -> dict:
     import random as _random
     cfg = P.cfg
     alert_cfg = (cfg.get("review") or {}).get("summary_alerts") or {}
-    per_item, verdict_counts, fix_kinds, drop_reasons, rounds = {}, {}, {}, {}, {}
+    per_item, verdict_counts, fix_kinds, drop_reasons, rounds, categories = {}, {}, {}, {}, {}, {}
     invalid = contradictory = 0
     for it in P.store.items():
         st = it.state
@@ -926,7 +982,9 @@ def summary(P, sample_n: int = 3, seed: int = 0) -> dict:
         verdict_counts[verdict or "none"] = verdict_counts.get(verdict or "none", 0) + 1
         n = max(1, int(st.get("review_round") or 1))
         rounds[n] = rounds.get(n, 0) + 1
-        if any("invalid" in (p or "") for p in nv.get("problems") or []):
+        n_inv = sum(1 for x in read_json(it.p("review", "runs.json"), []) or [] if x.get("outcome") == "invalid")
+        per_item[it.item_id]["invalid_verdicts"] = n_inv
+        if n_inv:
             invalid += 1
         # same package, disagreeing routed verdicts (two jobs of one round)
         by_pkg = {}
@@ -940,6 +998,8 @@ def summary(P, sample_n: int = 3, seed: int = 0) -> dict:
             if i.get("severity") == "blocking":
                 k = i.get("fix_kind") or "unknown"
                 fix_kinds[k] = fix_kinds.get(k, 0) + 1
+                cat = CATEGORIES.get(str(i.get("category") or "")[:1], "other")
+                categories[cat] = categories.get(cat, 0) + 1
         if st.get("status") == "dropped" and str(st.get("reason") or "").startswith("review:"):
             drop_reasons[str(st.get("reason"))[:120]] = drop_reasons.get(str(st.get("reason"))[:120], 0) + 1
     reviewed = len(per_item)
@@ -957,8 +1017,18 @@ def summary(P, sample_n: int = 3, seed: int = 0) -> dict:
         alerts.append(f"{infra} item(s) parked review:infra (review infrastructure)")
     passes = [i for i, x in per_item.items() if x["verdict"] == "pass"]
     sample = sorted(_random.Random(seed).sample(passes, min(sample_n, len(passes)))) if passes else []
+    # blocklist auto-recheck decisions (blocklist-trials.json + events)
+    from . import blocklist as _bl
+    bst = _bl.load_state(P.store)
+    bl = {name: dict(lifted=bool(r.get("lifted")), lifted_rate=r.get("lifted_rate"),
+                     trials={o: sum(1 for t in r.get("trials") or [] if t.get("outcome") == o)
+                             for o in ("ok", "fail", "pending", "void")},
+                     last_kept=(r.get("kept") or [None])[-1])
+          for name, r in (bst.get("rules") or {}).items()}
+    bl_events = [e for e in P.store.events() if e.get("kind") in ("blocklist_lifted", "blocklist_kept")][-20:]
     return dict(items=reviewed, verdicts=verdict_counts, drop_rate=round(rate, 4), alerts=alerts,
-                blocking_fix_kinds=fix_kinds, drop_reasons=drop_reasons, rounds_histogram=rounds,
+                blocking_fix_kinds=fix_kinds, blocking_categories=categories, drop_reasons=drop_reasons,
+                rounds_histogram=rounds, blocklist=bl, blocklist_events=bl_events,
                 invalid=invalid, contradictory=contradictory, review_infra_parked=infra,
                 pass_sample=[dict(item=i, verdict_path=str(P.store.root / "items" / i / "review" / "verdict.json"))
                              for i in sample], per_item=per_item)

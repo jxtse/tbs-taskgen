@@ -89,8 +89,10 @@ class Pipeline:
         its = [i for i in self.store.items() if i.state["status"] == "active" and i.state["stage"] == "S2"
                and (not only or i.item_id in only)]
         rules = self.cfg["screen"].get("blocklist")
-        if rules:                           # blocked papers are dropped by S2 without a screen call
-            its = [i for i in its if blocklist.match(read_json(i.p("S1_candidate.json")) or {}, rules) is None]
+        if rules:                           # blocked papers are dropped by S2 without a screen call (a rule the
+            lifted = blocklist.lifted_rules(blocklist.load_state(self.store))     # recheck lifted blocks nothing;
+            its = [i for i in its                                                # trial papers are screened by S2)
+                   if blocklist.match(read_json(i.p("S1_candidate.json")) or {}, rules, lifted) is None]
         if not its:
             return 0
         try:
@@ -177,9 +179,12 @@ class Pipeline:
             c = read_json(it.p("S1_candidate.json"), {}) or {}
             s4 = (read_json(it.p("S4_probe.json"), {}) or {}).get("jev", {}).get("score")
             s = (read_json(it.p("S2_screen.json"), {}) or {}).get("score")
-            s = s4 if isinstance(s4, (int, float)) else (s if isinstance(s, (int, float)) else float("-inf"))
-            info[it.item_id] = (c.get("_target") or "", s, c.get("title") or "")
-        by_score = sorted(items, key=lambda i: (-info[i.item_id][1], i.item_id))
+            # (has an S4 score, S4 score, S2 score): S4 and S2 scores are on different scales, so a paper with an
+            # S4 Jev score ranks above every paper that only has an S2 score; ties / no S4 fall back to S2
+            s2 = float(s) if isinstance(s, (int, float)) else float("-inf")
+            key = (1.0, float(s4), s2) if isinstance(s4, (int, float)) else (0.0, float("-inf"), s2)
+            info[it.item_id] = (c.get("_target") or "", key, c.get("title") or "")
+        by_score = sorted(items, key=lambda i: (tuple(-x for x in info[i.item_id][1]), i.item_id))
         if mode == "score":
             return by_score
         groups: dict[str, list] = {}
@@ -198,7 +203,7 @@ class Pipeline:
                         words.append(w)
                 groups[t] = placed + later
         out, k = [], 0
-        rows = sorted(groups.values(), key=lambda g: (-info[g[0].item_id][1], info[g[0].item_id][0]))
+        rows = sorted(groups.values(), key=lambda g: (tuple(-x for x in info[g[0].item_id][1]), info[g[0].item_id][0]))
         while any(k < len(g) for g in rows):
             out += [g[k] for g in rows if k < len(g)]
             k += 1
@@ -212,6 +217,9 @@ class Pipeline:
         steps = 0
         progress = True
         if last is None or last >= _stage_pos("S2"):    # the S2 Jev prefetch is S2 work
+            if self.cfg["screen"].get("blocklist"):
+                # trial papers the fetch queue delivered since S3 parked them count as successes now
+                blocklist.reevaluate(self.store, self.cfg, self.store.event)
             self.prefetch_screen(only)
 
         rewoken: set[str] = set()

@@ -446,6 +446,12 @@ DEFAULTS: dict[str, Any] = {
         "timeout_sec": 3600,                # agent timeout of the review task
         "max_revisions": 3,                 # review revisions per item; after the limit -> drop
         "allow_human": False,               # explicit opt-in: park for an operator instead of dropping
+        # a revision (or regate) that changed only the grader (tests/test_outputs.py, tests/measure.py; statement,
+        # data and thresholds untouched) re-scores the kept calibration's saved deliverables
+        # (items/<id>/calib/deliverables/<job>/, `tbsgen review deliverable`) with the new grader: all outcomes
+        # unchanged -> the label stands and S9R reviews again; a changed outcome or a run that cannot be re-scored
+        # -> the calibration is archived and redone.  False: always recalibrate.
+        "rescore_scoring_only": True,
         "review_parked": ["parked:teacher_failed"],   # also reviewed (diagnosis only; never released by S9R)
         "infra_retries": 2,                 # review runs without a usable verdict (infra + invalid) before drop
         "trace_digest_kb": 150,             # per calibration run, in the review bundle

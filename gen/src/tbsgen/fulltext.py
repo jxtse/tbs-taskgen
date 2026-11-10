@@ -348,6 +348,28 @@ def check_egress(ec: dict, transport: Transport) -> dict:
 # service with per-key quotas, and the publishers ask text miners to use them instead of the website.  An API
 # 429 means "slow down on the API", not "the campus IP is flagged on the website"; coupling them would let one
 # throttle stop the other channel for 6-24 h.  A website block, likewise, must not stop the sanctioned API.
+# DOI / handle resolvers and other pure redirect intermediaries: a block met after a redirect from one of them
+# belongs to the final site; cooling the resolver would stop every paper that only has a doi.org link
+RESOLVER_HOSTS = frozenset({"doi.org", "dx.doi.org", "www.doi.org", "hdl.handle.net", "n2t.net", "identifiers.org",
+                            "www.handle.net", "linkinghub.elsevier.com"})
+
+
+def block_targets(ledger_host: str, url: str, final_url: str) -> list[tuple[str, bool]]:
+    """Hosts to cool after one blocked response: [(host, counted_in_breaker)].  The response came from the final
+    host (after redirects): it is cooled and counted once.  The booked host (the ledger key, or the start of a
+    redirect chain) is cooled too — uncounted, so one response is one breaker block — unless it is a resolver /
+    redirect intermediary that merely forwarded to the blocking site."""
+    start = (urllib.parse.urlsplit(url).hostname or "").lower()
+    final = (urllib.parse.urlsplit(final_url or url).hostname or "").lower() or start
+    out = [(final, True)] if final else []
+    redirected = bool(start) and final != start
+    for h in {ledger_host.lower() if ledger_host else "", start} - {"", final}:
+        if redirected and h in RESOLVER_HOSTS:
+            continue
+        out.append((h, False))
+    return out
+
+
 PUBLISHERS: dict[str, dict] = {
     "elsevier": dict(prefixes=["10.1016", "10.1006", "10.1053", "10.1067"],
                      hosts=["www.sciencedirect.com", "pdf.sciencedirectassets.com", "linkinghub.elsevier.com"]),
@@ -689,8 +711,9 @@ class Fetcher:
                 txt, why, tm = self._validate(title, kind, r.body)
             if cool:
                 why = f"block signal HTTP {r.status}"
-                for h in {host, urllib.parse.urlsplit(r.url).hostname or ""} - {""}:
-                    self.ledger.block(h, self._r(f"{why} on {channel}"), seconds=cool, channel=channel)
+                for h, counted in block_targets(host, url, r.url):
+                    self.ledger.block(h, self._r(f"{why} on {channel}"), seconds=cool,
+                                      channel=channel if counted else None)
             if txt is not None:
                 # the reservation id travels with the text: a crash before record() can still be booked as ok
                 prov = self._save(self._cur, channel, r.url, r.body, txt, tm, kind, reservation=rid)
@@ -740,7 +763,8 @@ class Fetcher:
         for x in (rec.get("limited") or [])[n0:]:
             x["channel"] = x.get("channel") or channel
         if self.ledger is not None and (cool := block_signal(r.status, r.body)):
-            self.ledger.block(host, f"block signal HTTP {r.status} on metadata", seconds=cool)
+            for h, _ in block_targets(host, url, r.url):     # the blocking site, not a resolver in between
+                self.ledger.block(h, f"block signal HTTP {r.status} on metadata", seconds=cool)
         if r.status != 200:
             return None
         try:
