@@ -8,20 +8,28 @@ and a digest of every calibration run of the current calibration epoch (verifier
 teacher).  Its network is that of the teacher: the model endpoint during the agent phase only.
 
 The agent writes /app/review_out/verdict.json:
-    {"verdict": "pass" | "revise" | "drop" | "human",
+    {"verdict": "pass" | "revise" | "drop",
      "checklist": {"a_consistency": {"status": "ok"|"issue"|"na", "note": ...}, ... "g_calibration": {...}},
-     "issues": [{"id", "category", "severity": "blocking"|"minor", "title", "evidence": [...], "fix"}],
+     "issues": [{"id", "category", "severity": "blocking"|"minor", "fix_kind": "local"|"fundamental", "title",
+                 "evidence": [...], "fix"}],
      "label_assessment": {"label": ..., "trustworthy": true|false|null, "reason": ...},
      "summary": "..."}
 normalize() enforces the contract mechanically: a blocking issue without evidence is downgraded to minor; an issue
 marked "leak": true (ground truth / answers readable or copyable, or scoring tamperable) with evidence is blocking
-whatever severity the reviewer gave it (so "pass" with such an issue becomes "human"); only blocking issues may
-lead to revise/drop; an inconsistent or malformed verdict becomes "human".
+whatever severity the reviewer gave it.  Every blocking issue carries a fix_kind: "local" (fixable by editing the
+statement, the format notes, the test / scoring scripts, or an exploit baseline, without loosening a threshold and
+without touching the reference) or "fundamental" (the reference itself is wrong, the truth must be regenerated, or
+the task's core does not hold).  The final verdict is derived from the blocking issues, not taken from the reviewer:
+any "fundamental" blocking issue -> drop; only "local" ones -> revise; none -> pass.  Each blocking issue names its
+problem class (PROBLEM_CLASSES); the class, not the reviewer's own fix_kind, decides local vs fundamental.  A
+malformed verdict (unknown verdict or problem class, blocking issue without a class, verifier reward != 1) is
+invalid and the review run is retried (review.infra_retries), not routed anywhere.
 
 Routing (stages_b.s9r): pass -> S10 (minor issues in the manifest) for kept labels / stays parked for the parked
-ones; revise -> S8 review revision (review.max_revisions, default 1; thresholds locked) -> S6A_run/S6B/S6C/S7/PKG ->
-S9 from GLM in a new calibration epoch (old results archived) -> S9R again; drop -> dropped; human -> parked.  A
-second review that is not "pass" -> human.
+ones; revise -> S8 review revision (review.max_revisions, default 3; thresholds locked) -> S6A_run/S6B/S6C/S7/PKG ->
+S9 -> S9R again; drop -> dropped.  There is no "human" exit: after the revision limit, or when a revised package
+keeps failing, the item is dropped.  human stays a valid output only behind review.allow_human (default off), for
+installations that want an operator in the loop.
 """
 from __future__ import annotations
 
@@ -32,17 +40,55 @@ import time
 from pathlib import Path
 
 from . import calib
+from .state import read_json
 
-VERDICTS = ("pass", "revise", "drop", "human")
+VERDICTS = ("pass", "revise", "drop")
+ALLOWED_HUMAN = ("human",)          # accepted only behind review.allow_human (legacy verdicts stay readable)
 SEVERITIES = ("blocking", "minor")
+FIX_KINDS = ("local", "fundamental")
+# what a blocking issue is about (issue["problem"]): local problems a review revision can fix -> revise;
+# fundamental ones it cannot -> drop.  The code derives fix_kind from the problem class and the verdict from the
+# blocking issues, so a "revise" whose blocking issues are all fundamental is routed as drop.
+PROBLEM_CLASSES = {
+    "statement": "local",           # wording / missing or contradictory condition in instruction.md
+    "format_notes": "local",        # the data format notes (generator README)
+    "grader_io": "local",           # the scoring scripts' inputs / outputs (paths, columns, which file is read)
+    "exploit_baseline": "local",    # an exploit / cheating baseline is missing or wrong
+    "test_gap": "local",            # the tests miss a check (or check something the statement does not ask)
+    "timing_gate": "local",         # resource-metric policy / timing margin (thresholds stay locked)
+    "reference_wrong": "fundamental",   # the reference solution itself is wrong
+    "truth_regen": "fundamental",       # the truth / data must be regenerated
+    "core_invalid": "fundamental",      # the task's core does not hold (not separable, ill-posed, ...)
+    "calibration": "fundamental",       # the label cannot be trusted and no local edit changes that
+}
 CHECKLIST = ("a_consistency", "b_missing_conditions", "c_thresholds", "d_stability", "e_shortcuts_leaks",
-             "f_network_readymade", "g_calibration")
+             "f_network_readymade", "g_calibration", "h_timing_gate")
 CATEGORIES = {"a": "consistency", "b": "missing_conditions", "c": "thresholds", "d": "stability",
-              "e": "shortcuts_leaks", "f": "network_readymade", "g": "calibration"}
+              "e": "shortcuts_leaks", "f": "network_readymade", "g": "calibration", "h": "timing_gate"}
 VERDICT_PATH = "/app/review_out/verdict.json"
-# files a review revision (S8) may change: the statement, the data format notes (written by the generator) and
-# the test / scoring scripts.  Never the reference solution, the baselines, _spec/ or thresholds.json.
+# files a review revision (S8) may change: the statement, the data format notes (written by the generator), the
+# test / scoring scripts, and the exploit baselines.  Never the reference solution, the baselines' mid / naive,
+# _spec/ or thresholds.json.
 REVISION_PATHS = ("instruction.md", "tests/test_outputs.py", "tests/measure.py", "generator/generate.py")
+REVISION_BASELINES = ("baselines/exploit_",)        # prefix: existing exploit_*.py may be rewritten
+# a revision that changes only these is scoring-only: data, thresholds and the reference are untouched, so the
+# kept calibration can be re-scored with the new grader instead of being archived (review.rescore)
+GRADER_PATHS = ("tests/test_outputs.py", "tests/measure.py")
+# run record result types that produced no deliverable at all: no re-scoring can change them (the S7 nop gate
+# proves the new grader fails an empty output)
+NO_OUTPUT_TYPES = ("timeout_no_output", "fail_no_output", "no_output")
+
+
+# a timing_gate issue is fixed by flipping spec.resource_metric_gating (thresholds, data and reference stay locked):
+# the revision names this pseudo-path with the body "true" / "false"; it is applied to _spec/spec.json, never to
+# the task tree, and makes the revision a full one (re-measure, recalibrate)
+GATING_PATH = "_spec/resource_metric_gating"
+
+
+def revision_path_ok(rel: str) -> bool:
+    if rel in REVISION_PATHS or rel == GATING_PATH:
+        return True
+    return rel.startswith(REVISION_BASELINES) and ".." not in rel and rel.endswith(".py")
 
 
 # ------------------------------------------------------------------ config
@@ -272,7 +318,9 @@ def build_task(cfg: dict, item_dir: Path, state: dict, rnd: int, out: Path | Non
     (out / "task.toml").write_text("\n".join(lines) + "\n")
     (out / "instruction.md").write_text(instruction(cfg, item_dir, state, rnd, info))
     (out / "tests").mkdir()
-    (out / "tests" / "s9r_validate.py").write_text(VALIDATOR)
+    verdicts = list(VERDICTS) + (list(ALLOWED_HUMAN) if (cfg.get("review") or {}).get("allow_human") else [])
+    (out / "tests" / "s9r_validate.py").write_text(VALIDATOR.replace("{problems}", repr(sorted(PROBLEM_CLASSES)))
+                                                   .replace("{verdicts}", repr(verdicts)))
     (out / "tests" / "test.sh").write_text(TEST_SH)
     (out / "tests" / "test.sh").chmod(0o755)
     (out / "solution").mkdir()
@@ -295,15 +343,15 @@ fi
 """
 
 ORACLE_SH = """#!/bin/bash
-# oracle of the review task (harness smoke test only): a well-formed "human" verdict
+# oracle of the review task (harness smoke test only): a well-formed "pass" verdict
 mkdir -p /app/review_out
 cat > /app/review_out/verdict.json <<'EOF'
-{"verdict": "human", "issues": [], "checklist": {}, "label_assessment": {"label": null, "trustworthy": null,
+{"verdict": "pass", "issues": [], "checklist": {}, "label_assessment": {"label": null, "trustworthy": null,
  "reason": "oracle smoke test"}, "summary": "oracle smoke test of the S9R harness"}
 EOF
 """
 
-VALIDATOR = r'''"""Structure check of /app/review_out/verdict.json (S9R).  Writes the parsed verdict to argv[2]."""
+VALIDATOR = r'''"Structure check of /app/review_out/verdict.json (S9R).  Writes the parsed verdict to argv[2]."""
 import json, sys
 src, dst = sys.argv[1], sys.argv[2]
 try:
@@ -311,13 +359,19 @@ try:
 except Exception as e:
     print("verdict.json missing or not JSON:", e); sys.exit(1)
 errs = []
-if v.get("verdict") not in ("pass", "revise", "drop", "human"):
-    errs.append("verdict must be pass|revise|drop|human")
+PROBLEMS = {problems}
+VERDICTS = {verdicts}
+if not isinstance(v, dict):
+    print("verdict.json is not an object"); sys.exit(1)
+if v.get("verdict") not in VERDICTS:
+    errs.append("verdict must be " + "|".join(VERDICTS))
 if not isinstance(v.get("issues", []), list):
     errs.append("issues must be a list")
 for i, it in enumerate(v.get("issues") or [] if isinstance(v.get("issues", []), list) else []):
     if not isinstance(it, dict) or it.get("severity") not in ("blocking", "minor"):
         errs.append(f"issues[{i}].severity must be blocking|minor")
+    elif it.get("severity") == "blocking" and it.get("problem") not in PROBLEMS:
+        errs.append(f"issues[{i}].problem must be one of {sorted(PROBLEMS)} on a blocking issue")
 json.dump(v, open(dst, "w"), indent=1)
 print("\n".join(errs) or "ok")
 sys.exit(1 if errs else 0)
@@ -353,6 +407,7 @@ def instruction(cfg: dict, item_dir: Path, state: dict, rnd: int, info: dict) ->
                 "scratch.  Check that the revision fixed the earlier blocking issues without loosening the task, and "
                 "judge the task as it is now.\n").format(rnd=rnd)
     return REVIEW_PROMPT.format(item=item_dir.name, label=label, rnd=rnd, prev=prev,
+                                max_revisions=int((cfg.get("review") or {}).get("max_revisions", 3)),
                                 runs="\n".join(lines) or "- (no calibration runs recorded)",
                                 thresholds=_fmt_thresholds(item_dir), verdict_path=VERDICT_PATH,
                                 digests=", ".join(info.get("digests") or []) or "none")
@@ -417,6 +472,10 @@ f. **Network / ready-made code.**  Does solving it need the internet or the pape
 g. **Calibration evidence.**  Using the traces: did failures come from the task's difficulty, from a task defect
    (ambiguity, contradiction), or from the harness / infrastructure (timeouts from a slow model, crashes, API
    errors)?  Did passing runs really solve the task?  Is the label `{label}` trustworthy?
+h. **Timing in the verdict.**  Should the resource metric(s) (wall time / memory) count toward the reward
+   (`resource_metric_gating` in the spec: true = they gate, false = they are recorded but never decide a run)?
+   They should gate only when speed itself is the paper's contribution; otherwise a slower machine would fail a
+   correct solver.  Say which setting this task has and whether it is right.
 
 Run things.  Reproduce the reference score; when you suspect a defect, test it (e.g. follow the statement literally
 and see what the verifier says; compare the reference's convention with an alternative and see which metric moves).
@@ -424,11 +483,22 @@ and see what the verifier says; compare the reference's convention with an alter
 ## Rules for the verdict
 
 - `pass`: no blocking issue.  Minor issues are fine and are recorded.
-- `revise`: at least one **blocking** issue that a local edit of the statement, the format notes, or the test /
-  scoring scripts can fix *without loosening any threshold and without changing the reference solution*.
-- `drop`: a blocking issue that such an edit cannot fix (e.g. the reference is wrong, the task is trivially
-  exploitable by design, it needs the internet).
-- `human`: you cannot decide with the evidence available.
+- `revise`: at least one **blocking** issue that a local edit of the statement, the format notes, the test /
+  scoring scripts or an exploit baseline can fix *without loosening any threshold and without changing the
+  reference solution or the data*.  Up to {max_revisions} revision rounds are allowed per task; prefer revise
+  whenever a local fix exists.
+- `drop`: a blocking issue that such an edit cannot fix.  Any fundamental blocking issue means drop, whatever the
+  rest says.
+- Every blocking issue carries a `problem` class; the pipeline derives `fix_kind` and the routed verdict from it
+  (a `revise` whose blocking issues are all fundamental is routed as drop):
+  - local (-> revise): `statement` (wording, a missing or contradictory condition in instruction.md),
+    `format_notes` (the data format notes), `grader_io` (what the scoring scripts read / write: paths, columns,
+    which file is trusted), `exploit_baseline` (a cheating baseline missing or wrong), `test_gap` (the tests miss
+    a check or check something not asked), `timing_gate` (resource-metric policy or timing margin; thresholds
+    stay locked);
+  - fundamental (-> drop): `reference_wrong` (the reference solution itself is wrong), `truth_regen` (the truth
+    or data must be regenerated), `core_invalid` (the task's core does not hold), `calibration` (the label cannot
+    be trusted and no local edit changes that).
 - **blocking** = would make a correct, careful solver fail (or let a non-solver pass), or makes the label wrong.
 - **Any leak of ground truth or answers is blocking, never minor** — on public or hidden data alike: a file, the
   statement, a data note or an object in the image from which the expected answer of *any* scored metric (or a
@@ -445,7 +515,7 @@ Write `{verdict_path}` (JSON, exactly these keys) and optionally `/app/review_ou
 
 ```json
 {{
-  "verdict": "pass | revise | drop | human",
+  "verdict": "pass | revise | drop",
   "checklist": {{
     "a_consistency": {{"status": "ok | issue | na", "note": "..."}},
     "b_missing_conditions": {{"status": "...", "note": "..."}},
@@ -453,10 +523,13 @@ Write `{verdict_path}` (JSON, exactly these keys) and optionally `/app/review_ou
     "d_stability": {{"status": "...", "note": "..."}},
     "e_shortcuts_leaks": {{"status": "...", "note": "..."}},
     "f_network_readymade": {{"status": "...", "note": "..."}},
-    "g_calibration": {{"status": "...", "note": "..."}}
+    "g_calibration": {{"status": "...", "note": "..."}},
+    "h_timing_gate": {{"status": "...", "note": "..."}}
   }},
   "issues": [
-    {{"id": "I1", "category": "a|b|c|d|e|f|g", "severity": "blocking | minor", "leak": false, "title": "...",
+    {{"id": "I1", "category": "a|b|c|d|e|f|g|h", "severity": "blocking | minor",
+      "problem": "statement | format_notes | grader_io | exploit_baseline | test_gap | timing_gate | reference_wrong | truth_regen | core_invalid | calibration",
+      "leak": false, "title": "...",
       "evidence": ["instruction.md:53 says ... ; tests/measure.py:42 reads ...", "ran X -> output Y"],
       "fix": "the smallest edit that fixes it (which file, what change)"}}
   ],
@@ -481,28 +554,37 @@ def _has_evidence(ev) -> bool:
     return False
 
 
-def normalize(raw: dict | None, reward: float | None = None) -> dict:
+def normalize(raw: dict | None, reward: float | None = None, allow_human: bool = False) -> dict:
     """Apply the contract to a raw verdict: returns {verdict, raw_verdict, issues, blocking, minor, downgraded,
-    label_assessment, checklist, summary, problems}.  Strict: any structural problem (unknown verdict or severity,
-    non-object issue, verifier reward != 1 when known) makes the verdict "human"; the only silent rewrite is the
-    contract's own rule that a blocking issue without evidence counts as minor."""
+    label_assessment, checklist, problems}.  verdict None = invalid (structural problem: unknown verdict or
+    severity, non-object issue, blocking issue without a fix_kind, verifier reward != 1 when known) — the caller
+    retries the review run; it is not a routing outcome.  The routed verdict is derived from the blocking issues:
+    any fundamental one -> drop, otherwise any blocking one -> revise, none -> pass.  The only silent rewrites are
+    the contract's own rules (a blocking issue without evidence counts as minor; a leak with evidence is
+    blocking); a raw verdict that disagrees with its issues is recorded in problems but does not make the verdict
+    invalid, the derived verdict wins."""
     problems = []
     if not isinstance(raw, dict):
-        return dict(verdict="human", raw_verdict=None, issues=[], blocking=[], minor=[], downgraded=[],
+        return dict(verdict=None, raw_verdict=None, issues=[], blocking=[], minor=[], downgraded=[], escalated=[],
                     label_assessment={}, checklist={}, summary="", problems=["no verdict"])
     rv = raw.get("verdict")
-    issues, downgraded, escalated = [], [], []
+    if not isinstance(rv, (str, type(None))):
+        rv = repr(rv)[:40]                                     # unhashable / odd type: an unknown verdict
+    issues, downgraded, escalated, hard = [], [], [], []      # hard: structural problems -> invalid verdict
     if not isinstance(raw.get("issues", []), list):
         problems.append("issues is not a list")
+        hard.append("issues")
     for i, it in enumerate(raw.get("issues") or [] if isinstance(raw.get("issues"), list) else []):
         if not isinstance(it, dict):
             problems.append(f"issues[{i}] not an object")
+            hard.append(f"issues[{i}]")
             continue
         it = dict(it)
         it.setdefault("id", f"I{i + 1}")
         sev = it.get("severity")
         if sev not in SEVERITIES:
             problems.append(f"{it['id']}: severity {sev!r} not blocking|minor")
+            hard.append(it["id"])
             it["severity"] = "minor"
         elif sev == "blocking" and not _has_evidence(it.get("evidence")):
             it["severity"] = "minor"
@@ -515,25 +597,51 @@ def normalize(raw: dict | None, reward: float | None = None) -> dict:
             it["severity"] = "blocking"
             it["escalated"] = "leak is blocking"
             escalated.append(it["id"])
+        if it["severity"] == "blocking":
+            pc = it.get("problem")
+            fk = it.get("fix_kind")
+            if not isinstance(pc, (str, type(None))) or not isinstance(fk, (str, type(None))):
+                problems.append(f"{it['id']}: problem / fix_kind must be strings")
+                hard.append(it["id"])
+            elif pc in PROBLEM_CLASSES:
+                if fk is not None and fk != PROBLEM_CLASSES[pc]:
+                    problems.append(f"{it['id']}: fix_kind {fk!r} contradicts problem {pc!r} -> "
+                                    f"{PROBLEM_CLASSES[pc]}")
+                it["fix_kind"] = PROBLEM_CLASSES[pc]       # the class decides fixability, not the label
+            elif pc is not None:
+                problems.append(f"{it['id']}: problem {pc!r} not one of {sorted(PROBLEM_CLASSES)}")
+                hard.append(it["id"])
+            elif fk not in FIX_KINDS:
+                problems.append(f"{it['id']}: blocking issue without a problem class (or fix_kind)")
+                hard.append(it["id"])
         issues.append(it)
     if reward is not None and reward != 1:
         problems.append(f"review verifier reward {reward} (verdict.json failed the structure check)")
-    blocking = [i["id"] for i in issues if i["severity"] == "blocking"]
-    minor = [i["id"] for i in issues if i["severity"] == "minor"]
-    v = rv if rv in VERDICTS else None
-    if v is None:
+        hard.append("reward")
+    blocking = [i for i in issues if i["severity"] == "blocking"]
+    if rv not in VERDICTS and not (allow_human and rv in ALLOWED_HUMAN):
         problems.append(f"verdict {rv!r} not one of {VERDICTS}")
-    elif v in ("revise", "drop") and not blocking:
-        problems.append(f"verdict {v} without a (evidenced) blocking issue")
-    elif v == "pass" and blocking:
-        problems.append("verdict pass with blocking issues" + (f" (leak issues {escalated} are blocking)"
-                                                               if escalated else ""))
-    if problems:
+        v = None
+    elif hard:
+        v = None
+    elif allow_human and rv in ALLOWED_HUMAN:
         v = "human"
-    return dict(verdict=v, raw_verdict=rv, issues=issues, blocking=blocking, minor=minor, downgraded=downgraded,
-                escalated=escalated, label_assessment=raw.get("label_assessment") or {}, checklist=raw.get("checklist") or {},
-                reference_check=raw.get("reference_check") or {}, summary=str(raw.get("summary") or "")[:2000],
-                problems=problems)
+    elif rv in ("revise", "drop") and not blocking:
+        # the reviewer judged a defect but no blocking issue survives the contract (none, or all without
+        # evidence): never turned into a pass by the code -> invalid, the review runs again
+        problems.append(f"raw verdict {rv!r} without an evidenced blocking issue")
+        v = None
+    else:
+        # the verdict follows from the blocking issues, not from the reviewer's label
+        v = "drop" if any(i.get("fix_kind") == "fundamental" for i in blocking) else \
+            ("revise" if blocking else "pass")
+        if v != rv:
+            problems.append(f"raw verdict {rv!r} overridden by the blocking issues' fix_kinds -> {v}")
+    return dict(verdict=v, raw_verdict=rv, issues=issues, blocking=[i["id"] for i in blocking],
+                minor=[i["id"] for i in issues if i["severity"] == "minor"], downgraded=downgraded,
+                escalated=escalated, label_assessment=raw.get("label_assessment") or {},
+                checklist=raw.get("checklist") or {}, reference_check=raw.get("reference_check") or {},
+                summary=str(raw.get("summary") or "")[:2000], problems=problems)
 
 
 def read_verdict(trial: Path) -> dict | None:
@@ -541,14 +649,20 @@ def read_verdict(trial: Path) -> dict | None:
         p = trial / "verifier" / name
         if p.exists():
             try:
-                return json.loads(p.read_text())
-            except ValueError:
+                v = json.loads(p.read_text())
+            except (ValueError, UnicodeDecodeError, OSError):
                 continue
+            return v if v is not None else {"_corrupt": "verdict file holds JSON null"}
+    if any((trial / "verifier" / n).exists() for n in ("verdict.json", "verdict.raw.json")):
+        # a verdict file was written but cannot be parsed: a (broken) judgment, not missing infrastructure ->
+        # normalize() makes it invalid and the review is re-run, then dropped
+        return {"_corrupt": "verdict file is not valid JSON"}
     return None
 
 
-def classify(job_dir: Path, model: str | None, prices: dict) -> dict:
-    """A finished review job: outcome "done" (a verdict file came back) or "infra"; cost as for calibration."""
+def classify(job_dir: Path, model: str | None, prices: dict, allow_human: bool = False) -> dict:
+    """A finished review job: outcome "done" (a verdict file came back; verdict may still be None = invalid,
+    retried by routing) or "infra"; cost as for calibration."""
     trials = calib.collect(job_dir, model, prices)
     usd, kind, usage = calib.job_cost(trials)
     raw, trial = None, None
@@ -563,8 +677,9 @@ def classify(job_dir: Path, model: str | None, prices: dict) -> dict:
         reward = rw.get("reward")
         reward = float(reward) if isinstance(reward, (int, float)) else 0.0
     return dict(outcome="done" if raw is not None else "infra", verdict_raw=raw,
-                verdict=normalize(raw, reward) if raw is not None else None, trial=dict(last, job_dir=str(Path(job_dir).resolve()),
-                                                                                 verdict_trial=trial.name if trial else None),
+                verdict=normalize(raw, reward, allow_human) if raw is not None else None,
+                trial=dict(last, job_dir=str(Path(job_dir).resolve()),
+                           verdict_trial=trial.name if trial else None),
                 minutes=last.get("minutes"), cost_usd=usd, cost_kind=kind, usage=usage, n_trials=len(trials))
 
 
@@ -722,10 +837,16 @@ def revision_review(task: Path, patch: dict[str, str], depgraph: dict, threshold
     from . import repair
     reasons = []
     for rel in patch:
-        if rel not in REVISION_PATHS:
+        if not revision_path_ok(rel):
             reasons.append(f"path not allowed in a review revision: {rel!r}")
     if reasons:
         return dict(ok=False, reasons=reasons, files=sorted(patch), method="review-revision-v2")
+    if GATING_PATH in patch and patch[GATING_PATH].strip().lower() not in ("true", "false"):
+        return dict(ok=False, reasons=[f"{GATING_PATH} must be exactly true or false"], files=sorted(patch),
+                    method="review-revision-v2")
+    patch = {k: v for k, v in patch.items() if k != GATING_PATH}
+    if not patch:                                   # only the gating flag: nothing for the S8 code rules to check
+        return dict(ok=True, reasons=[], files=[GATING_PATH], method="review-revision-v2")
     rv = repair.review(task, patch, depgraph)
     reasons = list(rv["reasons"])
     t = "tests/test_outputs.py"
@@ -774,3 +895,177 @@ def lock_compare(locked: dict, fresh: dict) -> dict:
             looser = (b > a) if d == "<=" else (b < a)
         out[k] = dict(locked=a, fresh=b, direction=d, fresh_would_be_looser=looser)
     return out
+
+# ------------------------------------------------------- scoring-only revision / re-score
+def scoring_only(patch: dict) -> bool:
+    """True when a review revision (or a shared-verifier regate) changed only the grader: the statement, the data,
+    the thresholds and the reference solution are untouched, so the kept calibration can be re-scored with the
+    new grader instead of being archived (the deliverables do not depend on the grader)."""
+    # the resource-metric gating flag only changes how the verifier decides (tests/_metrics.py), not the task
+    return bool(patch) and all(rel in GRADER_PATHS or rel == GATING_PATH for rel in patch)
+
+
+def save_deliverable(item_dir: Path, job_name: str, src: Path, note: str = "") -> Path:
+    """Register a run's saved deliverable (its /app/output, e.g. re-played from the agent trace by the operator)
+    for re-scoring: items/<id>/calib/deliverables/<job_name>/ + provenance.json."""
+    d = item_dir / "calib" / "deliverables" / job_name
+    if d.exists():
+        shutil.rmtree(d)
+    shutil.copytree(src, d, symlinks=False)
+    (d / ".." / f"{job_name}.provenance.json").write_text(json.dumps(
+        dict(job_name=job_name, src=str(Path(src).resolve()), note=note[:500], ts=time.time()), indent=1))
+    return d
+
+
+def rescore_run(cfg: dict, item_dir: Path, run: dict) -> dict:
+    """Run the packaged verifier (pkg/tests, the new grader) on a run's saved deliverable in the local sandbox.
+    -> {ok, reward, passed} — ok=False when the sandbox could not run (infrastructure, not a label change)."""
+    from . import runner
+    pkg = item_dir / "pkg"
+    d = item_dir / "calib" / "deliverables" / run["job_name"]
+    if not d.is_dir() or not (pkg / "tests" / "test.sh").exists():
+        return dict(ok=False, why="no saved deliverable", reward=None, passed=None)
+    work = item_dir / "runs" / f"rescore-{run['job_name']}"
+    tests = work / "tests"
+    if tests.exists():
+        shutil.rmtree(tests)
+    shutil.copytree(pkg / "tests", tests)
+    logs = work / "logs"
+    if logs.exists():
+        shutil.rmtree(logs)
+    logs.mkdir(parents=True)
+    logs.chmod(0o777)
+    settle = float(cfg["gen"].get("verifier_settle_sec", 1.0))
+    from .spec import is_resource_metric
+    spec = runner.task_spec(item_dir / "task") or {}
+    budget = runner.timing_budget(cfg, spec)
+    r = runner.sandbox.run(cfg, [(d, "/src/output", "ro"), (tests, "/src/tests", "ro"),
+                                 (logs, "/logs/verifier", "rw"),
+                                 (pkg / "environment" / "data", "/src/data", "ro")],
+                           runner.VERIFIER_PRE + f"cd /tests && bash /tests/test.sh; rc=$?; sleep {settle:g}; exit $rc",
+                           int(cfg["gen"]["test_timeout"] + budget), f"tbsgen-rescore-{run['job_name']}", root=True)
+    rf = logs / "reward.txt"
+    reward = rf.read_text().strip() if rf.exists() and not rf.is_symlink() else None
+    if reward is None:                  # the verifier never finished (sandbox / docker trouble): not a re-score
+        return dict(ok=False, why=f"verifier wrote no reward (rc {r.get('rc')})", reward=None, passed=None,
+                    rc=r.get("rc"), err=(r.get("err") or "")[-300:])
+    return dict(ok=True, reward=reward, passed=reward == "1", rc=r.get("rc"), err=(r.get("err") or "")[-300:])
+
+
+def rescore_item(cfg: dict, item_dir: Path, runs: list) -> dict:
+    """Re-score every decisive run of the kept calibration with the new grader.  A run without a saved
+    deliverable keeps its outcome only when it produced no deliverable at all (NO_OUTPUT_TYPES — the S7 nop gate
+    proves the new grader fails an empty output).  -> {keep, checked, missing, changed, details}"""
+    checked, missing, changed, details = 0, [], [], []
+    for r in runs or []:
+        if r.get("outcome") not in ("pass", "fail"):
+            continue                                    # infra / unsettled runs never decided the label
+        was_pass = r.get("outcome") == "pass"
+        d = item_dir / "calib" / "deliverables" / r.get("job_name", "")
+        if not d.is_dir():
+            if not was_pass and r.get("result_type") in NO_OUTPUT_TYPES:
+                details.append(dict(job=r.get("job_name"), kept="no deliverable was produced", outcome=r.get("outcome")))
+                continue
+            missing.append(r.get("job_name"))
+            continue
+        res = rescore_run(cfg, item_dir, r)
+        checked += 1
+        if not res.get("ok"):
+            missing.append(r.get("job_name"))
+            details.append(dict(job=r.get("job_name"), error=res.get("why")))
+            continue
+        if res["passed"] != was_pass:
+            changed.append(dict(job=r.get("job_name"), was=was_pass, now=res["passed"], reward=res.get("reward")))
+        else:
+            details.append(dict(job=r.get("job_name"), outcome=r.get("outcome"), reward=res.get("reward")))
+    return dict(keep=not missing and not changed, checked=checked, missing=missing, changed=changed, details=details)
+
+
+# ------------------------------------------------------------------ batch summary
+def summary(P, sample_n: int = 3, seed: int = 0) -> dict:
+    """`tbsgen review summary`: this batch's review outcome.  Verdicts are the routed (derived) verdicts.
+    -> verdict counts, blocking-issue distribution (problem class / checklist category / fix kind), drop reasons,
+    per-item rounds and revisions, a random sample of passed items with the paths of their review records (for spot
+    checks), the blocklist auto-recheck decisions, and alerts {kind, msg}: drop rate over
+    review.summary_alerts.drop_rate, two reviews of the same package that disagree, invalid verdicts, review:infra
+    parks."""
+    import random as _random
+    cfg = P.cfg
+    alert_cfg = (cfg.get("review") or {}).get("summary_alerts") or {}
+    per_item, verdict_counts, fix_kinds, drop_reasons, rounds, categories, problems_ = {}, {}, {}, {}, {}, {}, {}
+    invalid, contradictions = 0, []
+    for it in P.store.items():
+        st = it.state
+        verdicts = sorted(it.p("review").glob("r*/*.verdict.json")) if it.p("review").exists() else []
+        if not verdicts and not it.p("review", "runs.json").exists():
+            continue                                  # never reviewed
+        v = read_json(it.p("review", "verdict.json"), None) or {}
+        nv = v.get("_normalized") or {}
+        verdict = nv.get("verdict")
+        per_item[it.item_id] = dict(stage=st.get("stage"), status=st.get("status"), label=st.get("calib_label"),
+                                    reason=st.get("reason"), verdict=verdict,
+                                    rounds=int(st.get("review_round") or 1),
+                                    revisions=int(st.get("review_revisions") or 0))
+        verdict_counts[verdict or "none"] = verdict_counts.get(verdict or "none", 0) + 1
+        n = int(st.get("review_revisions") or 0)
+        rounds[n] = rounds.get(n, 0) + 1
+        n_inv = sum(1 for x in read_json(it.p("review", "runs.json"), []) or [] if x.get("outcome") == "invalid")
+        per_item[it.item_id]["invalid_verdicts"] = n_inv
+        invalid += bool(n_inv)
+        # two reviews of the same package (same pkg hash and calibration epoch) that reached different verdicts
+        by_pkg: dict = {}
+        for p in verdicts:
+            vv = read_json(p, {}) or {}
+            r = (vv.get("_normalized") or {}).get("verdict")
+            if r is not None:
+                by_pkg.setdefault((vv.get("pkg_sha"), vv.get("calib_epoch")), []).append((p.parent.name, r))
+        for (sha, ep), vs in by_pkg.items():
+            if len({r for _, r in vs}) > 1:
+                contradictions.append(dict(item=it.item_id, pkg_sha=sha, calib_epoch=ep, verdicts=vs))
+        for i in nv.get("issues") or []:
+            if i.get("severity") == "blocking":
+                k = i.get("fix_kind") or "unknown"
+                fix_kinds[k] = fix_kinds.get(k, 0) + 1
+                cat = CATEGORIES.get(str(i.get("category") or "")[:1], "other")
+                categories[cat] = categories.get(cat, 0) + 1
+                pc = i.get("problem") or "unclassified"
+                problems_[pc] = problems_.get(pc, 0) + 1
+        if st.get("status") == "dropped":
+            key = str(st.get("reason") or "").split(" (")[0][:80]
+            drop_reasons[key] = drop_reasons.get(key, 0) + 1
+    reviewed = len(per_item)
+    dropped = sum(1 for x in per_item.values() if x["status"] == "dropped")
+    rate = (dropped / reviewed) if reviewed else 0.0
+    alerts = []
+    lim = float(alert_cfg.get("drop_rate", 0.5))
+    if reviewed and rate > lim:
+        alerts.append(dict(kind="drop_rate", msg=f"drop rate {dropped}/{reviewed} ({rate:.0%}) > {lim:.0%} "
+                                                 "(review.summary_alerts.drop_rate)"))
+    for c in contradictions:
+        alerts.append(dict(kind="contradiction", msg=f"{c['item']}: reviews of the same package disagree "
+                                                     f"{c['verdicts']}"))
+    if invalid:
+        alerts.append(dict(kind="invalid", msg=f"{invalid} item(s) with invalid (re-run) verdicts"))
+    infra = sum(1 for x in per_item.values() if str(x["reason"] or "").startswith("review:infra"))
+    if infra:
+        alerts.append(dict(kind="review_infra", msg=f"{infra} item(s) parked review:infra"))
+    passes = sorted(i for i, x in per_item.items() if x["verdict"] == "pass")
+    sample = sorted(_random.Random(seed).sample(passes, min(sample_n, len(passes)))) if passes else []
+
+    def records(iid):
+        d = P.store.root / "items" / iid / "review"
+        return [str(d / "verdict.json"), str(d / "runs.json")] + [str(p) for p in sorted(d.glob("r*/*.verdict.json"))]
+    from . import blocklist as _bl
+    bst = _bl.load_state(P.store)
+    bl = {name: dict(lifted=bool(r.get("lifted")), lifted_rate=r.get("lifted_rate"),
+                     trials={o: sum(1 for t in r.get("trials") or [] if t.get("outcome") == o)
+                             for o in ("ok", "fail", "pending", "void")},
+                     last_kept=(r.get("kept") or [None])[-1])
+          for name, r in (bst.get("rules") or {}).items()}
+    bl_events = [e for e in P.store.events() if e.get("kind") in ("blocklist_lifted", "blocklist_kept")][-20:]
+    return dict(items=reviewed, verdicts=verdict_counts, drop_rate=round(rate, 4), alerts=alerts,
+                blocking_problems=problems_, blocking_categories=categories, blocking_fix_kinds=fix_kinds,
+                drop_reasons=drop_reasons, revisions_histogram=rounds, invalid=invalid,
+                contradictions=contradictions, review_infra_parked=infra,
+                pass_sample=[dict(item=i, records=records(i)) for i in sample],
+                blocklist=bl, blocklist_events=bl_events, per_item=per_item)

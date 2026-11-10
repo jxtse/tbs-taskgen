@@ -57,6 +57,8 @@ def validate_spec(spec: dict, cfg: dict) -> list[str]:
             errs.append("PROG needs a shift node")
         if not any(m.get("on") == "hidden" for m in mets):
             errs.append("PROG needs hidden metrics")
+    if "resource_metric_gating" in spec and not isinstance(spec.get("resource_metric_gating"), bool):
+        errs.append("resource_metric_gating must be a boolean")
     return errs
 
 
@@ -108,10 +110,18 @@ def set_thresholds(spec: dict, measure: dict, cfg: dict) -> dict:
     floor_abs = float(tc.get("noise_floor_abs", 1e-9))
     out, sep = {}, []
     resource = {m["name"] for m in spec["metrics"] if is_resource_metric(m)}
+    # spec.resource_metric_gating (default false): wall time / memory are recorded but never decide a run, so
+    # they cannot separate the mid baseline either (only speed-contribution papers gate on them)
+    gating = bool(spec.get("resource_metric_gating"))
+    ungated = resource if not gating else set()
     for m in spec["metrics"]:
         name, d = m["name"], m["direction"]
         r_vals = [v.get(name) for v in measure["ref"].values()]
         m_vals = [v.get(name) for v in measure["mid"].values()]
+        if name in ungated and any(x is None or not math.isfinite(x) for x in r_vals) and \
+                any(x is not None and math.isfinite(x) for x in r_vals):
+            r_vals = [x for x in r_vals if x is not None and math.isfinite(x)]   # recorded-only: some seed has it
+        # (no value at all is still ref_metric_missing: every threshold must be a number downstream)
         if any(x is None or not math.isfinite(x) for x in r_vals):
             out[name] = dict(direction=d, threshold=None, error="reference metric missing/non-finite")
             continue
@@ -122,7 +132,7 @@ def set_thresholds(spec: dict, measure: dict, cfg: dict) -> dict:
         nop_vals = [v.get(name) for v in measure.get("nop", {}).values()]
         hit = [x for x in r_vals for nv in nop_vals if nv is not None and math.isfinite(nv) and
                math.isclose(x, nv, rel_tol=1e-12, abs_tol=1e-15)]
-        if hit:
+        if hit and name not in ungated:      # a recorded-only resource value may equal nop's (e.g. same RSS)
             out[name] = dict(direction=d, threshold=None,
                              error=f"reference value {hit[0]:g} equals the empty-output value of this metric")
             continue
@@ -133,6 +143,8 @@ def set_thresholds(spec: dict, measure: dict, cfg: dict) -> dict:
         n_best = None
         separating = m_best is not None and _worse(d, m_best, r) and \
             abs(m_best - r) > margin * max(abs(r), 1e-12) and not _noise(r, m_best, floor_abs)
+        if name in ungated:
+            separating = False                 # recorded only: never decides a run, so it separates nothing
         if separating:
             if r > 0 and m_best > 0:
                 thr = math.exp(math.log(r) + tc["frac"] * (math.log(m_best) - math.log(r)))
@@ -190,11 +202,14 @@ def set_thresholds(spec: dict, measure: dict, cfg: dict) -> dict:
     # v2.2: the 1..2 "near miss" rule counts failed criteria, not metric names: the same quantity measured on public
     # and on hidden data (public_X / hidden_X / X_public ...) is one criterion (e2e-iter1 RCESPP: mid failed
     # public_optimal_frac + hidden_optimal_frac + hidden_mean_rel_gap = 2 criteria, was counted as 3 and dropped)
-    mid_fail = {s: len({metric_family(k) for k, t in out.items() if t.get("threshold") is not None
+    mid_fail = {s: len({metric_family(k) for k, t in out.items() if k not in ungated
+                        and t.get("threshold") is not None
                         and v.get(k) is not None and _worse(t["direction"], v[k], t["threshold"])})
                 for s, v in measure["mid"].items()}
-    naive_fail = {s: sum(1 for k, t in out.items() if t.get("threshold") is not None and v.get(k) is not None
-                         and _worse(t["direction"], v[k], t["threshold"])) + sum(1 for k in out if k not in v)
+    naive_fail = {s: sum(1 for k, t in out.items() if k not in ungated and t.get("threshold") is not None
+                         and v.get(k) is not None
+                         and _worse(t["direction"], v[k], t["threshold"])) + sum(1 for k in out if k not in v
+                                                                                 and k not in ungated)
                   for s, v in measure.get("naive", {}).items()}
     # v2.2: the reference must not be clearly worse than the naive baseline on any metric; otherwise that metric
     # does not measure the method (e2e-iter1 IEnKS: on the hidden regime the reference diverged, filter RMSE 4.19
@@ -213,16 +228,18 @@ def set_thresholds(spec: dict, measure: dict, cfg: dict) -> dict:
                 ref_worse.append(name)
     lo, hi = tc["min_mid_fail"], tc["max_mid_fail"]
     status = "ok"
-    if any(t.get("threshold") is None for t in out.values()):
+    decides = {k: t for k, t in out.items() if k not in ungated}     # recorded-only metrics decide nothing
+    if any(t.get("threshold") is None for t in out.values()):         # (but every threshold must exist)
         status = "ref_metric_missing"
     elif ref_worse:
         status = "ref_worse_than_naive"
-    elif not all(t["ref_passes"] for t in out.values()):
+    elif not all(t["ref_passes"] for t in decides.values()):
         status = "ref_fails"
     elif not mid_fail or not all(lo <= n <= hi for n in mid_fail.values()):
         status = "not_separable"
     return dict(status=status, thresholds=out, separating=sep, mid_fail=mid_fail, naive_fail=naive_fail,
-                ref_worse_than_naive=ref_worse)
+                ref_worse_than_naive=ref_worse, resource_metric_gating=gating,
+                ungated_resource=sorted(ungated))
 
 
 # ------------------------------------------------------------------------------------------------ S6B early stops

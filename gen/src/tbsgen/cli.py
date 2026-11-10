@@ -54,6 +54,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from pathlib import Path
 
 from . import calib
@@ -101,8 +102,13 @@ def main(argv=None):
             s.add_argument("--item", default=None, help="prepare: item id")
             s.add_argument("--who", default="glm", choices=["glm", "teacher"])
         if name == "review":
-            s.add_argument("action", choices=["build"])
-            s.add_argument("--item", required=True)
+            s.add_argument("action", choices=["build", "summary", "deliverable"])
+            s.add_argument("--item", default=None, help="build / deliverable: item id")
+            s.add_argument("--job", default=None, help="deliverable: calibration job name")
+            s.add_argument("--src", default=None, help="deliverable: directory holding the run's /app/output")
+            s.add_argument("--note", default="", help="deliverable: provenance note (how it was recovered)")
+            s.add_argument("--sample", type=int, default=3, help="summary: pass items to sample for spot checks")
+            s.add_argument("--seed", type=int, default=None, help="summary: sampling seed (default: random)")
             s.add_argument("--round", type=int, default=None)
             s.add_argument("--out", default=None)
         if name == "report":
@@ -134,7 +140,8 @@ def main(argv=None):
             s.add_argument("--dry-run", action="store_true")
         if name == "fetch":
             s.add_argument("--only", default="", help="IDENT[,IDENT]: DOI, arXiv id or queue ident")
-            s.add_argument("--max", type=int, default=10)
+            s.add_argument("--max", type=int, default=None,
+                           help="papers per run (default: fulltext.remote.batch_max in remote mode, else 10)")
             s.add_argument("--channels", default="")
             s.add_argument("--no-browser", action="store_true")
             s.add_argument("--dry-run", action="store_true")
@@ -180,6 +187,23 @@ def main(argv=None):
         return _calib(P, a)
     elif a.cmd == "review":
         from . import review
+        if a.action == "summary":
+            seed = a.seed if a.seed is not None else int(time.time())
+            print(json.dumps(dict(review.summary(P, a.sample, seed), seed=seed), indent=1, ensure_ascii=False,
+                             default=str))
+            return 0
+        if not a.item:
+            sys.exit(f"tbsgen review {a.action}: --item is required")
+        if a.action == "deliverable":
+            it = P.store.item(a.item)
+            jobs = {x.get("job_name") for x in read_json(it.p("calib", "runs.json"), []) or []}
+            if not a.job or not a.src or a.job not in jobs or not Path(a.src).is_dir():
+                sys.exit("tbsgen review deliverable: --job must name a run of the current calibration and --src "
+                         "an existing directory")
+            d = review.save_deliverable(it.dir, a.job, Path(a.src), a.note)
+            P.store.event("review_deliverable_saved", item=a.item, job=a.job, note=a.note[:200], operator=True)
+            print(json.dumps(dict(item=a.item, job=a.job, saved=str(d))))
+            return 0
         it = P.store.item(a.item)
         rnd = a.round or int(it.state.get("review_round") or 1)
         out = review.build_task(P.cfg, it.dir, it.state, rnd, Path(a.out) if a.out else None)
@@ -271,6 +295,15 @@ def _running(P: Pipeline, item_id: str) -> bool:
     return any(r.get("outcome") is None and r.get("state", "launched") == "launched" for r in runs)
 
 
+def fetch_max_default(cfg: dict, given: int | None) -> int:
+    """`tbsgen fetch --max`: the given value, else the remote worker's per-job cap (fulltext.remote.batch_max)
+    when remote mode is on — one fetch then fills one remote batch — else 10."""
+    if given is not None:
+        return int(given)
+    rc = (cfg.get("fulltext") or {}).get("remote") or {}
+    return int(rc.get("batch_max", 50)) if rc.get("enabled") else 10
+
+
 def _fetch(P: Pipeline, a) -> int:
     from . import browser_ego, fulltext
     from .state import Store
@@ -311,7 +344,7 @@ def _fetch(P: Pipeline, a) -> int:
         print(json.dumps(stats, indent=1, ensure_ascii=False, default=str))
         return 2 if stats.get("refused") else 0
     only = [x.strip() for x in (getattr(a, "only", "") or "").split(",") if x.strip()] or None
-    stats = fulltext.drain_queue(f, max_papers=0 if only else a.max,
+    stats = fulltext.drain_queue(f, max_papers=0 if only else fetch_max_default(P.cfg, a.max),
                                  channels=[x for x in a.channels.split(",") if x] or None,
                                  browser=not a.no_browser, dry_run=a.dry_run, on_success=reactivate,
                                  log=lambda s: print(s, file=sys.stderr), only=only)

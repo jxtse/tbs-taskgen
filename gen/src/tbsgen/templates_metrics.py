@@ -13,7 +13,7 @@ v0.3: run_solution() runs the agent program as `nobody` with tests/truth unreada
 v0.2 adds run_solution(): the verifier executes the agent's delivered program on hidden, distribution-shifted
 evaluation inputs (/tests/hidden), so tuning only on the public data does not suffice (anti circular validation).
 """
-import json, math, os, signal, subprocess, sys, tempfile, time
+import json, math, os, re, signal, subprocess, sys, tempfile, time
 
 _PATH = os.environ.get("TBSGEN_METRICS", "/logs/verifier/metrics.jsonl")
 ENTRY = os.environ.get("TBSGEN_ENTRY", "/app/output/solution_cli.py")
@@ -22,7 +22,84 @@ LOGS = os.path.dirname(_PATH)
 # number of timed runs per hidden set (wall time = median); written by the pipeline when it copies this file
 # (config thresholds.timing_repeats for tasks with a resource metric, else 1)
 TIMING_REPEATS = 3  # tbsgen:timing_repeats
+# machine-speed reference (thresholds.speed_bench_sec, measured on the host that set the thresholds); None = no
+# scaling (first measurement: no thresholds exist yet).  Written by the pipeline when it copies this file.
+SPEED_BASE = None  # tbsgen:speed_base
+# resource-metric policy (spec.resource_metric_gating): false = wall time / memory are recorded but never decide
+# a run; true = they are asserted at the machine-scaled threshold
+RESOURCE_GATING = False  # tbsgen:resource_gating
+# the task's resource metrics {name: "time" | "memory"} (spec: name-based tbsgen.spec.RESOURCE_METRIC or
+# kind="resource"); written by the pipeline.  None (a standalone copy) -> the same name rule as tbsgen.spec.
+# Time-like ones scale with this machine's speed_bench() / SPEED_BASE (clamped); memory-like ones (peak RSS) do not
+# (they do not track CPU speed).  Any other metric is checked exactly as before.
+RESOURCE_METRICS = None  # tbsgen:resource_metrics
+_RESOURCE_NAME = re.compile(r"(?:^|_)(?:runtime|wall_?time|walltime|cpu_time|peak_memory|peak_rss|max_rss|peak_mem)"
+                            r"(?:_|$)", re.I)
+_MEMORY_NAME = re.compile(r"(?:^|_)(?:peak_memory|peak_rss|max_rss|peak_mem|memory|rss|mem|mb|mib|bytes)(?:_|$)", re.I)
+
+
+def resource_kind(name):
+    """"time" | "memory" for a resource metric, None for any other metric."""
+    if RESOURCE_METRICS is not None:
+        return RESOURCE_METRICS.get(name)
+    if not _RESOURCE_NAME.search(name):
+        return None
+    if _MEMORY_NAME.search(name):
+        return "memory"
+    # only an unmistakable time name is speed-scaled; anything else is treated like memory (never scaled)
+    return "time" if re.search(r"runtime|wall_?time|walltime|cpu_?time", name, re.I) else "memory"
+SPEED_MIN, SPEED_MAX = 0.25, 8.0
+# |ratio - 1| <= deadband -> ratio 1: same-host noise never moves a threshold (config thresholds.speed_deadband)
+SPEED_DEADBAND = 0.1  # tbsgen:speed_deadband
 _CACHE = {}
+
+
+# the fixed standard computation every machine runs (single-threaded env as the solutions get): the machine-speed
+# reference for the time-threshold scaling.  Deterministic, pure CPU, a few hundred ms.
+_BENCH_CODE = r'''
+import json, time
+try:
+    import numpy as np          # imported before the clock starts: interpreter / import I/O is not CPU speed
+except Exception:
+    np = None
+t0 = time.perf_counter()
+x = 0.0
+for i in range(400000):
+    x += (i % 7) * 0.5 - (i % 3)
+try:
+    a = np.linspace(0.0, 1.0, 65536)
+    for _ in range(48):
+        a = (np.fft.irfft(np.fft.rfft(a * 0.5))[: a.size] * 0.5) + 0.1
+    m = np.arange(192 * 192, dtype=float).reshape(192, 192)
+    for _ in range(50):
+        m = np.roll(m, 1, axis=0) * 0.99 + m * 0.01
+except Exception:
+    pass
+print(json.dumps({"sec": time.perf_counter() - t0, "x": round(x, 3)}))
+'''
+
+
+def speed_bench(repeats: int = 5):
+    """This machine's time on the fixed standard computation: median of `repeats` runs in a fresh interpreter with
+    the same thread environment the solutions get.  Cached per process; recorded (aux) in metrics.jsonl."""
+    if _CACHE.get("speed_bench") is not None:
+        return _CACHE["speed_bench"]
+    times = []
+    for _ in range(max(1, int(repeats))):
+        try:
+            p = subprocess.run([sys.executable, "-c", _BENCH_CODE], capture_output=True, text=True,
+                               env=_thread_env(dict(os.environ)), timeout=120)
+            d = json.loads(p.stdout.strip().splitlines()[-1])
+            t = float(d.get("sec") or 0.0)
+            if t > 0:
+                times.append(t)
+        except Exception:
+            pass
+    med = _median(times) if times else None
+    _CACHE["speed_bench"] = med
+    if med is not None:
+        _record({"name": "_speed_bench", "value": round(med, 6), "aux": True, "unit": "sec"})
+    return med
 
 
 def _record(rec):
@@ -32,7 +109,39 @@ def _record(rec):
 
 
 def check(name, value, threshold, direction):
+    """One metric check.  Resource metrics (wall time / memory) follow the resource-metric policy written by the
+    pipeline: RESOURCE_GATING False -> recorded (value, raw and effective threshold, speed ratio) but never
+    deciding a run; True -> asserted at the machine-scaled threshold.  Time-like resource thresholds scale with
+    this machine's speed (speed_bench() / SPEED_BASE, measured where the thresholds were set, clamped to
+    [SPEED_MIN, SPEED_MAX]); memory-like ones do not.  The recorded "threshold" stays the locked literal — the
+    pipeline's lock checks compare it (runner / review.runtime_thresholds); the effective one is recorded next to
+    it.  Non-resource metrics are asserted at the literal threshold as before."""
     value = float(value)
+    kind = resource_kind(name)
+    if kind:
+        ratio = 1.0
+        if kind == "time" and SPEED_BASE:
+            b = speed_bench()
+            if b and b > 0:
+                ratio = b / float(SPEED_BASE)
+                if abs(ratio - 1.0) <= SPEED_DEADBAND:
+                    ratio = 1.0                      # same host: noise never moves a threshold
+                ratio = min(SPEED_MAX, max(SPEED_MIN, ratio))
+        eff = float(threshold) * ratio if direction == "<=" else float(threshold) / ratio
+        rec = {"name": name, "value": value, "threshold": float(threshold), "direction": direction,
+               "threshold_effective": eff, "speed_ratio": round(ratio, 4)}
+        if not RESOURCE_GATING:
+            rec["gated"] = False
+            rec["passed_raw"] = bool((value >= threshold) if direction == ">=" else (value <= threshold))
+            _record(rec)
+            return
+        passed = (value >= eff) if direction == ">=" else (value <= eff)
+        if math.isnan(value):
+            passed = False
+        rec["passed"] = bool(passed)
+        _record(rec)
+        assert passed, f"{name}={value:.6g} fails {direction} {eff:.6g} (threshold {threshold:.6g} x speed ratio {ratio:.3f})"
+        return
     passed = (value >= threshold) if direction == ">=" else (value <= threshold)
     if math.isnan(value):
         passed = False
@@ -645,3 +754,5 @@ if __name__ == "__main__":
         print("reward", finalize_reward(sys.argv[2]))
     elif len(sys.argv) == 2 and sys.argv[1] == "--reap":
         print("left", _reap_nonroot())
+    elif len(sys.argv) == 2 and sys.argv[1] == "--speed-bench":
+        print(json.dumps({"speed_bench_sec": speed_bench()}))

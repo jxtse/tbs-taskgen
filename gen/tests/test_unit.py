@@ -1125,12 +1125,12 @@ def test_packaged_test_sh_writes_reward_via_finalize():
 def test_review_leak_issue_is_blocking():
     """S9R contract: a leak of ground truth / answers is blocking even when the reviewer called it minor."""
     from tbsgen import review
-    leak = dict(id="I1", category="e", severity="minor", leak=True, title="public truth leaked",
+    leak = dict(id="I1", category="e", severity="minor", leak=True, problem="grader_io", title="public truth leaked",
                 evidence=["environment/data/notes.md:12 lists the expected public outputs"], fix="remove")
     n = review.normalize(dict(verdict="revise", issues=[leak]))
     assert n["verdict"] == "revise" and n["blocking"] == ["I1"] and n["escalated"] == ["I1"]
     n = review.normalize(dict(verdict="pass", issues=[leak]))
-    assert n["verdict"] == "human" and any("leak" in p for p in n["problems"])
+    assert n["verdict"] == "revise" and n["escalated"] == ["I1"]           # a leak is never a pass
     no_ev = dict(leak, evidence=[])
     n = review.normalize(dict(verdict="pass", issues=[no_ev]))
     assert n["verdict"] == "pass" and n["blocking"] == []          # no evidence: still only a suspicion

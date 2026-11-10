@@ -73,13 +73,26 @@ Crossref · arXiv · Europe PMC              → S5 spec (teacher) → S6 genera
    diagnosis), is audited by a fresh code-executing agent (Claude Code, Opus by default) inside the task's own
    image, with the model endpoint as its only network. It sees the whole package, baselines, generator,
    threshold and gate records and a digest of every calibration trace, reruns the reference and tests, and
-   returns `pass` / `revise` / `drop` / `human` with evidence per checklist item (consistency, missing
-   conditions, thresholds, stability, shortcuts and leaks, network / ready-made code, calibration evidence).
-   A blocking issue without evidence is downgraded to minor; a leak of ground truth or answers (any metric,
-   public or hidden) or a way to tamper with the scoring is always blocking. Only `pass` releases a task. `revise` sends it
-   back to one local repair of the statement / format notes / test scripts with **thresholds locked**,
-   archives the old calibration, recalibrates from the student, and reviews again; a second non-pass goes to
-   a human. Details: [`gen/README.md`](gen/README.md) §5b.
+   returns `pass` / `revise` / `drop` with evidence per checklist item (consistency, missing conditions,
+   thresholds, stability, shortcuts and leaks, network / ready-made code, calibration evidence, and whether
+   timing metrics should gate at all). Every blocking issue names a problem class: local ones (statement, format
+   notes, grader inputs/outputs, exploit baseline, test gap, timing gate) can be revised; fundamental ones
+   (reference wrong, truth must be regenerated, task core invalid, untrustworthy calibration) mean drop. The
+   pipeline derives the verdict from those classes, so a `revise` whose blocking issues are all fundamental is
+   routed as `drop`. A blocking issue without evidence is downgraded to minor; a leak of ground truth or answers or
+   a way to tamper with the scoring is always blocking. There is no human exit by default: each task's fate is
+   decided by the review agent (`review.allow_human`, off by default, restores an operator park). Only `pass`
+   releases a task. `revise` sends it back to a local repair of the statement / format notes / test scripts with
+   **thresholds locked** (never loosened), up to `review.max_revisions` (default 3) rounds, then drop. A revision
+   that only changed the grader first re-scores the kept student and teacher deliverables with the new grader;
+   if no outcome changes the calibration is kept and the task is reviewed again, otherwise it is recalibrated.
+   `tbsgen review summary` reports verdict counts, issue classes, revision rounds per task, a random sample of
+   passed tasks with their review record paths for spot checks, and alerts (drop rate, contradictory reviews).
+   Details: [`gen/README.md`](gen/README.md) §5b.
+   Timing metrics (runtime, memory) are recorded but only decide a run when the spec sets
+   `resource_metric_gating = true` (speed is the paper's contribution); time thresholds are then scaled by the
+   grading machine's speed relative to the machine that set them (a fixed CPU benchmark recorded in
+   `thresholds.json`, ratio clamped to 0.25–8). Details: [`gen/README.md`](gen/README.md) §5c.
 6. **Packaging** (PKG, S10). Harbor task layout with a self-contained Dockerfile and a network
    policy that keeps the agent off the internet while it works (see
    [Network of packaged tasks](#network-of-packaged-tasks)); kept tasks are appended to
@@ -222,7 +235,9 @@ Before either mode, S2 drops papers from sources where the S3 channels have rare
 (`screen.blocklist`, matched on DOI prefix and optionally publication year): Elsevier before 2000, SAGE, the
 American Meteorological Society, Powder Diffraction, ASCE and SPIE. Such papers get `method = "blocklist"` and
 `reason = "blocklist:<rule>"` in `S2_screen.json` and cost no screen call. Set `screen.blocklist = []` to disable,
-or edit the list to add or remove publishers.
+or edit the list to add or remove publishers. A rule that blocks more than 10% of a target's candidates gets 5 trial
+papers a week through the normal download path (`screen.blocklist_recheck`); at ≥ 5 decided trials with ≥ 60%
+success the rule is lifted automatically. Lifts and keeps are logged as events and shown by `tbsgen review summary`.
 
 ```toml
 [models.roles]
@@ -248,7 +263,7 @@ Every network channel has its own switch, and only `cache` and `oa` are on by de
 | `cache` | `<doi_key>.txt` in `fulltext.cache_dirs` (read-only) or in `fulltext.write_cache_dir` | nothing | on |
 | `oa` | Europe PMC full-text XML (open-access PMC articles), then the PDF links in the retrieval record, then Unpaywall OA locations if `fulltext.oa.unpaywall_email` is set | nothing | on |
 | `elsevier` | Elsevier Article Retrieval API (full-text XML), DOI prefixes `fulltext.elsevier.prefixes` (`10.1016/`) | API key in `ELSEVIER_API_KEY` (optional `ELSEVIER_INSTTOKEN`) and an institutional entitlement | off |
-| `wiley` | Wiley TDM API (PDF), prefixes `10.1002/`, `10.1111/` | token in `WILEY_TDM_TOKEN`, accepted Wiley TDM licence | off |
+| `wiley` | Wiley TDM API (PDF), prefixes `10.1002/`, `10.1111/`, `10.1029/`, `10.1113/` | token in `WILEY_TDM_TOKEN`, accepted Wiley TDM licence | off |
 | `inst` | Publisher PDF URLs your institution's IP range is entitled to, configured as `fulltext.inst.routes` (`{prefix, url}`); empty by default | network on the institution's IP range | off |
 | `browser` | A local [ego-browser](https://ego.app) (Ego Lite) session with your signed-in profile, driven by the reviewed script [`browser_fetch.mjs`](gen/src/tbsgen/browser_fetch.mjs) | `ego-browser` on `PATH` | off; when on, S3 only queues and `tbsgen fetch` runs it |
 
@@ -275,8 +290,10 @@ the browser waits 60–120 s between two papers of one publisher and runs differ
 `browser.concurrency`, default 2). HTTP 429 cools the host for 6 hours; a challenge page (Cloudflare, captcha,
 Akamai "Access Denied") cools it for 24 hours and is never clicked through; a plain paywall 403 is not a block.
 By default a channel's breaker opens for the day after 3 block signals or 8 failures in a row; the `oa` channel,
-whose links point at many unrelated hosts, opens only after 10 block signals and never on failures alone (both
-configurable per channel: `breaker_blocks_per_day`, `breaker_consecutive_fail`). A cooldown also stops requests that
+whose links point at many unrelated hosts, opens only after 10 distinct blocked sites (one site that keeps blocking
+is handled by its own cooldown; `breaker_count_hosts`) and never on failures alone (configurable per channel:
+`breaker_blocks_per_day`, `breaker_consecutive_fail`). One blocked response counts once. After a redirect the
+cooldown lands on the final site; resolvers such as doi.org are never cooled. A cooldown also stops requests that
 were already waiting for their slot, and a longer cooldown is never shortened by a later, shorter one. All DOI
 prefixes of one publisher share the browser's pacing, caps and cooldowns, and a block on one of the publisher's web
 hosts stops both the HTTP channels and the browser for it. The TDM API hosts are kept separate: an API throttle

@@ -55,6 +55,9 @@ Write the task specification as ONE JSON object with keys:
    "mid_drop": [one key derive node], "naive_drop": [>=2 nodes],
    "difficulty_knobs": {{"derive_nodes": int, "chain_len": int, "files_crossed": int, "nonstd_tool": bool}}}},
 - "metrics": [{{"name", "direction": "<=" or ">=", "on": "public|hidden", "desc"}}]  (3-8 metrics, no thresholds yet),
+- "resource_metric_gating": false, or true ONLY when speed / memory itself is the paper's contribution (wall time
+  and memory metrics are then asserted at a machine-speed-scaled threshold; otherwise they are recorded only and
+  never decide a run, so they cannot be the metric that separates mid or naive),
 - "public_files": [..], "hidden_files": [..], "truth_files": [..],
 - "hidden_shift": str (PROG only), "why_naive_fails": str, "mid_missing_step": str,
 - "expected_separation": {{"<metric name>": "ref passes / mid fails / naive fails", ...}} for every metric: which
@@ -178,6 +181,9 @@ by generator/generate.py: edit the text there.  Make the statement, the format n
 agree (when they disagree, follow what the reference solution actually does and what measure.py scores), and state
 any convention the reference relies on that a careful solver needs (ranges, boundary handling, units, names).  Never
 reveal the reference's algorithm, hidden-truth values or constants it is supposed to derive.
+Timing / memory metrics decide a run only when the spec's resource_metric_gating is true (now: {gating}); a timing
+issue (should the runtime gate at all?) is fixed by returning the pseudo-file _spec/resource_metric_gating with the
+single word true or false (thresholds stay as they are).
 Return ONLY the files you change (same paths; no new files).  Format: === FILE: <path> === blocks, then === END ==="""
 
 

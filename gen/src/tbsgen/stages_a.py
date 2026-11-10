@@ -46,23 +46,31 @@ def screen_paper(P, it, c: dict, stage: str, fulltext_head: str | None = None) -
 
 
 def s2(P, it):
-    c = read_json(it.p("S1_candidate.json"))
-    rule = blocklist.match(c, P.cfg["screen"].get("blocklist"))
-    if rule is not None:                    # full text unobtainable: drop before spending a screen call
-        rec = blocklist.screen_record(c, rule)
-        write_json(it.p("S2_screen.json"), rec)
-        return it.finish("dropped", rec["reason"])
+    c = read_json(it.p("S1_candidate.json")) or {}
+    rules = P.cfg["screen"].get("blocklist")
+    c.setdefault("item_id", it.item_id)
+    rule = blocklist.match(c, rules, blocklist.lifted_rules(blocklist.load_state(P.store)))
+    if rule is not None:                    # full text unobtainable: drop before spending a screen call —
+        d = blocklist.decide(P.store, P.cfg, c, rules, rule, P.store.event)  # unless it is a recheck trial
+        if d.get("action") != "trial":
+            rec = blocklist.screen_record(c, rule)
+            write_json(it.p("S2_screen.json"), rec)
+            return it.finish("dropped", rec["reason"])
+        it.state["blocklist_trial"] = rule.get("name") or rule.get("doi_prefix")
+        it.save()
     rec = screen_paper(P, it, c, "S2")
     if rec is None:
         return
     write_json(it.p("S2_screen.json"), rec)
     if not rec["keep"]:
+        if it.state.get("blocklist_trial"):
+            blocklist.resolve(P.store, it, void=f"S2 screen: {rec['reason']}")   # never reached the download
         return it.finish("dropped", rec["reason"])
     it.advance("S2", "S3", score=rec["score"], screen=rec["method"], uncertain=bool(rec.get("uncertain")))
 
 
 def s3(P, it):
-    c = read_json(it.p("S1_candidate.json"))
+    c = read_json(it.p("S1_candidate.json")) or {}
     txt, rec = intake.fetch_fulltext(c, P.cfg, P.fulltext_fetcher())
     write_json(it.p("S3_fulltext.json"), rec)
     if txt is None:
@@ -75,10 +83,16 @@ def s3(P, it):
         write_json(it.p("S3_queue.json"), dict(entry, route="tbsgen fetch", errors=rec.get("errors"),
                                                skipped=rec.get("skipped")))
         it.finish("parked", "fulltext_unavailable")
+        if it.state.get("blocklist_trial"):
+            blocklist.resolve(P.store, it)        # trial decided: no full text (stays pending if still queued)
+            blocklist.reevaluate(P.store, P.cfg, P.store.event)
         if entry["ident"]:
             fulltext.enqueue(fulltext.queue_path(P.cfg), entry)
         return None
     it.p("fulltext.txt").write_text(txt)
+    if it.state.get("blocklist_trial"):
+        blocklist.resolve(P.store, it)            # trial decided: full text obtained
+        blocklist.reevaluate(P.store, P.cfg, P.store.event)
     it.advance("S3", "S4", source=rec.get("source"), chars=len(txt))
 
 
@@ -252,6 +266,7 @@ def s6a_run(P, it):
         nd.chmod(0o777)
         mn = runner.measure(P.cfg, task, gen, nd, work, f"nop{s}")
         meas.setdefault("nop", {})[str(s)] = mn["values"]
+        meas.setdefault("speed_bench", {})[str(s)] = runner.speed_bench(P.cfg, task, gen, work, s)
         for who, prog in (("ref", "solution/solve.py"), ("mid", "baselines/mid.py"), ("naive", "baselines/naive.py")):
             if not (task / prog).exists():
                 continue
@@ -274,6 +289,9 @@ def s6b(P, it):
     if it.state.get("thresholds_locked"):
         return _s6b_locked(P, it, spec, meas)
     th = set_thresholds(spec, meas, P.cfg)
+    bench = [v for v in (meas.get("speed_bench") or {}).values() if isinstance(v, (int, float))]
+    if bench:                      # machine-speed reference for the verifier's time-threshold scaling
+        th["speed_bench_sec"] = sorted(bench)[len(bench) // 2]
     dec = s6b_decision(th, meas, P.cfg, it.state)
     th["decision"] = dec
     write_json(it.p("thresholds.json"), th)
@@ -311,29 +329,52 @@ def s6b(P, it):
 
 
 def _s6b_locked(P, it, spec, meas):
-    """S6B after an S9R review revision: the thresholds stay those of thresholds.json (never re-derived, never
-    loosened).  The fresh derivation from the new measurement is recorded next to them (thresholds.relock.json)
-    for the reviewer; the reference must still clear every locked threshold on every seed, else a human decides."""
+    """S6B after an S9R review revision or a regate: the thresholds stay those of thresholds.json (never
+    re-derived, never loosened).  The fresh derivation from the new measurement is recorded next to them
+    (thresholds.relock.json) for the reviewer; the reference must still clear every locked threshold on every
+    seed.  A threshold set before the machine-speed reference was recorded (thresholds.speed_bench_sec) gets it
+    backfilled from this measurement — thresholds are set on this host, so its bench time is the reference.  A
+    reference that misses a locked threshold fails the revision: the review revision is retried with the failure
+    fed back (stages_b._revision_retry) while rounds remain, else the item is dropped."""
     from . import review
     old = read_json(it.p("thresholds.json"))
     fresh = set_thresholds(spec, meas, P.cfg)
     cmp_ = review.lock_compare(old["thresholds"], fresh["thresholds"])
+    bench = [v for v in (meas.get("speed_bench") or {}).values() if isinstance(v, (int, float))]
+    here = sorted(bench)[len(bench) // 2] if bench else None
+    base = old.get("speed_bench_sec") if isinstance(old.get("speed_bench_sec"), (int, float)) else None
+    if here and base is None:
+        old["speed_bench_sec"] = base = here
+        old["speed_bench_source"] = "backfilled by the locked re-measurement on this host"
+        write_json(it.p("thresholds.json"), old)
+    # the verifier's policy, applied to the re-measurement: resource metrics decide only with
+    # spec.resource_metric_gating, and time thresholds scale with this host's speed (the locked literal stays)
+    kinds = runner.resource_metric_kinds(spec) or {}
+    gating = runner.resource_gating(P.cfg, spec)
+    ratio = runner.speed_ratio(P.cfg, here, base)
     fails = {}
     for k, v in old["thresholds"].items():
+        kind = kinds.get(k)
+        if kind and not gating:
+            continue                                    # recorded only: never fails the revision
+        thr = v["threshold"]
+        if kind == "time":
+            thr = thr * ratio if v["direction"] == "<=" else thr / ratio
         for s, vals in (meas.get("ref") or {}).items():
             x = (vals or {}).get(k)
-            ok = isinstance(x, (int, float)) and (x <= v["threshold"] if v["direction"] == "<=" else x >= v["threshold"])
+            ok = isinstance(x, (int, float)) and (x <= thr if v["direction"] == "<=" else x >= thr)
             if not ok:
                 fails.setdefault(k, {})[s] = x
     write_json(it.p("thresholds.relock.json"), dict(ts=time.time(), locked=old["thresholds"], fresh=fresh["thresholds"],
                                                     compare=cmp_, ref_fails_locked=fails))
     log = read_json(it.p("S6B_decisions.json"), []) or []
-    log.append(dict(ts=time.time(), status="locked", action="S6C" if not fails else "parked", rule="thresholds_locked",
+    log.append(dict(ts=time.time(), status="locked", action="S6C" if not fails else "failed", rule="thresholds_locked",
                     reason="review revision: thresholds kept", detail=dict(ref_fails_locked=fails)))
     write_json(it.p("S6B_decisions.json"), log)
     if fails:
-        return it.finish("parked", "review:human (reference fails a locked threshold after the revision: "
-                         + ",".join(sorted(fails)) + ")")
+        from .stages_b import _revision_retry
+        return _revision_retry(P, it, "reference fails a locked threshold after the revision: "
+                                      + ",".join(sorted(fails)))
     return it.advance("S6B", "S6C", locked=True)
 
 
