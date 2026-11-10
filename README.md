@@ -60,7 +60,9 @@ Crossref · arXiv · Europe PMC              → S5 spec (teacher) → S6 genera
    least two criteria and the mid baseline one or two; scripted exploit attempts fail *and* each
    exploit really ran under the verifier's invocation and produced scorable output (`exploit_valid`; a
    crashing exploit tests nothing and goes to repair); resource metrics (runtime, memory) are timed as the
-   median of `thresholds.timing_repeats` runs (default 3) both when thresholds are set and when grading; `PROG`
+   median of `thresholds.timing_repeats` runs (default 3) both when thresholds are set and when grading; the
+   agent program's scored runs share one total cap that, with the repeats' budget and
+   `package.verifier_overhead_sec`, ends before the task's verifier timeout (checked at packaging); `PROG`
    tasks are graded on hidden, distribution-shifted inputs. Pre-release checks: the task image, the
    reference and the baselines must not use the paper's own published implementation, and public
    task files must not copy long passages of a TDM full text. Blocking failures go to a local repair

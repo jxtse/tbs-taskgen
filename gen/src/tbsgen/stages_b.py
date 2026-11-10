@@ -245,7 +245,7 @@ def pkg(P, it):
                 thresholds=read_json(it.p("thresholds.json"))["thresholds"],
                 model_cost=P.item_cost(it.item_id), packaged=time.time())
     out = package.package(P.cfg, it.dir, gen0, spec, prov)
-    v = package.validate_pkg(out)
+    v = package.validate_pkg(out, P.cfg)
     # the packaged image (Dockerfile written here, not by the model) gets the same ready-made check
     rm = prerelease.readymade_check(out, cand, spec)
     if not rm["ok"]:
@@ -347,6 +347,54 @@ def _cap_reached(P) -> float | None:
     return None
 
 
+def running_jobs(P) -> list[str]:
+    """Harbor jobs holding a calib.max_concurrent_jobs slot: records of the item's current stage (S9 -> calibration
+    runs, S9R -> review runs; the stage's watcher is what settles them) without an outcome that are launched,
+    reserved (about to launch / recovering), or whose job already exists."""
+    out = []
+    for it in P.store.items():
+        st = it.state.get("stage")
+        rf = ("calib", "runs.json") if st == "S9" else ("review", "runs.json") if st == "S9R" else None
+        if rf is None:
+            continue
+        for r in read_json(it.p(*rf), []) or []:
+            if r.get("outcome") is None and (r.get("state") in ("launched", "reserved") or calib.job_started(r)):
+                out.append(r.get("job_name") or "?")
+    return out
+
+
+def _slots_full(P, own: str | None = None) -> str | None:
+    """calib.max_concurrent_jobs (None = no limit): a new S9 / S9R job waits while that many are running; the
+    waiting item is stepped again by the next `run` / `calib watch` (reschedulable).  own: the job being
+    admitted (not counted against itself)."""
+    n = P.cfg["calib"].get("max_concurrent_jobs")
+    if n is None:
+        return None
+    cur = [j for j in running_jobs(P) if j != own]
+    if len(cur) >= int(n):
+        return f"slots full: {len(cur)}/{int(n)} jobs running ({', '.join(cur[:3])})"
+    return None
+
+
+@contextlib.contextmanager
+def slot_lock(P):
+    """Run-wide admission lock (flock on <run>/.calib-slots.lock), held only from the slot check through the
+    launch (never around preparation), so concurrent `run` / `calib watch` processes cannot both take the last
+    slot.  Taken inside an item lock; nothing takes an item lock while holding it."""
+    import fcntl
+    if P.cfg["calib"].get("max_concurrent_jobs") is None:
+        yield
+        return
+    p = Path(P.cfg["run"]["root"]) / ".calib-slots.lock"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with open(p, "a") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+
+
 def _save_run(it, rec):
     runs = read_json(it.p("calib", "runs.json"), [])
     for i, r in enumerate(runs):
@@ -389,6 +437,9 @@ def _s9(P, it):
                     _save_run(it, rec)
                 return it.finish("paused", f"budget:run_total_actual ({calib.actual_spend(P.ledger):.2f} >= {cap})",
                                  paused_stage="S9")
+            full = _slots_full(P, rec["job_name"]) if rec["state"] == "intent" and not calib.job_started(rec) else None
+            if full:
+                return it.finish("waiting", f"calib {rec['job_name']} queued: {full}")
             if rec["state"] == "intent" and not calib.job_started(rec) and c.get("prepare_command") and \
                     calib.prepared_dir(P.cfg, rec["who"]):
                 prep = calib.ensure_prepared(P.cfg, it.dir, rec["who"])    # an intent written before the hook ran
@@ -396,7 +447,13 @@ def _s9(P, it):
                     return it.finish("waiting", f"calib blocked: prepare_command failed "
                                                 f"({(prep.get('error') or '')[:120]}); fix and run "
                                                 "`tbsgen calib prepare --item ID`")
-            rec = calib.launch(P.cfg, rec, P.ledger, lambda r: _save_run(it, r))
+            with slot_lock(P):
+                full = _slots_full(P, rec["job_name"]) if rec["state"] == "intent" and \
+                    not calib.job_started(rec) else None
+                if not full:
+                    rec = calib.launch(P.cfg, rec, P.ledger, lambda r: _save_run(it, r))
+            if full:
+                return it.finish("waiting", f"calib {rec['job_name']} queued: {full}")
             if rec.get("blocked") and rec["state"] == "intent":
                 return it.finish("waiting", f"calib blocked: {rec['blocked']}")
             P.store.event("calib_reconciled", item=it.item_id, job=rec["job_name"], state=rec["state"])
@@ -428,6 +485,10 @@ def _s9(P, it):
             return it.advance("S9", "S10", label=what)
         return it.finish("done", f"label:{what} (not kept; S9b variants off)")
     n = sum(1 for r in runs if r["who"] == what) + 1
+    full = _slots_full(P) if c.get("allow_submit") else None
+    if full:
+        # checked before anything is prepared or persisted: the next step starts this run from scratch (same n)
+        return it.finish("waiting", f"calib {what} run {n} queued: {full}")
     if c.get("prepare_command") and calib.prepared_dir(P.cfg, what):
         # environment-preparation hook: build the run-ready copy of pkg/ before the job config points at it
         prep = calib.ensure_prepared(P.cfg, it.dir, what)
@@ -452,8 +513,14 @@ def _s9(P, it):
         # reservations only gate admission; a single Harbor run has no hard cost ceiling, so once settled
         # actual spend reaches the cap no further run is started (review #6)
         return it.finish("paused", f"budget:run_total_actual ({calib.actual_spend(P.ledger):.2f} >= {cap})")
-    _save_run(it, rec)                                       # intent persisted before reserve/launch (review #3)
-    rec = calib.launch(P.cfg, rec, P.ledger, lambda r: _save_run(it, r))
+    with slot_lock(P):
+        full = _slots_full(P, rec["job_name"])
+        if not full:
+            _save_run(it, rec)                               # intent persisted before reserve/launch (review #3)
+            rec = calib.launch(P.cfg, rec, P.ledger, lambda r: _save_run(it, r))
+    if full:
+        # nothing persisted: the next step prepares this run again (same n; the prepared copy is reused)
+        return it.finish("waiting", f"calib {what} run {n} queued: {full}")
     P.store.event("calib_submitted" if rec.get("submitted") else "calib_launch_failed", item=it.item_id, who=what,
                   config=rec["config"], state=rec["state"])
     if rec.get("submitted"):
@@ -708,7 +775,13 @@ def _s9r(P, it):
                     save(rec)
                 return it.finish("paused", f"budget:run_total_actual ({calib.actual_spend(P.ledger):.2f} >= {cap})",
                                  paused_stage="S9R")
-            rec = calib.launch(rcfg, rec, P.ledger, save)
+            with slot_lock(P):
+                full = _slots_full(P, rec["job_name"]) if rec["state"] == "intent" and \
+                    not calib.job_started(rec) else None
+                if not full:
+                    rec = calib.launch(rcfg, rec, P.ledger, save)
+            if full:
+                return it.finish("waiting", f"review {rec['job_name']} queued: {full}")
             if rec.get("blocked") and rec["state"] == "intent":
                 return it.finish("waiting", f"review blocked: {rec['blocked']}")
         elif rec.get("outcome") is None and rec.get("state") == "launched":
@@ -751,6 +824,10 @@ def _s9r(P, it):
                 return it.finish("parked", f"review:human ({why})")
             return it.finish("dropped", f"review:invalid {why}")
         return it.finish("parked", f"review:infra ({n_infra} infra, {n_invalid} invalid verdicts)")
+    full = _slots_full(P) if c.get("allow_submit") else None
+    if full:
+        # checked before the review task is built or anything persisted: the next step starts it from scratch
+        return it.finish("waiting", f"review round {rnd} queued: {full}")
     task = review.build_task(P.cfg, it.dir, it.state, rnd)
     rec = review.prepare(P.cfg, it.dir, task, rnd, len(all_rnd) + 1, epoch=epoch)
     if rec.get("blocked"):
@@ -763,8 +840,13 @@ def _s9r(P, it):
     if cap is not None:
         return it.finish("paused", f"budget:run_total_actual ({calib.actual_spend(P.ledger):.2f} >= {cap})",
                          paused_stage="S9R")
-    save(rec)
-    rec = calib.launch(rcfg, rec, P.ledger, save)
+    with slot_lock(P):
+        full = _slots_full(P, rec["job_name"])
+        if not full:
+            save(rec)
+            rec = calib.launch(rcfg, rec, P.ledger, save)
+    if full:
+        return it.finish("waiting", f"review round {rnd} queued: {full}")
     P.store.event("review_submitted" if rec.get("submitted") else "review_launch_failed", item=it.item_id,
                   round=rnd, state=rec["state"])
     if rec.get("submitted"):

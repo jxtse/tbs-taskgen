@@ -2,6 +2,7 @@
 S9 intents, resume --only/--stage), cost of runs without a Harbor cost (token estimate vs unknown), result types,
 `tbsgen calib watch`, teacher-only routing.  No Docker, no network, no real jobs."""
 import json
+import time
 import sqlite3
 from pathlib import Path
 
@@ -673,3 +674,99 @@ def test_launcher_exit_without_job_records_not_launched_cost(tmp_path):
     watch_tick(P)
     r = _runs(P, iid)[0]
     assert r["state"] == "launch_failed" and r["cost_kind"] == "not_launched" and r["cost_usd"] == 0.0
+
+
+
+# ------------------------------------------------------------------ calib.max_concurrent_jobs
+def test_max_concurrent_jobs_queues_extra_items_and_starts_them_when_a_slot_frees(tmp_path):
+    """3 S9 items, max 2 jobs: two launch, the third waits (nothing persisted, no ledger reservation); once a job
+    finishes, the next watch pass ingests it and starts the queued item -- never more than 2 running."""
+    from tbsgen import stages_b as B
+    P, ids, counter, jobs = _env(tmp_path, n_items=3, max_concurrent_jobs=2)
+    P.run()
+    assert counter.read_text().count("x") == 2
+    assert len(B.running_jobs(P)) == 2
+    queued = [i for i in ids if not P.store.item(i).p("calib", "runs.json").exists()]
+    assert len(queued) == 1
+    q = P.store.item(queued[0])
+    assert q.state["status"] == "waiting" and "slots full: 2/2" in q.state["reason"]
+    assert B.reschedulable(P.cfg, q)
+    P.run()                                                                     # still full: no new launch
+    assert counter.read_text().count("x") == 2
+    first = next(i for i in ids if i not in queued)
+    _finish(jobs, _runs(P, first)[0]["job_name"], reward=1.0, cost=2.0)       # GLM pass -> its glm2 takes the slot
+    watch_tick(P)
+    assert counter.read_text().count("x") == 3 and len(B.running_jobs(P)) == 2
+    assert not P.store.item(queued[0]).p("calib", "runs.json").exists()
+    _finish(jobs, _runs(P, first)[1]["job_name"], reward=1.0, cost=2.0)       # 2/2 pass -> label, slot frees
+    watch_tick(P)
+    assert counter.read_text().count("x") == 4 and len(B.running_jobs(P)) == 2
+    assert _runs(P, queued[0])[0]["state"] == "launched"
+
+
+def test_max_concurrent_jobs_none_keeps_old_behaviour(tmp_path):
+    P, ids, counter, jobs = _env(tmp_path, n_items=3)
+    P.run()
+    assert counter.read_text().count("x") == 3
+
+
+
+def test_max_concurrent_jobs_counts_reserved_and_review_runs_by_stage(tmp_path):
+    """A reserved (not yet started) run holds its slot; a pending review run counts while the item is at S9R and
+    stops counting once the item left S9R (e.g. regate --recalibrate), so it can never pin a slot forever."""
+    from tbsgen import stages_b as B
+    P, ids, counter, jobs = _env(tmp_path, n_items=2, max_concurrent_jobs=1)
+    a, b = (P.store.item(i) for i in ids)
+    a.p("calib").mkdir(parents=True, exist_ok=True)
+    a.p("calib", "runs.json").write_text(json.dumps([dict(job_name="ja", who="glm", state="reserved", outcome=None,
+                                                         job_dir=str(jobs / "ja"))]))
+    assert B.running_jobs(P) == ["ja"]
+    assert B._slots_full(P) and B._slots_full(P, own="ja") is None
+    b.p("review").mkdir(parents=True, exist_ok=True)
+    b.p("review", "runs.json").write_text(json.dumps([dict(job_name="rb", state="launched", outcome=None, n=1,
+                                                          job_dir=str(jobs / "rb"))]))
+    assert sorted(B.running_jobs(P)) == ["ja"]                       # b is at S9: its review record is not live
+    b.state.update(stage="S9R", status="waiting")
+    b.save()
+    assert sorted(B.running_jobs(P)) == ["ja", "rb"]
+    a.p("calib", "runs.json").write_text("[]")
+    P.run(only=[ids[0]])                                              # rb holds the only slot: a waits, no launch
+    assert not counter.exists() or counter.read_text().count("x") == 0
+    assert "slots full: 1/1" in P.store.item(ids[0]).state["reason"]
+    assert P.ledger.summary(__import__("tbsgen.budget", fromlist=["today"]).today())["calls_total"] == 0
+
+
+
+def test_slot_admission_waits_for_the_run_wide_lock(tmp_path):
+    """Another process holding <run>/.calib-slots.lock (mid-admission) blocks this process's admission until it
+    releases; after release the slot check sees its launched job and the item queues instead of launching."""
+    import subprocess
+    import sys
+    import threading
+    from tbsgen import stages_b as B
+    P, ids, counter, jobs = _env(tmp_path, n_items=1, max_concurrent_jobs=1)
+    lockf = tmp_path / "run" / ".calib-slots.lock"
+    holder = subprocess.Popen([sys.executable, "-c",
+                               "import fcntl,sys,time\nf=open(sys.argv[1],'a')\nfcntl.flock(f,fcntl.LOCK_EX)\n"
+                               "print('held',flush=True)\nsys.stdin.readline()\n", str(lockf)],
+                              stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+    assert holder.stdout.readline().strip() == "held"
+    done = threading.Event()
+    th = threading.Thread(target=lambda: (P.run(only=ids), done.set()))
+    th.start()
+    time.sleep(1.5)
+    assert not done.is_set() and not counter.exists()          # blocked inside the admission lock
+    # the other process "launched" a job meanwhile (its record is live at S9 of a second item)
+    other = P.store.item(P.ingest([dict(doi="10.1/s9-other", title="o", abstract="algorithm estimation")])[0])
+    other.p("calib").mkdir(parents=True, exist_ok=True)
+    other.p("calib", "runs.json").write_text(json.dumps([dict(job_name="jo", who="glm", state="launched",
+                                                              outcome=None, job_dir=str(jobs / "jo"))]))
+    other.state.update(stage="S9", status="waiting")
+    other.save()
+    holder.stdin.write("\n")
+    holder.stdin.flush()
+    holder.wait(10)
+    th.join(20)
+    assert done.is_set() and not counter.exists()
+    assert "slots full: 1/1" in P.store.item(ids[0]).state["reason"]
+    assert B.running_jobs(P) == ["jo"]

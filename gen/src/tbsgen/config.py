@@ -411,6 +411,10 @@ DEFAULTS: dict[str, Any] = {
         "timeout_no_output": "fail",
         "timeout_no_output_retries": 1,
         "watch_interval_s": 120,            # `tbsgen calib watch` poll interval
+        # At most this many Harbor jobs (S9 calibration + S9R review, all items of the run) running at once; a new
+        # job waits (status waiting, "queued: slots full") and is stepped again by the next run / calib watch.
+        # None = no limit.
+        "max_concurrent_jobs": None,
         # Hosts the agent may reach while it works when the task's agent phase is an allowlist
         # (package.network.mode = "agent-allowlist"): the model endpoint(s).  Written to the job config as
         # agents[].extra_allowed_hosts (= harbor run --allow-agent-host).  Empty with an allowlisted task: S9 does
@@ -462,6 +466,12 @@ DEFAULTS: dict[str, Any] = {
         "dockerfile_mode": "selfcontained",  # "selfcontained" (pip in Dockerfile, portable) | "local_base"
         "agent_hours": 2,
         "verifier_timeout": 900,
+        # verifier seconds kept for everything but the agent program's scored runs (image start, pytest, speed
+        # benchmark, metric computation).  The scored runs of one verifier session get at most
+        # min(verifier_timeout, gen.test_timeout) - verifier_overhead_sec in total (_metrics.SCORED_BUDGET_SEC),
+        # whatever timeout tests/measure.py passes; the timed repeats get thresholds.timing_budget_sec on top, which
+        # is added to the task's verifier timeout.  PKG checks scored + repeats + overhead <= the verifier timeout.
+        "verifier_overhead_sec": 120,
         # Network of the packaged task (prerelease.py).  "agent-allowlist": no internet while the agent works
         # except `agent_hosts` + the model endpoint added per run (calib.agent_allowed_hosts / --allow-agent-host);
         # agent setup runs before that with network (installs the agent CLI); the verifier is offline.
