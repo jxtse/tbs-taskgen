@@ -751,3 +751,25 @@ def test_rescore_failure_stops_s9_and_retry_keeps_first_data_hash(tmp_path, monk
     it.save()
     assert ((it.state.get("revision_data_hash") if it.state.get("thresholds_locked") else None)
             or "pkg") == "first-hash"
+
+
+def test_codex_r3_regate_without_rescore_recalibrates_and_exploit_limit_after_revision(tmp_path):
+    from tbsgen import stages_b
+    P, iid, jobs = _env(tmp_path, review_kw={"rescore_scoring_only": False})
+    _to_label(P, iid, jobs)
+    _finish(jobs, _runs(P, iid, "review")[0]["job_name"], verdict=V("pass"))
+    watch_tick(P, only=[iid])
+    stages_b.regate(P, P.store.item(iid), "template v3")
+    st = P.store.item(iid).state
+    assert st["calib_epoch"] == 1 and "calib_label" not in st and "rescore_pending" not in st
+    # exploit repair budget spent after a review revision: the review revision budget decides (retry), not a drop
+    P, iid, _ = _env(tmp_path / "ex")
+    it = P.store.item(iid)
+    write_json(it.p("review", "verdict.json"), dict(V("revise", [BLOCK]), round=1,
+                                                    _normalized=review.normalize(V("revise", [BLOCK]))))
+    it.state.update(stage="S8", status="active", thresholds_locked=True, post_revision=True, review_revisions=1,
+                    review_round=1, exploit_repair_rounds=2, repair_from="gates:exploit_valid")
+    it.save()
+    stages_b.s8(P, it)
+    st = P.store.item(iid).state
+    assert st["status"] == "active" and st["repair_from"] == "review:r1", st

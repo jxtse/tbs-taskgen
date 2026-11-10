@@ -649,9 +649,10 @@ def read_verdict(trial: Path) -> dict | None:
         p = trial / "verifier" / name
         if p.exists():
             try:
-                return json.loads(p.read_text())
+                v = json.loads(p.read_text())
             except (ValueError, UnicodeDecodeError, OSError):
                 continue
+            return v if v is not None else {"_corrupt": "verdict file holds JSON null"}
     if any((trial / "verifier" / n).exists() for n in ("verdict.json", "verdict.raw.json")):
         # a verdict file was written but cannot be parsed: a (broken) judgment, not missing infrastructure ->
         # normalize() makes it invalid and the review is re-run, then dropped

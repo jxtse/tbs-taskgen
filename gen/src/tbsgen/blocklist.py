@@ -105,7 +105,7 @@ def target_share(store, c: dict, rules: list[dict], rule: dict, lifted: set[str]
     tgt = str(c.get("_target") or c.get("target") or "")
     if not tgt:
         return None
-    key = (tgt, rule.get("name"))
+    key = (tgt, rule.get("name") or rule.get("doi_prefix"), rule.get("before_year"))
     if key in cache:
         return cache[key]
     n = m = 0

@@ -40,11 +40,11 @@ def _item_with_base(tmp_path, base):
     return d
 
 
-@pytest.mark.parametrize("host,value,bench", [("aliyun", 0.0128, 0.30), ("gu26-a", 0.0630, 1.20),
-                                              ("gu26-b", 0.0663, 1.20)])
+@pytest.mark.parametrize("host,value,bench", [("fast-host", 0.0128, 0.30), ("slow-host-a", 0.0630, 1.20),
+                                              ("slow-host-b", 0.0663, 1.20)])
 def test_fastpt_runtime_gate_scales_with_machine_speed(tmp_path, host, value, bench):
-    """FAST-PT: threshold 0.056 s set on the fast host (bench 0.30 s); gu26 (bench 4x slower) oracle 0.063-0.066 s
-    passes at 0.056 x 4; the Aliyun oracle 0.0128 s passes unscaled.  With gating on (speed is the contribution)."""
+    """FAST-PT: threshold 0.056 s set on a fast host (bench 0.30 s); a slow host (bench 4x slower) oracle 0.063-0.066 s
+    passes at 0.056 x 4; the fast-host oracle 0.0128 s passes unscaled.  With gating on (speed is the contribution)."""
     cfg = load_config()
     spec = dict(FASTPT_SPEC, resource_metric_gating=True)
     m = _metrics_module(tmp_path, cfg, spec, _item_with_base(tmp_path, 0.30), bench=bench)
@@ -57,7 +57,7 @@ def test_fastpt_runtime_gate_scales_with_machine_speed(tmp_path, host, value, be
 def test_unscaled_slow_host_fails_and_ratio_is_clamped(tmp_path):
     cfg = load_config()
     spec = dict(FASTPT_SPEC, resource_metric_gating=True)
-    # no speed base recorded (old thresholds): no scaling -> the gu26 oracle fails, as observed before this change
+    # no speed base recorded (old thresholds): no scaling -> the slow-host oracle fails, as observed before this change
     m = _metrics_module(tmp_path, cfg, spec, None, bench=1.20)
     with pytest.raises(AssertionError):
         m.check("hidden_runtime_per_spectrum", 0.0630, 0.056, "<=")
@@ -355,9 +355,14 @@ def test_codex_r2_memory_never_scaled_and_ungated_never_decides_s6b():
                 naive={"0": dict(err=5.0, hidden_peak_rss=50.0)}, nop={"0": dict(err=1e6, hidden_peak_rss=50.0)})
     th = set_thresholds(spec, meas, cfg)
     assert th["status"] == "ok", th                 # ref RSS == nop RSS: recorded only, decides nothing
+    # no value at all (every seed): still ref_metric_missing -- every threshold must be a number downstream
     meas["ref"]["0"]["hidden_peak_rss"] = float("nan")
-    assert set_thresholds(spec, meas, cfg)["status"] == "ok"
-    assert set_thresholds(dict(spec, resource_metric_gating=True), meas, cfg)["status"] == "ref_metric_missing"
+    assert set_thresholds(spec, meas, cfg)["status"] == "ref_metric_missing"
+    # one seed without it: the finite seeds set the recorded-only threshold
+    meas["ref"]["1"] = dict(err=0.1, hidden_peak_rss=40.0)
+    meas["mid"]["1"] = dict(err=1.0, hidden_peak_rss=40.0)
+    th = set_thresholds(spec, meas, cfg)
+    assert th["status"] == "ok" and isinstance(th["thresholds"]["hidden_peak_rss"]["threshold"], float)
 
 
 def test_codex_r2_corrupt_verdict_is_invalid_and_gating_revision(tmp_path):
@@ -373,3 +378,17 @@ def test_codex_r2_corrupt_verdict_is_invalid_and_gating_revision(tmp_path):
     assert ok["ok"] and review.scoring_only({review.GATING_PATH: "false"})
     assert not review.revision_review(task, {review.GATING_PATH: "maybe"}, {})["ok"]
     assert "fail_no_output" in review.NO_OUTPUT_TYPES
+
+
+def test_codex_r3_null_verdict_invalid_and_rule_cache_key(tmp_path):
+    trial = tmp_path / "t"
+    (trial / "verifier").mkdir(parents=True)
+    (trial / "verifier" / "verdict.json").write_text("null")
+    assert review.normalize(review.read_verdict(trial))["verdict"] is None
+    P, ids = _bl_env(tmp_path / "bl", n_blocked=5, n_other=5)
+    rules = [dict(doi_prefix="10.9999"), dict(doi_prefix="10.1177")]          # unnamed rules
+    c = dict(read_json(P.store.item(ids[0]).p("S1_candidate.json")), item_id=ids[0])
+    cache = {}
+    a = blocklist.target_share(P.store, c, rules, rules[0], set(), cache)
+    b = blocklist.target_share(P.store, c, rules, rules[1], set(), cache)
+    assert a == 0.5 and b == 0.5 and len(cache) == 2

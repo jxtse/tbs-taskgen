@@ -133,9 +133,11 @@ def regate(P, it, reason: str, recalibrate: bool = False) -> dict:
         st["thresholds_locked"] = True
         st["revision_data_hash"] = review.pkg_data_hash(it.p("pkg"))
         st["post_regate"] = True
-        if recalibrate:
+        if recalibrate or not (P.cfg.get("review") or {}).get("rescore_scoring_only", True):
+            # re-scoring switched off: the kept calibration cannot be checked against the new grader -> redo it
             rec["archived_epoch"] = _archive_calibration(it)
-        elif not st.get("rescore_pending") and (P.cfg.get("review") or {}).get("rescore_scoring_only", True):
+            st.pop("calib_label", None)
+        elif not st.get("rescore_pending"):
             # the shared verifier template changed: the kept calibration stands until S9 re-scores the saved
             # deliverables with the new grader (review.rescore_item), as the reference re-measurement does
             st["rescore_pending"] = dict(reason="regate", files=["tests/_metrics.py", "tests/test.sh"], ts=time.time())
@@ -156,6 +158,9 @@ def _s8_exploits(P, it):
     n = int(it.state.get("exploit_repair_rounds", 0))
     locked = bool(it.state.get("thresholds_locked"))
     if n >= int(P.cfg["gates"].get("max_exploit_repair_rounds", 2)):
+        if it.state.get("post_revision"):
+            # after a review revision the review's own revision budget decides (feedback, else drop)
+            return _revision_retry(P, it, f"exploit_valid still failing after {n} exploit repair rounds")
         if locked and (P.cfg.get("review") or {}).get("allow_human"):
             return it.finish("parked", f"exploit_repair_limit:{n}")
         return it.finish("dropped", f"exploit_repair_limit:{n}")
