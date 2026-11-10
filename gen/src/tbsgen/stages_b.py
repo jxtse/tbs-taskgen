@@ -737,9 +737,13 @@ def _s9r(P, it):
     n_infra = sum(1 for r in runs if r.get("outcome") == "infra")
     n_invalid = sum(1 for r in runs if r.get("outcome") == "invalid")
     if n_infra + n_invalid > int(rv.get("infra_retries", 2)):
-        if n_invalid and not rv.get("allow_human"):
-            # the reviewer kept breaking the verdict contract: no usable judgment -> drop (no operator exit)
-            return it.finish("dropped", f"review:invalid r{rnd} ({n_infra} infra, {n_invalid} invalid verdicts)")
+        if n_invalid:
+            # the reviewer kept breaking the verdict contract: no usable judgment -> drop (no operator exit unless
+            # review.allow_human)
+            why = f"r{rnd}: {n_infra} infra, {n_invalid} invalid verdicts"
+            if rv.get("allow_human"):
+                return it.finish("parked", f"review:human ({why})")
+            return it.finish("dropped", f"review:invalid {why}")
         return it.finish("parked", f"review:infra ({n_infra} infra, {n_invalid} invalid verdicts)")
     task = review.build_task(P.cfg, it.dir, it.state, rnd)
     rec = review.prepare(P.cfg, it.dir, task, rnd, len(all_rnd) + 1, epoch=epoch)

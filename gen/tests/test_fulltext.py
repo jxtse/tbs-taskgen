@@ -1052,3 +1052,15 @@ def test_consecutive_5xx_cool_the_host(tmp_path):
     assert sum("fullTextXML" in u for u in net.hosts()) == n == 3
     clock.t += 601
     assert led.cooling("www.ebi.ac.uk") is None
+
+
+def test_block_after_resolver_redirect_cools_final_site_once(tmp_path):
+    """B1/B3: an inst route through doi.org that lands on a challenge page cools the publisher's site (counted
+    once in the breaker), never doi.org itself."""
+    f, net, led, clock = mkfetcher(tmp_path, {"doi.org": Resp(403, {}, CF, "https://pub.example.org/x")},
+                                   SECRETS, inst={"enabled": True, "routes": [
+                                       {"prefix": "10.5555/", "url": "https://doi.org/{doi}"}]})
+    f.fetch(dict(doi="10.5555/a1", title=TITLE))
+    assert led.cooling("pub.example.org") and led.cooling("doi.org") is None
+    n = led.db.execute("select count(*) from blocks where channel='inst'").fetchone()[0]
+    assert n == 1

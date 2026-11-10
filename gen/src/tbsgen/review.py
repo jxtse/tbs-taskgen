@@ -957,67 +957,78 @@ def rescore_item(cfg: dict, item_dir: Path, runs: list) -> dict:
 
 # ------------------------------------------------------------------ batch summary
 def summary(P, sample_n: int = 3, seed: int = 0) -> dict:
-    """`tbsgen review summary`: this batch's review outcome.  Verdicts are the routed (derived) verdicts; alerts
-    flag anything an operator should look at (drop rate over review.summary_alerts.drop_rate, verdicts of the
-    same package that disagree, invalid verdicts, review:infra parks, label changes)."""
+    """`tbsgen review summary`: this batch's review outcome.  Verdicts are the routed (derived) verdicts.
+    -> verdict counts, blocking-issue distribution (problem class / checklist category / fix kind), drop reasons,
+    per-item rounds and revisions, a random sample of passed items with the paths of their review records (for spot
+    checks), the blocklist auto-recheck decisions, and alerts {kind, msg}: drop rate over
+    review.summary_alerts.drop_rate, two reviews of the same package that disagree, invalid verdicts, review:infra
+    parks."""
     import random as _random
     cfg = P.cfg
     alert_cfg = (cfg.get("review") or {}).get("summary_alerts") or {}
-    per_item, verdict_counts, fix_kinds, drop_reasons, rounds, categories = {}, {}, {}, {}, {}, {}
-    invalid = contradictory = 0
+    per_item, verdict_counts, fix_kinds, drop_reasons, rounds, categories, problems_ = {}, {}, {}, {}, {}, {}, {}
+    invalid, contradictions = 0, []
     for it in P.store.items():
         st = it.state
-        rd = it.p("review")
-        if not rd.exists():
-            continue
-        verdicts = sorted(rd.glob("r*/*.verdict.json"))
+        verdicts = sorted(it.p("review").glob("r*/*.verdict.json")) if it.p("review").exists() else []
         if not verdicts:
             continue
-        v = read_json(it.p("review", "verdict.json"), None)
-        nv = (v or {}).get("_normalized") or {}
-        verdict = nv.get("verdict") or v.get("verdict") if v else None
+        v = read_json(it.p("review", "verdict.json"), None) or {}
+        nv = v.get("_normalized") or {}
+        verdict = nv.get("verdict")
         per_item[it.item_id] = dict(stage=st.get("stage"), status=st.get("status"), label=st.get("calib_label"),
                                     reason=st.get("reason"), verdict=verdict,
-                                    rounds=st.get("review_round", 0), revisions=st.get("review_revisions", 0))
+                                    rounds=int(st.get("review_round") or 1),
+                                    revisions=int(st.get("review_revisions") or 0))
         verdict_counts[verdict or "none"] = verdict_counts.get(verdict or "none", 0) + 1
-        n = max(1, int(st.get("review_round") or 1))
+        n = int(st.get("review_revisions") or 0)
         rounds[n] = rounds.get(n, 0) + 1
         n_inv = sum(1 for x in read_json(it.p("review", "runs.json"), []) or [] if x.get("outcome") == "invalid")
         per_item[it.item_id]["invalid_verdicts"] = n_inv
-        if n_inv:
-            invalid += 1
-        # same package, disagreeing routed verdicts (two jobs of one round)
-        by_pkg = {}
+        invalid += bool(n_inv)
+        # two reviews of the same package (same pkg hash and calibration epoch) that reached different verdicts
+        by_pkg: dict = {}
         for p in verdicts:
             vv = read_json(p, {}) or {}
-            by_pkg.setdefault(vv.get("pkg_sha"), []).append((vv.get("_normalized") or {}).get("verdict"))
-        for sha, vs in by_pkg.items():
-            if len(set(vs)) > 1:
-                contradictory += 1
+            r = (vv.get("_normalized") or {}).get("verdict")
+            if r is not None:
+                by_pkg.setdefault((vv.get("pkg_sha"), vv.get("calib_epoch")), []).append((p.parent.name, r))
+        for (sha, ep), vs in by_pkg.items():
+            if len({r for _, r in vs}) > 1:
+                contradictions.append(dict(item=it.item_id, pkg_sha=sha, calib_epoch=ep, verdicts=vs))
         for i in nv.get("issues") or []:
             if i.get("severity") == "blocking":
                 k = i.get("fix_kind") or "unknown"
                 fix_kinds[k] = fix_kinds.get(k, 0) + 1
                 cat = CATEGORIES.get(str(i.get("category") or "")[:1], "other")
                 categories[cat] = categories.get(cat, 0) + 1
-        if st.get("status") == "dropped" and str(st.get("reason") or "").startswith("review:"):
-            drop_reasons[str(st.get("reason"))[:120]] = drop_reasons.get(str(st.get("reason"))[:120], 0) + 1
+                pc = i.get("problem") or "unclassified"
+                problems_[pc] = problems_.get(pc, 0) + 1
+        if st.get("status") == "dropped":
+            key = str(st.get("reason") or "").split(" (")[0][:80]
+            drop_reasons[key] = drop_reasons.get(key, 0) + 1
     reviewed = len(per_item)
     dropped = sum(1 for x in per_item.values() if x["status"] == "dropped")
     rate = (dropped / reviewed) if reviewed else 0.0
     alerts = []
-    if reviewed and rate > float(alert_cfg.get("drop_rate", 0.5)):
-        alerts.append(f"drop rate {dropped}/{reviewed} ({rate:.0%}) over review.summary_alerts.drop_rate")
-    if contradictory:
-        alerts.append(f"{contradictory} item(s) with disagreeing verdicts for the same package")
+    lim = float(alert_cfg.get("drop_rate", 0.5))
+    if reviewed and rate > lim:
+        alerts.append(dict(kind="drop_rate", msg=f"drop rate {dropped}/{reviewed} ({rate:.0%}) > {lim:.0%} "
+                                                 "(review.summary_alerts.drop_rate)"))
+    for c in contradictions:
+        alerts.append(dict(kind="contradiction", msg=f"{c['item']}: reviews of the same package disagree "
+                                                     f"{c['verdicts']}"))
     if invalid:
-        alerts.append(f"{invalid} item(s) with invalid (retried) verdicts")
+        alerts.append(dict(kind="invalid", msg=f"{invalid} item(s) with invalid (re-run) verdicts"))
     infra = sum(1 for x in per_item.values() if str(x["reason"] or "").startswith("review:infra"))
     if infra:
-        alerts.append(f"{infra} item(s) parked review:infra (review infrastructure)")
-    passes = [i for i, x in per_item.items() if x["verdict"] == "pass"]
+        alerts.append(dict(kind="review_infra", msg=f"{infra} item(s) parked review:infra"))
+    passes = sorted(i for i, x in per_item.items() if x["verdict"] == "pass")
     sample = sorted(_random.Random(seed).sample(passes, min(sample_n, len(passes)))) if passes else []
-    # blocklist auto-recheck decisions (blocklist-trials.json + events)
+
+    def records(iid):
+        d = P.store.root / "items" / iid / "review"
+        return [str(d / "verdict.json"), str(d / "runs.json")] + [str(p) for p in sorted(d.glob("r*/*.verdict.json"))]
     from . import blocklist as _bl
     bst = _bl.load_state(P.store)
     bl = {name: dict(lifted=bool(r.get("lifted")), lifted_rate=r.get("lifted_rate"),
@@ -1027,9 +1038,8 @@ def summary(P, sample_n: int = 3, seed: int = 0) -> dict:
           for name, r in (bst.get("rules") or {}).items()}
     bl_events = [e for e in P.store.events() if e.get("kind") in ("blocklist_lifted", "blocklist_kept")][-20:]
     return dict(items=reviewed, verdicts=verdict_counts, drop_rate=round(rate, 4), alerts=alerts,
-                blocking_fix_kinds=fix_kinds, blocking_categories=categories, drop_reasons=drop_reasons,
-                rounds_histogram=rounds, blocklist=bl, blocklist_events=bl_events,
-                invalid=invalid, contradictory=contradictory, review_infra_parked=infra,
-                pass_sample=[dict(item=i, verdict_path=str(P.store.root / "items" / i / "review" / "verdict.json"))
-                             for i in sample], per_item=per_item)
-
+                blocking_problems=problems_, blocking_categories=categories, blocking_fix_kinds=fix_kinds,
+                drop_reasons=drop_reasons, revisions_histogram=rounds, invalid=invalid,
+                contradictions=contradictions, review_infra_parked=infra,
+                pass_sample=[dict(item=i, records=records(i)) for i in sample],
+                blocklist=bl, blocklist_events=bl_events, per_item=per_item)
