@@ -76,7 +76,7 @@ def s8(P, it):
         last = sorted(it.p("gates").glob("attempt-*.json")) if it.p("gates").exists() else []
         oc = ((read_json(last[-1], {}) or {}).get("details") or {}).get("output_contract") if last else None
         if oc and not oc.get("ok"):
-            why += " " + json.dumps(oc.get("mismatch"))[:300]
+            why += " output_contract mismatch: " + json.dumps(oc.get("mismatch"))[:1500]
         return _revision_retry(P, it, why)
     rounds = it.state.get("repair_rounds", 0)
     if rounds >= P.cfg["gates"]["max_repair_rounds"]:
@@ -951,7 +951,7 @@ def _revision_retry(P, it, why: str):
     verdict = read_json(it.p("review", "verdict.json"), {}) or {}
     routed = verdict.get("round") == rnd and (verdict.get("_normalized") or {}).get("verdict") == "revise"
     if it.state.get("post_revision") and n < int(rv.get("max_revisions", 3)) and routed:
-        it.state["revision_feedback"] = str(why)[:500]
+        it.state["revision_feedback"] = str(why)[:2000]
         it.state["repair_from"] = f"review:r{rnd}"
         return it.goto("S8", f"review revision retry: {why[:160]}")
     return it.finish("dropped", f"review:gate_failed ({why[:300]})")

@@ -127,3 +127,48 @@ def test_s8_slim_carries_the_mismatch_to_the_repair_prompt():
              details={"output_contract": {"ok": False, "mismatch": {"o.csv": {"stated": ["a"], "reference": ["b"]}}}})
     out = _slim(g)
     assert out["details"]["output_contract"]["mismatch"]["o.csv"]["reference"] == ["b"] and "fix_hint" in out
+
+
+def test_input_attributed_and_partial_declarations_are_skipped(tmp_path):
+    """Codex r2: an input file's columns on the output's line, and partial lists, are not exhaustive headers."""
+    d = _out(tmp_path, {"out.csv": "id,value,diag"})
+    for ins in ("`out.csv`: derived from `input.csv` (columns: `id,x`)\n",
+                "`out.csv` includes columns `id,value`; additional columns are allowed\n",
+                "`out.csv`: header at least `id,value`\n"):
+        assert gates.output_contract(ins, d)["checked"] == [], ins
+
+
+def test_prefixed_paths_resolve_and_compressed_names_do_not(tmp_path):
+    d = tmp_path / "o"
+    (d / "results").mkdir(parents=True)
+    (d / "results" / "out.csv").write_text("id,value\n")
+    for ins in ("Write `./results/out.csv`. Header: `id,wrong`\n",
+                "Write `/app/output/results/out.csv`. Header: `id,wrong`\n",
+                "Write `out.csv`. Header: `id,wrong`\n"):
+        assert not gates.output_contract(ins, d)["ok"], ins
+    assert gates.output_contract("Write `out.csv.gz`. Header: `id,wrong`\n", d)["checked"] == []
+
+
+def test_keyword_without_list_does_not_hide_a_later_declaration(tmp_path):
+    ins = "`out.csv` has a header row.\nHeader: `id,wrong`\n"
+    d = _out(tmp_path, {"out.csv": "id,value"})
+    r = gates.output_contract(ins, d)
+    assert not r["ok"] and r["mismatch"]["out.csv"]["line"] == 2
+
+
+def test_locked_retry_feedback_carries_full_mismatch(tmp_path, monkeypatch):
+    """After a review revision (thresholds locked) an output_contract failure goes back to the revision with the
+    file / stated / reference columns in the feedback (not truncated to the gate name)."""
+    import json
+    from types import SimpleNamespace
+    from tbsgen import stages_b
+    seen = {}
+    monkeypatch.setattr(stages_b, "_revision_retry", lambda P, it, why: seen.setdefault("why", why))
+    (tmp_path / "gates").mkdir()
+    wide = ["c%02d" % i for i in range(30)]
+    (tmp_path / "gates" / "attempt-3.json").write_text(json.dumps(dict(details=dict(output_contract=dict(
+        ok=False, mismatch={"o.csv": dict(stated=wide[:-1], line=9, reference=wide)})))))
+    it = SimpleNamespace(state=dict(repair_from="gates:output_contract", thresholds_locked=True),
+                         p=lambda *a: tmp_path.joinpath(*a))
+    stages_b.s8(SimpleNamespace(cfg=load_config(None)), it)
+    assert "c29" in seen["why"] and '"line": 9' in seen["why"]

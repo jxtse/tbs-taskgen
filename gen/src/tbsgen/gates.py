@@ -55,40 +55,58 @@ def _split_header(text: str) -> list[str] | None:
     return cols
 
 
+_FILE_TOK = re.compile(r"[\w./-]+\.(?:csv|tsv|json|npz|npy|txt|parquet|h5|hdf5|dat|xlsx?)(?![\w-]|\.\w)", re.I)
+_PARTIAL = re.compile(r"\b(includ\w*|at least|additional|extra|optional|among|such as|e\.g\.|for example|"
+                      r"subset|other columns|more columns|may also|derived from|same as|like)\b", re.I)
+_OUT_PREFIX = re.compile(r"^(?:\./|/app/output/|output/|<output_dir>/)")
+
+
+def _norm_path(tok: str) -> str:
+    return _OUT_PREFIX.sub("", tok.strip())
+
+
 def stated_csv_headers(ins: str, names: list[str]) -> dict[str, list[dict]]:
-    """Explicit CSV header declarations in the statement, per output file: a line that names the file (relative
-    path, or its basename when that basename is unique among the outputs) and, on that line or one of the next 2
-    lines (before any other output file is named), the word "header"/"columns" followed by ONE backticked
-    comma-separated list.  Anything else (input-column lists, ambiguous lines with two lists after the keyword,
-    individually backticked columns, two outputs on one line) is not a declaration and is not judged.
-    -> {file: [{"cols": [...], "line": n}, ...]} -- every declaration, not just the first."""
+    """Explicit, exhaustive CSV header declarations in the statement, per output file.  A declaration: a line that
+    names exactly one of the outputs (inputs may be named too; then a list on that same line is not used), the
+    output given as a relative path (with
+    ./, /app/output/, output/ or <output_dir>/ stripped; or its basename when that basename is unique among the
+    outputs), and, on that line or on one of the next 2 lines that name no file at all, the word
+    "header"/"columns" followed by exactly ONE backticked comma-separated list.  Lines with partial wording
+    ("includes", "at least", "additional", "e.g.", "derived from", ...) are skipped, as are lists on a line that
+    names another file (input-column lists) or two lists after the keyword.  Anything not matching is not judged.
+    -> {file: [{"cols": [...], "line": n}, ...]} -- every declaration in the window, not just the first."""
     lines = ins.splitlines()
-    base_count: dict[str, int] = {}
+    by_base: dict[str, list[str]] = {}
     for n in names:
-        b = n.rsplit("/", 1)[-1]
-        base_count[b] = base_count.get(b, 0) + 1
-    pats = {}
-    for n in names:
-        b = n.rsplit("/", 1)[-1]
-        alts = [re.escape(n)] + ([re.escape(b)] if base_count[b] == 1 and b != n else [])
-        pats[n] = re.compile(r"(?<![\w./-])(?:" + "|".join(alts) + r")(?![\w-])")
+        by_base.setdefault(n.rsplit("/", 1)[-1], []).append(n)
+
+    def resolve(tok: str) -> str | None:
+        t = _norm_path(tok)
+        if t in names:
+            return t
+        same = by_base.get(t.rsplit("/", 1)[-1]) or []
+        return same[0] if "/" not in t and len(same) == 1 else None
+
+    files_on = [[m.group(0) for m in _FILE_TOK.finditer(line)] for line in lines]
     out: dict[str, list[dict]] = {}
-    for n in names:
-        for k, line in enumerate(lines):
-            if not pats[n].search(line):
+    for k, toks in enumerate(files_on):
+        uniq = {_norm_path(t) for t in toks}
+        outs = {r for r in (resolve(t) for t in uniq) if r is not None}
+        if len(outs) != 1:
+            continue                                    # no output, or two outputs on one line: ambiguous
+        n = outs.pop()
+        for j in range(k, min(k + 3, len(lines))):
+            if j > k and files_on[j]:
+                break                                   # another file is named: its own declaration window
+            if j == k and len(uniq) > 1:
+                continue                                # same line names an input too: its list may be the input's
+            line = lines[j]
+            m = _HDR_KW.search(line)
+            if not m or _PARTIAL.search(line):
                 continue
-            if any(o != n and pats[o].search(line) for o in names):
-                continue
-            for j in range(k, min(k + 3, len(lines))):
-                if j > k and any(pats[o].search(lines[j]) for o in names):
-                    break
-                m = _HDR_KW.search(lines[j])
-                if not m:
-                    continue
-                ticks = [t for t in (_split_header(x) for x in _TICK.findall(lines[j][m.end():])) if t]
-                if len(ticks) == 1:
-                    out.setdefault(n, []).append(dict(cols=ticks[0], line=j + 1))
-                break
+            ticks = [t for t in (_split_header(x) for x in _TICK.findall(line[m.end():])) if t]
+            if len(ticks) == 1:
+                out.setdefault(n, []).append(dict(cols=ticks[0], line=j + 1))
     return out
 
 
