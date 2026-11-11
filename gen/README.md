@@ -2,6 +2,26 @@
 
 出题管线 MVP：从检索结果开始，经过全文获取、可行性检查、规格、生成、机械门、修复、校准调度，最后打包成 Harbor 任务。**已在少量真实论文上端到端跑通（见 §6），还没有量产。**
 
+## 0. 代码驱动出题（`code.grounded`，2026-11-12 起）
+
+出题依赖**论文原文 + 作者配套代码**：没有作者代码的论文直接淘汰，不留例外通道。许可证只记录、不过滤
+（任务包与训练数据都不进公开仓库，作者代码只在内部运行目录）。`code.grounded = false`（默认）时管线与以前完全相同。
+
+```
+S1 → S2a 代码信号预筛（不花全文额度） → S2 摘要筛 → S3 全文 → S3b 作者代码硬确认 → S4 …
+```
+
+| 阶段 | 产物 | 淘汰原因 |
+|---|---|---|
+| S2a | `S2a_code_signal.json`：元数据代码链接、检索层 `code_signals`（OpenAlex 全文 / PwC / GitHub README）、PwC 存档（`code.pwc_path`）；都没有时查一次 OpenAlex 全文标记 | `no_code_signal` |
+| S3b | `S3b_code.json`：全文与元数据里的每个代码链接（上下文、Code Availability 段、参考文献区、标题词、README 是否引用本文、PwC official）→ 规则打分；模糊链接先查 README，仍模糊时 `roles.code_owner="jev"` 用 Jev 判定（不用 Opus）；作者链接在 GitHub / GitLab / Bitbucket / Zenodo / CRAN / PyPI / Bioconductor / SourceForge 上实际解析，记录 license、语言、大小 | `code_on_request`、`third_party_code_only`、`code_repo_unavailable`（404 / 私有 / 空仓库）、`data_only_no_code`、`code_host_unsupported`（Code Ocean、Figshare 等）、`no_code_link` |
+
+S3b 规则在 2026-11-11 摸底的 224 篇（人工读上下文标注）上：论文级召回 0.96、精度 0.98。
+
+配置（`[code]`）：`grounded`、`prescreen`（S2a 开关，默认开）、`openalex_flag`、`fulltext_terms`、`pwc_path`、
+`github_client`（`gh` 用 gh CLI 自带认证 / `rest` 匿名）、`proxy`、`mailto`、`jev_own_threshold`；
+`[models.roles] code_owner = "rules" | "jev"`。检索侧见 `retrieval/README.md` 的“代码通道”。
+
 ## 1. 架构
 
 ```
@@ -11,6 +31,7 @@ src/tbsgen/
   models.py        模型调用层：TeacherClient（Anthropic 兼容端点）/ FakeClient（脚本化）/ RecordingClient（录制）
   state.py         每条目一个状态目录 + state.json 状态机；events.jsonl
   pipeline.py      编排：逐条推进、断点续跑、预算/熔断暂停、resume
+  codegate.py      代码驱动出题：S2a 代码信号预筛、S3b 作者代码确认与仓库解析（§0）
   intake.py        S1 读检索层输出；S2 规则筛选（rules-v2）；S3 全文（调 fulltext.py）；S4 可行性（规则部分 + 官方题去重）
   blocklist.py     S2 前置黑名单：按 DOI 前缀（可加发表年份）直接丢弃拿不到全文的论文，配置 screen.blocklist；
                    自动复查（screen.blocklist_recheck）：每周少量试取，成功率够高自动解除规则
@@ -48,7 +69,7 @@ eval/                        泄漏门回测结果
 ledger.sqlite  events.jsonl  reports/daily-<日期>.md  release/manifest.jsonl
 items/<item_id>/
   state.json                 当前阶段、状态、历史、各阶段尝试次数
-  S1_candidate.json S2_screen.json S2_jev.json S3_fulltext.json fulltext.txt S4_probe.json
+  S1_candidate.json S2a_code_signal.json S2_screen.json S2_jev.json S3_fulltext.json fulltext.txt S3b_code.json S4_probe.json
   _spec/{spec,depgraph,coverage,provenance}.json      出题侧，不进 Harbor
   task/                      工作树：generator/ solution/ baselines/ tests/ instruction.md
   runs/                      沙箱运行产物

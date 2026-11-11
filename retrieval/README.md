@@ -86,6 +86,35 @@ Tavily 适配器已删除（2026-11-05 评测质量明显低于 Exa：可用资�
 
 融合规则：每个源的每类列表（例如 `openalex.search`）内，一篇论文按最佳名次计 `w/(60+rank)`，其余命中按 25% 计入；然后跨列表求和。权重在 `config.py: fusion.weights`。预筛规则沿用早期方法文献检索的排除口径：剔除综述/教程/观点类，剔除非英文（语言字段或拉丁字符占比 < 85%），摘要不足 200 字符的论文不剔除，只把分数 ×0.5 并标记 `abstract_missing`（`drop_no_abstract=True` 时改为硬剔除），剔除 `leak_refs`（配置项，JSON 文件，默认不设）里的 TBS 题目出处 DOI，剔除勘误/社论/数据集等类型，剔除 1985 年以前的论文。资源清单另外剔除 URL 含 `terminal-bench-science` 的条目：TBS 仓库本身会泄题，2026-11-05 评测中网络检索源返回过它。
 
+## 代码通道（`code.enabled`，代码驱动出题用）
+
+`config.code.enabled = true` 时（默认关），检索偏向有作者代码的论文（`tbsretr/codeindex.py`）：
+
+- **OpenAlex 全文代码通道** `openalex.code`：目标的前 `code.channel_max_queries` 条查询再跑一次，加过滤
+  `fulltext.search:github.com|zenodo.org|gitlab` 和 `publication_year:>=code.min_year`（默认 2018）。
+- **融合头部放大**：`fusion.top_n × code.top_n_factor`（默认 2.75；实测约 35% 的候选有代码信号）。
+- **代码信号**（每篇写进 `code_signals`，找到的仓库并入 `code_links`）：元数据里的代码链接；OpenAlex 全文标记
+  （每 50 个 DOI 一次调用）；Papers with Code 冻结存档离线 join（`code.pwc_path`）；GitHub README 搜索
+  `"<doi>" in:readme` / `"<arxiv>" in:readme`（前 `code.github_max_papers` 篇，每篇最多 2 次；`gh` CLI 自带认证，
+  30 次/分钟，`sources.github.min_interval_s=2.2`；403/429 进入冷却）。
+- **年份偏置**：早于 `code.min_year` 的论文排到后面，不剔除（`code.prefer_recent`）。
+
+2026-11-11 摸底（224 篇）：OpenAlex 全文召回作者代码 84%；四路合并召回 92%、精度 82%。
+
+PwC 存档 TSV 的生成（HF `pwc-archive/links-between-paper-and-code` 的 parquet，约 30 万条）：
+
+```python
+import gzip, re, pyarrow.parquet as pq
+rows = pq.read_table("links.parquet", columns=["paper_title", "paper_arxiv_id", "repo_url", "is_official",
+                                               "mentioned_in_paper"]).to_pylist()
+with gzip.open("pwc_links.tsv.gz", "wt") as f:
+    f.write("arxiv\ttitle_key\trepo_url\tis_official\tmentioned_in_paper\n")
+    for r in rows:
+        tk = re.sub(r"[^a-z0-9]", "", (r["paper_title"] or "").lower())[:80]
+        f.write(f"{r['paper_arxiv_id'] or ''}\t{tk}\t{r['repo_url']}\t{int(bool(r['is_official']))}\t"
+                f"{int(bool(r['mentioned_in_paper']))}\n")
+```
+
 ## 凭据
 
 - key 只从环境变量读取，建议由密钥管理工具在运行时注入。**不要**把 key 写进仓库或任何文件。

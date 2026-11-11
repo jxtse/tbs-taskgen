@@ -13,6 +13,7 @@ import uuid
 from typing import Any
 from concurrent.futures import ThreadPoolExecutor
 
+from . import codeindex
 from .fusion import Pool, fuse, fuse_resources, load_leak, prefilter_reason, rrf_scores
 from .ledger import BudgetExceeded, Http, Ledger, SourceCooling
 from .model import Paper, RankedList, Target, informative_words
@@ -31,6 +32,7 @@ class Retriever:
         self.ledger = Ledger(cfg["state_dir"], run=self.run)
         self.http = Http(cfg, self.ledger, transport=transport, offline=offline)
         self.src = {n: cls(cfg, self.http) for n, cls in ALL.items() if sources is None or n in sources}
+        self.code_errors: list[str] = []
         self.leak = load_leak(cfg.get("leak_refs"))
         self.stopped: dict[str, str] = {}
         self._enriched: list[Paper] = []
@@ -89,6 +91,10 @@ class Retriever:
                 out.append(self._run(name, s.search, q, t))
             if sc.get("semantic") and t.description:
                 out.append(self._run(name, s.semantic, t.description, t))
+            cc = self.cfg.get("code") or {}
+            if cc.get("enabled"):
+                for q in t.queries[: int(cc.get("channel_max_queries", 4))]:
+                    out.append(self._run(name, codeindex.openalex_code_search, s, q, t))
         elif name == "s2":
             for q in t.queries[: sc["max_queries"]]:
                 out.append(self._run(name, s.search, q, t))
@@ -173,7 +179,17 @@ class Retriever:
         timings["enrich"] = round(time.time() - t2, 2)
 
         exclude = {d.lower() for d in t.exclude_dois}
-        papers, dropped = fuse(pool, self.cfg, self.leak, exclude)
+        cc = self.cfg.get("code") or {}
+        top_n = None
+        if cc.get("enabled"):
+            top_n = int(round(self.cfg["fusion"]["top_n"] * float(cc.get("top_n_factor", 1.0))))
+        papers, dropped = fuse(pool, self.cfg, self.leak, exclude, top_n=top_n)
+        code_info = {}
+        if cc.get("enabled"):
+            t3 = time.time()
+            code_info = self._code_signals(papers, t)
+            codeindex.year_bias(papers, self.cfg)
+            timings["code"] = round(time.time() - t3, 2)
         resources = fuse_resources(lists, papers, leak_urls=tuple(self.cfg.get("leak_url_substrings", ())))
         timings["total"] = round(time.time() - t0, 2)
         drop_counts: dict[str, int] = {}
@@ -190,9 +206,38 @@ class Retriever:
                             "status": self.stopped.get(n, "ok"),
                             "errors": self.src[n].errors[-5:] if n in self.src else []}
                         for n in PAPER_SOURCES if n in self.src},
-            "enrich": enrich, "timings": timings,
+            "enrich": enrich, "timings": timings, **({"code": code_info} if code_info else {}),
             "_lists": lists, "_pool": pool, "_enriched": list(self._enriched),   # in-memory only; dropped by to_json()
         }
+
+    def _code_signals(self, papers: list[dict], t: Target) -> dict:
+        """code_signals for every fused paper (see codeindex.annotate).  A failing signal source only loses its
+        own signal (recorded in the result's code.errors)."""
+        cc = self.cfg["code"]
+        flags: set[str] = set()
+        if cc.get("flag_head", True) and "openalex" in self.src:
+            got = self._run("openalex", codeindex.openalex_fulltext_flags, self.src["openalex"],
+                            [p["doi"] for p in papers if p.get("doi")], t.id)
+            flags = got or set()
+        pwc = codeindex.pwc_index(cc.get("pwc_path"))
+        gh_hits: dict[str, list[str]] = {}
+        n_gh = 0
+        if cc.get("github_search") and self.cfg["sources"]["github"].get("enabled", True):
+            gh = codeindex._gh_cli_transport() if cc.get("github_client", "gh") == "gh" else None
+            for p in papers[: int(cc.get("github_max_papers", 40))]:
+                if not (p.get("doi") or p.get("arxiv")):
+                    continue
+                key = p.get("doi") or p.get("arxiv") or p.get("title", "")[:80]
+                try:
+                    gh_hits[key] = codeindex.github_readme_search(self.http, self.cfg, p, t.id, gh=gh)
+                    n_gh += 1
+                except STOP_EXC as e:
+                    self.code_errors.append(f"github: {e}"[:200])
+                    break
+        codeindex.annotate(papers, oa_flags=flags, pwc=pwc, gh_hits=gh_hits)
+        n_any = sum(1 for p in papers if p["code_signals"]["any"])
+        return {"papers": len(papers), "with_signal": n_any, "openalex_fulltext": len(flags),
+                "pwc_loaded": bool(pwc), "github_searched": n_gh, "errors": self.code_errors[-5:]}
 
     def _timed(self, n, t):
         a = time.time()

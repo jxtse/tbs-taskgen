@@ -37,6 +37,7 @@ DEFAULTS: dict = {
             # papers that show up in the code/data/docs channels count, but weakly
             "exa.code": 0.3, "exa.data": 0.3, "exa.docs": 0.3,
             "crossref.search": 0.7, "arxiv.search": 0.7, "europepmc.search": 0.5,
+            "openalex.code": 1.0,                  # code.enabled only
         },
     },
     "prefilter": {
@@ -49,6 +50,24 @@ DEFAULTS: dict = {
     # Pseudo-seeds for snowball / S2 recommendations when the target has no seed DOIs: the top-k pre-filtered
     # papers of the OpenAlex keyword lists alone (OpenAlex is in every ablation arm, so ablations stay comparable).
     "pseudo_seeds": {"k": 3},
+    # Code-grounded retrieval (tbsgen S2a/S3b need the authors' own code; see codeindex.py).  `enabled` adds the
+    # OpenAlex full-text code channel (ranked list openalex.code), flags the fused head with code_signals
+    # (OpenAlex full text / metadata links / Papers-with-Code archive / GitHub README search) and widens the head
+    # by `top_n_factor` so that the same number of papers survives the code filter (measured: ~35 % of the
+    # candidates have any signal, 2.5-3x).  Off by default: the classic retrieval is unchanged.
+    "code": {
+        "enabled": False,
+        "top_n_factor": 2.75,                      # fusion.top_n x this when enabled
+        "fulltext_terms": ["github.com", "zenodo.org", "gitlab"],
+        "channel_max_queries": 4,                  # openalex.code queries per target (target queries in order)
+        "flag_head": True,                         # OpenAlex full-text flag for the fused head (1 call / 50 DOIs)
+        "min_year": 2018,                          # code channel filter + soft rank bias (older papers go last)
+        "prefer_recent": True,
+        "pwc_path": None,                          # TSV(.gz): arxiv, title_key, repo_url, is_official, mentioned_in_paper
+        "github_search": True,                     # README search for "<doi>" / "<arxiv>" (head papers only)
+        "github_client": "gh",                     # "gh" (gh CLI auth, 30/min) | "rest" (anonymous, 10/min)
+        "github_max_papers": 40,                   # README searches per target (2 calls / paper)
+    },
     "sources": {
         "openalex": {
             "enabled": True, "key_env": "OPENALEX_API_KEY", "require_key": False,
@@ -96,6 +115,10 @@ DEFAULTS: dict = {
         "arxiv": {
             "enabled": True, "min_interval_s": 3.1, "max_results": 20, "max_queries": 2,   # ToU: 1 req / 3 s, 1 conn
             "daily_max_calls": 1000, "retries": 3, "cooldown_429_s": 3600,
+        },
+        "github": {
+            # code.github_search only (README search).  The search API allows 30 req/min with auth, 10 without.
+            "enabled": True, "min_interval_s": 2.2, "daily_max_calls": 1500, "retries": 2, "cooldown_429_s": 600,
         },
         "europepmc": {
             # biomedical targets only (routed); 2026-11-05 eval: +2 core papers in head-60, 0 not found elsewhere

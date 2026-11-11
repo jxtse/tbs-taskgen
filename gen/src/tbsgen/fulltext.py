@@ -1037,7 +1037,7 @@ class Fetcher:
 
 # ------------------------------------------------------------------------------------------- purge (TDM terms)
 # stages that still read items/<id>/fulltext.txt (S4/S5 prompts, S7 tdm_verbatim gate, S8 repair -> S7)
-_EARLY_STAGES = ("S1", "S2", "S3", "S4", "S5", "S6A", "S6A_run", "S6M", "S6B", "S6C", "S7", "S8")
+_EARLY_STAGES = ("S1", "S2a", "S2", "S3", "S3b", "S4", "S5", "S6A", "S6A_run", "S6M", "S6B", "S6C", "S7", "S8")
 
 
 def _text_channel(prov: dict) -> str | None:
