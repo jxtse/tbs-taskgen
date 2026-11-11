@@ -347,3 +347,29 @@ def test_inject_script_checks_pin(tmp_path):
     write_json(t / "environment" / "work" / ".tbsgen-remote-repo", {"repo_dir": str(tmp_path.resolve() / "lnk" / "repo"),
                                                                      "pin": "abc"})
     assert subprocess.run(["bash", str(sc), str(t), root], capture_output=True).returncode == 3
+
+
+def test_r3_regressions(tmp_path, monkeypatch):
+    # a tmux failure (launch_attempted set, not_started) is not charged on resume
+    P, it, fl = _agent_item(tmp_path / "a", monkeypatch, {"runnability.json": "{}"})
+    write_json(it.p("S4c", "run.json"), {"state": "launch_failed", "job_name": "j0", "launch_attempted": 1.0,
+                                         "not_started": True, "error": "tmux rc=1"})
+    P.run(max_steps=1, until="S4c")
+    assert P.store.item(it.item_id).state["status"] == "waiting" and len(fl.calls) == 1
+    assert read_json(it.p("S4c", "spent.json"))["j0"] == {"usd": 0.0, "sec": 0.0}
+    # charges are keyed by job: re-processing the same finished record does not double-charge or forget it
+    P, it, fl = _agent_item(tmp_path / "b", monkeypatch, {"_spec/spec.json": "{}"}, stage="S5G")
+    rec = {"state": "finished", "job_name": "j1", "retry": True, "launch_attempted": 1.0, "finished_ts": 61.0,
+           "cost_usd": 5.0, "minutes": 1.0, "counted": True}
+    write_json(it.p("S5G", "run.json"), rec)
+    write_json(it.p("S5G", "spent.json"), {"j1": {"usd": 5.0, "sec": 60.0}})
+    P.run(max_steps=1, until="S5G")
+    assert read_json(it.p("S5G", "spent.json")) == {"j1": {"usd": 5.0, "sec": 60.0}}
+    assert P.store.item(it.item_id).state["S5G_spent"] == {"usd": 5.0, "sec": 60.0}
+    # an empty run log is a valid receipt
+    files = {"runnability.json": json.dumps({"runnable": True, "reason": "ok", "entry": "python ex.py"}),
+             "HOWTO.md": "x", "runs/0.json": json.dumps({"cmd": "python ex.py", "rc": 0, "log": "runs/0.log"}),
+             "runs/0.log": ""}
+    P, it, _ = _agent_item(tmp_path / "c", monkeypatch, files)
+    P.run(max_steps=3, until="S4c")
+    assert it.p("S4c", "run.log").exists() and P.store.item(it.item_id).state.get("reason") != "code_not_runnable"

@@ -531,27 +531,30 @@ def _agent_stage(P, it, kind: str, instruction: str, need: list[str], timeout_s:
     if rec is not None and rec.get("state") == "launch_failed":
         rec["retry"] = True                     # infrastructure: a resumed item launches a fresh job
         rec["state"] = "finished"
-        if not rec.get("launch_attempted"):
-            rec["counted"] = True               # never started: nothing spent
     if rec is None or (rec.get("state") == "finished" and rec.get("retry")):
         why = codeagent.env_ok(P.cfg, agent=True)
         if why:
             it.finish("paused", f"code:config:{why}", paused_stage=kind)
             return None
-        # per-paper caps are cumulative over all jobs of this stage: each new job gets what is left
-        spent = it.state.get(f"{kind}_spent", {"usd": 0.0, "sec": 0.0})
-        if rec is not None and rec.get("launch_attempted") and not rec.get("counted"):
-            # a job that may have run: unknown cost counts as its whole allowance, unknown time as wall time since
-            # the launch (never as zero)
-            b = rec.get("budget") or {}
-            usd = rec.get("cost_usd")
-            usd = float(usd) if usd is not None else float(b.get("max_usd") or max_usd or 0.0)
-            sec = 60.0 * float(rec["minutes"]) if rec.get("minutes") is not None else \
-                max(0.0, float(rec.get("finished_ts") or time.time()) - float(rec["launch_attempted"]))
-            spent = dict(usd=spent["usd"] + usd, sec=spent["sec"] + sec)
-            it.state[f"{kind}_spent"] = spent
-            rec["counted"] = True
-            write_json(recp, rec)
+        # per-paper caps are cumulative over all jobs of this stage.  <kind>/spent.json maps job name -> charge and is
+        # written (atomically) before anything else, so a crash and resume recomputes the same total (idempotent).
+        sp = it.p(kind, "spent.json")
+        charges = read_json(sp, {}) or {}
+        if rec is not None and rec.get("job_name") and rec["job_name"] not in charges:
+            if rec.get("not_started") or not rec.get("launch_attempted"):
+                usd, sec = 0.0, 0.0             # confirmed never started
+            else:
+                # a job that may have run: unknown cost counts as its whole allowance, unknown time as wall time
+                # since the launch (never as zero)
+                b = rec.get("budget") or {}
+                usd = rec.get("cost_usd")
+                usd = float(usd) if usd is not None else float(b.get("max_usd") or max_usd or 0.0)
+                sec = 60.0 * float(rec["minutes"]) if rec.get("minutes") is not None else \
+                    max(0.0, float(rec.get("finished_ts") or time.time()) - float(rec["launch_attempted"]))
+            charges[rec["job_name"]] = dict(usd=usd, sec=sec)
+            write_json(sp, charges)
+        spent = dict(usd=sum(c["usd"] for c in charges.values()), sec=sum(c["sec"] for c in charges.values()))
+        it.state[f"{kind}_spent"] = spent
         left_s = timeout_s - spent["sec"]
         left_usd = None if max_usd is None else float(max_usd) - spent["usd"]
         floor = (600.0, 1.0) if spent["sec"] or spent["usd"] else (1.0, 0.01)   # first job: the configured caps
@@ -624,7 +627,7 @@ def s4c(P, it):
         # whose command is the reported entry (and its log)
         ok_runs = [r for r in receipts if r.get("rc") == 0 and str(r.get("cmd", "")).strip() ==
                    str(res.get("entry", "")).strip() and out and codeagent.safe_read(out / str(r.get("log", "")),
-                                                                                    root=out)]
+                                                                                    root=out) is not None]
         bad = [k for k, ok in (("reason", res.get("reason") == "ok"), ("entry", bool(str(res.get("entry", "")).strip())),
                                ("HOWTO.md", it.p("S4c", "HOWTO.md").exists()), ("reward", rec.get("reward") == 1),
                                ("receipt", bool(ok_runs))) if not ok]

@@ -409,7 +409,8 @@ def launch_agent(cfg: dict, it, kind: str, conf: dict, ledger, est_usd: float) -
         r = subprocess.run([cfg["calib"].get("tmux_bin", "tmux"), "new-session", "-d", "-s", rec["tmux"], "bash", "-lc",
                             inner], capture_output=True, text=True, timeout=60)
         if r.returncode != 0:
-            rec.update(state="launch_failed", error=f"tmux rc={r.returncode}: {r.stderr[-300:]}")
+            # tmux could not create the session: the job never started (nothing spent)
+            rec.update(state="launch_failed", not_started=True, error=f"tmux rc={r.returncode}: {r.stderr[-300:]}")
             if ledger is not None and rec.get("ledger_call"):
                 ledger.settle(rec["ledger_call"], 0.0, status="error", kind="not_launched", note=rec["error"])
         else:
