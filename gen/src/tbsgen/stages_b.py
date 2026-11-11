@@ -144,16 +144,7 @@ def regate(P, it, reason: str, recalibrate: bool = False) -> dict:
         st["thresholds_locked"] = True
         st["revision_data_hash"] = review.pkg_data_hash(it.p("pkg"))
         st["post_regate"] = True
-        # the packaged statement would change (e.g. a harness note PKG adds): the kept calibration ran on another
-        # statement, so re-scoring its deliverables cannot stand in for it -> recalibrate
-        spec = read_json(it.p("_spec", "spec.json"), {}) or {}
-        try:
-            new_ins = package.instruction_text(P.cfg, spec, it.p("task", "instruction.md").read_text())
-            statement_changed = new_ins != it.p("pkg", "instruction.md").read_text()
-        except OSError:
-            statement_changed = True
-        rec["statement_changed"] = statement_changed
-        if recalibrate or statement_changed or not (P.cfg.get("review") or {}).get("rescore_scoring_only", True):
+        if recalibrate or not (P.cfg.get("review") or {}).get("rescore_scoring_only", True):
             # re-scoring switched off: the kept calibration cannot be checked against the new grader -> redo it
             rec["archived_epoch"] = _archive_calibration(it)
             st.pop("calib_label", None)
@@ -269,8 +260,19 @@ def pkg(P, it):
                 spec_sha=_sha_file(it.p("_spec", "spec.json")), gates=gate["gates"],
                 thresholds=read_json(it.p("thresholds.json"))["thresholds"],
                 model_cost=P.item_cost(it.item_id), packaged=time.time())
+    try:
+        old_ins = it.p("pkg", "instruction.md").read_text()
+    except OSError:
+        old_ins = None
     out = package.package(P.cfg, it.dir, gen0, spec, prov)
     v = package.validate_pkg(out, P.cfg)
+    if it.state.get("rescore_pending") and old_ins is not None and \
+            (out / "instruction.md").read_text() != old_ins:
+        # a scoring-only revision / regate would re-score the kept calibration, but the packaged statement changed
+        # (e.g. a note PKG adds, a criteria table S7 appended): those runs read another statement -> recalibrate
+        epoch = _archive_calibration(it)
+        it.state.pop("rescore_pending", None)
+        P.store.event("calib_archived", item=it.item_id, epoch=epoch, reason="packaged statement changed")
     # the packaged image (Dockerfile written here, not by the model) gets the same ready-made check
     rm = prerelease.readymade_check(out, cand, spec)
     if not rm["ok"]:
