@@ -37,10 +37,8 @@ from .spec import metric_family
 
 
 CLI_RE = re.compile(r"solution_cli\.py\s+<input_dir>\s+<output_dir>")
-_HDR_KW = re.compile(r"\b(header|columns?)\b\s*[:=]?", re.I)
-_TICK = re.compile(r"`([^`\n]+)`")
-
-
+# a declaration is "Header: `a,b,c`" / "Columns: `a,b,c`": the keyword, a colon, then directly the backticked list
+_DECL = re.compile(r"(?:^|[\s(*_|>-])(?:header|columns)\s*:\s*`([^`\n]+)`", re.I)
 def _split_header(text: str) -> list[str] | None:
     """A backticked CSV header `a,b,c` -> ["a", "b", "c"] (csv rules; surrounding spaces trimmed, inner kept);
     None unless it is at least two plain column names."""
@@ -55,9 +53,11 @@ def _split_header(text: str) -> list[str] | None:
     return cols
 
 
-_FILE_TOK = re.compile(r"[\w./-]+\.(?:csv|tsv|json|npz|npy|txt|parquet|h5|hdf5|dat|xlsx?)(?![\w-]|\.\w)", re.I)
-_PARTIAL = re.compile(r"\b(includ\w*|at least|additional|extra|optional|among|such as|e\.g\.|for example|"
-                      r"subset|other columns|more columns|may also|derived from|same as|like)\b", re.I)
+# any file-like token: name.ext, including multi-part extensions (input.csv.gz) and <output_dir>/ prefixes
+_FILE_TOK = re.compile(r"(?<![\w./<>-])(?:<\w+>/)?[\w./-]*\w\.[A-Za-z][\w]*(?:\.[A-Za-z][\w]*)*(?![\w-])")
+_PARTIAL = re.compile(r"(?:\b(?:includ\w*|at least|additional|extra|optional|among|such as|for example|subset|"
+                      r"other columns|more columns|may also|derived from|same as|like|whose|corresponds?)\b|"
+                      r"\be\.g\.|\bi\.e\.)", re.I)
 _OUT_PREFIX = re.compile(r"^(?:\./|/app/output/|output/|<output_dir>/)")
 
 
@@ -66,15 +66,16 @@ def _norm_path(tok: str) -> str:
 
 
 def stated_csv_headers(ins: str, names: list[str]) -> dict[str, list[dict]]:
-    """Explicit, exhaustive CSV header declarations in the statement, per output file.  A declaration: a line that
-    names exactly one of the outputs (inputs may be named too; then a list on that same line is not used), the
-    output given as a relative path (with
-    ./, /app/output/, output/ or <output_dir>/ stripped; or its basename when that basename is unique among the
-    outputs), and, on that line or on one of the next 2 lines that name no file at all, the word
-    "header"/"columns" followed by exactly ONE backticked comma-separated list.  Lines with partial wording
-    ("includes", "at least", "additional", "e.g.", "derived from", ...) are skipped, as are lists on a line that
-    names another file (input-column lists) or two lists after the keyword.  Anything not matching is not judged.
-    -> {file: [{"cols": [...], "line": n}, ...]} -- every declaration in the window, not just the first."""
+    """Explicit, exhaustive CSV header declarations in the statement, per output file.  Strict on purpose (a false
+    positive would block a good task):
+      - anchor: a line that names exactly one of the outputs (relative path; ./, /app/output/, output/,
+        <output_dir>/ stripped; or its basename when unique among the outputs).  File tokens are any name.ext.
+      - declaration: `Header: `a,b,c`` / `Columns: `a,b,c`` -- the keyword, a colon, then directly ONE backticked
+        comma list -- on the anchor line (only if it names no other file) or on one of the next 2 lines, which
+        must name no file at all.
+      - the anchor line and the declaration line must not use partial / attributing wording (includes, at least,
+        additional, e.g., i.e., derived from, same as, like, whose, corresponds ...).
+    -> {file: [{"cols": [...], "line": n}, ...]} -- every declaration in the window."""
     lines = ins.splitlines()
     by_base: dict[str, list[str]] = {}
     for n in names:
@@ -87,26 +88,23 @@ def stated_csv_headers(ins: str, names: list[str]) -> dict[str, list[dict]]:
         same = by_base.get(t.rsplit("/", 1)[-1]) or []
         return same[0] if "/" not in t and len(same) == 1 else None
 
-    files_on = [[m.group(0) for m in _FILE_TOK.finditer(line)] for line in lines]
+    files_on = [{_norm_path(m.group(0)) for m in _FILE_TOK.finditer(line)} for line in lines]
     out: dict[str, list[dict]] = {}
     for k, toks in enumerate(files_on):
-        uniq = {_norm_path(t) for t in toks}
-        outs = {r for r in (resolve(t) for t in uniq) if r is not None}
-        if len(outs) != 1:
-            continue                                    # no output, or two outputs on one line: ambiguous
+        outs = {r for r in (resolve(t) for t in toks) if r is not None}
+        if len(outs) != 1 or _PARTIAL.search(lines[k]):
+            continue
         n = outs.pop()
         for j in range(k, min(k + 3, len(lines))):
             if j > k and files_on[j]:
                 break                                   # another file is named: its own declaration window
-            if j == k and len(uniq) > 1:
-                continue                                # same line names an input too: its list may be the input's
-            line = lines[j]
-            m = _HDR_KW.search(line)
-            if not m or _PARTIAL.search(line):
+            if j == k and len(toks) > 1:
+                continue                                # the anchor line names an input too
+            if _PARTIAL.search(lines[j]):
                 continue
-            ticks = [t for t in (_split_header(x) for x in _TICK.findall(line[m.end():])) if t]
-            if len(ticks) == 1:
-                out.setdefault(n, []).append(dict(cols=ticks[0], line=j + 1))
+            decl = [c for c in (_split_header(x) for x in _DECL.findall(lines[j])) if c]
+            if len(decl) == 1:
+                out.setdefault(n, []).append(dict(cols=decl[0], line=j + 1))
     return out
 
 

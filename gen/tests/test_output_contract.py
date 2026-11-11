@@ -75,7 +75,7 @@ def test_input_column_lists_without_header_keyword_are_not_judged(tmp_path):
 
 def test_two_lists_after_keyword_or_two_outputs_on_a_line_are_ambiguous():
     ins = ("- `a.csv` header: `x,y` (same as `u,v`)\n"
-           "- `b.csv` and `c.csv`, header `p,q`\n")
+           "- `b.csv` and `c.csv`, Header: `p,q`\n")
     assert gates.stated_csv_headers(ins, ["a.csv", "b.csv", "c.csv"]) == {}
 
 
@@ -94,13 +94,13 @@ def test_same_basename_in_two_dirs_needs_the_path(tmp_path):
     (d / "b").mkdir()
     (d / "a" / "out.csv").write_text("x,y\n")
     (d / "b" / "out.csv").write_text("p,q\n")
-    ins = "- `a/out.csv`: header `x,y`\n- `b/out.csv`: header `p,q`\n- `out.csv` header `z,w`\n"
+    ins = "- `a/out.csv`: Header: `x,y`\n- `b/out.csv`: Header: `p,q`\n- `out.csv` Header: `z,w`\n"
     r = gates.output_contract(ins, d)
     assert r["ok"] and r["checked"] == ["a/out.csv", "b/out.csv"], r
 
 
 def test_every_declaration_is_checked(tmp_path):
-    ins = "- `o.csv`: header `a,b`\n\n## Format\n`o.csv` columns: `a,c`\n"
+    ins = "- `o.csv`: Header: `a,b`\n\n## Format\n`o.csv` columns: `a,c`\n"
     d = _out(tmp_path, {"o.csv": "a,b"})
     r = gates.output_contract(ins, d)
     assert not r["ok"] and r["mismatch"]["o.csv"]["stated"] == ["a", "c"], r
@@ -172,3 +172,38 @@ def test_locked_retry_feedback_carries_full_mismatch(tmp_path, monkeypatch):
                          p=lambda *a: tmp_path.joinpath(*a))
     stages_b.s8(SimpleNamespace(cfg=load_config(None)), it)
     assert "c29" in seen["why"] and '"line": 9' in seen["why"]
+
+
+def test_codex_r3_false_positive_shapes_are_not_judged(tmp_path):
+    d = _out(tmp_path, {"out.csv": "id,value,extra"})
+    for ins in ("`out.csv`: one row per `input.feather` (columns: `id,x`)\n",
+                "`out.csv`: one row per `input.csv.gz` (columns: `id,x`)\n",
+                "`out.csv` corresponds to `input.csv`, whose\ncolumns are `id,x`\n",
+                "`out.csv` corresponds to the input, whose\nColumns: `id,x`\n",
+                "`out.csv` has these columns, e.g. `id,value`\n",
+                "`out.csv`: columns `id` and `value`; accepted labels are `low,high`\n"):
+        assert gates.output_contract(ins, d)["checked"] == [], ins
+
+
+def test_output_dir_placeholder_prefix_resolves(tmp_path):
+    d = tmp_path / "o"
+    (d / "results").mkdir(parents=True)
+    (d / "results" / "out.csv").write_text("id,value\n")
+    assert not gates.output_contract("Write `<output_dir>/results/out.csv`. Header: `id,wrong`\n", d)["ok"]
+
+
+def test_latest_attempt_is_chosen_numerically(tmp_path, monkeypatch):
+    import json
+    from types import SimpleNamespace
+    from tbsgen import stages_b
+    seen = {}
+    monkeypatch.setattr(stages_b, "_revision_retry", lambda P, it, why: seen.setdefault("why", why))
+    (tmp_path / "gates").mkdir()
+    (tmp_path / "gates" / "attempt-9.json").write_text(json.dumps(dict(details=dict(output_contract=dict(
+        ok=False, mismatch={"stale.csv": dict(stated=["a", "b"], line=1, reference=["a", "c"])})))))
+    (tmp_path / "gates" / "attempt-10.json").write_text(json.dumps(dict(details=dict(output_contract=dict(
+        ok=False, mismatch={"new.csv": dict(stated=["a", "b"], line=2, reference=["a", "z"])})))))
+    it = SimpleNamespace(state=dict(repair_from="gates:output_contract", thresholds_locked=True),
+                         p=lambda *a: tmp_path.joinpath(*a))
+    stages_b.s8(SimpleNamespace(cfg=load_config(None)), it)
+    assert "new.csv" in seen["why"] and "stale.csv" not in seen["why"] and '"z"' in seen["why"]

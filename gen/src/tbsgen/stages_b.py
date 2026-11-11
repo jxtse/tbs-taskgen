@@ -73,10 +73,16 @@ def s8(P, it):
         # and is not bound by the revision limit, so it must not run — the review revision is retried (feedback)
         # while rounds remain, else the item is dropped (review.allow_human restores the old park)
         why = f"after the review revision: {it.state.get('repair_from')}"
-        last = sorted(it.p("gates").glob("attempt-*.json")) if it.p("gates").exists() else []
+        last = sorted(it.p("gates").glob("attempt-*.json"),
+                      key=lambda q: int(q.stem.split("-")[-1]) if q.stem.split("-")[-1].isdigit() else -1) \
+            if it.p("gates").exists() else []
         oc = ((read_json(last[-1], {}) or {}).get("details") or {}).get("output_contract") if last else None
         if oc and not oc.get("ok"):
-            why += " output_contract mismatch: " + json.dumps(oc.get("mismatch"))[:1500]
+            # compact per-file difference first, so the budget never cuts the columns that matter
+            diff = {f: dict(missing_in_statement=sorted(set(m["reference"]) - set(m["stated"])),
+                            not_in_reference=sorted(set(m["stated"]) - set(m["reference"])), line=m.get("line"))
+                    for f, m in (oc.get("mismatch") or {}).items()}
+            why += " output_contract mismatch (statement vs reference header): " + json.dumps(diff)[:1700]
         return _revision_retry(P, it, why)
     rounds = it.state.get("repair_rounds", 0)
     if rounds >= P.cfg["gates"]["max_repair_rounds"]:
