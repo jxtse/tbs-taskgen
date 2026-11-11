@@ -225,7 +225,18 @@ DOI / arXiv id) or an OpenAlex full-text flag; **S3b** (after the full text) sco
 (Code Availability section, link context, reference list, README citing the paper), asks the cheap Jev model only
 for ambiguous links (`roles.code_owner = "jev"`), resolves the authors' links on their host and drops with a
 specific reason (`code_on_request`, `third_party_code_only`, `code_repo_unavailable`, `data_only_no_code`,
-`code_host_unsupported`, `no_code_link`). Licences are recorded, not filtered. The retrieval side
+`code_host_unsupported`, `no_code_link`). Licences are recorded, not filtered. **S3c** clones (or downloads) the authors' code on a build host over ssh and pins it (commit SHA / archive sha256; size
+cap, no LFS); third-party code never runs on the orchestrating machine. **S4c** is a runnability gate: a Claude Code
+agent job on the build host installs the code (package hosts allowlisted during install), runs one of the authors'
+examples / tests and writes a "how to run it" note, or the paper is dropped (`code_not_runnable`, `code_needs_gpu`,
+`code_needs_commercial_license`, ...). **S5G** replaces the single-call S5 + S6A: a Claude Code agent with the paper,
+the repository, that note and the harness contract writes exactly the same artefacts (`_spec/spec.json`,
+`task/{instruction.md, generator, solution, tests/measure.py, baselines}`) and iterates in its container until the
+reference and the baselines separate; everything from S6A_run on is unchanged (`code.authoring = "single_call"`
+restores the old path). The task image never contains the authors' repository or package: S7's ready-made check
+includes the authors' repository / package / main function names, a new blocking `author_leak` gate checks the
+statement and public files for them, and the S9R checklist asks whether the task is just a re-run of the authors'
+repository. `sandbox.backend = "ssh"` runs the generator / reference / baselines in the build host's Docker. The retrieval side
 (`retrieval/`, `code.enabled`) adds an OpenAlex full-text code channel, widens the fused head
 (`code.top_n_factor`, default 2.75) and prefers papers from `code.min_year` (default 2018) on. Details:
 [`gen/README.md`](gen/README.md) §0.

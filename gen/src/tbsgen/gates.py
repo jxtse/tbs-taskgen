@@ -301,10 +301,15 @@ def run_gates(cfg: dict, item_dir: Path, spec: dict, thresholds: dict, attempt: 
     # ready-made implementation of the paper in the image, the reference or a baseline (prerelease.py)
     from . import prerelease
     from .state import read_json
-    rm = prerelease.readymade_check(task, read_json(item_dir / "S1_candidate.json", {}), spec,
+    spec_a = prerelease.with_author_code(item_dir, spec)
+    rm = prerelease.readymade_check(task, read_json(item_dir / "S1_candidate.json", {}), spec_a,
                                     public_env=gen0 / "environment")
     g["readymade"] = rm["ok"]
     det["readymade"] = rm
+    if (item_dir / "_spec" / "author_code.json").exists():
+        al = prerelease.author_name_leaks(task, spec_a, public_env=gen0 / "environment")
+        g["author_leak"] = al["ok"]
+        det["author_leak"] = al
     blocking = [k for k, v in g.items() if not v and k in _blocking(cfg)]
     nonblocking = [k for k, v in g.items() if not v and k not in _blocking(cfg)]
     return dict(attempt=attempt, gates=g, blocking=blocking, nonblocking=nonblocking, ok=all(g.values()),

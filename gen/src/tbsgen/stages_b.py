@@ -232,6 +232,10 @@ def _slim(g):
             out["fix_hint"] = ("instruction.md states a CSV header that differs from what the reference writes and "
                                "tests/measure.py reads (details.output_contract: file, stated columns, reference "
                                "columns): make the statement, the reference and the scorer agree on one format.")
+        if "author_leak" in out.get("blocking", []):
+            out["details"]["author_leak"] = det.get("author_leak")
+            out["fix_hint"] = ("instruction.md or a public data file names the authors' repository / package / "
+                               "function (details.author_leak): describe the method scientifically instead.")
         if "readymade" in out.get("blocking", []):
             out["details"]["readymade"] = det.get("readymade")
             out["fix_hint"] = ("the task depends on the paper's own published implementation (see details.readymade): "
@@ -280,7 +284,13 @@ def pkg(P, it):
         P.store.event("calib_archived", item=it.item_id, epoch=epoch, reason="packaged statement changed")
     it.state.pop("pkg_statement_sha", None)
     # the packaged image (Dockerfile written here, not by the model) gets the same ready-made check
-    rm = prerelease.readymade_check(out, cand, spec)
+    spec_a = prerelease.with_author_code(it.dir, spec)
+    rm = prerelease.readymade_check(out, cand, spec_a)
+    if (it.p("_spec", "author_code.json")).exists():
+        al = prerelease.author_name_leaks(out, spec_a)
+        if not al["ok"]:
+            rm = dict(rm, ok=False, findings=list(rm.get("findings") or []) + [dict(kind="author_name", **f)
+                                                                               for f in al["findings"]])
     if not rm["ok"]:
         v = dict(v, ok=False, errors=list(v.get("errors") or []) + [f"readymade: {rm['findings'][:3]}"])
     write_json(it.p("PKG_check.json"), v)

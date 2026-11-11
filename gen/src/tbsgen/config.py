@@ -296,6 +296,37 @@ DEFAULTS: dict[str, Any] = {
         "proxy": "env",                     # "env": honour HTTPS_PROXY | "none": direct
         "mailto": "jxtse@users.noreply.github.com",
         "jev_own_threshold": 0.5,           # roles.code_owner = "jev": ambiguous links own if P(own) >= this
+        # S3c: fetch the authors' code on the build host (third-party code never runs on this machine)
+        "fetch": True,
+        "host": None,                       # ssh host of the build machine (e.g. the GPU-less build server)
+        "remote_root": None,                # build-host directory for repositories (internal; never published)
+        "run_tag": None,                    # subdirectory per run (default "run")
+        "max_repo_mb": 500,                 # working tree without .git; LFS objects are never fetched
+        "fetch_timeout_s": 900,
+        # S4c runnability gate + S5G authoring: Claude Code agent jobs (Harbor) on the build host
+        "runnability": True,
+        "runnability_timeout_s": 3600, "runnability_max_usd": 8.0, "runnability_est_usd": 6.0,
+        "authoring": "agent",               # "agent" (S5G) | "single_call" (old S5 + S6A, fallback)
+        "authoring_timeout_s": 7200,        # per paper (one S5G job)
+        "authoring_max_usd": 20.0,          # Claude Code --max-budget-usd (estimated at list price)
+        "authoring_est_usd": 15.0,          # ledger reservation per job, settled with the reported cost
+        "authoring_max_jobs": 2,            # S5G jobs per item (S6B back-to-spec / regenerate -> a new job)
+        "agent_hints": "",                  # text appended to the agent instructions (build-host notes: mirrors)
+        "agent_harbor_root": None,          # local dir with the launcher (default calib.teacher_harbor_root)
+        "agent_launcher": None,             # launcher script (default calib.teacher_launcher)
+        "agent": None,                      # agent import path (default calib.teacher_agent)
+        "agent_environment": None,          # environment import path (default calib.teacher_environment)
+        "agent_model": None,                # default calib.teacher_model
+        "agent_effort": "high",
+        "agent_allowed_hosts": None,        # model endpoint host(s) (default calib.teacher_agent_allowed_hosts)
+        "install_hosts": ["pypi.org", "files.pythonhosted.org", "github.com", "codeload.github.com",
+                          "objects.githubusercontent.com", "raw.githubusercontent.com", "zenodo.org",
+                          "cran.r-project.org", "cloud.r-project.org", "bioconductor.org", "deb.debian.org",
+                          "security.debian.org", "mirrors.nju.edu.cn", "conda.anaconda.org", "repo.anaconda.com",
+                          "pkg.julialang.org", "static.crates.io", "index.crates.io", "gitlab.com"],
+        "agent_base_image": "python:3.11-slim",
+        "agent_cpus": 4, "agent_memory_mb": 16384,
+        "agent_jobs_dir": None,             # default <item>/<stage>/jobs
     },
     "probe": {
         "tbs_tasks_root": None,             # TB-Science task texts (<task>/instruction.md ...); None -> no dedup
@@ -375,7 +406,7 @@ DEFAULTS: dict[str, Any] = {
         "max_exploit_repair_rounds": 2,     # S8 rounds when exploit_valid is the only blocking gate: only the broken
                                             # baselines/exploit_*.py are rewritten (allowed with locked thresholds)
         "blocking": ["oracle", "hidden_shift", "leak", "isolation", "infeasible", "determinism", "truth_isolation",
-                     "cli_contract", "output_contract", "tdm_verbatim", "readymade"],
+                     "cli_contract", "output_contract", "tdm_verbatim", "readymade", "author_leak"],
         # readymade (prerelease.readymade_check): the task image installs, or the reference / a baseline imports,
         # the paper's own implementation (code_links repo names, method_names of the S5 spec).  Rules only.
         # TDM terms (Elsevier: quotes <= 200 chars; Wiley: no redistribution): longest verbatim overlap between
@@ -385,7 +416,10 @@ DEFAULTS: dict[str, Any] = {
         "tdm_verbatim_unknown": False,      # True: a full text of unknown channel is checked too
     },
     "sandbox": {
-        "backend": "docker",                # only docker is supported
+        "backend": "docker",                # "docker" (local) | "ssh" (docker on `host`; code-grounded runs: the
+                                            # authors' code runs on the build host only)
+        "host": None, "remote_dir": None,   # ssh backend: host and per-call work directory there
+        "docker_config": None,              # ssh backend: DOCKER_CONFIG on the host (None = default)
         "image": "tbsgen-base:py311-sci-v2",
         "cpus": 2, "memory": "4g", "pids": 512,
     },

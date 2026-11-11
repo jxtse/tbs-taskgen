@@ -26,7 +26,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-STAGES = ["S1", "S2a", "S2", "S3", "S3b", "S4", "S5", "S6A", "S6B", "S6C", "S7", "S8", "PKG", "S9", "S9R", "S10"]
+STAGES = ["S1", "S2a", "S2", "S3", "S3b", "S3c", "S4", "S4c", "S5", "S5G", "S6A", "S6B", "S6C", "S7", "S8", "PKG", "S9", "S9R", "S10"]
 TERMINAL = {"done", "dropped", "parked"}
 
 

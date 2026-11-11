@@ -64,7 +64,7 @@ def s3b(P, it):
     if not rec["keep"]:
         return it.finish("dropped", rec["reason"])
     p = rec["primary"]
-    it.advance("S3b", "S4", repo=p.get("url"),
+    it.advance("S3b", _code_next_after_s3b(P), repo=p.get("url"),
                license=p.get("license"), language=p.get("language"))
 
 
@@ -172,10 +172,12 @@ def s4(P, it):
     write_json(it.p("S4_probe.json"), rec)
     if not rec["feasible"]:
         return it.finish("dropped", ",".join(rec["reasons"]))
-    it.advance("S4", "S5")
+    it.advance("S4", "S4c" if codegate.grounded(P.cfg) and codegate.ccfg(P.cfg).get("runnability", True) else "S5")
 
 
 def s5(P, it):
+    if _agent_reauthor(P, it, "back_to_spec"):
+        return
     c = read_json(it.p("S1_candidate.json"))
     client = P.client("spec")
     excerpt = it.p("fulltext.txt").read_text()[: P.cfg["spec"]["excerpt_chars"]]
@@ -267,6 +269,8 @@ def chat_files(P, it, role: str, stage: str, user: str, need: set[str], max_toke
 
 
 def s6a(P, it):
+    if it.state.get("regen_6a") and _agent_reauthor(P, it, "regenerate_reference"):
+        return
     spec = read_json(it.p("_spec", "spec.json"))
     task = it.p("task")
     if not (task / "generator" / "generate.py").exists() or it.state.get("regen_6a"):
@@ -481,3 +485,184 @@ def _to_repair(P, it, why: str, info):
     it.state["repair_from"] = why
     it.save()
     it.goto("S8", why)
+
+
+# =============================================================================================== code-grounded S3c/S4c/S5G
+def _code_next_after_s3b(P) -> str:
+    return "S3c" if codegate.ccfg(P.cfg).get("fetch", True) else "S4"
+
+
+def s3c(P, it):
+    """Fetch the authors' code on the build host and pin it (commit SHA / archive sha256)."""
+    from . import codeagent
+    rec = read_json(it.p("S3b_code.json"), {}) or {}
+    prim = rec.get("primary") or {}
+    if not prim:
+        return it.finish("dropped", "no_code_primary")
+    why = codeagent.env_ok(P.cfg)
+    if why:
+        return it.finish("paused", f"code:config:{why}", paused_stage="S3c")
+    r = codeagent.s3c_fetch(P.cfg, it.item_id, prim)
+    write_json(it.p("S3c_code.json"), dict(r, primary_url=prim.get("url"), license=prim.get("license"),
+                                           ts=time.time()))
+    if not r.get("ok"):
+        if r.get("transient") or r.get("why") in ("clone_failed", "download_failed") and it.bump("S3c:fetch") < 3:
+            return it.finish("paused", f"code:fetch:{r.get('why')}", paused_stage="S3c")
+        reason = {"too_large": "code_too_large", "unsupported": "code_host_unsupported"}.get(r.get("why"),
+                                                                                          "code_fetch_failed")
+        return it.finish("dropped", reason)
+    it.advance("S3c", "S4", pin=r.get("pin"), size_mb=r.get("size_mb"), languages=r.get("languages"))
+
+
+def _agent_stage(P, it, kind: str, instruction: str, need: list[str], timeout_s: float, max_usd: float | None,
+                 est_usd: float, with_contract: bool):
+    """Shared S4c / S5G driver: build + launch the job once, then (later steps) poll it.  Returns the finished
+    run record, or None while it runs (the item is left `waiting`)."""
+    from . import codeagent
+    recp = it.p(kind, "run.json")
+    rec = read_json(recp, None)
+    if rec is not None and rec.get("state") == "finished" and it.state.pop(f"{kind}_rerun", None):
+        rec["retry"] = True                     # S6B sent the task back: author it again (with feedback)
+    if rec is None or (rec.get("state") == "finished" and rec.get("retry")):
+        why = codeagent.env_ok(P.cfg, agent=True)
+        if why:
+            it.finish("paused", f"code:config:{why}", paused_stage=kind)
+            return None
+        n = it.bump(f"{kind}:job")
+        work = it.p(kind, "work")
+        codeagent.stage_inputs(P.cfg, it, work, with_contract)
+        task = codeagent.build_agent_task(P.cfg, kind, it.item_id, work, it.p(kind, "task"), instruction, need,
+                                          timeout_s)
+        jobs = Path(codeagent._c(P.cfg).get("agent_jobs_dir") or it.p(kind, "jobs"))
+        conf = codeagent.agent_job_config(P.cfg, task, f"tbsgen-{it.item_id}-{kind.lower()}{n}", jobs, max_usd)
+        rec = codeagent.launch_agent(P.cfg, it, kind, conf, P.ledger, est_usd)
+        if rec.get("state") == "launch_failed":
+            it.finish("paused", f"code:{kind}:launch_failed", paused_stage=kind)
+            return None
+        it.finish("waiting", f"{kind}:agent_running", job=rec["job_name"])
+        return None
+    if rec.get("state") in ("intent", "reserved"):
+        rec = codeagent.launch_agent(P.cfg, it, kind, json.loads(Path(rec["config"]).read_text()), P.ledger, est_usd)
+        it.finish("waiting", f"{kind}:agent_running", job=rec.get("job_name"))
+        return None
+    if rec.get("state") == "launched":
+        rec = codeagent.poll_agent(P.cfg, it, kind, P.ledger)
+        if rec is None or rec.get("state") != "finished":
+            if it.state.get("status") != "waiting":
+                it.finish("waiting", f"{kind}:agent_running", job=(rec or {}).get("job_name"))
+            return None
+    return rec
+
+
+def s4c(P, it):
+    """Runnability gate: a Claude Code agent installs and runs the authors' code once on the build host."""
+    from . import codeagent
+    from .prompts_code import S4C_RUNNABILITY
+    c = codegate.ccfg(P.cfg)
+    tmo = float(c.get("runnability_timeout_s", 3600))
+    rec = _agent_stage(P, it, "S4c", S4C_RUNNABILITY.format(item=it.item_id, minutes=int(tmo // 60)),
+                       ["runnability.json", "HOWTO.md"], tmo, c.get("runnability_max_usd", 8.0),
+                       float(c.get("runnability_est_usd", 6.0)), with_contract=False)
+    if rec is None:
+        return
+    out = codeagent.deliverable(rec)
+    res = read_json(out / "runnability.json", None) if out else None
+    if out:
+        for f in ("runnability.json", "HOWTO.md", "run.log", "setup.sh"):
+            if (out / f).exists():
+                shutil.copy(out / f, it.p("S4c", f))
+    write_json(it.p("S4c_runnability.json"), dict(job=rec.get("job_name"), outcome=rec.get("outcome"),
+                                                  exception=rec.get("exception"), cost_usd=rec.get("cost_usd"),
+                                                  minutes=rec.get("minutes"), result=res))
+    if not isinstance(res, dict):
+        if rec.get("outcome") in ("launcher_failed", "no_result") and it.bump("S4c:infra") < 2:
+            rec["retry"] = True
+            write_json(it.p("S4c", "run.json"), rec)
+            return it.goto("S4c", "runnability job infra failure: retry")
+        return it.finish("dropped", "code_runnability_agent_failed")
+    if not res.get("runnable"):
+        why = str(res.get("reason") or "other")
+        reason = {"needs_gpu": "code_needs_gpu", "needs_commercial_license": "code_needs_commercial_license",
+                  "needs_mathematica": "code_needs_commercial_license",
+                  "matlab_octave_incompatible": "code_matlab_octave_incompatible"}.get(why, "code_not_runnable")
+        return it.finish("dropped", reason, detail=why)
+    it.advance("S4c", "S5G" if codegate.ccfg(P.cfg).get("authoring", "agent") == "agent" else "S5",
+               language=res.get("language"), seconds=res.get("seconds"))
+
+
+S5G_FILES = ["_spec/spec.json", "_spec/author_code.json", "task/instruction.md", "task/generator/generate.py",
+             "task/solution/solve.py", "task/tests/measure.py", "task/baselines/mid.py", "task/baselines/naive.py"]
+
+
+def s5g(P, it):
+    """Task authoring by a Claude Code agent on the build host (replaces S5 + S6A; same artefacts)."""
+    from . import codeagent
+    from .prompts_code import CODE_PROMPT_VERSION, S5G_AUTHOR
+    c = codegate.ccfg(P.cfg)
+    tmo = float(c.get("authoring_timeout_s", 7200))
+    lo, hi = P.cfg["spec"].get("expert_hours", [2, 6])
+    rec = _agent_stage(P, it, "S5G", S5G_AUTHOR.format(item=it.item_id, minutes=int(tmo // 60),
+                                                       forms=P.cfg["spec"]["allowed_forms"], hours_lo=lo, hours_hi=hi),
+                       S5G_FILES, tmo, c.get("authoring_max_usd", 20.0), float(c.get("authoring_est_usd", 15.0)),
+                       with_contract=True)
+    if rec is None:
+        return
+    out = codeagent.deliverable(rec)
+    miss = [f for f in S5G_FILES if not (out and (out / f).exists())]
+    write_json(it.p("S5G_result.json"), dict(job=rec.get("job_name"), outcome=rec.get("outcome"),
+                                             exception=rec.get("exception"), cost_usd=rec.get("cost_usd"),
+                                             cost_kind=rec.get("cost_kind"), minutes=rec.get("minutes"),
+                                             missing=miss, prompt_version=CODE_PROMPT_VERSION))
+    if miss:
+        if rec.get("outcome") in ("launcher_failed", "no_result") and it.bump("S5G:infra") < 2:
+            rec["retry"] = True
+            write_json(it.p("S5G", "run.json"), rec)
+            return it.goto("S5G", "authoring job infra failure: retry")
+        return it.finish("dropped", "s5g_missing_files", missing=miss[:5])
+    try:
+        spec = json.loads((out / "_spec" / "spec.json").read_text())
+    except (OSError, ValueError) as e:
+        return it.finish("dropped", f"s5g_spec_unparseable:{type(e).__name__}")
+    errs = validate_spec(spec, P.cfg)
+    write_json(it.p("_spec", "spec_errors.json"), errs)
+    if errs:
+        return it.finish("dropped", "spec_invalid")
+    task = it.p("task")
+    if task.exists():
+        shutil.rmtree(task)
+    shutil.copytree(out / "task", task)
+    for extra in ("environment",):                 # the task image is built by PKG only (no agent-made env files)
+        if (task / extra).exists():
+            shutil.rmtree(task / extra)
+    author = json.loads((out / "_spec" / "author_code.json").read_text())
+    s3c = read_json(it.p("S3c_code.json"), {}) or {}
+    author.update(pin=s3c.get("pin"), repo_url=s3c.get("primary_url"), license=s3c.get("license"))
+    write_json(it.p("_spec", "author_code.json"), author)
+    write_json(it.p("_spec", "spec.json"), spec)
+    write_json(it.p("_spec", "depgraph.json"), spec["depgraph"])
+    write_json(it.p("_spec", "coverage.json"), dict(form=spec.get("form"), domain=spec.get("domain"),
+                                                    field=spec.get("field"), competencies=spec.get("competencies")))
+    c1 = read_json(it.p("S1_candidate.json"), {}) or {}
+    write_json(it.p("_spec", "provenance.json"), dict(
+        doi=c1.get("doi"), title=c1.get("title"), target=c1.get("_target"), prompt_version=CODE_PROMPT_VERSION,
+        authoring="agent", agent_job=rec.get("job_name"), fulltext=read_json(it.p("S3_fulltext.json")),
+        fulltext_sha=hashlib.sha256(it.p("fulltext.txt").read_bytes()).hexdigest()[:16],
+        author_code=dict(repo=s3c.get("primary_url"), pin=s3c.get("pin"), license=s3c.get("license"))))
+    if (out / "report.md").exists():
+        shutil.copy(out / "report.md", it.p("S5G", "report.md"))
+    it.advance("S5G", "S6A_run", form=spec.get("form"), cost_usd=rec.get("cost_usd"), minutes=rec.get("minutes"))
+
+
+def _agent_reauthor(P, it, why: str) -> bool:
+    """Code-grounded items authored by the S5G agent go back to S5G (not to the single-call S5 / S6A) when S6B
+    asks for a new spec or a regenerated reference; at most code.authoring_max_jobs jobs per item."""
+    if not it.p("_spec", "author_code.json").exists() or codegate.ccfg(P.cfg).get("authoring", "agent") != "agent":
+        return False
+    n = it.state.get("attempts", {}).get("S5G:job", 0)
+    if n >= int(codegate.ccfg(P.cfg).get("authoring_max_jobs", 2)):
+        it.finish("dropped", f"s5g_jobs_exhausted:{why}")
+        return True
+    it.state.pop("regen_6a", None)
+    it.state["S5G_rerun"] = True
+    it.goto("S5G", f"re-author by agent: {why}")
+    return True

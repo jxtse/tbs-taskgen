@@ -62,9 +62,10 @@ PROBLEM_CLASSES = {
     "calibration": "fundamental",       # the label cannot be trusted and no local edit changes that
 }
 CHECKLIST = ("a_consistency", "b_missing_conditions", "c_thresholds", "d_stability", "e_shortcuts_leaks",
-             "f_network_readymade", "g_calibration", "h_timing_gate")
+             "f_network_readymade", "g_calibration", "h_timing_gate", "i_author_code")
 CATEGORIES = {"a": "consistency", "b": "missing_conditions", "c": "thresholds", "d": "stability",
-              "e": "shortcuts_leaks", "f": "network_readymade", "g": "calibration", "h": "timing_gate"}
+              "e": "shortcuts_leaks", "f": "network_readymade", "g": "calibration", "h": "timing_gate",
+              "i": "author_code"}
 VERDICT_PATH = "/app/review_out/verdict.json"
 # files a review revision (S8) may change: the statement, the data format notes (written by the generator), the
 # test / scoring scripts, and the exploit baselines.  Never the reference solution, the baselines' mid / naive,
@@ -230,6 +231,8 @@ def write_bundle(item_dir: Path, dest: Path, state: dict, digest_kb: int = 150) 
             shutil.copy2(item_dir / name, rec / name)
     if (item_dir / "_spec" / "spec.json").exists():
         shutil.copy2(item_dir / "_spec" / "spec.json", rec / "spec.json")
+    if (item_dir / "_spec" / "author_code.json").exists():         # code-grounded: names only, never the code
+        shutil.copy2(item_dir / "_spec" / "author_code.json", rec / "author_code.json")
     gates = sorted((item_dir / "gates").glob("attempt-*.json")) if (item_dir / "gates").exists() else []
     if gates:
         (rec / "s7_gates").mkdir()
@@ -482,6 +485,12 @@ f. **Network / ready-made code.**  Does solving it need the internet or the pape
 g. **Calibration evidence.**  Using the traces: did failures come from the task's difficulty, from a task defect
    (ambiguity, contradiction), or from the harness / infrastructure (timeouts from a slow model, crashes, API
    errors)?  Did passing runs really solve the task?  Is the label `{label}` trustworthy?
+i. **Authors' code (code-grounded tasks; `records/author_code.json` exists, else answer "na").**  Is the task more
+   than re-running the authors' repository (an agent that knew the repository could not pass by calling or pasting
+   it; the task needs the paper's reasoning, not just the package's API)?  Does the statement, the data or the image
+   leak the authors' implementation (repository / package / function / file names, vendored code, an installable
+   package)?  A leak of the authors' implementation is blocking (`statement` if only the wording names it,
+   `core_invalid` if the task is only a re-run).
 h. **Timing in the verdict.**  Should the resource metric(s) (wall time / memory) count toward the reward
    (`resource_metric_gating` in the spec: true = they gate, false = they are recorded but never decide a run)?
    They should gate only when speed itself is the paper's contribution; otherwise a slower machine would fail a
@@ -533,6 +542,7 @@ Write `{verdict_path}` (JSON, exactly these keys) and optionally `/app/review_ou
     "d_stability": {{"status": "...", "note": "..."}},
     "e_shortcuts_leaks": {{"status": "...", "note": "..."}},
     "f_network_readymade": {{"status": "...", "note": "..."}},
+    "i_author_code": {{"status": "...", "note": "..."}},
     "g_calibration": {{"status": "...", "note": "..."}},
     "h_timing_gate": {{"status": "...", "note": "..."}}
   }},
