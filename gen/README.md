@@ -8,7 +8,9 @@
 （任务包与训练数据都不进公开仓库，作者代码只在内部运行目录）。`code.grounded = false`（默认）时管线与以前完全相同。
 
 ```
-S1 → S2a 代码信号预筛（不花全文额度） → S2 摘要筛 → S3 全文 → S3b 作者代码硬确认 → S4 …
+S1 → S2a 代码信号预筛（不花全文额度） → S2 摘要筛 → S3 全文 → S3b 作者代码硬确认 → S3c 获取代码（构建机）
+   → S4 可行性 → S4c 可运行性硬门（构建机 Claude Code agent） → S5G 出题 agent（构建机 Claude Code）
+   → S6A_run → S6B → S6C → S7 → S8 → PKG → S9 → S9R → S10（后段不变）
 ```
 
 | 阶段 | 产物 | 淘汰原因 |
@@ -25,9 +27,37 @@ S3b 规则在 2026-11-11 摸底的 224 篇（人工读上下文标注，93 篇�
 S2a 查不到 OpenAlex 时暂停（`code:openalex_unavailable`），都用 `tbsgen resume --reason code:` 恢复。私有仓库不算公开代码。
 `tbsgen fetch` 投递全文时按条目自己 run 当时写进 `S3_queue.json` 的 `next_stage` 推进（旧条目默认 S4）。
 
+| S3c | `S3c_code.json`：在构建机（`code.host`，ssh）上 `git clone --depth 1`（不拉 LFS、不拉子模块）或下载 Zenodo / CRAN / PyPI 源码包；固定 commit SHA（压缩包为 sha256）；记录大小（不含 .git）、语言、依赖文件、LICENSE 首行。代码只放在构建机的 `code.remote_root/<run_tag>/<item>/repo`，本机不执行、不保存第三方代码 | `code_too_large`（> `code.max_repo_mb`，默认 500）、`code_fetch_failed`、`code_host_unsupported`；网络失败暂停重试 |
+| S4c | 构建机上的 Harbor 作业（`code.agent_launcher`，默认沿用教师路由：Opus 经 Substrate 中继）：agent 在容器里装环境（安装期只放行包索引和代码托管站 `code.install_hosts`，外加模型端点）、通过回执包装 `/work/tbsgen-run.sh` 跑一次作者的示例 / 测试 / 主入口（记录命令、退出码、日志；“可运行”必须有一条退出码 0、命令等于 `entry` 的回执），写 `runnability.json`、`HOWTO.md`（给下一步的“如何运行作者代码”）、`setup.sh`。MATLAB 先试 Octave | `code_not_runnable`、`code_needs_gpu`、`code_needs_commercial_license`（含 Mathematica）、`code_matlab_octave_incompatible`、`code_runnability_agent_failed` |
+| S5G | 构建机上的 Claude Code 出题 agent：输入论文全文、作者仓库、S4c 的 HOWTO、harness 契约原文（S5_SPEC、S6A_GEN、METRICS_API、`_metrics.py` 模板）；输出与 S5 + S6A **完全相同**的产物（`_spec/spec.json`、`task/{instruction.md, generator, solution, tests/measure.py, baselines/mid.py, baselines/naive.py}`）加 `_spec/author_code.json`（包名、主要函数、参考解用了作者哪些代码、数据来源）。agent 可在容器里反复运行生成器、参考解、基线直到拉开差距。之后 S6A_run 起全部沿用旧阶段；S6B 要求重新出规格 / 重写参考解时回到 S5G（每篇最多 `code.authoring_max_jobs` 次） | `s5g_missing_files`、`spec_invalid`、`s5g_jobs_exhausted:*` |
+
+防泄漏：任务镜像（PKG 生成的 Dockerfile）只有固定科学计算栈，agent 写的 `task/environment/` 一律丢弃；作者代码只能
+被移植进参考解，或在构建期生成真值（存进 `generator/assets/`，附 PROVENANCE）。S7 的 `readymade` 门加入作者仓库名、
+包名、主要函数名（`_spec/author_code.json`）；新 S7 门 `author_leak`（阻断）检查题面和公开数据文件是否点名这些名字；
+PKG 打包时同样检查。S9R 审核清单新增 `i_author_code`：任务是否只是“重跑作者仓库”、是否泄漏作者实现。
+
+预算：每个 agent 作业在账本里按 `code.runnability_est_usd` / `code.authoring_est_usd` 预留（阶段 S4c / S5G，教师模型），
+结束后按 Claude Code 报告的 `cost_usd`（没有时按 token × `models.prices`）结算；单篇时长上限
+`code.authoring_timeout_s`（默认 7200 s），估算费用上限 `code.authoring_max_usd`（默认 $20，传给 Claude Code
+`--max-budget-usd`）。`code.authoring = "single_call"` 回退到旧的单次调用 S5 + S6A。
+
+作者代码注入：S3c 把代码放在构建机 `<remote_root>/<run_tag 或 run 唯一 id>/<item>/pins/<pin>/repo`（每个 pin 不可变、原子发布、
+符号链接全部删除）。agent 作业的 `environment/work/.tbsgen-remote-repo` 写明 `{repo_dir, pin}`；作业启动器须在构建机上调用
+`gen/scripts/inject-author-repo.sh <task> <remote_root>`（拒绝链接路径、根目录外路径和 pin 不符），作业 Dockerfile 在
+`/work/repo.PIN` 与 pin 不一致时拒绝构建，因此未注入时不会产生模型开销。agent 交付物按 trial 根目录逐级拒绝符号链接。
+单篇预算按作业累计（`<stage>/spent.json` 以作业名为键，崩溃后可幂等重算；费用未知时按该作业上限计）。
+
+沙箱（代码驱动运行必需）：`sandbox.backend = "ssh"`（`sandbox.host`、`sandbox.remote_dir`、`sandbox.docker_config`）让 S6A_run / S7
+的生成器、参考解、基线在构建机的 docker（`--network none`、资源上限同本机）里跑：移植了作者代码的参考解也只在构建机执行。
+
 配置（`[code]`）：`grounded`、`prescreen`（S2a 开关，默认开）、`openalex_flag`、`fulltext_terms`、`pwc_path`、
 `github_client`（`gh` 用 gh CLI 自带认证 / `rest` 匿名）、`proxy`、`mailto`、`jev_own_threshold`（没有 maybe 放行开关）；
-`[models.roles] code_owner = "rules" | "jev"`。检索侧见 `retrieval/README.md` 的“代码通道”。
+`[models.roles] code_owner = "rules" | "jev"`；S3c / S4c / S5G：`fetch`、`host`、`remote_root`、`run_tag`、
+`max_repo_mb`、`fetch_timeout_s`、`runnability`、`runnability_timeout_s`、`runnability_max_usd`、`runnability_est_usd`、
+`authoring`（`agent` | `single_call`）、`authoring_timeout_s`、`authoring_max_usd`、`authoring_est_usd`、
+`authoring_max_jobs`、`agent_harbor_root`、`agent_launcher`、`agent`、`agent_environment`、`agent_model`、
+`agent_effort`、`agent_allowed_hosts`、`install_hosts`、`agent_base_image`、`agent_cpus`、`agent_memory_mb`、
+`agent_jobs_dir`、`agent_hints`。检索侧见 `retrieval/README.md` 的“代码通道”。
 
 ## 1. 架构
 
@@ -39,6 +69,8 @@ src/tbsgen/
   state.py         每条目一个状态目录 + state.json 状态机；events.jsonl
   pipeline.py      编排：逐条推进、断点续跑、预算/熔断暂停、resume
   codegate.py      代码驱动出题：S2a 代码信号预筛、S3b 作者代码确认与仓库解析（§0）
+  codeagent.py     代码驱动出题：S3c 构建机获取代码、S4c / S5G 构建机 Claude Code agent 作业（§0）
+  prompts_code.py  S4c 可运行性、S5G 出题 agent 的指令
   intake.py        S1 读检索层输出；S2 规则筛选（rules-v2）；S3 全文（调 fulltext.py）；S4 可行性（规则部分 + 官方题去重）
   blocklist.py     S2 前置黑名单：按 DOI 前缀（可加发表年份）直接丢弃拿不到全文的论文，配置 screen.blocklist；
                    自动复查（screen.blocklist_recheck）：每周少量试取，成功率够高自动解除规则
@@ -76,7 +108,9 @@ eval/                        泄漏门回测结果
 ledger.sqlite  events.jsonl  reports/daily-<日期>.md  release/manifest.jsonl
 items/<item_id>/
   state.json                 当前阶段、状态、历史、各阶段尝试次数
-  S1_candidate.json S2a_code_signal.json S2_screen.json S2_jev.json S3_fulltext.json fulltext.txt S3b_code.json S4_probe.json
+  S1_candidate.json S2a_code_signal.json S2_screen.json S2_jev.json S3_fulltext.json fulltext.txt S3b_code.json
+  S3c_code.json S4_probe.json S4c/{run.json,task,HOWTO.md,run.log} S4c_runnability.json S5G/{run.json,task,report.md}
+  S5G_result.json _spec/author_code.json
   _spec/{spec,depgraph,coverage,provenance}.json      出题侧，不进 Harbor
   task/                      工作树：generator/ solution/ baselines/ tests/ instruction.md
   runs/                      沙箱运行产物

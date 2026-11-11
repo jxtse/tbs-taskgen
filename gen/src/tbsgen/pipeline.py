@@ -20,8 +20,9 @@ from .config import resolve_role
 from .models import ModelError, get_client
 from .state import STAGES, Store, read_json, write_json
 
-HANDLERS = {"S1": A.s1, "S2a": A.s2a, "S3b": A.s3b, "S2": A.s2, "S3": A.s3, "S4": A.s4, "S5": A.s5, "S6A": A.s6a, "S6A_run": A.s6a_run, "S6M": A.s6m,
+HANDLERS = {"S1": A.s1, "S2a": A.s2a, "S3b": A.s3b, "S3c": A.s3c, "S4c": A.s4c, "S5G": A.s5g, "S2": A.s2, "S3": A.s3, "S4": A.s4, "S5": A.s5, "S6A": A.s6a, "S6A_run": A.s6a_run, "S6M": A.s6m,
             "S6B": A.s6b, "S6C": B.s6c, "S7": B.s7, "S8": B.s8, "PKG": B.pkg, "S9": B.s9, "S9R": B.s9r, "S10": B.s10}
+AGENT_STAGES = ("S4c", "S5G")     # code-grounded Harbor agent jobs: the item waits while its job runs
 MODEL_STAGES = {"S5": "spec", "S6A": "gen", "S6M": "gen", "S6C": "tests", "S8": "repair"}
 # sub-stages that are not in state.STAGES (for `run --until`): S6A_run is part of S6A; S6M (a model call) comes
 # after S6B, so `--until S6B` does not start it
@@ -226,6 +227,7 @@ class Pipeline:
             self.prefetch_screen(only)
 
         rewoken: set[str] = set()
+        polled: set[str] = set()
 
         def runnable(it) -> bool:
             if only and it.item_id not in only:
@@ -234,6 +236,9 @@ class Pipeline:
                 return False
             if it.state["status"] == "active":
                 return True
+            # code-grounded agent job (S4c / S5G) running on the build host: poll it once per run
+            if it.state["status"] == "waiting" and it.state["stage"] in AGENT_STAGES:
+                return it.item_id not in polled
             # S9 waiting with nothing running (prepared while allow_submit was off, or blocked): once per run
             return it.item_id not in rewoken and B.reschedulable(self.cfg, it)
 
@@ -243,7 +248,9 @@ class Pipeline:
             for it in self.order([i for i in self.store.items() if runnable(i)]):
                 if not runnable(it):            # its status may have changed since the snapshot
                     continue
-                if it.state["status"] == "waiting":
+                if it.state["status"] == "waiting" and it.state["stage"] in AGENT_STAGES:
+                    polled.add(it.item_id)
+                elif it.state["status"] == "waiting":
                     rewoken.add(it.item_id)
                     if not B.rewake(self.cfg, it):      # re-checked under the item lock
                         continue

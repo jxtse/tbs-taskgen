@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import ast
 import contextlib
+import json
 import re
 from pathlib import Path
 
@@ -145,6 +146,17 @@ def signals(candidate: dict, spec: dict | None) -> dict:
     for m in (spec or {}).get("method_names") or []:
         for t in _tokens(str(m)):
             names.setdefault(t, f"method name {m}")
+    # code-grounded: the authors' repository / package / main function names (S5G _spec/author_code.json)
+    ac = (spec or {}).get("_author_code") or {}
+    for k, label in (("package_names", "author package"), ("main_functions", "author function")):
+        for m in ac.get(k) or []:
+            for t in _tokens(str(m)):
+                names.setdefault(t, f"{label} {m}")
+    for u in [ac.get("repo"), ac.get("repo_url")]:
+        for r in repo_names([u] if u else []):
+            repos.append(r) if r not in repos else None
+            for t in _tokens(r["name"]):
+                names.setdefault(t, f"author repo {r.get('owner', '')}/{r['name']}")
     # software names given in the candidate record (retrieval: `libs`, `software`, `tools`)
     for k in ("libs", "software", "tools", "packages"):
         for m in candidate.get(k) or []:
@@ -328,3 +340,45 @@ def readymade_check(task: Path, candidate: dict, spec: dict | None, public_env: 
                     break
     return dict(ok=not findings, findings=findings, companion_code=[r["url"] for r in sg["repos"]],
                 signals=sorted(sg["names"]))
+
+
+# ------------------------------------------------------------------------------------------- code-grounded leaks
+def with_author_code(item_dir: Path, spec: dict | None) -> dict | None:
+    """spec + `_author_code` (the S5G record) so the ready-made check knows the authors' names."""
+    try:
+        ac = json.loads((Path(item_dir) / "_spec" / "author_code.json").read_text())
+    except (OSError, ValueError):
+        return spec
+    return dict(spec or {}, _author_code=ac)
+
+
+_TEXT_EXT = re.compile(r"\.(md|txt|csv|tsv|json|ya?ml|toml|py|r|jl|ini|cfg)$", re.I)
+
+
+def author_name_leaks(task: Path, spec: dict | None, public_env: Path | None = None) -> dict:
+    """The statement and the public files must not name the authors' repository, package or main functions
+    (whole-word, case-insensitive; names shorter than 4 characters are skipped)."""
+    ac = (spec or {}).get("_author_code") or {}
+    names = set()
+    for k in ("package_names", "main_functions"):
+        names |= {str(x) for x in ac.get(k) or [] if isinstance(x, str)}
+    for r in repo_names([u for u in (ac.get("repo"), ac.get("repo_url")) if u]):
+        names.add(r["name"])
+    names = {n for n in names if len(n) >= 4 and _norm(n) not in GENERIC and _norm(n) not in BASE_STACK}
+    if not names:
+        return dict(ok=True, findings=[], names=[])
+    rx = re.compile(r"(?<![A-Za-z0-9_])(" + "|".join(re.escape(n) for n in sorted(names, key=len, reverse=True)) +
+                    r")(?![A-Za-z0-9_])", re.I)
+    files = [task / "instruction.md"]
+    for env in [task / "environment"] + ([public_env] if public_env else []):
+        if env.exists():
+            files += [p for p in sorted(env.rglob("*")) if p.is_file() and _TEXT_EXT.search(p.name)
+                      and p.stat().st_size < 5_000_000]
+    findings = []
+    for f in files:
+        if not f.exists():
+            continue
+        m = rx.search(f.read_text(errors="replace"))
+        if m:
+            findings.append(dict(file=str(f.relative_to(task)) if task in f.parents else str(f), name=m.group(1)))
+    return dict(ok=not findings, findings=findings, names=sorted(names))
