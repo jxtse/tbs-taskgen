@@ -144,11 +144,19 @@ def trace_digest(trial: Path, max_chars: int = 150_000) -> str:
                 o = json.loads(line)
             except json.JSONDecodeError:
                 continue
+            if not isinstance(o, dict):
+                continue
             t = o.get("type")
             if t == "result":
                 final = o
                 continue
-            m = o.get("message") or {}
+            if t == "system" and o.get("subtype") == "permission_denied":
+                # Claude Code safety check refused a tool call; `message` is a plain string here
+                calls.append(("tool", f"(denied) {o.get('tool_name')}: {_short(o.get('decision_reason'), 300)}"))
+                continue
+            m = o.get("message")
+            if not isinstance(m, dict):
+                continue
             for b in m.get("content") or [] if isinstance(m.get("content"), list) else []:
                 if not isinstance(b, dict):
                     continue
