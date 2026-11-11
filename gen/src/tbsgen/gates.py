@@ -37,56 +37,81 @@ from .spec import metric_family
 
 
 CLI_RE = re.compile(r"solution_cli\.py\s+<input_dir>\s+<output_dir>")
-_HEADER_RE = re.compile(r"^[A-Za-z_][\w.\-]*(?:,[A-Za-z_][\w.\-]*)+$")
+_HDR_KW = re.compile(r"\b(header|columns?)\b\s*[:=]?", re.I)
+_TICK = re.compile(r"`([^`\n]+)`")
 
 
-def stated_csv_headers(ins: str, names: list[str]) -> dict[str, list[str]]:
-    """CSV headers the statement gives for these output files: the first backticked comma-separated column list
-    (e.g. `material,rate,H_fit_GPa`) on the line that names the file or on the next 3 lines, stopping at a line that
-    names another of the files.  Files without a stated header are left out."""
+def _split_header(text: str) -> list[str] | None:
+    """A backticked CSV header `a,b,c` -> ["a", "b", "c"] (csv rules; surrounding spaces trimmed, inner kept);
+    None unless it is at least two plain column names."""
+    import csv
+    try:
+        cols = next(csv.reader([text]))
+    except (StopIteration, csv.Error):
+        return None
+    cols = [c.strip() for c in cols]
+    if len(cols) < 2 or any(not c or len(c) > 64 or not re.match(r"^[A-Za-z_][\w .\-()/]*$", c) for c in cols):
+        return None
+    return cols
+
+
+def stated_csv_headers(ins: str, names: list[str]) -> dict[str, list[dict]]:
+    """Explicit CSV header declarations in the statement, per output file: a line that names the file (relative
+    path, or its basename when that basename is unique among the outputs) and, on that line or one of the next 2
+    lines (before any other output file is named), the word "header"/"columns" followed by ONE backticked
+    comma-separated list.  Anything else (input-column lists, ambiguous lines with two lists after the keyword,
+    individually backticked columns, two outputs on one line) is not a declaration and is not judged.
+    -> {file: [{"cols": [...], "line": n}, ...]} -- every declaration, not just the first."""
     lines = ins.splitlines()
-    out = {}
-    for name in names:
-        pat = re.compile(r"(?<![\w.])" + re.escape(name) + r"(?![\w])")
+    base_count: dict[str, int] = {}
+    for n in names:
+        b = n.rsplit("/", 1)[-1]
+        base_count[b] = base_count.get(b, 0) + 1
+    pats = {}
+    for n in names:
+        b = n.rsplit("/", 1)[-1]
+        alts = [re.escape(n)] + ([re.escape(b)] if base_count[b] == 1 and b != n else [])
+        pats[n] = re.compile(r"(?<![\w./-])(?:" + "|".join(alts) + r")(?![\w-])")
+    out: dict[str, list[dict]] = {}
+    for n in names:
         for k, line in enumerate(lines):
-            if not pat.search(line):
+            if not pats[n].search(line):
                 continue
-            found = None
-            for j in range(k, min(k + 4, len(lines))):
-                if j > k and any(o != name and re.search(r"(?<![\w.])" + re.escape(o) + r"(?![\w])", lines[j])
-                                 for o in names):
+            if any(o != n and pats[o].search(line) for o in names):
+                continue
+            for j in range(k, min(k + 3, len(lines))):
+                if j > k and any(pats[o].search(lines[j]) for o in names):
                     break
-                for cand in re.findall(r"`([^`\n]+)`", lines[j]):
-                    c = cand.replace(" ", "")
-                    if _HEADER_RE.match(c):
-                        found = c.split(",")
-                        break
-                if found:
-                    break
-            if found:
-                out[name] = found
+                m = _HDR_KW.search(lines[j])
+                if not m:
+                    continue
+                ticks = [t for t in (_split_header(x) for x in _TICK.findall(lines[j][m.end():])) if t]
+                if len(ticks) == 1:
+                    out.setdefault(n, []).append(dict(cols=ticks[0], line=j + 1))
                 break
     return out
 
 
 def output_contract(ins: str, ref_out: Path) -> dict:
-    """The statement's CSV headers must match what the reference writes (and the verifier, which the reference
-    passes, reads).  e2e-batch2 (nano): the statement said `material,rate,depth_nm,H_fit_GPa` while the scorer
-    merged on obs_id / H_fit, so every agent that followed the text scored inf -- including Opus.  -> {ok, mismatch}"""
-    files = sorted(p for p in Path(ref_out).rglob("*.csv") if p.is_file()) if Path(ref_out).exists() else []
-    names = sorted({p.name for p in files})
-    stated = stated_csv_headers(ins, names)
+    """The statement's explicit CSV header declarations must match what the reference writes (and the verifier,
+    which the reference passes, reads), as column sets.  e2e-batch2 (nano): the statement said
+    `material,rate,depth_nm,H_fit_GPa` while the scorer merged on obs_id / H_fit, so every agent that followed the
+    text scored inf -- including Opus.  -> {ok, mismatch: {file: {stated, line, reference}}, checked}"""
+    import csv
+    ref_out = Path(ref_out)
+    files = sorted(p for p in ref_out.rglob("*.csv") if p.is_file()) if ref_out.exists() else []
+    rel = {str(p.relative_to(ref_out)): p for p in files}
+    stated = stated_csv_headers(ins, sorted(rel))
     mismatch = {}
-    for p in files:
-        if p.name not in stated or p.name in mismatch:
-            continue
+    for name, decls in stated.items():
         try:
-            with open(p, newline="") as fh:
-                hdr = [h.strip() for h in (fh.readline().strip().split(","))]
-        except OSError:
+            with open(rel[name], newline="") as fh:
+                hdr = [c.strip() for c in next(csv.reader(fh), [])]
+        except (OSError, csv.Error, UnicodeDecodeError):
             continue
-        if set(hdr) != set(stated[p.name]):
-            mismatch[p.name] = dict(stated=stated[p.name], reference=hdr)
+        bad = [d for d in decls if set(d["cols"]) != set(hdr)]
+        if bad:
+            mismatch[name] = dict(stated=bad[0]["cols"], line=bad[0]["line"], reference=hdr)
     return dict(ok=not mismatch, mismatch=mismatch, checked=sorted(stated))
 
 
