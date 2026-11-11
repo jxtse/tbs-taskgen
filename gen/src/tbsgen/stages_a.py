@@ -294,6 +294,11 @@ def s6a(P, it):
 
 def s6a_run(P, it):
     """Measure the reference (and mid/naive if S6C already produced them) on each seed."""
+    if it.p("_spec", "author_code.json").exists():
+        from . import codeagent
+        why = codeagent.env_ok(P.cfg)
+        if why:                                 # a reference that ports the authors' code runs on the build host only
+            return it.finish("paused", f"code:config:{why}", paused_stage="S6A_run")
     task = it.p("task")
     work = it.p("runs", "s6")
     meas = {"ref": {}, "mid": {}, "naive": {}, "nop": {}, "runs": {}}
@@ -523,11 +528,26 @@ def _agent_stage(P, it, kind: str, instruction: str, need: list[str], timeout_s:
     rec = read_json(recp, None)
     if rec is not None and rec.get("state") == "finished" and it.state.pop(f"{kind}_rerun", None):
         rec["retry"] = True                     # S6B sent the task back: author it again (with feedback)
+    if rec is not None and rec.get("state") == "launch_failed":
+        rec["retry"] = True                     # infrastructure: a resumed item launches a fresh job
+        rec["state"] = "finished"
     if rec is None or (rec.get("state") == "finished" and rec.get("retry")):
         why = codeagent.env_ok(P.cfg, agent=True)
         if why:
             it.finish("paused", f"code:config:{why}", paused_stage=kind)
             return None
+        # per-paper caps are cumulative over all jobs of this stage: each new job gets what is left
+        spent = it.state.get(f"{kind}_spent", {"usd": 0.0, "sec": 0.0})
+        if rec is not None and rec.get("state") == "finished" and not rec.get("counted"):
+            spent = dict(usd=spent["usd"] + float(rec.get("cost_usd") or 0.0),
+                         sec=spent["sec"] + 60.0 * float(rec.get("minutes") or 0.0))
+            it.state[f"{kind}_spent"] = spent
+        left_s = timeout_s - spent["sec"]
+        left_usd = None if max_usd is None else float(max_usd) - spent["usd"]
+        if left_s < 600 or (left_usd is not None and left_usd < 1.0):
+            it.finish("dropped", f"{kind.lower()}_budget_exhausted", spent=spent)
+            return None
+        timeout_s, max_usd, est_usd = left_s, left_usd, min(est_usd, left_usd) if left_usd is not None else est_usd
         n = it.bump(f"{kind}:job")
         work = it.p(kind, "work")
         codeagent.stage_inputs(P.cfg, it, work, with_contract)
@@ -536,6 +556,8 @@ def _agent_stage(P, it, kind: str, instruction: str, need: list[str], timeout_s:
         jobs = Path(codeagent._c(P.cfg).get("agent_jobs_dir") or it.p(kind, "jobs"))
         conf = codeagent.agent_job_config(P.cfg, task, f"tbsgen-{it.item_id}-{kind.lower()}{n}", jobs, max_usd)
         rec = codeagent.launch_agent(P.cfg, it, kind, conf, P.ledger, est_usd)
+        rec["budget"] = dict(timeout_s=timeout_s, max_usd=max_usd)
+        write_json(recp, rec)
         if rec.get("state") == "launch_failed":
             it.finish("paused", f"code:{kind}:launch_failed", paused_stage=kind)
             return None
@@ -566,11 +588,24 @@ def s4c(P, it):
     if rec is None:
         return
     out = codeagent.deliverable(rec)
-    res = read_json(out / "runnability.json", None) if out else None
+    res = None
     if out:
         for f in ("runnability.json", "HOWTO.md", "run.log", "setup.sh"):
-            if (out / f).exists():
-                shutil.copy(out / f, it.p("S4c", f))
+            body = codeagent.safe_read(out / f)
+            if body is not None:
+                it.p("S4c", f).write_text(body)
+        try:
+            res = json.loads(codeagent.safe_read(out / "runnability.json") or "null")
+        except ValueError:
+            res = None
+    if isinstance(res, dict):
+        # schema: runnable is a real boolean; a runnable verdict needs the run log, the how-to and a verifier pass
+        bad = [k for k, ok in (("runnable", isinstance(res.get("runnable"), bool)),
+                               ("run.log", bool(res.get("runnable") is not True or it.p("S4c", "run.log").exists())),
+                               ("HOWTO.md", it.p("S4c", "HOWTO.md").exists()),
+                               ("reward", rec.get("reward") == 1 or res.get("runnable") is not True)) if not ok]
+        if bad:
+            res = dict(res, runnable=False, reason="invalid_result", invalid=bad)
     write_json(it.p("S4c_runnability.json"), dict(job=rec.get("job_name"), outcome=rec.get("outcome"),
                                                   exception=rec.get("exception"), cost_usd=rec.get("cost_usd"),
                                                   minutes=rec.get("minutes"), result=res))
@@ -580,7 +615,7 @@ def s4c(P, it):
             write_json(it.p("S4c", "run.json"), rec)
             return it.goto("S4c", "runnability job infra failure: retry")
         return it.finish("dropped", "code_runnability_agent_failed")
-    if not res.get("runnable"):
+    if res.get("runnable") is not True:
         why = str(res.get("reason") or "other")
         reason = {"needs_gpu": "code_needs_gpu", "needs_commercial_license": "code_needs_commercial_license",
                   "needs_mathematica": "code_needs_commercial_license",
@@ -620,7 +655,7 @@ def s5g(P, it):
             return it.goto("S5G", "authoring job infra failure: retry")
         return it.finish("dropped", "s5g_missing_files", missing=miss[:5])
     try:
-        spec = json.loads((out / "_spec" / "spec.json").read_text())
+        spec = json.loads(codeagent.safe_read(out / "_spec" / "spec.json") or "")
     except (OSError, ValueError) as e:
         return it.finish("dropped", f"s5g_spec_unparseable:{type(e).__name__}")
     errs = validate_spec(spec, P.cfg)
@@ -630,11 +665,17 @@ def s5g(P, it):
     task = it.p("task")
     if task.exists():
         shutil.rmtree(task)
-    shutil.copytree(out / "task", task)
+    refused = codeagent.safe_copytree(out / "task", task)
+    if refused:
+        shutil.rmtree(task, ignore_errors=True)
+        return it.finish("dropped", "s5g_unsafe_files", refused=refused[:10])
     for extra in ("environment",):                 # the task image is built by PKG only (no agent-made env files)
         if (task / extra).exists():
             shutil.rmtree(task / extra)
-    author = json.loads((out / "_spec" / "author_code.json").read_text())
+    try:
+        author = json.loads(codeagent.safe_read(out / "_spec" / "author_code.json") or "")
+    except ValueError:
+        return it.finish("dropped", "s5g_author_code_unparseable")
     s3c = read_json(it.p("S3c_code.json"), {}) or {}
     author.update(pin=s3c.get("pin"), repo_url=s3c.get("primary_url"), license=s3c.get("license"))
     write_json(it.p("_spec", "author_code.json"), author)
@@ -648,8 +689,9 @@ def s5g(P, it):
         authoring="agent", agent_job=rec.get("job_name"), fulltext=read_json(it.p("S3_fulltext.json")),
         fulltext_sha=hashlib.sha256(it.p("fulltext.txt").read_bytes()).hexdigest()[:16],
         author_code=dict(repo=s3c.get("primary_url"), pin=s3c.get("pin"), license=s3c.get("license"))))
-    if (out / "report.md").exists():
-        shutil.copy(out / "report.md", it.p("S5G", "report.md"))
+    rep = codeagent.safe_read(out / "report.md")
+    if rep is not None:
+        it.p("S5G", "report.md").write_text(rep)
     it.advance("S5G", "S6A_run", form=spec.get("form"), cost_usd=rec.get("cost_usd"), minutes=rec.get("minutes"))
 
 

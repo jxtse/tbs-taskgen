@@ -42,6 +42,11 @@ def s6c(P, it):
 
 
 def s7(P, it):
+    if it.p("_spec", "author_code.json").exists():
+        from . import codeagent
+        why = codeagent.env_ok(P.cfg)
+        if why:
+            return it.finish("paused", f"code:config:{why}", paused_stage="S7")
     spec = read_json(it.p("_spec", "spec.json"))
     th = read_json(it.p("thresholds.json"))["thresholds"]
     n = it.bump("S7")

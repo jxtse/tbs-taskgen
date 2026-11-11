@@ -52,7 +52,7 @@ separates a correct expert solution from simpler approaches.
 
 ## Inputs (read-only)
 - `/work/paper.txt`, `/work/candidate.json` — the paper.
-- `/work/repo/` — the authors' code, pinned (`/work/code.json`).  `/work/HOWTO.md`, `/work/runnability.json` — how to
+- `/work/repo/` — the authors' code, pinned (`/work/code.json`; `.tbsgen-remote-repo` names the pin).  `/work/HOWTO.md`, `/work/runnability.json` — how to
   install and run it (from the previous step: follow `install` / `setup.sh` there first).
 - `/work/contract/S5_SPEC.txt` and `/work/contract/S6A_GEN.txt` — the harness contract the pipeline uses everywhere
   (`{{...}}` are template slots: ignore them).  Your files must satisfy it exactly: the same locations
@@ -81,11 +81,13 @@ separates a correct expert solution from simpler approaches.
 ## Grounding in the authors' code (this is the point of this pipeline)
 - The **reference solution** should call or port the authors' implementation of the paper's method (port = copy the
   needed functions into `solution/solve.py`, self-contained; credit the source file in a comment).  It must run in
-  the task image, which contains the pinned scientific Python stack plus what you list in requirements.txt / apt.txt
-  — **never** the authors' repository or package (the solver must not get it).  If the authors' code is not Python
-  or is too heavy to port, use it at **build time only**: the generator may call it to produce ground truth (then
-  list its toolchain in `generator/BUILD.md` — the build step runs the generator in a container like this one), and
-  the reference re-implements the method in Python.
+  the task image: python 3.11 with exactly numpy 2.1.3, scipy 1.14.1, pandas 2.2.3, scikit-learn 1.5.2,
+  statsmodels 0.14.4 (no other packages, no network) -- **never** the authors' repository or package (the solver
+  must not get it).  Test that in a fresh venv with only those pins.  If the authors' code is not Python or needs
+  other packages, use it at **build time only**: run it here to produce ground truth / reference outputs for fixed
+  inputs, store them under `generator/assets/` (small, < 20 MB, with `generator/assets/PROVENANCE.md`: exact
+  commands, commit), have `generate.py` read them, and write the reference as a faithful Python re-implementation
+  checked against those assets.
 - **Data**: prefer the real data shipped with the repository or the authors' own simulator / data generator; vary
   seeds / parameters for the hidden (PROG) inputs.  Synthetic data from your own generator is the fallback.
 - `generator/generate.py <seed>` must be deterministic in the seed and run with the same pinned stack (it runs in a
@@ -94,8 +96,8 @@ separates a correct expert solution from simpler approaches.
 ## No leaks of the authors' implementation
 - `instruction.md` must not name the repository, the package, the authors' function / class names, or their file
   names.  Describe the method scientifically (as the paper does), not by pointing at code.
-- No file under `task/environment/` may contain the authors' code; `requirements.txt` / `apt.txt` must not install
-  the authors' package.  The solver's environment never gets `/work/repo`.
+- Do not write `task/environment/` (the pipeline builds the task image itself and discards that directory).  The
+  solver's environment never gets `/work/repo` or the authors' package.
 
 ## Iterate until it works (you can run everything here)
 Run, from `/app/out/task`: `python generator/generate.py 0` and `1`, the reference and both baselines on the

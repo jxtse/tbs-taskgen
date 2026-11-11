@@ -69,45 +69,54 @@ def ssh_run(cfg: dict, cmd: str, timeout: float = 600, stdin: bytes | None = Non
 
 def remote_item_dir(cfg: dict, item_id: str) -> str:
     root = _c(cfg).get("remote_root")
-    if not root:
-        raise ValueError("code.remote_root is not set (build-host directory for the authors' code)")
-    tag = _c(cfg).get("run_tag") or "run"
+    if not root or not str(root).startswith("/"):
+        raise ValueError("code.remote_root must be an absolute build-host directory for the authors' code")
+    if not re.fullmatch(r"[A-Za-z0-9._:-]+", item_id):
+        raise ValueError(f"unsafe item id {item_id!r}")
+    tag = _c(cfg).get("run_tag") or Path(str((cfg.get("run") or {}).get("root") or "run")).name
     return f"{root.rstrip('/')}/{tag}/{item_id}"
 
 
 # ----------------------------------------------------------------------------------------------- S3c
 FETCH_SH = r"""
 set -uo pipefail
-D={dir}; URL={url}; KIND={kind}; MAXMB={maxmb}; REF={ref}
-mkdir -p "$D"; cd "$D"
-rm -rf repo.tmp; mkdir -p dl
+ROOT={root}; D={dir}; URL={url}; KIND={kind}; MAXMB={maxmb}; REF={ref}
 emit() {{ echo "TBSGEN_RESULT $1"; }}
+case "$D" in "$ROOT"/*) ;; *) emit '{{"ok": false, "why": "bad_dir"}}'; exit 0 ;; esac
+mkdir -p "$D" && cd "$D" || {{ emit '{{"ok": false, "why": "fetch_error", "err": "cannot create item dir"}}'; exit 0; }}
+[ "$(pwd -P)" = "$(cd "$D" && pwd -P)" ] || exit 1
+rm -rf "$D/repo.tmp" "$D/dl"; mkdir -p "$D/dl"
 if [ "$KIND" = git ]; then
   export GIT_LFS_SKIP_SMUDGE=1 GIT_TERMINAL_PROMPT=0
   if ! timeout {tmo} git -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=120 clone --quiet --depth 1 \
-       --no-recurse-submodules ${{REF:+--branch "$REF"}} "$URL" repo.tmp 2> dl/clone.err; then
-    emit "{{\"ok\": false, \"why\": \"clone_failed\", \"err\": $(tail -c 400 dl/clone.err | python3 -c 'import json,sys;print(json.dumps(sys.stdin.read()))')}}"; exit 0
+       --no-recurse-submodules ${{REF:+--branch "$REF"}} "$URL" "$D/repo.tmp" 2> "$D/dl/clone.err"; then
+    emit "{{\"ok\": false, \"why\": \"clone_failed\", \"err\": $(tail -c 400 "$D/dl/clone.err" | python3 -c 'import json,sys;print(json.dumps(sys.stdin.read()))')}}"; exit 0
   fi
-  SHA=$(git -C repo.tmp rev-parse HEAD); PIN="$SHA"
+  SHA=$(git -C "$D/repo.tmp" rev-parse HEAD); PIN="$SHA"
 else
-  if ! timeout {tmo} curl -sSfL --max-filesize $((MAXMB*1024*1024)) -o dl/archive "$URL" 2> dl/curl.err; then
-    emit "{{\"ok\": false, \"why\": \"download_failed\", \"err\": $(tail -c 400 dl/curl.err | python3 -c 'import json,sys;print(json.dumps(sys.stdin.read()))')}}"; exit 0
+  if ! timeout {tmo} curl -sSfL --max-filesize $((MAXMB*1024*1024)) -o "$D/dl/archive" "$URL" 2> "$D/dl/curl.err"; then
+    emit "{{\"ok\": false, \"why\": \"download_failed\", \"err\": $(tail -c 400 "$D/dl/curl.err" | python3 -c 'import json,sys;print(json.dumps(sys.stdin.read()))')}}"; exit 0
   fi
-  PIN=sha256:$(sha256sum dl/archive | cut -d' ' -f1); SHA=""
-  mkdir -p repo.tmp
-  (cd repo.tmp && (unzip -q ../dl/archive 2>/dev/null || tar xf ../dl/archive 2>/dev/null)) || {{
+  PIN=sha256:$(sha256sum "$D/dl/archive" 2>/dev/null | cut -d' ' -f1 || shasum -a 256 "$D/dl/archive" | cut -d' ' -f1); SHA=""
+  mkdir -p "$D/repo.tmp"
+  (cd "$D/repo.tmp" && (unzip -q ../dl/archive 2>/dev/null || tar xf ../dl/archive 2>/dev/null)) || {{
     emit '{{"ok": false, "why": "unpack_failed"}}'; exit 0; }}
-  # a single top-level directory is the project root
-  n=$(ls -A repo.tmp | wc -l); if [ "$n" = 1 ] && [ -d "repo.tmp/$(ls -A repo.tmp)" ]; then
-    mv "repo.tmp/$(ls -A repo.tmp)" repo.tmp2 && rmdir repo.tmp && mv repo.tmp2 repo.tmp; fi
+  n=$(ls -A "$D/repo.tmp" | wc -l | tr -d ' ')
+  if [ "$n" = 1 ] && [ -d "$D/repo.tmp/$(ls -A "$D/repo.tmp")" ]; then
+    mv "$D/repo.tmp/$(ls -A "$D/repo.tmp")" "$D/repo.tmp2" && rmdir "$D/repo.tmp" && mv "$D/repo.tmp2" "$D/repo.tmp"; fi
 fi
+cd "$D/repo.tmp/.." || exit 1
 MB=$(python3 -c 'import os,sys;print(int(sum(os.path.getsize(os.path.join(d,f)) for d,ds,fs in os.walk("repo.tmp") if not (ds.remove(".git") if ".git" in ds else None) for f in fs if not os.path.islink(os.path.join(d,f)))/1048576+0.999))')
-if [ "$MB" -gt "$MAXMB" ]; then rm -rf repo.tmp; emit "{{\"ok\": false, \"why\": \"too_large\", \"mb\": $MB}}"; exit 0; fi
-rm -rf repo; mv repo.tmp repo
-LFS=$(grep -l "filter=lfs" repo/.gitattributes 2>/dev/null | wc -l)
-python3 - "$PIN" "$SHA" "$MB" "$LFS" <<'EOF'
+if [ "$MB" -gt "$MAXMB" ]; then rm -rf "$D/repo.tmp"; emit "{{\"ok\": false, \"why\": \"too_large\", \"mb\": $MB}}"; exit 0; fi
+# immutable per pin: <item>/<pin>/repo is never replaced (another run / fetch of the same pin reuses it)
+PD="$D/pins/$(echo "$PIN" | tr ':' '-' | cut -c1-72)"
+if [ -d "$PD/repo" ]; then rm -rf "$D/repo.tmp"; else mkdir -p "$PD" && mv "$D/repo.tmp" "$PD/repo"; fi
+cd "$PD" || exit 1
+echo "$PIN" > "$PD/PIN"
+LFS=$(grep -l "filter=lfs" repo/.gitattributes 2>/dev/null | wc -l | tr -d ' ')
+python3 - "$PIN" "$SHA" "$MB" "$LFS" "$PD" <<'EOF'
 import json, os, sys, collections
-pin, sha, mb, lfs = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
+pin, sha, mb, lfs, pd = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4]), sys.argv[5]
 EXT = {{".py": "Python", ".ipynb": "Python", ".r": "R", ".jl": "Julia", ".m": "MATLAB", ".c": "C", ".h": "C",
        ".cpp": "C++", ".cc": "C++", ".hpp": "C++", ".f90": "Fortran", ".f": "Fortran", ".rs": "Rust", ".go": "Go",
        ".java": "Java", ".wl": "Mathematica", ".nb": "Mathematica", ".cu": "CUDA", ".pyx": "Cython", ".stan": "Stan"}}
@@ -120,6 +129,8 @@ for dp, dn, fn in os.walk("repo"):
         files += 1
         p = os.path.join(dp, f)
         e = os.path.splitext(f)[1].lower()
+        if os.path.islink(p):
+            continue
         try:
             sz = os.path.getsize(p)
         except OSError:
@@ -128,9 +139,12 @@ for dp, dn, fn in os.walk("repo"):
             langs[EXT[e]] += sz
         if f in DEP or f.startswith("requirements"):
             deps.append(os.path.relpath(p, "repo"))
-        if dp == "repo" and f.upper().startswith(("LICENSE", "LICENCE", "COPYING")) and lic is None:
-            lic = open(p, errors="ignore").read(300).strip().splitlines()[0][:120] if sz else None
+        if dp == "repo" and f.upper().startswith(("LICENSE", "LICENCE", "COPYING")) and lic is None \
+                and os.path.isfile(p) and not os.path.islink(p) and sz:      # never follow a link out of the tree
+            lines = open(p, errors="ignore").read(300).strip().splitlines()
+            lic = lines[0][:120] if lines else None
 print("TBSGEN_RESULT " + json.dumps(dict(ok=True, pin=pin, sha=sha or None, size_mb=mb, lfs_skipped=bool(lfs),
+      remote_dir=pd,
       files=files, languages={{k: round(v / 1024) for k, v in langs.most_common(6)}}, dep_files=sorted(deps)[:20],
       license_file=lic)))
 EOF
@@ -173,7 +187,8 @@ def s3c_fetch(cfg: dict, item_id: str, primary: dict, runner=None) -> dict:
     d = remote_item_dir(cfg, item_id)
     mx = int(_c(cfg).get("max_repo_mb", 500))
     tmo = int(_c(cfg).get("fetch_timeout_s", 900))
-    sh = FETCH_SH.format(dir=shlex.quote(d), url=shlex.quote(str(spec["url"])), kind=spec["kind"], maxmb=mx,
+    sh = FETCH_SH.format(root=shlex.quote(str(_c(cfg)["remote_root"]).rstrip("/")), dir=shlex.quote(d),
+                         url=shlex.quote(str(spec["url"])), kind=spec["kind"], maxmb=mx,
                          ref=shlex.quote(spec.get("ref") or ""), tmo=tmo)
     r = run(sh, tmo + 120)
     res = None
@@ -186,7 +201,8 @@ def s3c_fetch(cfg: dict, item_id: str, primary: dict, runner=None) -> dict:
             break
     if res is None:
         return dict(ok=False, why="fetch_error", rc=r.get("rc"), err=(r.get("err") or "")[-400:], transient=True)
-    return dict(res, source=spec, remote_dir=d, host=_c(cfg).get("host"))
+    res.setdefault("remote_dir", d)
+    return dict(res, source=spec, host=_c(cfg).get("host"))
 
 
 def _pypi_sdist(name: str, cfg: dict) -> tuple[bool, str]:
@@ -421,9 +437,12 @@ def stage_inputs(cfg: dict, it, work: Path, with_contract: bool) -> dict:
     s3c = read_json(it.p("S3c_code.json"), {}) or {}
     write_json(work / "code.json", {k: s3c.get(k) for k in ("source", "pin", "sha", "size_mb", "languages",
                                                              "dep_files", "license_file", "lfs_skipped")})
-    # the authors' repository is NOT copied here (it never leaves the build host): the agent launcher copies
-    # <remote_dir>/repo into environment/work/repo of the synced task on the build host before the job starts
-    (work / ".tbsgen-remote-repo").write_text(str(s3c.get("remote_dir", "")) + "/repo\n")
+    # the authors' repository is NOT copied here (it never leaves the build host).  Launcher contract: when the
+    # synced task has environment/work/.tbsgen-remote-repo (JSON {repo_dir, pin}), the launcher copies repo_dir
+    # into environment/work/repo ON the build host after checking <repo_dir>/../PIN == pin, and refuses otherwise
+    # (reference implementation: scripts/build-host-launch.sh).
+    write_json(work / ".tbsgen-remote-repo", dict(repo_dir=str(s3c.get("remote_dir", "")) + "/repo",
+                                                  pin=s3c.get("pin")))
     # a re-authoring job (S6B sent the task back) sees why the previous attempt failed
     fb = {n: read_json(it.p(n), None) for n in ("S6A_measure.json", "S6B_decisions.json", "S6_failure.json")}
     if any(v is not None for v in fb.values()) and with_contract:
@@ -452,12 +471,41 @@ def sha_tree(d: Path) -> str:
 
 
 def env_ok(cfg: dict, agent: bool = False) -> str | None:
-    """Why S3c (agent=False) / the agent stages (agent=True) cannot run with this config (None = fine)."""
+    """Why S3c (agent=False) / the agent stages (agent=True) cannot run with this config (None = fine).  A
+    code-grounded run must execute every generator / reference / baseline on the build host (the reference may
+    port the authors' code): sandbox.backend must be "ssh"."""
     c = _c(cfg)
     if not c.get("host") or not c.get("remote_root"):
         return "code.host / code.remote_root not set"
+    if (cfg.get("sandbox") or {}).get("backend") != "ssh" and not c.get("allow_local_sandbox"):
+        return "sandbox.backend must be \"ssh\" (build host) for code-grounded runs"
     if agent and not (c.get("agent_harbor_root") or cfg["calib"].get("teacher_harbor_root")):
         return "code.agent_harbor_root not set"
     return None
 
 
+
+
+def safe_copytree(src: Path, dst: Path) -> list[str]:
+    """Copy an agent deliverable tree, refusing symlinks and special files (a link could point anywhere on the
+    machine that copies it).  Returns the refused relative paths; nothing outside src is ever read."""
+    refused = []
+    src = Path(src)
+    for p in sorted(src.rglob("*")):
+        rel = p.relative_to(src)
+        if p.is_symlink() or not (p.is_file() or p.is_dir()):
+            refused.append(str(rel))
+            continue
+        if p.is_dir():
+            (dst / rel).mkdir(parents=True, exist_ok=True)
+        else:
+            (dst / rel).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(p, dst / rel, follow_symlinks=False)
+    return refused
+
+
+def safe_read(p: Path, limit: int = 2_000_000) -> str | None:
+    p = Path(p)
+    if p.is_symlink() or not p.is_file() or p.stat().st_size > limit:
+        return None
+    return p.read_text(errors="replace")

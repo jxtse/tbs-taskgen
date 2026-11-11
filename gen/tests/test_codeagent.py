@@ -33,6 +33,7 @@ def _cfg(tmp_path, **code):
     return load_config(None, {"run": {"root": str(tmp_path / "run")},
                               "code": dict(grounded=True, host="local", remote_root=str(tmp_path / "remote"),
                                            run_tag="t", **code),
+                              "sandbox": {"backend": "ssh", "host": "bh", "remote_dir": "/w"},
                               "fulltext": {"allow_network": False, "cache_dirs": []}})
 
 
@@ -46,7 +47,12 @@ def test_s3c_fetch_local_git_pins_sha(tmp_path):
     assert r["sha"] == sha and r["pin"] == sha
     assert r["languages"].get("Python") is not None and "requirements.txt" in r["dep_files"]
     assert r["license_file"].startswith("MIT")
-    assert (tmp_path / "remote" / "t" / "it1" / "repo" / "fastsmoother.py").exists()
+    assert Path(r["remote_dir"], "repo", "fastsmoother.py").exists()
+    assert Path(r["remote_dir"], "PIN").read_text().strip() == sha
+    # a second fetch of the same pin reuses (never replaces) the stored tree
+    (Path(r["remote_dir"]) / "repo" / "marker").write_text("x")
+    r2 = codeagent.s3c_fetch(cfg, "it1", prim)
+    assert r2["remote_dir"] == r["remote_dir"] and (Path(r["remote_dir"]) / "repo" / "marker").exists()
 
 
 def test_s3c_too_large(tmp_path):
@@ -119,11 +125,11 @@ def _agent_item(tmp_path, monkeypatch, files, stage="S4c", **code):
 def test_s4c_runnable_then_s5g(tmp_path, monkeypatch):
     P, it, fl = _agent_item(tmp_path, monkeypatch, {
         "runnability.json": json.dumps({"runnable": True, "reason": "ok", "language": "Python", "seconds": 3}),
-        "HOWTO.md": "pip install .; python -m fastsmoother"})
+        "HOWTO.md": "pip install .; python -m fastsmoother", "run.log": "ran"})
     P.run(max_steps=1, until="S4c")
     assert P.store.item(it.item_id).state["status"] == "waiting"
     task = it.p("S4c", "task")
-    assert (task / "environment" / "work" / ".tbsgen-remote-repo").read_text().strip() == "/r/x/repo"
+    assert read_json(task / "environment" / "work" / ".tbsgen-remote-repo") == {"repo_dir": "/r/x/repo", "pin": "abc"}
     assert not (task / "environment" / "work" / "repo").exists()      # never copied off the build host
     P.run(max_steps=2, until="S4c")
     st = P.store.item(it.item_id).state
@@ -234,3 +240,69 @@ def test_sandbox_ssh_backend_command(tmp_path, monkeypatch):
     assert len(back) == 1 and back[0][-1].startswith(str(tmp_path / "out"))     # only the rw mount comes back
     with pytest.raises(ValueError):
         sandbox.run(load_config(None, {"sandbox": {"backend": "ssh"}}), [], "x", 1)
+
+
+def test_r1_regressions(tmp_path, monkeypatch):
+    # "runnable": "false" (a string) or a missing run.log never passes
+    for files in ({"runnability.json": json.dumps({"runnable": "false"}), "HOWTO.md": "x", "run.log": "y"},
+                  {"runnability.json": json.dumps({"runnable": True}), "HOWTO.md": "x"}):
+        P, it, _ = _agent_item(tmp_path / str(len(files)), monkeypatch, files)
+        P.run(max_steps=3, until="S4c")
+        st = P.store.item(it.item_id).state
+        assert st["status"] == "dropped" and st["reason"] == "code_not_runnable", st
+    # a symlink in the agent's deliverable is refused (never dereferenced)
+    files = {"_spec/spec.json": json.dumps(SPEC), "_spec/author_code.json": "{}", "task/instruction.md": "x",
+             "task/generator/generate.py": "x", "task/solution/solve.py": "x", "task/tests/measure.py": "x",
+             "task/baselines/mid.py": "x", "task/baselines/naive.py": "x"}
+    P, it, fl = _agent_item(tmp_path / "ln", monkeypatch, files, stage="S5G")
+    monkeypatch.setattr("tbsgen.stages_a.validate_spec", lambda s, c: [])
+    P.run(max_steps=1, until="S5G")
+    tr = next(Path(it.p("S5G", "jobs")).glob("*/*__x"))
+    os.symlink("/etc/hosts", tr / "verifier" / "out" / "task" / "solution" / "data.txt")
+    P.run(max_steps=1, until="S5G")
+    st = P.store.item(it.item_id).state
+    assert st["status"] == "dropped" and st["reason"] == "s5g_unsafe_files"
+    # grounded + local sandbox is refused (third-party-derived code never runs locally)
+    cfg = _cfg(tmp_path)
+    cfg["sandbox"]["backend"] = "docker"
+    assert "ssh" in codeagent.env_ok(cfg)
+
+
+def test_cumulative_authoring_budget(tmp_path, monkeypatch):
+    files = {"_spec/spec.json": "{}"}
+    P, it, fl = _agent_item(tmp_path, monkeypatch, files, stage="S5G", authoring_max_usd=20.0,
+                            authoring_timeout_s=7200)
+    fl.cost = 19.5
+    P.run(max_steps=2, until="S5G")                      # job 1 finishes: missing files -> dropped
+    st = P.store.item(it.item_id).state
+    assert st["reason"] == "s5g_missing_files"
+    # a re-author request after $19.5 spent: less than $1 left -> budget exhausted, no second job
+    it2 = P.store.item(it.item_id)
+    it2.state.update(stage="S5G", status="active", S5G_rerun=True)
+    it2.save()
+    P.run(max_steps=1, until="S5G")
+    st = P.store.item(it.item_id).state
+    assert st["status"] == "dropped" and st["reason"] == "s5g_budget_exhausted", st
+    assert len(fl.calls) == 1
+
+
+def test_launch_failed_is_retried_on_resume(tmp_path, monkeypatch):
+    P, it, fl = _agent_item(tmp_path, monkeypatch, {"runnability.json": "{}"})
+    write_json(it.p("S4c", "run.json"), {"state": "launch_failed", "job_name": "old", "error": "tmux"})
+    P.run(max_steps=1, until="S4c")
+    assert P.store.item(it.item_id).state["status"] == "waiting" and len(fl.calls) == 1
+
+
+def test_inject_script_checks_pin(tmp_path):
+    sc = Path(__file__).parents[1] / "scripts" / "inject-author-repo.sh"
+    pd = tmp_path / "pins" / "abc"
+    (pd / "repo").mkdir(parents=True)
+    (pd / "repo" / "a.py").write_text("x")
+    (pd / "PIN").write_text("abc\n")
+    t = tmp_path / "task"
+    (t / "environment" / "work").mkdir(parents=True)
+    write_json(t / "environment" / "work" / ".tbsgen-remote-repo", {"repo_dir": str(pd / "repo"), "pin": "abc"})
+    assert subprocess.run(["bash", str(sc), str(t)], capture_output=True).returncode == 0
+    assert (t / "environment" / "work" / "repo" / "a.py").exists()
+    write_json(t / "environment" / "work" / ".tbsgen-remote-repo", {"repo_dir": str(pd / "repo"), "pin": "zzz"})
+    assert subprocess.run(["bash", str(sc), str(t)], capture_output=True).returncode == 3
