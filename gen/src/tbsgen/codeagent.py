@@ -98,7 +98,7 @@ def remote_item_dir(cfg: dict, item_id: str) -> str:
 # ----------------------------------------------------------------------------------------------- S3c
 FETCH_SH = r"""
 set -uo pipefail
-ROOT={root}; D={dir}; URL={url}; KIND={kind}; MAXMB={maxmb}; REF={ref}
+ROOT={root}; D={dir}; URL={url}; KIND={kind}; MAXMB={maxmb}; REF={ref}; VIA=""
 emit() {{ echo "TBSGEN_RESULT $1"; }}
 case "$D" in "$ROOT"/*) ;; *) emit '{{"ok": false, "why": "bad_dir"}}'; exit 0 ;; esac
 mkdir -p "$D" && cd "$D" || {{ emit '{{"ok": false, "why": "fetch_error", "err": "cannot create item dir"}}'; exit 0; }}
@@ -108,11 +108,31 @@ trap 'rm -rf "$W"' EXIT
 mkdir -p "$W/dl"
 if [ "$KIND" = git ]; then
   export GIT_LFS_SKIP_SMUDGE=1 GIT_TERMINAL_PROMPT=0
-  if ! timeout {tmo} git -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=120 clone --quiet --depth 1 \
+  # a 30 s reachability probe first: a host that hangs (e.g. github.com from the build host) must not eat the full
+  # clone timeout before the codeload fallback below
+  if ! timeout 30 git ls-remote -q "$URL" HEAD > /dev/null 2> "$W/dl/clone.err" || \
+     ! timeout {tmo} git -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=120 clone --quiet --depth 1 \
        --no-recurse-submodules ${{REF:+--branch "$REF"}} "$URL" "$W/repo.tmp" 2> "$W/dl/clone.err"; then
-    emit "{{\"ok\": false, \"why\": \"clone_failed\", \"err\": $(tail -c 400 "$W/dl/clone.err" | python3 -c 'import json,sys;print(json.dumps(sys.stdin.read()))')}}"; exit 0
+    rm -rf "$W/repo.tmp"
+    # GitHub fallback (github.com unreachable from the build host while api / codeload work): resolve the default
+    # branch head SHA through the API, download that exact commit's tarball from codeload (still pinned to the SHA)
+    GH=$(echo "$URL" | sed -nE 's#^https://github\.com/([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)\.git$#\1#p')
+    SHA=""
+    if [ -n "$GH" ]; then
+      SHA=$(timeout 60 curl -sSf -H "Accept: application/vnd.github.sha" "https://api.github.com/repos/$GH/commits/${{REF:-HEAD}}" 2>/dev/null | grep -E '^[0-9a-f]{{40}}$' || true)
+    fi
+    if [ -z "$SHA" ] || ! timeout {tmo} curl -sSfL --max-filesize $((MAXMB*1024*1024)) -o "$W/dl/archive.tgz" \
+         "https://codeload.github.com/$GH/tar.gz/$SHA" 2>> "$W/dl/clone.err"; then
+      emit "{{\"ok\": false, \"why\": \"clone_failed\", \"err\": $(tail -c 400 "$W/dl/clone.err" | python3 -c 'import json,sys;print(json.dumps(sys.stdin.read()))')}}"; exit 0
+    fi
+    mkdir -p "$W/repo.tmp" && tar xzf "$W/dl/archive.tgz" -C "$W/repo.tmp" --strip-components=1 --no-same-owner 2>/dev/null || {{
+      emit '{{"ok": false, "why": "unpack_failed"}}'; exit 0; }}
+    find "$W/repo.tmp" -type l -delete
+    VIA=codeload
+  else
+    SHA=$(git -C "$W/repo.tmp" rev-parse HEAD)
   fi
-  SHA=$(git -C "$W/repo.tmp" rev-parse HEAD); PIN="$SHA"
+  PIN="$SHA"
 else
   if ! timeout {tmo} curl -sSfL --max-filesize $((MAXMB*1024*1024)) -o "$W/dl/archive" "$URL" 2> "$W/dl/curl.err"; then
     emit "{{\"ok\": false, \"why\": \"download_failed\", \"err\": $(tail -c 400 "$W/dl/curl.err" | python3 -c 'import json,sys;print(json.dumps(sys.stdin.read()))')}}"; exit 0
@@ -143,9 +163,9 @@ fi
 [ -d "$PD/repo" ] && [ "$(cat "$PD/PIN" 2>/dev/null)" = "$PIN" ] || {{ emit '{{"ok": false, "why": "fetch_error", "err": "pin publish failed"}}'; exit 0; }}
 cd "$PD" || exit 1
 LFS=$(grep -l "filter=lfs" repo/.gitattributes 2>/dev/null | wc -l | tr -d ' ')
-python3 - "$PIN" "$SHA" "$MB" "$LFS" "$PD" <<'EOF'
+python3 - "$PIN" "$SHA" "$MB" "$LFS" "$PD" "$VIA" <<'EOF'
 import json, os, sys, collections
-pin, sha, mb, lfs, pd = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4]), sys.argv[5]
+pin, sha, mb, lfs, pd, via = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4]), sys.argv[5], sys.argv[6]
 EXT = {{".py": "Python", ".ipynb": "Python", ".r": "R", ".jl": "Julia", ".m": "MATLAB", ".c": "C", ".h": "C",
        ".cpp": "C++", ".cc": "C++", ".hpp": "C++", ".f90": "Fortran", ".f": "Fortran", ".rs": "Rust", ".go": "Go",
        ".java": "Java", ".wl": "Mathematica", ".nb": "Mathematica", ".cu": "CUDA", ".pyx": "Cython", ".stan": "Stan"}}
@@ -173,7 +193,7 @@ for dp, dn, fn in os.walk("repo"):
             lines = open(p, errors="ignore").read(300).strip().splitlines()
             lic = lines[0][:120] if lines else None
 print("TBSGEN_RESULT " + json.dumps(dict(ok=True, pin=pin, sha=sha or None, size_mb=mb, lfs_skipped=bool(lfs),
-      remote_dir=pd,
+      remote_dir=pd, via=via or "git",
       files=files, languages={{k: round(v / 1024) for k, v in langs.most_common(6)}}, dep_files=sorted(deps)[:20],
       license_file=lic)))
 EOF

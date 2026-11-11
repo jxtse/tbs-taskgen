@@ -373,3 +373,14 @@ def test_r3_regressions(tmp_path, monkeypatch):
     P, it, _ = _agent_item(tmp_path / "c", monkeypatch, files)
     P.run(max_steps=3, until="S4c")
     assert it.p("S4c", "run.log").exists() and P.store.item(it.item_id).state.get("reason") != "code_not_runnable"
+
+
+def test_fetch_script_github_fallback_renders(tmp_path):
+    """The rendered fetch script is valid bash and carries the pinned codeload fallback for GitHub."""
+    import shlex
+    sh = codeagent.FETCH_SH.format(root="/r", dir=shlex.quote("/r/x/it"), url=shlex.quote("https://github.com/a/b.git"),
+                                   kind="git", maxmb=500, ref="''", tmo=60)
+    f = tmp_path / "f.sh"
+    f.write_text(sh)
+    assert subprocess.run(["bash", "-n", str(f)]).returncode == 0
+    assert "git ls-remote" in sh and "codeload.github.com/$GH/tar.gz/$SHA" in sh and "commits/${REF:-HEAD}" in sh
