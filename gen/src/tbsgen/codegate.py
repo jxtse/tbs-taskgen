@@ -574,7 +574,12 @@ def s3b_record(fulltext: str, cand: dict, cfg: dict, *, jev: Callable | None = N
             if rc and not l["readme_cites_paper"]:
                 l["readme_cites_paper"] = True
                 l["own_score"] += 2                # a candidate signal for Jev; never "own" on its own
-        if l["own_guess"] == "own":
+        in_abstract = l["key"].split("/", 1)[-1].lower() in (cand.get("abstract") or "").lower().replace("https://", "")
+        if l.get("n", 0) == 0 and not l.get("pwc_official") and not in_abstract:
+            # never written in the paper (only metadata / a README that cites it / PwC "mentioned"): no evidence
+            # that the paper's authors wrote it -- citers, course demos and re-implementations look the same
+            l["verdict"], l["verdict_by"] = "third", "rules:not_in_paper"
+        elif l["own_guess"] == "own":
             l["verdict"], l["verdict_by"] = "own", "rules"
         elif l["own_guess"] == "third":
             l["verdict"], l["verdict_by"] = "third", "rules"

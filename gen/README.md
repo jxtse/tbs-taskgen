@@ -16,7 +16,7 @@ S1 → S2a 代码信号预筛（不花全文额度） → S2 摘要筛 → S3 �
 | 阶段 | 产物 | 淘汰原因 |
 |---|---|---|
 | S2a | `S2a_code_signal.json`：元数据代码链接、检索层 `code_signals`（OpenAlex 全文 / PwC / GitHub README）、PwC 存档（`code.pwc_path`）；都没有时查一次 OpenAlex 全文标记 | `no_code_signal` |
-| S3b | `S3b_code.json`：全文与元数据里的每个代码链接（上下文、Code Availability 段、参考文献区、标题词、README 是否引用本文、PwC official）→ 规则打分；模糊链接先查 README，仍模糊时 `roles.code_owner="jev"` 用 Jev 判定（不用 Opus）；作者链接在 GitHub / GitLab / Bitbucket / Zenodo / CRAN / PyPI / Bioconductor / SourceForge 上实际解析，记录 license、语言、大小 | `code_on_request`、`third_party_code_only`、`code_repo_unavailable`（404 / 私有 / 空仓库）、`data_only_no_code`、`code_host_unsupported`（Code Ocean、Figshare 等）、`no_code_link` |
+| S3b | `S3b_code.json`：全文与元数据里的每个代码链接（上下文、Code Availability 段、参考文献区、标题词、README 是否引用本文、PwC official）→ 规则打分；全文和摘要都没写出的链接（只来自元数据、引用本文的 README 或 PwC mentioned）直接判为非作者代码（`rules:not_in_paper`，PwC official 除外）；模糊链接先查 README，仍模糊时 `roles.code_owner="jev"` 用 Jev 判定（不用 Opus）；作者链接在 GitHub / GitLab / Bitbucket / Zenodo / CRAN / PyPI / Bioconductor / SourceForge 上实际解析，记录 license、语言、大小 | `code_on_request`、`third_party_code_only`、`code_repo_unavailable`（404 / 私有 / 空仓库）、`data_only_no_code`、`code_host_unsupported`（Code Ocean、Figshare 等）、`no_code_link` |
 
 S3b 规则在 2026-11-11 摸底的 224 篇（人工读上下文标注，93 篇有作者代码）上：规则直接判 own 的 38 篇全对；
 “own + 模糊”合起来作为候选时论文级召回 0.95、精度 0.98，另外 50 篇作者代码只能落在“模糊”里，所以生产配置应设
