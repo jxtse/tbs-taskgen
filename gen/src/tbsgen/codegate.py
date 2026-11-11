@@ -19,6 +19,9 @@ S3b  (after the full text).  Every code-host link in the full text and the metad
        data_only_no_code         own deposit holds data, no code
        code_host_unsupported     own code only on a host we cannot fetch (Code Ocean capsule, Figshare ...)
        no_code_link              no code link at all in the full text and metadata
+       (paused, not dropped: code_host_unavailable - the host could not answer (network / rate limit / 5xx);
+        code_owner_undecided - Jev is configured but unavailable.  `tbsgen resume --reason code:` retries.)
+     Ambiguous links without Jev follow code.maybe_policy ("drop" default, "own").
      Licences are recorded, never filtered (decision 2026-11-11).
 """
 from __future__ import annotations
@@ -122,8 +125,9 @@ def _norm_doi(d: str | None) -> str | None:
     return d if d.startswith("10.") else None
 
 
-def openalex_fulltext_flag(c: dict, cfg: dict) -> bool | None:
-    """Does OpenAlex's full-text index of this DOI mention a code host?  None = unknown (no DOI / error)."""
+def openalex_fulltext_flag(c: dict, cfg: dict) -> bool | None | str:
+    """Does OpenAlex's full-text index of this DOI mention a code host?  None = not applicable (no DOI);
+    "error" = OpenAlex did not answer (network / 429 / 5xx)."""
     doi = _norm_doi(c.get("doi"))
     if not doi or doi.startswith("10.48550"):
         return None
@@ -132,7 +136,7 @@ def openalex_fulltext_flag(c: dict, cfg: dict) -> bool | None:
                                 "mailto": ccfg(cfg).get("mailto", "noreply@example.org")})
     st, d = http_json("https://api.openalex.org/works?" + q, cfg)
     if st != 200 or not isinstance(d, dict):
-        return None
+        return "error"
     return bool(d.get("results"))
 
 
@@ -145,11 +149,15 @@ def s2a_signals(c: dict, cfg: dict, oa_flag: Callable | None = None) -> dict:
     if ccfg(cfg).get("pwc_path"):
         from tbsretr.codeindex import pwc_index
         hits = pwc_index(ccfg(cfg)["pwc_path"]).lookup(c.get("arxiv"), c.get("title"))
-        pw = [h["repo"] for h in hits if h["official"] or h["mentioned"]][:5]
+        pw = [h["repo"] for h in hits if h["official"]][:5]
+        sig["pwc_mentioned"] = [h["repo"] for h in hits if h["mentioned"] and not h["official"]][:5]
     sig["pwc"] = pw
+    pw = pw + sig.get("pwc_mentioned", [])
     sig["openalex_fulltext"] = None
     if not (links or sig["retrieval"] or pw) and ccfg(cfg).get("openalex_flag", True):
-        sig["openalex_fulltext"] = (oa_flag or openalex_fulltext_flag)(c, cfg)
+        f = (oa_flag or openalex_fulltext_flag)(c, cfg)
+        sig["openalex_fulltext"] = f if isinstance(f, bool) else None
+        sig["openalex_fulltext_error"] = f == "error"
     sig["any"] = bool(links or sig["retrieval"] or pw or sig["openalex_fulltext"])
     return sig
 
@@ -207,14 +215,13 @@ FETCHABLE = {"github", "gitlab", "bitbucket", "zenodo", "cran", "pypi", "biocond
 
 
 def _clean_repo(r: str) -> str:
-    # PDF text glues the next word onto the URL ("repo.Acknowledgments"): keep only a known package suffix
+    """Trailing punctuation off; a word that PDF extraction glued on after a sentence period ("repo.Acknowledgments",
+    "repo.The") is cut.  Legal dotted names stay (solver.v2, Foo.jl, user.github.io)."""
     r = re.sub(r"[.,;:)\]]+$", "", r)
-    low = r.lower()
-    for suf in KEEP_SUFFIX:
-        i = low.find(suf)
-        if i > 0 and (i + len(suf) == len(low) or low[i + len(suf)] == "."):
-            return r[:i + len(suf)]
-    return r.split(".")[0] if "." in r else r
+    m = re.match(r"^(.+?)\.([A-Z][a-z]{2,}[A-Za-z]*)$", r)
+    if m and not any(r.lower().endswith(suf) for suf in KEEP_SUFFIX):
+        return m.group(1)
+    return r
 
 
 def canon(kind: str, m: re.Match) -> tuple[str, dict]:
@@ -228,8 +235,12 @@ def canon(kind: str, m: re.Match) -> tuple[str, dict]:
     if kind == "gitlab":
         p = re.sub(r"[.,;:)\]]+$", "", g[0]).split("/-/")[0]
         parts = p.split("/")
+        for i, seg in enumerate(parts):           # /tree/<ref>, /blob/<ref> (old GitLab URLs without /-/)
+            if seg in ("tree", "blob", "raw", "issues", "merge_requests", "wikis") and i >= 2:
+                parts = parts[:i]
+                break
         parts[-1] = _clean_repo(parts[-1])
-        path = "/".join(parts[:3])
+        path = "/".join(parts)
         hm = re.search(r"gitlab\.[a-z.]+", m.group(0), re.I)
         host = hm.group(0).lower().rstrip(".") if hm else "gitlab.com"
         return f"{host}/{path}".lower(), dict(path=path, gl_host=host, url=f"https://{host}/{path}")
@@ -252,8 +263,13 @@ def extract_links(fulltext: str, cand: dict) -> tuple[list[dict], dict]:
     1..2 maybe, <= 0 third party).  Also returns paper-level facts (Code Availability text, on-request)."""
     s = norm_text(fulltext or "")
     refm = list(REF_HDR.finditer(s))
-    ref_start = refm[-1].start() if refm and refm[-1].start() > len(s) * 0.4 else len(s)
+    # the last reference-list header in the second part of the text (short texts: anywhere after the start)
+    ref_start = refm[-1].start() if refm and refm[-1].start() > min(len(s) * 0.4, 2000) else len(s)
     ca = CODE_AVAIL.search(s)
+    if ca and ca.start() >= ref_start:
+        ca = None
+    # the section ends at the reference list or after 1500 chars, whichever is first
+    ca_end = min(ca.start() + 1500, ref_start) if ca else -1
     found: dict[str, dict] = {}
     for kind, rx in HOST_RES:
         for m in rx.finditer(s):
@@ -265,15 +281,23 @@ def extract_links(fulltext: str, cand: dict) -> tuple[list[dict], dict]:
             e["n"] += 1
             if len(e["ctxs"]) < 3:
                 e["ctxs"].append(re.sub(r"\s+", " ", s[max(0, m.start() - 350): m.end() + 150]))
-            e["in_refs_only"] = e["in_refs_only"] and m.start() >= ref_start
-            near = s[max(0, m.start() - 250): m.start()]
-            e["pos"] += bool(OWN_POS.search(near))
-            e["strong"] += bool(OWN_STRONG.search(near))
+            in_refs = m.start() >= ref_start
+            e["in_refs_only"] = e["in_refs_only"] and in_refs
+            # ownership phrases count only in the body and only within the link's own section (never across the
+            # reference-list header): a reference entry never inherits "our code is available"
+            lo = max(0, m.start() - 250)
+            if not in_refs:
+                hdr = list(re.finditer(r"\n\s*[A-Z][A-Za-z ]{2,40}\n", s[lo:m.start()]))
+                near = s[lo + hdr[-1].start():m.start()] if hdr and not CODE_AVAIL.search(hdr[-1].group(0)) \
+                    else s[lo:m.start()]
+                e["pos"] += bool(OWN_POS.search(near))
+                e["strong"] += bool(OWN_STRONG.search(near))
             e["third"] += bool(THIRD.search(s[max(0, m.start() - 120): m.start()]))
-            if ca and 0 <= m.start() - ca.start() < 1500:
+            if ca and ca.start() <= m.start() < ca_end:
                 e["in_code_avail"] = True
-    for u in list(cand.get("code_links") or []) + list((cand.get("code_signals") or {}).get("pwc") or []) + \
-            list((cand.get("code_signals") or {}).get("gh_readme") or []):
+    cs = cand.get("code_signals") or {}
+    for u in list(cand.get("code_links") or []) + list(cs.get("pwc") or []) + list(cs.get("pwc_mentioned") or []) + \
+            list(cs.get("gh_readme") or []):
         for kind, rx in HOST_RES:
             m = rx.search(str(u))
             if m:
@@ -286,6 +310,8 @@ def extract_links(fulltext: str, cand: dict) -> tuple[list[dict], dict]:
                  (cand.get("code_signals") or {}).get("gh_readme") or []}
     pwc = {str(u).lower().rstrip("/").removeprefix("https://") for u in
            (cand.get("code_signals") or {}).get("pwc") or []}
+    pwc_m = {str(u).lower().rstrip("/").removeprefix("https://") for u in
+             (cand.get("code_signals") or {}).get("pwc_mentioned") or []}
     tt = _title_tokens(cand.get("title"))
     for e in found.values():
         name = e["key"].split("/")[-1].split(":")[-1]
@@ -293,8 +319,11 @@ def extract_links(fulltext: str, cand: dict) -> tuple[list[dict], dict]:
         e["generic"] = "/".join(e["key"].split("/")[1:3]) in GENERIC_REPOS
         e["readme_cites_paper"] = e["key"] in gh_readme
         e["pwc_official"] = e["key"] in pwc
+        e["pwc_mentioned"] = e["key"] in pwc_m
+        # README citing the paper / PwC "mentioned" are candidate signals only (citers and re-implementers do
+        # that too); PwC is_official is the archive's own-code flag
         sc = 3 * (e["strong"] > 0) + 2 * e["in_code_avail"] + (e["pos"] > 0) + e["name_in_title"] + e["from_meta"] \
-            + 3 * e["readme_cites_paper"] + 2 * e["pwc_official"] - 2 * e["in_refs_only"] \
+            + 2 * e["readme_cites_paper"] + 2 * e["pwc_official"] + e["pwc_mentioned"] - 2 * e["in_refs_only"] \
             - (e["third"] > 0 and e["strong"] == 0) - 4 * e["generic"]
         e["own_score"] = sc
         # thresholds from the 2026-11-11 study (224 papers, own code by reading the contexts): own >= 3; a
@@ -308,13 +337,17 @@ def extract_links(fulltext: str, cand: dict) -> tuple[list[dict], dict]:
 
 
 # ----------------------------------------------------------------------------------------------- S3b: resolve
-CODE_EXT = re.compile(r"\.(py|r|jl|m|c|cc|cpp|h|hpp|f90|f|rs|go|java|ipynb|sh|zip|tar\.gz|tgz|tar)$", re.I)
+CODE_EXT = re.compile(r"\.(py|r|jl|m|c|cc|cpp|h|hpp|f90|f|rs|go|java|ipynb|sh|cu|stan)$", re.I)
+ARCHIVE_EXT = re.compile(r"\.(zip|tar\.gz|tgz|tar|tar\.bz2|tar\.xz)$", re.I)
+TRANSIENT = {0, 403, 429, 500, 502, 503, 504}     # cannot decide now: pause, never drop (403 = rate limit on GitHub)
 DATA_EXT = re.compile(r"\.(csv|tsv|txt|h5|hdf5|nc|mat|npy|npz|json|xlsx?|fits|parquet|vcf|bam|fastq|gz|nii)$", re.I)
 
 
 def resolve(link: dict, cfg: dict, get=None, gh=None) -> dict:
-    """Host metadata of one link: exists, empty, kind (code / data / package), license, language, size_kb, ..."""
+    """Host metadata of one link: exists, empty, kind (code / data / package), license, language, size_kb, ...
+    `transient` = the host could not answer now (network, rate limit, 5xx): never a reason to drop."""
     get = get or (lambda u: http_json(u, cfg))
+    get_status = get
     gh = gh or (lambda p: gh_json(p, cfg))
     h = link["host"]
     out: dict = dict(host=h, key=link["key"], url=link.get("url"), exists=False, empty=None, kind="code",
@@ -351,8 +384,9 @@ def resolve(link: dict, cfg: dict, get=None, gh=None) -> dict:
                 files = [(f.get("key") or "", int(f.get("size") or 0)) for f in d.get("files") or []]
                 rtype = ((md.get("resource_type") or {}).get("type") or "").lower()
                 code_files = [f for f in files if CODE_EXT.search(f[0])]
-                kind = "code" if rtype == "software" or (code_files and not all(DATA_EXT.search(f[0])
-                                                                                 for f in code_files)) else "data"
+                # an archive is code only in a software record (GitHub-Zenodo releases are "software"); an
+                # archive in a dataset record is data unless code files sit next to it
+                kind = "code" if rtype == "software" or code_files else "data"
                 out.update(exists=True, empty=not files, kind=kind, resource_type=rtype,
                            license=(md.get("license") or {}).get("id") if isinstance(md.get("license"), dict)
                            else md.get("license"), size_kb=sum(s for _, s in files) // 1024,
@@ -375,10 +409,12 @@ def resolve(link: dict, cfg: dict, get=None, gh=None) -> dict:
                            language="Python", repo_urls=urls[:3], url=f"https://pypi.org/project/{info.get('name')}")
             out["status"] = st
         elif h == "bioconductor":
-            # no light-weight JSON endpoint per package: S3c clones git.bioconductor.org and decides there
-            out.update(exists=True, empty=False, kind="package", language="R",
-                       url=f"https://bioconductor.org/packages/{link['name']}",
-                       git=f"https://git.bioconductor.org/packages/{link['name']}", unverified=True)
+            st, _ = get_status(f"https://bioconductor.org/packages/release/bioc/html/{link['name']}.html")
+            if st == 200:
+                out.update(exists=True, empty=False, kind="package", language="R",
+                           url=f"https://bioconductor.org/packages/{link['name']}",
+                           git=f"https://git.bioconductor.org/packages/{link['name']}")
+            out["status"] = st
         elif h == "sourceforge":
             st, d = get(f"https://sourceforge.net/rest/p/{link['name']}")
             out.update(exists=st == 200, empty=False if st == 200 else None)
@@ -387,6 +423,8 @@ def resolve(link: dict, cfg: dict, get=None, gh=None) -> dict:
             out.update(kind="unsupported", exists=None)
     except Exception as e:  # noqa: BLE001
         out["error"] = f"{type(e).__name__}: {e}"[:200]
+        out["status"] = 0
+    out["transient"] = not out.get("exists") and out.get("status") in TRANSIENT
     return out
 
 
@@ -444,10 +482,13 @@ def decide(links: list[dict], paper: dict, resolved: dict[str, dict]) -> dict:
         r = resolved.get(l["key"]) or {}
         if l["host"] not in FETCHABLE:
             continue
-        if r.get("exists") and not r.get("empty") and r.get("kind") in ("code", "package"):
+        if r.get("exists") and not r.get("empty") and not r.get("private") and r.get("kind") in ("code", "package"):
             ok.append((l, r))
     if not ok:
         rs = [resolved.get(l["key"]) or {} for l in own]
+        if any(r.get("transient") for r in rs):
+            return dict(keep=False, reason=None, pause="code_host_unavailable", primary=None,
+                        own=[l["key"] for l in own])
         if any(r.get("exists") and r.get("kind") == "data" for r in rs) and \
                 not any(r.get("exists") and r.get("kind") in ("code", "package") for r in rs):
             reason = "data_only_no_code"
@@ -478,21 +519,25 @@ def s3b_record(fulltext: str, cand: dict, cfg: dict, *, jev: Callable | None = N
         if l["own_guess"] == "maybe" and l["host"] == "github":
             # README citing the paper settles an ambiguous GitHub link without a model call
             rc = readme_cites(l, cand, cfg, gh=gh_raw)
-            l["readme_cites_paper"] = l["readme_cites_paper"] or bool(rc)
-            if rc:
-                l["own_score"] += 3
-                l["own_guess"] = "own"
+            if rc and not l["readme_cites_paper"]:
+                l["readme_cites_paper"] = True
+                l["own_score"] += 2
+                if l["own_score"] >= 3:
+                    l["own_guess"] = "own"
         if l["own_guess"] == "own":
             l["verdict"], l["verdict_by"] = "own", "rules"
         elif l["own_guess"] == "third":
             l["verdict"], l["verdict_by"] = "third", "rules"
-        else:
-            p = jev(l) if jev else None
+        elif jev is not None:
+            p = jev(l)
             l["jev_own_p"] = p
-            if p is None:
-                l["verdict"], l["verdict_by"] = "own", "rules:maybe->own"
+            if p is None:                      # Jev configured but unavailable: undecided -> the stage pauses
+                l["verdict"], l["verdict_by"] = "unknown", "jev_unavailable"
             else:
                 l["verdict"], l["verdict_by"] = ("own" if p >= th else "third"), "jev"
+        else:                                  # rules only: explicit policy for ambiguous links
+            own_if_maybe = ccfg(cfg).get("maybe_policy", "drop") == "own"
+            l["verdict"], l["verdict_by"] = ("own" if own_if_maybe else "third"), "rules:maybe"
     for l in links:
         if l["verdict"] == "own" and l["key"] not in resolved:
             resolved[l["key"]] = resolve(l, cfg, get=get, gh=gh)
@@ -504,7 +549,12 @@ def s3b_record(fulltext: str, cand: dict, cfg: dict, *, jev: Callable | None = N
                         sub = dict(key=key, host="github", **info)
                         resolved[key] = resolve(sub, cfg, get=get, gh=gh)
                         resolved[l["key"]].setdefault("source_repo", resolved[key])
-    dec = decide(links, paper, resolved)
+    if any(l.get("verdict") == "unknown" for l in links) and \
+            not any(l.get("verdict") == "own" and not (resolved.get(l["key"]) or {}).get("transient") and
+                    (resolved.get(l["key"]) or {}).get("exists") for l in links):
+        dec = dict(keep=False, reason=None, pause="code_owner_undecided", primary=None, own=[])
+    else:
+        dec = decide(links, paper, resolved)
     if dec["keep"] and dec["primary"].get("kind") == "package" and \
             (dec["primary"].get("source_repo") or {}).get("exists"):
         dec["primary"] = dict(dec["primary"]["source_repo"], package=dec["primary"].get("url"),

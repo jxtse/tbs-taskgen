@@ -159,14 +159,14 @@ def github_readme_search(http, cfg: dict, p: dict, target_id: str = "", gh=None)
         q = f'"{t}" in:readme'
         url = "https://api.github.com/search/repositories?" + urllib.parse.urlencode({"q": q, "per_page": 5})
         if gh is not None:
-            # same cache / budget / pacing / cooldown as Http.request, the call itself through the gh CLI
+            # same cache / budget / pacing / cooldown / offline rule as Http.request; the call itself through gh
             key = led.cache_key("GET", url, None)
             hit = led.cache_get(key, cfg.get("cache_ttl_days", 30))
             if hit:
                 led.book("github", "readme_search", url, hit[0], 0.0, cached=True, target=target_id)
                 st, d = hit[0], json.loads(hit[1] or b"{}")
             else:
-                if led.cooling("github") > 0:
+                if getattr(http, "offline", False) or led.cooling("github") > 0:
                     break
                 led.check_budget("github", scfg)
                 led.wait_turn("github", scfg.get("min_interval_s", 2.2))
@@ -178,12 +178,16 @@ def github_readme_search(http, cfg: dict, p: dict, target_id: str = "", gh=None)
                     led.set_cooldown("github", scfg.get("cooldown_429_s", 600), f"http {st}")
                     break
         else:
+            # anonymous search API: 10 requests / minute -> at least 6.5 s apart; a rate-limit 403 cools the source
+            led.wait_turn("github", max(6.5, float(scfg.get("min_interval_s", 2.2))))
             try:
                 r = http.request("github", "readme_search", url, target=target_id,
-                                 headers={"Accept": "application/vnd.github+json"})
+                                 headers={"Accept": "application/vnd.github+json"}, ok_statuses=(200, 422))
                 st, d = r.status, (r.json() if r.status == 200 else {})
-            except HTTPFailure:
-                st, d = 0, {}
+            except HTTPFailure as e:
+                if e.status == 403:
+                    led.set_cooldown("github", scfg.get("cooldown_429_s", 600), "http 403 (rate limit)")
+                break
         if st == 200:
             out += [it["full_name"] for it in d.get("items", []) if it.get("full_name")]
     return sorted(set(out))
@@ -195,13 +199,18 @@ def annotate(papers: list[dict], *, oa_flags: set[str], pwc: PwcIndex, gh_hits: 
     for p in papers:
         key = p.get("doi") or p.get("arxiv") or p.get("title", "")[:80]
         pw = pwc.lookup(p.get("arxiv"), p.get("title")) if pwc else []
-        sig: dict = dict(meta=has_meta_code(p), openalex_fulltext=bool(norm_doi(p.get("doi")) in oa_flags),
-                   pwc=[h["repo"] for h in pw if h["official"] or h["mentioned"]][:5],
-                   pwc_unofficial=[h["repo"] for h in pw if not (h["official"] or h["mentioned"])][:3],
-                   gh_readme=[f"https://github.com/{r}" for r in gh_hits.get(key, [])][:5])
-        sig["any"] = bool(sig["meta"] or sig["openalex_fulltext"] or sig["pwc"] or sig["gh_readme"])
+        in_code_channel = bool((p.get("ranks") or {}).get("openalex.code"))
+        sig: dict = dict(meta=has_meta_code(p),
+                         openalex_fulltext=bool(norm_doi(p.get("doi")) in oa_flags) or in_code_channel,
+                         pwc=[h["repo"] for h in pw if h["official"]][:5],                 # archive: is_official
+                         pwc_mentioned=[h["repo"] for h in pw if h["mentioned"] and not h["official"]][:5],
+                         pwc_unofficial=[h["repo"] for h in pw if not (h["official"] or h["mentioned"])][:3],
+                         gh_readme=[f"https://github.com/{r}" for r in gh_hits.get(key, [])][:5])
+        sig["any"] = bool(sig["meta"] or sig["openalex_fulltext"] or sig["pwc"] or sig["pwc_mentioned"]
+                          or sig["gh_readme"])
         p["code_signals"] = sig
-        extra = list(sig["pwc"]) + list(sig["gh_readme"])
+        # candidates only: ownership is decided downstream (tbsgen S3b) from the paper's own text
+        extra = list(sig["pwc"]) + list(sig["pwc_mentioned"]) + list(sig["gh_readme"])
         if extra:
             p["code_links"] = sorted(set(p.get("code_links") or []) | set(extra))
 

@@ -96,6 +96,7 @@ def test_pwc_index(tmp_path):
     papers = [{"arxiv": "2101.00001", "title": "t", "code_links": []}]
     codeindex.annotate(papers, oa_flags=set(), pwc=ix, gh_hits={})
     assert papers[0]["code_signals"]["pwc"] == ["https://github.com/x/off"]
+    assert papers[0]["code_signals"]["pwc_mentioned"] == []
     assert papers[0]["code_signals"]["pwc_unofficial"] == ["https://github.com/y/fan"]
     assert papers[0]["code_signals"]["any"]
 
@@ -124,3 +125,18 @@ def test_meta_code_detection():
     assert codeindex.has_meta_code({"code_links": ["github.com/a/b"]})
     assert codeindex.has_meta_code({"code_links": ["https://zenodo.org/records/1"]})
     assert not codeindex.has_meta_code({"code_links": ["https://example.org/x"]})
+
+
+def test_gh_branch_respects_offline(cfg):
+    c = _cfg(cfg)
+    _, led, http = make_sources(c, FakeOA())
+    http.offline = True
+    calls = []
+    assert codeindex.github_readme_search(http, c, {"doi": "10.1/zzz"}, gh=lambda p, q: calls.append(q)) == []
+    assert calls == []
+
+
+def test_code_channel_hit_counts_as_signal():
+    papers = [{"doi": "10.1/x", "title": "t", "code_links": [], "ranks": {"openalex.code": 3}}]
+    codeindex.annotate(papers, oa_flags=set(), pwc=codeindex.PwcIndex(None), gh_hits={})
+    assert papers[0]["code_signals"]["any"]

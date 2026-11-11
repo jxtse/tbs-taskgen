@@ -31,6 +31,8 @@ def s2a(P, it):
     sig = codegate.s2a_signals(c, P.cfg)
     write_json(it.p("S2a_code_signal.json"), dict(sig, ts=time.time()))
     if not sig["any"]:
+        if sig.get("openalex_fulltext_error"):     # OpenAlex unreachable / rate-limited: undecided, retry later
+            return it.finish("paused", "code:openalex_unavailable", paused_stage="S2a")
         return it.finish("dropped", "no_code_signal")
     it.advance("S2a", "S2", signals=[k for k in ("meta", "retrieval", "pwc", "openalex_fulltext") if sig.get(k)])
 
@@ -38,6 +40,12 @@ def s2a(P, it):
 def s3b(P, it):
     """Code-grounded confirmation on the full text: the authors' own code exists and resolves on its host."""
     c = read_json(it.p("S1_candidate.json")) or {}
+    # S2a's findings (e.g. a PwC archive repo) are evidence for S3b too
+    sig = read_json(it.p("S2a_code_signal.json"), {}) or {}
+    cs = dict(c.get("code_signals") or {})
+    for k in ("pwc", "pwc_mentioned"):
+        cs[k] = sorted(set(cs.get(k) or []) | set(sig.get(k) or []))
+    c = dict(c, code_signals=cs)
     txt = it.p("fulltext.txt").read_text(errors="replace")
     jev = None
     if resolve_role(P.cfg, "code_owner") == "jev":
@@ -51,6 +59,8 @@ def s3b(P, it):
                 return None
     rec = codegate.s3b_record(txt, c, P.cfg, jev=jev)
     write_json(it.p("S3b_code.json"), rec)
+    if rec.get("pause"):          # host / Jev could not answer now: retry later (`tbsgen resume --reason code:`)
+        return it.finish("paused", f"code:{rec['pause']}", paused_stage="S3b")
     if not rec["keep"]:
         return it.finish("dropped", rec["reason"])
     p = rec["primary"]
@@ -114,7 +124,7 @@ def s3(P, it):
         # 1. intent record, 2. park, 3. queue.  A crash between 2 and 3 is repaired by `tbsgen fetch`, which
         # first re-queues every item parked with fulltext_unavailable from its S3_queue.json (fulltext.reconcile).
         write_json(it.p("S3_queue.json"), dict(entry, route="tbsgen fetch", errors=rec.get("errors"),
-                                               skipped=rec.get("skipped")))
+                                               skipped=rec.get("skipped"), next_stage=codegate.after_s3(P.cfg)))
         it.finish("parked", "fulltext_unavailable")
         if it.state.get("blocklist_trial"):
             blocklist.resolve(P.store, it)        # trial decided: no full text (stays pending if still queued)

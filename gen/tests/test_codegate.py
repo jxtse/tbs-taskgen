@@ -97,13 +97,95 @@ def test_ambiguous_goes_to_jev_not_teacher():
     assert seen == ["github.com/bob/xtools"] and not r["keep"] and r["reason"] == "third_party_code_only"
 
 
-def test_readme_citing_paper_settles_maybe():
+def test_readme_citing_paper_is_a_signal_not_a_verdict():
     ft = "Paper X\nResults were computed with the scripts at https://github.com/bob/xtools.\nReferences\n"
     gh_raw = fake_gh({"repos/bob/xtools/readme": (200, "Code for doi 10.1/xyz")})
     gh = fake_gh({"repos/bob/xtools": (200, {"size": 5, "language": "R"})})
     r = codegate.s3b_record(ft, {"title": "Paper X", "doi": "10.1/xyz"}, {"code": {}}, jev=lambda l: 0.0,
                             get=fake_get({}), gh=gh, gh_raw=gh_raw)
+    assert not r["keep"]                      # Jev says third party: the README alone does not decide
+    r = codegate.s3b_record(ft, {"title": "Paper X", "doi": "10.1/xyz"}, {"code": {}}, jev=lambda l: 0.9,
+                            get=fake_get({}), gh=gh, gh_raw=gh_raw)
     assert r["keep"] and r["primary"]["language"] == "R"
+
+
+def test_maybe_without_jev_follows_policy_and_jev_down_pauses():
+    ft = "Paper X\nResults were computed with the scripts at https://github.com/bob/xtools.\nReferences\n"
+    gh = fake_gh({"repos/bob/xtools": (200, {"size": 5})})
+    r = codegate.s3b_record(ft, {"title": "Paper X"}, {"code": {}}, get=fake_get({}), gh=gh, gh_raw=fake_gh({}))
+    assert not r["keep"] and r["reason"] == "third_party_code_only"
+    r = codegate.s3b_record(ft, {"title": "Paper X"}, {"code": {"maybe_policy": "own"}}, get=fake_get({}), gh=gh,
+                            gh_raw=fake_gh({}))
+    assert r["keep"]
+    r = codegate.s3b_record(ft, {"title": "Paper X"}, {"code": {}}, jev=lambda l: None, get=fake_get({}), gh=gh,
+                            gh_raw=fake_gh({}))
+    assert not r["keep"] and r["pause"] == "code_owner_undecided"
+
+
+def test_on_request_paper_not_rescued_by_reference_link():
+    ft = ("Paper\nCode availability\nThe code is available upon reasonable request from the corresponding author."
+          "\nReferences\n[1] Smith. Tool. https://github.com/smith/tool\n" + "x " * 50)
+    r = codegate.s3b_record(ft, {"title": "Paper"}, {"code": {}}, get=fake_get({}),
+                            gh=fake_gh({"repos/smith/tool": (200, {"size": 9})}), gh_raw=fake_gh({}))
+    assert not r["keep"] and r["reason"] == "code_on_request"
+
+
+def test_private_transient_bioconductor_zenodo_archive():
+    c = {"title": "Fast smoothing"}
+    r = codegate.s3b_record(FT_OWN, c, {"code": {}}, get=fake_get({}),
+                            gh=fake_gh({"repos/alice/fastsmoother": (200, {"size": 9, "private": True})}),
+                            gh_raw=fake_gh({}))
+    assert not r["keep"] and r["reason"] == "code_repo_unavailable"
+    r = codegate.s3b_record(FT_OWN, c, {"code": {}}, get=fake_get({"zenodo": (503, None)}),
+                            gh=fake_gh({"repos/alice/fastsmoother": (403, None)}), gh_raw=fake_gh({}))
+    assert not r["keep"] and r["pause"] == "code_host_unavailable"
+    ft = "Paper\nCode availability\nOur code is available at https://bioconductor.org/packages/fakepkg.\n"
+    r = codegate.s3b_record(ft, {"title": "Paper"}, {"code": {}}, get=fake_get({}), gh=fake_gh({}),
+                            gh_raw=fake_gh({}))
+    assert not r["keep"] and r["reason"] == "code_repo_unavailable"
+    ft = "Paper\nCode availability\nOur code and data are available at https://zenodo.org/records/5555.\n"
+    get = fake_get({"api/records/5555": (200, {"metadata": {"resource_type": {"type": "dataset"}},
+                                                "files": [{"key": "observations.zip", "size": 5}]})})
+    r = codegate.s3b_record(ft, {"title": "Paper"}, {"code": {}}, get=get, gh=fake_gh({}), gh_raw=fake_gh({}))
+    assert not r["keep"] and r["reason"] == "data_only_no_code"
+
+
+def test_repo_names_kept():
+    links, _ = codegate.extract_links("see https://github.com/a/solver.v2 and https://github.com/b/Foo.jl and "
+                                      "https://github.com/c/tool.Acknowledgments and "
+                                      "https://gitlab.com/grp/sub/deeper/proj/-/tree/main", {})
+    keys = {l["key"] for l in links}
+    assert {"github.com/a/solver.v2", "github.com/b/foo.jl", "github.com/c/tool",
+            "gitlab.com/grp/sub/deeper/proj"} <= keys
+
+
+def test_s2a_pwc_reaches_s3b(tmp_path, monkeypatch):
+    P = _pipe(tmp_path)
+    [a] = P.ingest([{"doi": "10.1/a", "title": "Some paper"}])
+    it = P.store.item(a)
+    write_json(it.p("S2a_code_signal.json"), {"pwc": ["https://github.com/alice/fastsmoother"], "any": True})
+    it.state["stage"] = "S3b"
+    it.save()
+    it.p("fulltext.txt").write_text("Some paper\nNo links in this text.\n")
+    seen = {}
+
+    def fake_record(txt, c, cfg, jev=None, **kw):
+        seen["cs"] = c["code_signals"]
+        return dict(keep=False, reason="x", links=[], paper={})
+    monkeypatch.setattr(codegate, "s3b_record", fake_record)
+    P.run(max_steps=1)
+    assert seen["cs"]["pwc"] == ["https://github.com/alice/fastsmoother"]
+
+
+def test_fetch_delivery_uses_subscriber_next_stage(tmp_path):
+    P = _pipe(tmp_path)
+    [a] = P.ingest([{"doi": "10.1/a", "title": "Some paper"}])
+    it = P.store.item(a)
+    it.state["stage"] = "S3"
+    it.save()
+    P.run(max_steps=1)                         # no full text offline -> parked, queue entry written
+    q = read_json(it.p("S3_queue.json"))
+    assert P.store.item(a).state["status"] == "parked" and q["next_stage"] == "S3b"
 
 
 def test_pdf_broken_url_joined():
