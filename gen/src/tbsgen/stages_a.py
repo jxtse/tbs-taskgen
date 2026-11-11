@@ -531,6 +531,8 @@ def _agent_stage(P, it, kind: str, instruction: str, need: list[str], timeout_s:
     if rec is not None and rec.get("state") == "launch_failed":
         rec["retry"] = True                     # infrastructure: a resumed item launches a fresh job
         rec["state"] = "finished"
+        if not rec.get("launch_attempted"):
+            rec["counted"] = True               # never started: nothing spent
     if rec is None or (rec.get("state") == "finished" and rec.get("retry")):
         why = codeagent.env_ok(P.cfg, agent=True)
         if why:
@@ -538,13 +540,22 @@ def _agent_stage(P, it, kind: str, instruction: str, need: list[str], timeout_s:
             return None
         # per-paper caps are cumulative over all jobs of this stage: each new job gets what is left
         spent = it.state.get(f"{kind}_spent", {"usd": 0.0, "sec": 0.0})
-        if rec is not None and rec.get("state") == "finished" and not rec.get("counted"):
-            spent = dict(usd=spent["usd"] + float(rec.get("cost_usd") or 0.0),
-                         sec=spent["sec"] + 60.0 * float(rec.get("minutes") or 0.0))
+        if rec is not None and rec.get("launch_attempted") and not rec.get("counted"):
+            # a job that may have run: unknown cost counts as its whole allowance, unknown time as wall time since
+            # the launch (never as zero)
+            b = rec.get("budget") or {}
+            usd = rec.get("cost_usd")
+            usd = float(usd) if usd is not None else float(b.get("max_usd") or max_usd or 0.0)
+            sec = 60.0 * float(rec["minutes"]) if rec.get("minutes") is not None else \
+                max(0.0, float(rec.get("finished_ts") or time.time()) - float(rec["launch_attempted"]))
+            spent = dict(usd=spent["usd"] + usd, sec=spent["sec"] + sec)
             it.state[f"{kind}_spent"] = spent
+            rec["counted"] = True
+            write_json(recp, rec)
         left_s = timeout_s - spent["sec"]
         left_usd = None if max_usd is None else float(max_usd) - spent["usd"]
-        if left_s < 600 or (left_usd is not None and left_usd < 1.0):
+        floor = (600.0, 1.0) if spent["sec"] or spent["usd"] else (1.0, 0.01)   # first job: the configured caps
+        if left_s < floor[0] or (left_usd is not None and left_usd < floor[1]):
             it.finish("dropped", f"{kind.lower()}_budget_exhausted", spent=spent)
             return None
         timeout_s, max_usd, est_usd = left_s, left_usd, min(est_usd, left_usd) if left_usd is not None else est_usd
@@ -590,22 +601,39 @@ def s4c(P, it):
     out = codeagent.deliverable(rec)
     res = None
     if out:
-        for f in ("runnability.json", "HOWTO.md", "run.log", "setup.sh"):
-            body = codeagent.safe_read(out / f)
+        for f in ("runnability.json", "HOWTO.md", "setup.sh"):
+            body = codeagent.safe_read(out / f, root=Path(rec["trial"]))
             if body is not None:
                 it.p("S4c", f).write_text(body)
         try:
-            res = json.loads(codeagent.safe_read(out / "runnability.json") or "null")
+            res = json.loads(codeagent.safe_read(out / "runnability.json", root=Path(rec["trial"])) or "null")
         except ValueError:
             res = None
-    if isinstance(res, dict):
-        # schema: runnable is a real boolean; a runnable verdict needs the run log, the how-to and a verifier pass
-        bad = [k for k, ok in (("runnable", isinstance(res.get("runnable"), bool)),
-                               ("run.log", bool(res.get("runnable") is not True or it.p("S4c", "run.log").exists())),
-                               ("HOWTO.md", it.p("S4c", "HOWTO.md").exists()),
-                               ("reward", rec.get("reward") == 1 or res.get("runnable") is not True)) if not ok]
+    receipts = []
+    if out:
+        for f in sorted((out / "runs").glob("*.json")) if (out / "runs").is_dir() else []:
+            try:
+                rr = json.loads(codeagent.safe_read(f, root=out) or "null")
+            except ValueError:
+                rr = None
+            if isinstance(rr, dict):
+                receipts.append(rr)
+        write_json(it.p("S4c", "receipts.json"), receipts)
+    if isinstance(res, dict) and res.get("runnable") is True:
+        # a runnable verdict needs: reason "ok", the how-to, a verifier pass and a wrapper receipt with exit code 0
+        # whose command is the reported entry (and its log)
+        ok_runs = [r for r in receipts if r.get("rc") == 0 and str(r.get("cmd", "")).strip() ==
+                   str(res.get("entry", "")).strip() and out and codeagent.safe_read(out / str(r.get("log", "")),
+                                                                                    root=out)]
+        bad = [k for k, ok in (("reason", res.get("reason") == "ok"), ("entry", bool(str(res.get("entry", "")).strip())),
+                               ("HOWTO.md", it.p("S4c", "HOWTO.md").exists()), ("reward", rec.get("reward") == 1),
+                               ("receipt", bool(ok_runs))) if not ok]
         if bad:
             res = dict(res, runnable=False, reason="invalid_result", invalid=bad)
+        else:
+            it.p("S4c", "run.log").write_text(codeagent.safe_read(out / str(ok_runs[-1]["log"]), root=out) or "")
+    elif isinstance(res, dict) and not isinstance(res.get("runnable"), bool):
+        res = dict(res, runnable=False, reason="invalid_result", invalid=["runnable"])
     write_json(it.p("S4c_runnability.json"), dict(job=rec.get("job_name"), outcome=rec.get("outcome"),
                                                   exception=rec.get("exception"), cost_usd=rec.get("cost_usd"),
                                                   minutes=rec.get("minutes"), result=res))
@@ -643,7 +671,7 @@ def s5g(P, it):
     if rec is None:
         return
     out = codeagent.deliverable(rec)
-    miss = [f for f in S5G_FILES if not (out and (out / f).exists())]
+    miss = [f for f in S5G_FILES if not (out and codeagent.safe_read(out / f, root=Path(rec["trial"])) is not None)]
     write_json(it.p("S5G_result.json"), dict(job=rec.get("job_name"), outcome=rec.get("outcome"),
                                              exception=rec.get("exception"), cost_usd=rec.get("cost_usd"),
                                              cost_kind=rec.get("cost_kind"), minutes=rec.get("minutes"),
@@ -655,7 +683,7 @@ def s5g(P, it):
             return it.goto("S5G", "authoring job infra failure: retry")
         return it.finish("dropped", "s5g_missing_files", missing=miss[:5])
     try:
-        spec = json.loads(codeagent.safe_read(out / "_spec" / "spec.json") or "")
+        spec = json.loads(codeagent.safe_read(out / "_spec" / "spec.json", root=Path(rec["trial"])) or "")
     except (OSError, ValueError) as e:
         return it.finish("dropped", f"s5g_spec_unparseable:{type(e).__name__}")
     errs = validate_spec(spec, P.cfg)
@@ -673,7 +701,7 @@ def s5g(P, it):
         if (task / extra).exists():
             shutil.rmtree(task / extra)
     try:
-        author = json.loads(codeagent.safe_read(out / "_spec" / "author_code.json") or "")
+        author = json.loads(codeagent.safe_read(out / "_spec" / "author_code.json", root=Path(rec["trial"])) or "")
     except ValueError:
         return it.finish("dropped", "s5g_author_code_unparseable")
     s3c = read_json(it.p("S3c_code.json"), {}) or {}
@@ -689,7 +717,7 @@ def s5g(P, it):
         authoring="agent", agent_job=rec.get("job_name"), fulltext=read_json(it.p("S3_fulltext.json")),
         fulltext_sha=hashlib.sha256(it.p("fulltext.txt").read_bytes()).hexdigest()[:16],
         author_code=dict(repo=s3c.get("primary_url"), pin=s3c.get("pin"), license=s3c.get("license"))))
-    rep = codeagent.safe_read(out / "report.md")
+    rep = codeagent.safe_read(out / "report.md", root=Path(rec["trial"]))
     if rep is not None:
         it.p("S5G", "report.md").write_text(rep)
     it.advance("S5G", "S6A_run", form=spec.get("form"), cost_usd=rec.get("cost_usd"), minutes=rec.get("minutes"))

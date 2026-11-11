@@ -17,7 +17,9 @@ Work in this container (you are root; network access is allowed while you instal
 2. Install what is needed **inside this container** (apt, pip, conda/mamba, R `install.packages` / `BiocManager`,
    Julia `Pkg`, cargo, make / cmake ...).  Any language is fine.  Use CPU only: never install CUDA.
    MATLAB code: try GNU Octave (`apt-get install octave`) first.
-3. Run **one** real example of the authors' code end to end: their example / demo / test suite / main entry point on
+3. Run **one** real example of the authors' code end to end **through the receipt wrapper**:
+   `/work/tbsgen-run.sh <command>` (it records the command, exit code and log under /app/out/runs/; S4c accepts
+   "runnable" only with such a receipt of exit code 0 whose command equals "entry" below).  The example: their example / demo / test suite / main entry point on
    the data shipped with the repository or on small synthetic input you create.  It counts only if the authors'
    own code computes a numerical result (an import that succeeds is not enough).  Keep the run under 15 minutes on
    4 CPUs; reduce sizes / iterations if the documented example is bigger.

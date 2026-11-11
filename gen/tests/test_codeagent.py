@@ -124,12 +124,15 @@ def _agent_item(tmp_path, monkeypatch, files, stage="S4c", **code):
 
 def test_s4c_runnable_then_s5g(tmp_path, monkeypatch):
     P, it, fl = _agent_item(tmp_path, monkeypatch, {
-        "runnability.json": json.dumps({"runnable": True, "reason": "ok", "language": "Python", "seconds": 3}),
-        "HOWTO.md": "pip install .; python -m fastsmoother", "run.log": "ran"})
+        "runnability.json": json.dumps({"runnable": True, "reason": "ok", "language": "Python", "seconds": 3,
+                                        "entry": "python -m fastsmoother"}),
+        "HOWTO.md": "pip install .; python -m fastsmoother", "runs/0.json": json.dumps({"cmd": "python -m fastsmoother", "rc": 0, "seconds": 3, "log": "runs/0.log"}),
+        "runs/0.log": "ok"})
     P.run(max_steps=1, until="S4c")
     assert P.store.item(it.item_id).state["status"] == "waiting"
     task = it.p("S4c", "task")
     assert read_json(task / "environment" / "work" / ".tbsgen-remote-repo") == {"repo_dir": "/r/x/repo", "pin": "abc"}
+    assert "/work/repo.PIN" in (task / "environment" / "Dockerfile").read_text()
     assert not (task / "environment" / "work" / "repo").exists()      # never copied off the build host
     P.run(max_steps=2, until="S4c")
     st = P.store.item(it.item_id).state
@@ -244,9 +247,14 @@ def test_sandbox_ssh_backend_command(tmp_path, monkeypatch):
 
 def test_r1_regressions(tmp_path, monkeypatch):
     # "runnable": "false" (a string) or a missing run.log never passes
-    for files in ({"runnability.json": json.dumps({"runnable": "false"}), "HOWTO.md": "x", "run.log": "y"},
-                  {"runnability.json": json.dumps({"runnable": True}), "HOWTO.md": "x"}):
-        P, it, _ = _agent_item(tmp_path / str(len(files)), monkeypatch, files)
+    bad_runs = {"runs/0.json": json.dumps({"cmd": "python run.py", "rc": 1, "log": "runs/0.log"}), "runs/0.log": "boom"}
+    for i, files in enumerate(({"runnability.json": json.dumps({"runnable": "false"}), "HOWTO.md": "x"},
+                               {"runnability.json": json.dumps({"runnable": True, "reason": "ok"}), "HOWTO.md": "x"},
+                               {"runnability.json": json.dumps({"runnable": True, "reason": "crashes",
+                                                                "entry": "python run.py"}), "HOWTO.md": "x", **bad_runs},
+                               {"runnability.json": json.dumps({"runnable": True, "reason": "ok",
+                                                                "entry": "python run.py"}), "HOWTO.md": "x", **bad_runs})):
+        P, it, _ = _agent_item(tmp_path / str(i), monkeypatch, files)
         P.run(max_steps=3, until="S4c")
         st = P.store.item(it.item_id).state
         assert st["status"] == "dropped" and st["reason"] == "code_not_runnable", st
@@ -266,6 +274,27 @@ def test_r1_regressions(tmp_path, monkeypatch):
     cfg = _cfg(tmp_path)
     cfg["sandbox"]["backend"] = "docker"
     assert "ssh" in codeagent.env_ok(cfg)
+
+
+def test_symlinked_deliverable_root_refused(tmp_path):
+    tr = tmp_path / "trial"
+    (tr / "verifier").mkdir(parents=True)
+    (tmp_path / "outside").mkdir()
+    (tmp_path / "outside" / "x.txt").write_text("secret")
+    os.symlink(tmp_path / "outside", tr / "verifier" / "out")
+    assert codeagent.deliverable({"trial": str(tr)}) is None
+    assert codeagent.safe_read(tr / "verifier" / "out" / "x.txt", root=tr) is None
+    assert codeagent.safe_copytree(tr / "verifier" / "out", tmp_path / "dst", root=tr) == ["."]
+
+
+def test_unknown_cost_counts_full_allowance(tmp_path, monkeypatch):
+    P, it, fl = _agent_item(tmp_path, monkeypatch, {"_spec/spec.json": "{}"}, stage="S5G")
+    write_json(it.p("S5G", "run.json"), {"state": "finished", "job_name": "old", "retry": True,
+                                         "launch_attempted": 1.0, "finished_ts": 2.0, "cost_usd": None,
+                                         "budget": {"max_usd": 20.0}})
+    P.run(max_steps=1, until="S5G")
+    st = P.store.item(it.item_id).state
+    assert st["status"] == "dropped" and st["reason"] == "s5g_budget_exhausted" and not fl.calls
 
 
 def test_cumulative_authoring_budget(tmp_path, monkeypatch):
@@ -288,7 +317,7 @@ def test_cumulative_authoring_budget(tmp_path, monkeypatch):
 
 def test_launch_failed_is_retried_on_resume(tmp_path, monkeypatch):
     P, it, fl = _agent_item(tmp_path, monkeypatch, {"runnability.json": "{}"})
-    write_json(it.p("S4c", "run.json"), {"state": "launch_failed", "job_name": "old", "error": "tmux"})
+    write_json(it.p("S4c", "run.json"), {"state": "launch_failed", "job_name": "old", "error": "tmux"})   # never started
     P.run(max_steps=1, until="S4c")
     assert P.store.item(it.item_id).state["status"] == "waiting" and len(fl.calls) == 1
 
@@ -302,7 +331,19 @@ def test_inject_script_checks_pin(tmp_path):
     t = tmp_path / "task"
     (t / "environment" / "work").mkdir(parents=True)
     write_json(t / "environment" / "work" / ".tbsgen-remote-repo", {"repo_dir": str(pd / "repo"), "pin": "abc"})
-    assert subprocess.run(["bash", str(sc), str(t)], capture_output=True).returncode == 0
+    root = str(tmp_path.resolve())
+    pdr = (pd / "repo").resolve()
+    write_json(t / "environment" / "work" / ".tbsgen-remote-repo", {"repo_dir": str(pdr), "pin": "abc"})
+    r = subprocess.run(["bash", str(sc), str(t), root], capture_output=True, text=True)
+    if "realpath" in r.stderr and "illegal option" in r.stderr or r.returncode == 127:
+        pytest.skip("GNU realpath / cp not available")
+    assert r.returncode == 0, r.stderr
     assert (t / "environment" / "work" / "repo" / "a.py").exists()
-    write_json(t / "environment" / "work" / ".tbsgen-remote-repo", {"repo_dir": str(pd / "repo"), "pin": "zzz"})
-    assert subprocess.run(["bash", str(sc), str(t)], capture_output=True).returncode == 3
+    assert (t / "environment" / "work" / "repo.PIN").read_text().strip() == "abc"
+    write_json(t / "environment" / "work" / ".tbsgen-remote-repo", {"repo_dir": str(pdr), "pin": "zzz"})
+    assert subprocess.run(["bash", str(sc), str(t), root], capture_output=True).returncode == 3
+    # a repo dir reached through a link is refused
+    os.symlink(pd, tmp_path / "lnk")
+    write_json(t / "environment" / "work" / ".tbsgen-remote-repo", {"repo_dir": str(tmp_path.resolve() / "lnk" / "repo"),
+                                                                     "pin": "abc"})
+    assert subprocess.run(["bash", str(sc), str(t), root], capture_output=True).returncode == 3

@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import shlex
 import shutil
@@ -67,13 +68,30 @@ def ssh_run(cfg: dict, cmd: str, timeout: float = 600, stdin: bytes | None = Non
         return dict(rc=-1, out="", err=f"{type(e).__name__}: {e}")
 
 
+def run_id(cfg: dict) -> str:
+    """A persistent unique id of this run directory (run_id.txt in the run root, created once)."""
+    root = Path(str((cfg.get("run") or {}).get("root") or "."))
+    f = root / "code_run_id.txt"
+    if not f.exists():
+        import uuid
+        root.mkdir(parents=True, exist_ok=True)
+        tmp = f.with_suffix(f".tmp{os.getpid()}")
+        tmp.write_text(f"{root.name[:40]}-{uuid.uuid4().hex[:8]}\n")
+        try:
+            os.link(tmp, f)                 # atomic create-if-absent
+        except FileExistsError:
+            pass
+        tmp.unlink()
+    return f.read_text().strip()
+
+
 def remote_item_dir(cfg: dict, item_id: str) -> str:
     root = _c(cfg).get("remote_root")
     if not root or not str(root).startswith("/"):
         raise ValueError("code.remote_root must be an absolute build-host directory for the authors' code")
     if not re.fullmatch(r"[A-Za-z0-9._:-]+", item_id):
         raise ValueError(f"unsafe item id {item_id!r}")
-    tag = _c(cfg).get("run_tag") or Path(str((cfg.get("run") or {}).get("root") or "run")).name
+    tag = _c(cfg).get("run_tag") or run_id(cfg)
     return f"{root.rstrip('/')}/{tag}/{item_id}"
 
 
@@ -85,34 +103,45 @@ emit() {{ echo "TBSGEN_RESULT $1"; }}
 case "$D" in "$ROOT"/*) ;; *) emit '{{"ok": false, "why": "bad_dir"}}'; exit 0 ;; esac
 mkdir -p "$D" && cd "$D" || {{ emit '{{"ok": false, "why": "fetch_error", "err": "cannot create item dir"}}'; exit 0; }}
 [ "$(pwd -P)" = "$(cd "$D" && pwd -P)" ] || exit 1
-rm -rf "$D/repo.tmp" "$D/dl"; mkdir -p "$D/dl"
+W=$(mktemp -d "$D/fetch.XXXXXX") || {{ emit '{{"ok": false, "why": "fetch_error", "err": "mktemp"}}'; exit 0; }}
+trap 'rm -rf "$W"' EXIT
+mkdir -p "$W/dl"
 if [ "$KIND" = git ]; then
   export GIT_LFS_SKIP_SMUDGE=1 GIT_TERMINAL_PROMPT=0
   if ! timeout {tmo} git -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=120 clone --quiet --depth 1 \
-       --no-recurse-submodules ${{REF:+--branch "$REF"}} "$URL" "$D/repo.tmp" 2> "$D/dl/clone.err"; then
-    emit "{{\"ok\": false, \"why\": \"clone_failed\", \"err\": $(tail -c 400 "$D/dl/clone.err" | python3 -c 'import json,sys;print(json.dumps(sys.stdin.read()))')}}"; exit 0
+       --no-recurse-submodules ${{REF:+--branch "$REF"}} "$URL" "$W/repo.tmp" 2> "$W/dl/clone.err"; then
+    emit "{{\"ok\": false, \"why\": \"clone_failed\", \"err\": $(tail -c 400 "$W/dl/clone.err" | python3 -c 'import json,sys;print(json.dumps(sys.stdin.read()))')}}"; exit 0
   fi
-  SHA=$(git -C "$D/repo.tmp" rev-parse HEAD); PIN="$SHA"
+  SHA=$(git -C "$W/repo.tmp" rev-parse HEAD); PIN="$SHA"
 else
-  if ! timeout {tmo} curl -sSfL --max-filesize $((MAXMB*1024*1024)) -o "$D/dl/archive" "$URL" 2> "$D/dl/curl.err"; then
-    emit "{{\"ok\": false, \"why\": \"download_failed\", \"err\": $(tail -c 400 "$D/dl/curl.err" | python3 -c 'import json,sys;print(json.dumps(sys.stdin.read()))')}}"; exit 0
+  if ! timeout {tmo} curl -sSfL --max-filesize $((MAXMB*1024*1024)) -o "$W/dl/archive" "$URL" 2> "$W/dl/curl.err"; then
+    emit "{{\"ok\": false, \"why\": \"download_failed\", \"err\": $(tail -c 400 "$W/dl/curl.err" | python3 -c 'import json,sys;print(json.dumps(sys.stdin.read()))')}}"; exit 0
   fi
-  PIN=sha256:$(sha256sum "$D/dl/archive" 2>/dev/null | cut -d' ' -f1 || shasum -a 256 "$D/dl/archive" | cut -d' ' -f1); SHA=""
-  mkdir -p "$D/repo.tmp"
-  (cd "$D/repo.tmp" && (unzip -q ../dl/archive 2>/dev/null || tar xf ../dl/archive 2>/dev/null)) || {{
+  PIN=sha256:$(sha256sum "$W/dl/archive" 2>/dev/null | cut -d' ' -f1 || shasum -a 256 "$W/dl/archive" | cut -d' ' -f1); SHA=""
+  mkdir -p "$W/repo.tmp"
+  (cd "$W/repo.tmp" && (unzip -q ../dl/archive 2>/dev/null || tar xf ../dl/archive 2>/dev/null)) || {{
     emit '{{"ok": false, "why": "unpack_failed"}}'; exit 0; }}
-  n=$(ls -A "$D/repo.tmp" | wc -l | tr -d ' ')
-  if [ "$n" = 1 ] && [ -d "$D/repo.tmp/$(ls -A "$D/repo.tmp")" ]; then
-    mv "$D/repo.tmp/$(ls -A "$D/repo.tmp")" "$D/repo.tmp2" && rmdir "$D/repo.tmp" && mv "$D/repo.tmp2" "$D/repo.tmp"; fi
+  n=$(ls -A "$W/repo.tmp" | wc -l | tr -d ' ')
+  if [ "$n" = 1 ] && [ -d "$W/repo.tmp/$(ls -A "$W/repo.tmp")" ]; then
+    TOP="$W/repo.tmp/$(ls -A "$W/repo.tmp")"
+    [ -L "$TOP" ] && {{ emit '{{"ok": false, "why": "unpack_failed", "err": "top-level link"}}'; exit 0; }}
+    mv "$TOP" "$W/repo.tmp2" && rmdir "$W/repo.tmp" && mv "$W/repo.tmp2" "$W/repo.tmp"; fi
+  # archives may carry links: drop every link (a link can point anywhere on the build host)
+  find "$W/repo.tmp" -type l -delete
 fi
-cd "$D/repo.tmp/.." || exit 1
+cd "$W/repo.tmp/.." || exit 1
 MB=$(python3 -c 'import os,sys;print(int(sum(os.path.getsize(os.path.join(d,f)) for d,ds,fs in os.walk("repo.tmp") if not (ds.remove(".git") if ".git" in ds else None) for f in fs if not os.path.islink(os.path.join(d,f)))/1048576+0.999))')
-if [ "$MB" -gt "$MAXMB" ]; then rm -rf "$D/repo.tmp"; emit "{{\"ok\": false, \"why\": \"too_large\", \"mb\": $MB}}"; exit 0; fi
+if [ "$MB" -gt "$MAXMB" ]; then rm -rf "$W/repo.tmp"; emit "{{\"ok\": false, \"why\": \"too_large\", \"mb\": $MB}}"; exit 0; fi
 # immutable per pin: <item>/<pin>/repo is never replaced (another run / fetch of the same pin reuses it)
 PD="$D/pins/$(echo "$PIN" | tr ':' '-' | cut -c1-72)"
-if [ -d "$PD/repo" ]; then rm -rf "$D/repo.tmp"; else mkdir -p "$PD" && mv "$D/repo.tmp" "$PD/repo"; fi
+mkdir -p "$D/pins"
+if [ ! -d "$PD/repo" ]; then
+  # atomic publish: a complete <pin>/ appears with one rename; a concurrent fetch of the same pin keeps the first
+  mkdir -p "$W/pub" && mv "$W/repo.tmp" "$W/pub/repo" && echo "$PIN" > "$W/pub/PIN" && \
+    mv -T "$W/pub" "$PD" 2>/dev/null || mv "$W/pub" "$PD" 2>/dev/null || true
+fi
+[ -d "$PD/repo" ] && [ "$(cat "$PD/PIN" 2>/dev/null)" = "$PIN" ] || {{ emit '{{"ok": false, "why": "fetch_error", "err": "pin publish failed"}}'; exit 0; }}
 cd "$PD" || exit 1
-echo "$PIN" > "$PD/PIN"
 LFS=$(grep -l "filter=lfs" repo/.gitattributes 2>/dev/null | wc -l | tr -d ' ')
 python3 - "$PIN" "$SHA" "$MB" "$LFS" "$PD" <<'EOF'
 import json, os, sys, collections
@@ -253,7 +282,25 @@ AGENT_DOCKERFILE = """FROM {image}
 # toolchains are installed by the agent while it works (allowlisted package hosts), not at build time
 WORKDIR /app
 COPY work /work
+{repo_check}
 RUN mkdir -p /app/out /logs/verifier && chmod -R a+rwX /work /app
+"""
+
+RUN_WRAPPER = """#!/bin/bash
+# usage: /work/tbsgen-run.sh <command...>   runs the command, records a receipt in /app/out/runs/ (cmd, rc, seconds)
+# and the log in /app/out/runs/<n>.log.  S4c accepts "runnable" only with a receipt of rc 0.
+mkdir -p /app/out/runs
+n=$(ls /app/out/runs/*.json 2>/dev/null | wc -l)
+t0=$(date +%s)
+"$@" > /app/out/runs/$n.log 2>&1
+rc=$?
+python3 - "$n" "$rc" "$(( $(date +%s) - t0 ))" "$*" <<'EOF'
+import json, sys
+n, rc, sec, cmd = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), sys.argv[4]
+json.dump(dict(cmd=cmd, rc=rc, seconds=sec, log=f"runs/{n}.log"), open(f"/app/out/runs/{n}.json", "w"))
+EOF
+tail -n 40 /app/out/runs/$n.log
+exit $rc
 """
 
 VERIFY_SH = """#!/bin/bash
@@ -278,8 +325,16 @@ def build_agent_task(cfg: dict, kind: str, item_id: str, work: Path, out: Path, 
         shutil.rmtree(out)
     (out / "environment").mkdir(parents=True)
     shutil.copytree(work, out / "environment" / "work", symlinks=False)
+    marker = read_json(work / ".tbsgen-remote-repo", None)
+    # the image does not build unless the launcher injected the pinned authors' repo (no model spend otherwise)
+    check = (f"RUN test -d /work/repo && test -n \"$(ls -A /work/repo)\" && "
+             f"test \"$(cat /work/repo.PIN)\" = {json.dumps(str(marker.get('pin')))} || "
+             f"(echo 'authors repo not injected or pin mismatch' >&2; exit 1)") if marker else ""
     (out / "environment" / "Dockerfile").write_text(AGENT_DOCKERFILE.format(
-        image=image or _c(cfg).get("agent_base_image", "python:3.11-slim")))
+        image=image or _c(cfg).get("agent_base_image", "python:3.11-slim"), repo_check=check))
+    # S4c run receipts: the agent runs the authors' example through this wrapper (command, exit code, log)
+    (out / "environment" / "work" / "tbsgen-run.sh").write_text(RUN_WRAPPER)
+    (out / "environment" / "work" / "tbsgen-run.sh").chmod(0o755)
     (out / "tests").mkdir()
     (out / "tests" / "test.sh").write_text(VERIFY_SH)
     (out / "tests" / "test.sh").chmod(0o755)
@@ -394,7 +449,7 @@ def poll_agent(cfg: dict, it, kind: str, ledger) -> dict | None:
         dict(cost_usd=None, cost_kind="unknown", usage=None)
     tr = read_json(trial / "result.json", {}) if trial else {}
     exc = ((tr or {}).get("exception_info") or {}).get("exception_type")
-    rec.update(state="finished", trial=str(trial) if trial else None, cost_usd=cost["cost_usd"],
+    rec.update(state="finished", finished_ts=time.time(), trial=str(trial) if trial else None, cost_usd=cost["cost_usd"],
                cost_kind=cost["cost_kind"], usage=cost.get("usage"), exception=exc,
                reward=(((tr or {}).get("verifier_result") or {}).get("rewards") or {}).get("reward"),
                minutes=_minutes(tr))
@@ -416,11 +471,13 @@ def _minutes(tr: dict) -> float | None:
 
 
 def deliverable(rec: dict) -> Path | None:
-    """The agent's /app/out as copied by the verifier (logs/verifier/out)."""
+    """The agent's /app/out as copied by the verifier (logs/verifier/out); None if any component below the trial
+    directory is a link."""
     if not rec or not rec.get("trial"):
         return None
-    p = Path(rec["trial"]) / "verifier" / "out"
-    return p if p.exists() else None
+    t = Path(rec["trial"])
+    p = t / "verifier" / "out"
+    return p if p.is_dir() and _inside(t, p) else None
 
 
 # ----------------------------------------------------------------------------------------------- inputs
@@ -477,7 +534,7 @@ def env_ok(cfg: dict, agent: bool = False) -> str | None:
     c = _c(cfg)
     if not c.get("host") or not c.get("remote_root"):
         return "code.host / code.remote_root not set"
-    if (cfg.get("sandbox") or {}).get("backend") != "ssh" and not c.get("allow_local_sandbox"):
+    if (cfg.get("sandbox") or {}).get("backend") != "ssh":
         return "sandbox.backend must be \"ssh\" (build host) for code-grounded runs"
     if agent and not (c.get("agent_harbor_root") or cfg["calib"].get("teacher_harbor_root")):
         return "code.agent_harbor_root not set"
@@ -486,11 +543,29 @@ def env_ok(cfg: dict, agent: bool = False) -> str | None:
 
 
 
-def safe_copytree(src: Path, dst: Path) -> list[str]:
-    """Copy an agent deliverable tree, refusing symlinks and special files (a link could point anywhere on the
-    machine that copies it).  Returns the refused relative paths; nothing outside src is ever read."""
+def _inside(root: Path, p: Path) -> bool:
+    """No component of p below root (nor root itself) is a symlink, and p resolves inside root."""
+    root = Path(root)
+    if root.is_symlink():
+        return False
+    cur = root
+    for part in Path(p).relative_to(root).parts:
+        cur = cur / part
+        if cur.is_symlink():
+            return False
+    try:
+        return Path(p).resolve().is_relative_to(root.resolve())
+    except OSError:
+        return False
+
+
+def safe_copytree(src: Path, dst: Path, root: Path | None = None) -> list[str]:
+    """Copy an agent deliverable tree, refusing symlinks (at any level, from the trusted `root` down) and special
+    files.  Returns the refused relative paths; nothing outside the tree is ever read."""
     refused = []
     src = Path(src)
+    if not _inside(Path(root or src), src) or not src.is_dir():
+        return ["."]
     for p in sorted(src.rglob("*")):
         rel = p.relative_to(src)
         if p.is_symlink() or not (p.is_file() or p.is_dir()):
@@ -504,8 +579,9 @@ def safe_copytree(src: Path, dst: Path) -> list[str]:
     return refused
 
 
-def safe_read(p: Path, limit: int = 2_000_000) -> str | None:
+def safe_read(p: Path, limit: int = 2_000_000, root: Path | None = None) -> str | None:
+    """Read a deliverable file only if no path component from the trusted root down is a link."""
     p = Path(p)
-    if p.is_symlink() or not p.is_file() or p.stat().st_size > limit:
+    if not _inside(Path(root or p.parent), p) or not p.is_file() or p.stat().st_size > limit:
         return None
     return p.read_text(errors="replace")
