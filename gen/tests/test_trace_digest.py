@@ -23,3 +23,18 @@ def test_trace_digest_tolerates_string_message_and_non_dict_lines(tmp_path):
     d = review.trace_digest(t)
     assert "hello" in d and "Bash: ls" in d and "(denied) Bash: Dangerous rm operation" in d
     assert "subtype=success" in d and "- ok" in d
+
+
+def test_trace_digest_tolerates_odd_nested_fields(tmp_path):
+    t = tmp_path / "trial"
+    (t / "agent").mkdir(parents=True)
+    rows = [
+        {"type": "assistant", "message": {"id": ["x"], "content": [
+            {"type": "text", "text": None}, {"type": "tool_use", "id": ["y"], "name": "Bash", "input": "ls -la"},
+            {"type": "tool_use", "id": "z", "name": "Edit", "input": ["a"]}]}},
+        {"type": "user", "message": {"content": [{"type": "tool_result", "content": 42},
+                                                 {"type": "tool_result", "content": [{"text": None}, "s"]}]}},
+    ]
+    (t / "agent" / "claude-code.txt").write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+    d = review.trace_digest(t)
+    assert 'Bash: "ls -la"' in d and "Edit:" in d and "- 42" in d
