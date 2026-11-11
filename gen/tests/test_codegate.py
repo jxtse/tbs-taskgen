@@ -114,9 +114,6 @@ def test_maybe_without_jev_follows_policy_and_jev_down_pauses():
     gh = fake_gh({"repos/bob/xtools": (200, {"size": 5})})
     r = codegate.s3b_record(ft, {"title": "Paper X"}, {"code": {}}, get=fake_get({}), gh=gh, gh_raw=fake_gh({}))
     assert not r["keep"] and r["reason"] == "third_party_code_only"
-    r = codegate.s3b_record(ft, {"title": "Paper X"}, {"code": {"maybe_policy": "own"}}, get=fake_get({}), gh=gh,
-                            gh_raw=fake_gh({}))
-    assert r["keep"]
     r = codegate.s3b_record(ft, {"title": "Paper X"}, {"code": {}}, jev=lambda l: None, get=fake_get({}), gh=gh,
                             gh_raw=fake_gh({}))
     assert not r["keep"] and r["pause"] == "code_owner_undecided"
@@ -152,10 +149,11 @@ def test_private_transient_bioconductor_zenodo_archive():
 
 def test_repo_names_kept():
     links, _ = codegate.extract_links("see https://github.com/a/solver.v2 and https://github.com/b/Foo.jl and "
+                                      "https://github.com/d/Solver.Core and "
                                       "https://github.com/c/tool.Acknowledgments and "
                                       "https://gitlab.com/grp/sub/deeper/proj/-/tree/main", {})
     keys = {l["key"] for l in links}
-    assert {"github.com/a/solver.v2", "github.com/b/foo.jl", "github.com/c/tool",
+    assert {"github.com/a/solver.v2", "github.com/b/foo.jl", "github.com/c/tool", "github.com/d/solver.core",
             "gitlab.com/grp/sub/deeper/proj"} <= keys
 
 
@@ -231,3 +229,38 @@ def test_s3b_stage(tmp_path, monkeypatch):
     st = P.store.item(a).state
     assert st["status"] == "dropped" and st["reason"] == "code_on_request"
     assert read_json(it.p("S3b_code.json"))["paper"]["on_request"]
+
+
+def test_r2_regressions():
+    # candidate signals alone (metadata + README + title) never make a link "own" without Jev
+    ft = "Fastsmoother paper\nWe compare with https://github.com/bob/fastsmoother in Section 3.\nReferences\n"
+    c = {"title": "Fastsmoother paper", "code_links": ["https://github.com/bob/fastsmoother"],
+         "code_signals": {"gh_readme": ["https://github.com/bob/fastsmoother"]}}
+    gh = fake_gh({"repos/bob/fastsmoother": (200, {"size": 5})})
+    r = codegate.s3b_record(ft, c, {"code": {}}, get=fake_get({}), gh=gh, gh_raw=fake_gh({}))
+    assert not r["keep"]
+    # code availability ends at the next heading: an acknowledgement link does not inherit it
+    ft = ("Paper\nCode availability\nCode is available on request from the corresponding author.\n"
+          "Acknowledgements\nWe thank the authors of https://github.com/x/tool for figures.\n")
+    r = codegate.s3b_record(ft, {"title": "Paper"}, {"code": {}}, get=fake_get({}),
+                            gh=fake_gh({"repos/x/tool": (200, {"size": 5})}), gh_raw=fake_gh({}))
+    assert not r["keep"] and r["reason"] == "code_on_request"
+    # unknown Jev + an own link that is private -> pause, not drop
+    ft2 = FT_OWN.replace("References", "Acknowledgements\nScripts from https://github.com/bob/xtools.\nReferences")
+    gh = fake_gh({"repos/alice/fastsmoother": (200, {"size": 9, "private": True}),
+                  "repos/bob/xtools": (200, {"size": 5})})
+    r = codegate.s3b_record(ft2, {"title": "Fast smoothing"}, {"code": {}}, jev=lambda l: None,
+                            get=fake_get({"zenodo": (404, None)}), gh=gh, gh_raw=fake_gh({}))
+    assert r.get("pause") == "code_owner_undecided"
+    # every 5xx is transient
+    for st in (507, 520, 522, 529):
+        r = codegate.s3b_record(FT_OWN, {"title": "Fast smoothing"}, {"code": {}}, get=fake_get({"zenodo": (st, None)}),
+                                gh=fake_gh({"repos/alice/fastsmoother": (st, None)}), gh_raw=fake_gh({}))
+        assert r.get("pause") == "code_host_unavailable", st
+    # a package whose source repo is private keeps the public package as primary
+    ft = "Pkg paper\nCode availability\nOur code is available at https://pypi.org/project/fastpkg.\n"
+    get = fake_get({"pypi.org/pypi/fastpkg": (200, {"info": {"name": "fastpkg", "project_urls":
+                                                             {"Source": "https://github.com/a/fastpkg"}}})})
+    gh = fake_gh({"repos/a/fastpkg": (200, {"size": 5, "private": True})})
+    r = codegate.s3b_record(ft, {"title": "Pkg paper"}, {"code": {}}, get=get, gh=gh, gh_raw=fake_gh({}))
+    assert r["keep"] and r["primary"]["kind"] == "package" and not r["primary"].get("private")

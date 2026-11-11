@@ -16,14 +16,17 @@ S1 → S2a 代码信号预筛（不花全文额度） → S2 摘要筛 → S3 �
 | S2a | `S2a_code_signal.json`：元数据代码链接、检索层 `code_signals`（OpenAlex 全文 / PwC / GitHub README）、PwC 存档（`code.pwc_path`）；都没有时查一次 OpenAlex 全文标记 | `no_code_signal` |
 | S3b | `S3b_code.json`：全文与元数据里的每个代码链接（上下文、Code Availability 段、参考文献区、标题词、README 是否引用本文、PwC official）→ 规则打分；模糊链接先查 README，仍模糊时 `roles.code_owner="jev"` 用 Jev 判定（不用 Opus）；作者链接在 GitHub / GitLab / Bitbucket / Zenodo / CRAN / PyPI / Bioconductor / SourceForge 上实际解析，记录 license、语言、大小 | `code_on_request`、`third_party_code_only`、`code_repo_unavailable`（404 / 私有 / 空仓库）、`data_only_no_code`、`code_host_unsupported`（Code Ocean、Figshare 等）、`no_code_link` |
 
-S3b 规则在 2026-11-11 摸底的 224 篇（人工读上下文标注）上：把“own + 模糊”都算作候选时论文级召回 0.96、精度 0.98；
-模糊链接的最终归属：配了 Jev 时由 Jev 判定，Jev 不可用时该条目暂停（`code:code_owner_undecided`）；没配 Jev 时按
-`code.maybe_policy`（默认 `drop`）。仓库主机暂时无响应（网络、限流、5xx）时也只暂停（`code:code_host_unavailable`），
+S3b 规则在 2026-11-11 摸底的 224 篇（人工读上下文标注，93 篇有作者代码）上：规则直接判 own 的 38 篇全对；
+“own + 模糊”合起来作为候选时论文级召回 0.95、精度 0.98，另外 50 篇作者代码只能落在“模糊”里，所以生产配置应设
+`roles.code_owner = "jev"`（规则单独使用时召回只有约 0.41）；
+模糊链接的最终归属：配了 Jev 时由 Jev 判定，Jev 不可用时该条目暂停（`code:code_owner_undecided`）；没配 Jev 时模糊链接不算作者代码。
+规则直接判 own 需要论文自身的归属证据（链接旁的“our code is available…”类表述、Code Availability 段，Code Availability
+段截止到下一个章节标题）或 PwC `is_official`；README 引用本文、PwC mentioned、元数据、标题词只让链接成为候选。仓库主机暂时无响应（网络、限流、5xx）时也只暂停（`code:code_host_unavailable`），
 S2a 查不到 OpenAlex 时暂停（`code:openalex_unavailable`），都用 `tbsgen resume --reason code:` 恢复。私有仓库不算公开代码。
 `tbsgen fetch` 投递全文时按条目自己 run 当时写进 `S3_queue.json` 的 `next_stage` 推进（旧条目默认 S4）。
 
 配置（`[code]`）：`grounded`、`prescreen`（S2a 开关，默认开）、`openalex_flag`、`fulltext_terms`、`pwc_path`、
-`github_client`（`gh` 用 gh CLI 自带认证 / `rest` 匿名）、`proxy`、`mailto`、`jev_own_threshold`；
+`github_client`（`gh` 用 gh CLI 自带认证 / `rest` 匿名）、`proxy`、`mailto`、`jev_own_threshold`（没有 maybe 放行开关）；
 `[models.roles] code_owner = "rules" | "jev"`。检索侧见 `retrieval/README.md` 的“代码通道”。
 
 ## 1. 架构

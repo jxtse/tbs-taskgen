@@ -118,7 +118,8 @@ DEFAULTS: dict = {
         },
         "github": {
             # code.github_search only (README search).  The search API allows 30 req/min with auth, 10 without.
-            "enabled": True, "min_interval_s": 2.2, "daily_max_calls": 1500, "retries": 2, "cooldown_429_s": 600,
+            # retries 0: a retry inside Http.request would bypass the anonymous 6.5 s spacing (10 req/min)
+            "enabled": True, "min_interval_s": 2.2, "daily_max_calls": 1500, "retries": 0, "cooldown_429_s": 600,
         },
         "europepmc": {
             # biomedical targets only (routed); 2026-11-05 eval: +2 core papers in head-60, 0 not found elsewhere

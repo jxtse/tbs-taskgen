@@ -21,7 +21,7 @@ S3b  (after the full text).  Every code-host link in the full text and the metad
        no_code_link              no code link at all in the full text and metadata
        (paused, not dropped: code_host_unavailable - the host could not answer (network / rate limit / 5xx);
         code_owner_undecided - Jev is configured but unavailable.  `tbsgen resume --reason code:` retries.)
-     Ambiguous links without Jev follow code.maybe_policy ("drop" default, "own").
+     Ambiguous links without Jev are not counted as own code (the paper is dropped if nothing else is).
      Licences are recorded, never filtered (decision 2026-11-11).
 """
 from __future__ import annotations
@@ -166,8 +166,9 @@ def s2a_signals(c: dict, cfg: dict, oa_flag: Callable | None = None) -> dict:
 def norm_text(s: str) -> str:
     s = s.replace("\u00ad", "")
     # PDF text breaks URLs at line ends: "https://github.com/foo/\nbar"
-    return re.sub(r"((?:github|gitlab|bitbucket|zenodo|codeocean|figshare|osf)\S*?[/\-_.])\s*\n\s*(?=[A-Za-z0-9])",
-                  r"\1", s)
+    # (only after "/", "-" or "_": a URL that ends a sentence with "." must not swallow the next line / heading)
+    return re.sub(r"((?:github|gitlab|bitbucket|zenodo|codeocean|figshare|osf)[^\s)]*?[/\-_])[ \t]*\n[ \t]*"
+                  r"(?=[A-Za-z0-9])", r"\1", s)
 
 
 HOST_RES = [
@@ -200,6 +201,10 @@ OWN_STRONG = re.compile(r"(code availability|software availability|our (source )
                         r".{0,40}(code|implementation|package|software))", re.I)
 THIRD = re.compile(r"(we used|using the|was used|were used|implemented (in|with|using)|et al\.|\[\d+\]|was performed "
                    r"(with|using)|was computed (with|using)|package \(|toolbox \(|library \()", re.I)
+NEXT_SECTION = re.compile(r"\n\s*(?:\d+\.?\s*)?(acknowledg\w*|author contributions?|contributions|competing interests?|"
+                          r"conflicts? of interest|declaration of (competing )?interests?|funding( information)?|"
+                          r"data availability|supplementary (information|material)|additional information|ethics\b|"
+                          r"references|bibliography|appendix|abbreviations|orcid|correspondence)\b", re.I)
 REF_HDR = re.compile(r"\n\s*(references|bibliography|literature cited|works cited|reference list)\s*\n", re.I)
 CODE_AVAIL = re.compile(r"(code|software|data and code|code and data|data and software) availability", re.I)
 ON_REQUEST = re.compile(r"(code|codes|software|scripts?|implementation)[^.]{0,160}?(available|provided|shared)"
@@ -214,14 +219,18 @@ KEEP_SUFFIX = (".jl", ".py", ".github.io", ".r", ".js", ".rs", ".m")
 FETCHABLE = {"github", "gitlab", "bitbucket", "zenodo", "cran", "pypi", "bioconductor", "sourceforge"}
 
 
+GLUED = re.compile(r"^(.+?)\.(Acknowledg\w*|References?|Funding|Author\w*|Competing|Conflicts?|Data|Code|Software|"
+                   r"Supplementary|Additional|Declarations?|Ethics|The|This|These|In|We|Our|All|For|See|Figure|Fig|"
+                   r"Table|Accessed|Available|Last|Retrieved|Online|Version|Results?|Methods?|Discussion|Conclusions?)$")
+
+
 def _clean_repo(r: str) -> str:
-    """Trailing punctuation off; a word that PDF extraction glued on after a sentence period ("repo.Acknowledgments",
-    "repo.The") is cut.  Legal dotted names stay (solver.v2, Foo.jl, user.github.io)."""
+    """Trailing punctuation off; a common English / section word that PDF extraction glued on after a sentence
+    period ("repo.Acknowledgments", "repo.The") is cut.  Any other dotted name stays (solver.v2, Solver.Core,
+    Foo.jl, user.github.io)."""
     r = re.sub(r"[.,;:)\]]+$", "", r)
-    m = re.match(r"^(.+?)\.([A-Z][a-z]{2,}[A-Za-z]*)$", r)
-    if m and not any(r.lower().endswith(suf) for suf in KEEP_SUFFIX):
-        return m.group(1)
-    return r
+    m = GLUED.match(r)
+    return m.group(1) if m else r
 
 
 def canon(kind: str, m: re.Match) -> tuple[str, dict]:
@@ -268,8 +277,11 @@ def extract_links(fulltext: str, cand: dict) -> tuple[list[dict], dict]:
     ca = CODE_AVAIL.search(s)
     if ca and ca.start() >= ref_start:
         ca = None
-    # the section ends at the reference list or after 1500 chars, whichever is first
-    ca_end = min(ca.start() + 1500, ref_start) if ca else -1
+    # the section ends at the next section heading, the reference list or after 1500 chars, whichever is first
+    ca_end = -1
+    if ca:
+        nxt = NEXT_SECTION.search(s, ca.end(), min(ca.start() + 1500, ref_start))
+        ca_end = nxt.start() if nxt else min(ca.start() + 1500, ref_start)
     found: dict[str, dict] = {}
     for kind, rx in HOST_RES:
         for m in rx.finditer(s):
@@ -326,10 +338,15 @@ def extract_links(fulltext: str, cand: dict) -> tuple[list[dict], dict]:
             + 2 * e["readme_cites_paper"] + 2 * e["pwc_official"] + e["pwc_mentioned"] - 2 * e["in_refs_only"] \
             - (e["third"] > 0 and e["strong"] == 0) - 4 * e["generic"]
         e["own_score"] = sc
+        # rule "own" needs ownership evidence from the paper itself (an ownership phrase next to the link, the
+        # Code Availability section) or the archive's is_official flag; README / PwC-mentioned / metadata / title
+        # only make a link a candidate ("maybe": Jev decides, else dropped)
+        e["text_evidence"] = bool(e["strong"] or e["in_code_avail"] or e["pwc_official"])
         # thresholds from the 2026-11-11 study (224 papers, own code by reading the contexts): own >= 3; a
         # non-reference link with score 0..2 is "maybe" (README check, then Jev or keep).  Paper level, maybe->own:
         # recall 0.96, precision 0.98.
-        e["own_guess"] = "own" if sc >= 3 else ("maybe" if sc >= 0 and not e["in_refs_only"] else "third")
+        e["own_guess"] = "own" if sc >= 3 and e["text_evidence"] else (
+            "maybe" if sc >= 0 and (not e["in_refs_only"] or e["readme_cites_paper"] or e["pwc_mentioned"]) else "third")
     paper = dict(code_availability=re.sub(r"\s+", " ", s[ca.start(): ca.start() + 1200]) if ca else None,
                  on_request=bool(ON_REQUEST.search(s[ca.start(): ca.start() + 1500] if ca else s)),
                  ref_start_frac=round(ref_start / max(1, len(s)), 2))
@@ -339,7 +356,9 @@ def extract_links(fulltext: str, cand: dict) -> tuple[list[dict], dict]:
 # ----------------------------------------------------------------------------------------------- S3b: resolve
 CODE_EXT = re.compile(r"\.(py|r|jl|m|c|cc|cpp|h|hpp|f90|f|rs|go|java|ipynb|sh|cu|stan)$", re.I)
 ARCHIVE_EXT = re.compile(r"\.(zip|tar\.gz|tgz|tar|tar\.bz2|tar\.xz)$", re.I)
-TRANSIENT = {0, 403, 429, 500, 502, 503, 504}     # cannot decide now: pause, never drop (403 = rate limit on GitHub)
+def transient_status(st) -> bool:
+    """Cannot decide now -> pause, never drop: no answer, 403 (GitHub rate limit), 408, 429, any 5xx."""
+    return st is None or st == 0 or st in (403, 408, 429) or 500 <= int(st) <= 599
 DATA_EXT = re.compile(r"\.(csv|tsv|txt|h5|hdf5|nc|mat|npy|npz|json|xlsx?|fits|parquet|vcf|bam|fastq|gz|nii)$", re.I)
 
 
@@ -424,7 +443,7 @@ def resolve(link: dict, cfg: dict, get=None, gh=None) -> dict:
     except Exception as e:  # noqa: BLE001
         out["error"] = f"{type(e).__name__}: {e}"[:200]
         out["status"] = 0
-    out["transient"] = not out.get("exists") and out.get("status") in TRANSIENT
+    out["transient"] = not out.get("exists") and transient_status(out.get("status"))
     return out
 
 
@@ -468,6 +487,11 @@ def jev_own(client, it, cand: dict, link: dict) -> float | None:
     return float(a["noul"]) if "noul" in a else None
 
 
+def usable(r: dict) -> bool:
+    """Public, non-empty, code (or a code package) on its host."""
+    return bool(r.get("exists") and not r.get("empty") and not r.get("private") and r.get("kind") in ("code", "package"))
+
+
 def decide(links: list[dict], paper: dict, resolved: dict[str, dict]) -> dict:
     """links carry verdict own|third (after rules / Jev).  -> dict(keep, reason, primary, own)."""
     own = [l for l in links if l.get("verdict") == "own"]
@@ -482,7 +506,7 @@ def decide(links: list[dict], paper: dict, resolved: dict[str, dict]) -> dict:
         r = resolved.get(l["key"]) or {}
         if l["host"] not in FETCHABLE:
             continue
-        if r.get("exists") and not r.get("empty") and not r.get("private") and r.get("kind") in ("code", "package"):
+        if usable(r):
             ok.append((l, r))
     if not ok:
         rs = [resolved.get(l["key"]) or {} for l in own]
@@ -521,9 +545,7 @@ def s3b_record(fulltext: str, cand: dict, cfg: dict, *, jev: Callable | None = N
             rc = readme_cites(l, cand, cfg, gh=gh_raw)
             if rc and not l["readme_cites_paper"]:
                 l["readme_cites_paper"] = True
-                l["own_score"] += 2
-                if l["own_score"] >= 3:
-                    l["own_guess"] = "own"
+                l["own_score"] += 2                # a candidate signal for Jev; never "own" on its own
         if l["own_guess"] == "own":
             l["verdict"], l["verdict_by"] = "own", "rules"
         elif l["own_guess"] == "third":
@@ -535,9 +557,8 @@ def s3b_record(fulltext: str, cand: dict, cfg: dict, *, jev: Callable | None = N
                 l["verdict"], l["verdict_by"] = "unknown", "jev_unavailable"
             else:
                 l["verdict"], l["verdict_by"] = ("own" if p >= th else "third"), "jev"
-        else:                                  # rules only: explicit policy for ambiguous links
-            own_if_maybe = ccfg(cfg).get("maybe_policy", "drop") == "own"
-            l["verdict"], l["verdict_by"] = ("own" if own_if_maybe else "third"), "rules:maybe"
+        else:                                  # rules only: an unconfirmed link is not the authors' code
+            l["verdict"], l["verdict_by"] = "third", "rules:maybe_unconfirmed"
     for l in links:
         if l["verdict"] == "own" and l["key"] not in resolved:
             resolved[l["key"]] = resolve(l, cfg, get=get, gh=gh)
@@ -550,13 +571,12 @@ def s3b_record(fulltext: str, cand: dict, cfg: dict, *, jev: Callable | None = N
                         resolved[key] = resolve(sub, cfg, get=get, gh=gh)
                         resolved[l["key"]].setdefault("source_repo", resolved[key])
     if any(l.get("verdict") == "unknown" for l in links) and \
-            not any(l.get("verdict") == "own" and not (resolved.get(l["key"]) or {}).get("transient") and
-                    (resolved.get(l["key"]) or {}).get("exists") for l in links):
+            not any(l.get("verdict") == "own" and l["host"] in FETCHABLE and usable(resolved.get(l["key"]) or {})
+                    for l in links):
         dec = dict(keep=False, reason=None, pause="code_owner_undecided", primary=None, own=[])
     else:
         dec = decide(links, paper, resolved)
-    if dec["keep"] and dec["primary"].get("kind") == "package" and \
-            (dec["primary"].get("source_repo") or {}).get("exists"):
+    if dec["keep"] and dec["primary"].get("kind") == "package" and usable(dec["primary"].get("source_repo") or {}):
         dec["primary"] = dict(dec["primary"]["source_repo"], package=dec["primary"].get("url"),
                               package_license=dec["primary"].get("license"), own_score=dec["primary"]["own_score"],
                               verdict_by=dec["primary"].get("verdict_by"))

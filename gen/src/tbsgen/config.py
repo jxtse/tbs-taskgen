@@ -296,8 +296,6 @@ DEFAULTS: dict[str, Any] = {
         "proxy": "env",                     # "env": honour HTTPS_PROXY | "none": direct
         "mailto": "jxtse@users.noreply.github.com",
         "jev_own_threshold": 0.5,           # roles.code_owner = "jev": ambiguous links own if P(own) >= this
-        "maybe_policy": "drop",             # roles.code_owner = "rules": ambiguous links count as "drop" (third
-                                            # party) | "own".  Jev unavailable -> S3b pauses (code:...)
     },
     "probe": {
         "tbs_tasks_root": None,             # TB-Science task texts (<task>/instruction.md ...); None -> no dedup
