@@ -286,6 +286,24 @@ def canon(kind: str, m: re.Match) -> tuple[str, dict]:
     return f"{kind}:{(g[0] if g else m.group(0))[:80].rstrip('.,;)')}".lower(), {}
 
 
+def text_keys(text: str | None) -> set[str]:
+    """Canonical code-link keys written in a text (same normalisation and canonicalisation as the full text)."""
+    t = norm_text(text or "")
+    out = set()
+    for kind, rx in HOST_RES:
+        for m in rx.finditer(t):
+            out.add(canon(kind, m)[0])
+    return out
+
+
+def url_keys(urls) -> set[str]:
+    """Canonical keys of structured URL lists (PwC, README search, metadata): one URL at a time."""
+    out = set()
+    for u in urls or []:
+        out |= text_keys(str(u))
+    return out
+
+
 def _title_tokens(t: str | None) -> set[str]:
     return {w.lower() for w in re.findall(r"[A-Za-z][A-Za-z0-9\-]{3,}", t or "")} - {
         "with", "from", "using", "based", "model", "models", "data", "method", "methods", "analysis", "through",
@@ -340,12 +358,10 @@ def extract_links(fulltext: str, cand: dict) -> tuple[list[dict], dict]:
                 e["from_meta"] = True
                 e.pop("alt_repo", None)
                 break
-    gh_readme = {str(u).lower().rstrip("/").removeprefix("https://") for u in
-                 (cand.get("code_signals") or {}).get("gh_readme") or []}
-    pwc = {str(u).lower().rstrip("/").removeprefix("https://") for u in
-           (cand.get("code_signals") or {}).get("pwc") or []}
-    pwc_m = {str(u).lower().rstrip("/").removeprefix("https://") for u in
-             (cand.get("code_signals") or {}).get("pwc_mentioned") or []}
+    gh_readme = url_keys((cand.get("code_signals") or {}).get("gh_readme"))
+    pwc = url_keys((cand.get("code_signals") or {}).get("pwc"))
+    pwc_m = url_keys((cand.get("code_signals") or {}).get("pwc_mentioned"))
+    abstract_keys = text_keys(cand.get("abstract"))
     tt = _title_tokens(cand.get("title"))
     for e in found.values():
         name = e["key"].split("/")[-1].split(":")[-1]
@@ -354,6 +370,8 @@ def extract_links(fulltext: str, cand: dict) -> tuple[list[dict], dict]:
         e["readme_cites_paper"] = e["key"] in gh_readme
         e["pwc_official"] = e["key"] in pwc
         e["pwc_mentioned"] = e["key"] in pwc_m
+        # written in the paper: in the full text, or in the abstract (publisher metadata), compared by canonical key
+        e["in_paper"] = e["n"] > 0 or e["key"] in abstract_keys
         # README citing the paper / PwC "mentioned" are candidate signals only (citers and re-implementers do
         # that too); PwC is_official is the archive's own-code flag
         sc = 3 * (e["strong"] > 0) + 2 * e["in_code_avail"] + (e["pos"] > 0) + e["name_in_title"] + e["from_meta"] \
@@ -568,18 +586,18 @@ def s3b_record(fulltext: str, cand: dict, cfg: dict, *, jev: Callable | None = N
         if l["generic"]:
             l["verdict"], l["verdict_by"] = "third", "rules:generic"
             continue
+        if not l["in_paper"] and not l["pwc_official"]:
+            # never written in the paper (only metadata / a README that cites it / PwC "mentioned"): no evidence
+            # that the paper's authors wrote it -- citers, course demos and re-implementations look the same
+            l["verdict"], l["verdict_by"] = "third", "rules:not_in_paper"
+            continue
         if l["own_guess"] == "maybe" and l["host"] == "github":
             # README citing the paper settles an ambiguous GitHub link without a model call
             rc = readme_cites(l, cand, cfg, gh=gh_raw)
             if rc and not l["readme_cites_paper"]:
                 l["readme_cites_paper"] = True
                 l["own_score"] += 2                # a candidate signal for Jev; never "own" on its own
-        in_abstract = l["key"].split("/", 1)[-1].lower() in (cand.get("abstract") or "").lower().replace("https://", "")
-        if l.get("n", 0) == 0 and not l.get("pwc_official") and not in_abstract:
-            # never written in the paper (only metadata / a README that cites it / PwC "mentioned"): no evidence
-            # that the paper's authors wrote it -- citers, course demos and re-implementations look the same
-            l["verdict"], l["verdict_by"] = "third", "rules:not_in_paper"
-        elif l["own_guess"] == "own":
+        if l["own_guess"] == "own":
             l["verdict"], l["verdict_by"] = "own", "rules"
         elif l["own_guess"] == "third":
             l["verdict"], l["verdict_by"] = "third", "rules"

@@ -315,3 +315,24 @@ def test_link_not_in_paper_is_never_own():
           "code_links": ["https://github.com/alice/labeling"]}
     rec3 = codegate.s3b_record(ft, c3, {"code": {}}, jev=lambda l: 0.99, gh=gh, gh_raw=fake_gh({}))
     assert rec3["keep"]
+
+
+def test_not_in_paper_uses_canonical_keys():
+    ft = "We study pricing.  Methods.  Our labeling algorithm is new.\nReferences\n[1] Someone. A book. 2001.\n"
+    gh = fake_gh({"repos/alice/solver": (200, {"size": 10, "html_url": "https://github.com/alice/solver"})})
+    get = fake_get({"zenodo.org/api/records/1234567": (200, {"metadata": {"resource_type": {"type": "software"}},
+                                                              "files": [{"key": "s.zip", "size": 9}]})})
+    # path-substring look-alike in the abstract does not count
+    c = {"title": "Pricing", "abstract": "See github.com/malice/solver-course for a course.",
+         "code_signals": {"gh_readme": ["https://github.com/alice/solver"]}}
+    r = codegate.s3b_record(ft, c, {"code": {}}, jev=lambda l: 0.99, gh=gh, gh_raw=fake_gh({}))
+    assert not r["keep"]
+    # a Zenodo record written in the abstract is in the paper (Jev decides)
+    c = {"title": "Pricing", "abstract": "Code: https://zenodo.org/records/1234567 .",
+         "code_signals": {"gh_readme": []}, "code_links": ["https://zenodo.org/records/1234567"]}
+    r = codegate.s3b_record(ft, c, {"code": {}}, jev=lambda l: 0.99, gh=gh, get=get, gh_raw=fake_gh({}))
+    assert r["keep"] and r["primary"]["key"] == "zenodo:1234567"
+    # PwC official given as http://...git keeps its exemption
+    c = {"title": "Pricing", "code_signals": {"pwc": ["http://github.com/alice/solver.git"]}}
+    r = codegate.s3b_record(ft, c, {"code": {}}, jev=lambda l: 0.99, gh=gh, gh_raw=fake_gh({}))
+    assert r["keep"]
