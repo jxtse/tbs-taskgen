@@ -153,7 +153,8 @@ def test_repo_names_kept():
                                       "https://github.com/c/tool.Acknowledgments and "
                                       "https://gitlab.com/grp/sub/deeper/proj/-/tree/main", {})
     keys = {l["key"] for l in links}
-    assert {"github.com/a/solver.v2", "github.com/b/foo.jl", "github.com/c/tool", "github.com/d/solver.core",
+    assert {"github.com/a/solver.v2", "github.com/b/foo.jl", "github.com/c/tool.acknowledgments",
+            "github.com/d/solver.core",
             "gitlab.com/grp/sub/deeper/proj"} <= keys
 
 
@@ -264,3 +265,27 @@ def test_r2_regressions():
     gh = fake_gh({"repos/a/fastpkg": (200, {"size": 5, "private": True})})
     r = codegate.s3b_record(ft, {"title": "Pkg paper"}, {"code": {}}, get=get, gh=gh, gh_raw=fake_gh({}))
     assert r["keep"] and r["primary"]["kind"] == "package" and not r["primary"].get("private")
+
+
+def test_r3_regressions():
+    # numbered / colon headings end the Code Availability section and the ownership context
+    for hdr in ("6 Acknowledgements", "Acknowledgements:", "6. Acknowledgments"):
+        ft = ("Paper\nCode availability\nCode is available on request from the corresponding author.\n" + hdr +
+              "\nWe thank the authors of https://github.com/x/tool for figures.\n")
+        r = codegate.s3b_record(ft, {"title": "Paper"}, {"code": {}}, get=fake_get({}),
+                                gh=fake_gh({"repos/x/tool": (200, {"size": 5})}), gh_raw=fake_gh({}))
+        assert not r["keep"] and r["reason"] == "code_on_request", hdr
+    # a dotted name is kept; the glued-word cut is only tried when the full name 404s
+    ft = "Paper\nCode availability\nOur code is available at https://github.com/a/Solver.Data\n"
+    gh = fake_gh({"repos/a/Solver.Data": (200, {"size": 5}), "repos/a/Solver": (200, {"size": 5})})
+    r = codegate.s3b_record(ft, {"title": "Paper"}, {"code": {}}, get=fake_get({}), gh=gh, gh_raw=fake_gh({}))
+    assert r["keep"] and r["primary"]["key"] == "github.com/a/solver.data" and not r["primary"].get("alt_used")
+    ft = "Paper\nCode availability\nOur code is available at https://github.com/a/tool.Acknowledgments\n"
+    gh = fake_gh({"repos/a/tool": (200, {"size": 5})})
+    r = codegate.s3b_record(ft, {"title": "Paper"}, {"code": {}}, get=fake_get({}), gh=gh, gh_raw=fake_gh({}))
+    assert r["keep"] and r["primary"]["alt_used"] == "tool"
+    # unsupported hosts drop, they do not pause
+    ft = "Paper\nCode availability\nOur code is available at https://codeocean.com/capsule/1234567\n"
+    r = codegate.s3b_record(ft, {"title": "Paper"}, {"code": {}}, get=fake_get({}), gh=fake_gh({}),
+                            gh_raw=fake_gh({}))
+    assert not r["keep"] and r["reason"] == "code_host_unsupported" and not r.get("pause")

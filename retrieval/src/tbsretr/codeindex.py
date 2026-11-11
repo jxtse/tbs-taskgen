@@ -180,6 +180,8 @@ def github_readme_search(http, cfg: dict, p: dict, target_id: str = "", gh=None)
         else:
             # anonymous search API: 10 requests / minute -> at least 6.5 s apart; a rate-limit 403 cools the source
             led.wait_turn("github", max(6.5, float(scfg.get("min_interval_s", 2.2))))
+            # Http.request retries would send without this spacing: the github source never retries internally
+            http.cfg["sources"]["github"] = dict(scfg, retries=0)
             try:
                 r = http.request("github", "readme_search", url, target=target_id,
                                  headers={"Accept": "application/vnd.github+json"}, ok_statuses=(200, 422))

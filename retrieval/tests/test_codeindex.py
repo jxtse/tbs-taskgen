@@ -140,3 +140,16 @@ def test_code_channel_hit_counts_as_signal():
     papers = [{"doi": "10.1/x", "title": "t", "code_links": [], "ranks": {"openalex.code": 3}}]
     codeindex.annotate(papers, oa_flags=set(), pwc=codeindex.PwcIndex(None), gh_hits={})
     assert papers[0]["code_signals"]["any"]
+
+
+def test_anonymous_github_never_retries_internally(cfg):
+    c = _cfg(cfg)
+    c["sources"]["github"]["retries"] = 3
+    calls = []
+
+    def tr(method, url, headers, body):
+        calls.append(url)
+        return 503, {}, b""
+    _, led, http = make_sources(c, tr)
+    codeindex.github_readme_search(http, c, {"doi": "10.1/q"})
+    assert len(calls) == 1

@@ -201,10 +201,29 @@ OWN_STRONG = re.compile(r"(code availability|software availability|our (source )
                         r".{0,40}(code|implementation|package|software))", re.I)
 THIRD = re.compile(r"(we used|using the|was used|were used|implemented (in|with|using)|et al\.|\[\d+\]|was performed "
                    r"(with|using)|was computed (with|using)|package \(|toolbox \(|library \()", re.I)
-NEXT_SECTION = re.compile(r"\n\s*(?:\d+\.?\s*)?(acknowledg\w*|author contributions?|contributions|competing interests?|"
-                          r"conflicts? of interest|declaration of (competing )?interests?|funding( information)?|"
-                          r"data availability|supplementary (information|material)|additional information|ethics\b|"
-                          r"references|bibliography|appendix|abbreviations|orcid|correspondence)\b", re.I)
+# a section heading: a line that starts (optionally numbered "6", "6.", "6.1", "A.") with a known back-matter /
+# section word, or a short Title-case line on its own; ":" after the heading word is allowed
+_SEC_WORDS = (r"acknowledg\w*|author(?:s'?)? contributions?|contributions|competing interests?|conflicts? of interest|"
+              r"declaration of (?:competing )?interests?|declarations?|funding(?: information)?|data availability|"
+              r"data and code availability|code availability|software availability|supplementary (?:information|"
+              r"material|data)|additional information|ethics\b[\w ]*|references|bibliography|appendix\b[\w ]*|"
+              r"abbreviations|orcid|correspondence|introduction|methods?|materials and methods|results|discussion|"
+              r"conclusions?|summary")
+SECTION_HDR = re.compile(r"\n[ \t]*(?:(?:\d+(?:\.\d+)*|[A-Z])\.?[ \t]+)?(?:(?:" + _SEC_WORDS + r")\b[^\n]{0,40}|"
+                         r"[A-Z][A-Za-z]+(?: [A-Za-z]+){0,4}[ \t]*:?[ \t]*(?=\n))", re.I)
+
+
+def section_start(s: str, pos: int, lo: int) -> int:
+    """Start of the section that holds `pos` (the last heading in s[lo:pos]), or lo."""
+    last = None
+    for m in SECTION_HDR.finditer(s, lo, pos):
+        last = m
+    return last.start() if last else lo
+
+
+def section_end(s: str, start_after: int, hi: int) -> int:
+    m = SECTION_HDR.search(s, start_after, hi)
+    return m.start() if m else hi
 REF_HDR = re.compile(r"\n\s*(references|bibliography|literature cited|works cited|reference list)\s*\n", re.I)
 CODE_AVAIL = re.compile(r"(code|software|data and code|code and data|data and software) availability", re.I)
 ON_REQUEST = re.compile(r"(code|codes|software|scripts?|implementation)[^.]{0,160}?(available|provided|shared)"
@@ -225,12 +244,15 @@ GLUED = re.compile(r"^(.+?)\.(Acknowledg\w*|References?|Funding|Author\w*|Compet
 
 
 def _clean_repo(r: str) -> str:
-    """Trailing punctuation off; a common English / section word that PDF extraction glued on after a sentence
-    period ("repo.Acknowledgments", "repo.The") is cut.  Any other dotted name stays (solver.v2, Solver.Core,
-    Foo.jl, user.github.io)."""
-    r = re.sub(r"[.,;:)\]]+$", "", r)
+    """Trailing punctuation off.  The name is otherwise kept as written (solver.v2, Solver.Core, Solver.Data)."""
+    return re.sub(r"[.,;:)\]]+$", "", r)
+
+
+def glued_alt(r: str) -> str | None:
+    """The name without a common word that PDF extraction may have glued on after a sentence period
+    ("repo.Acknowledgments").  Only tried when the name as written does not exist on the host."""
     m = GLUED.match(r)
-    return m.group(1) if m else r
+    return m.group(1) if m else None
 
 
 def canon(kind: str, m: re.Match) -> tuple[str, dict]:
@@ -240,7 +262,10 @@ def canon(kind: str, m: re.Match) -> tuple[str, dict]:
         if r.lower().endswith(".git"):
             r = r[:-4]
         host = "github.com" if kind == "github" else "bitbucket.org"
-        return f"{host}/{o}/{r}".lower(), dict(owner=o, repo=r, url=f"https://{host}/{o}/{r}")
+        info = dict(owner=o, repo=r, url=f"https://{host}/{o}/{r}")
+        if glued_alt(r):
+            info["alt_repo"] = glued_alt(r)
+        return f"{host}/{o}/{r}".lower(), info
     if kind == "gitlab":
         p = re.sub(r"[.,;:)\]]+$", "", g[0]).split("/-/")[0]
         parts = p.split("/")
@@ -278,10 +303,7 @@ def extract_links(fulltext: str, cand: dict) -> tuple[list[dict], dict]:
     if ca and ca.start() >= ref_start:
         ca = None
     # the section ends at the next section heading, the reference list or after 1500 chars, whichever is first
-    ca_end = -1
-    if ca:
-        nxt = NEXT_SECTION.search(s, ca.end(), min(ca.start() + 1500, ref_start))
-        ca_end = nxt.start() if nxt else min(ca.start() + 1500, ref_start)
+    ca_end = section_end(s, ca.end(), min(ca.start() + 1500, ref_start)) if ca else -1
     found: dict[str, dict] = {}
     for kind, rx in HOST_RES:
         for m in rx.finditer(s):
@@ -299,9 +321,7 @@ def extract_links(fulltext: str, cand: dict) -> tuple[list[dict], dict]:
             # reference-list header): a reference entry never inherits "our code is available"
             lo = max(0, m.start() - 250)
             if not in_refs:
-                hdr = list(re.finditer(r"\n\s*[A-Z][A-Za-z ]{2,40}\n", s[lo:m.start()]))
-                near = s[lo + hdr[-1].start():m.start()] if hdr and not CODE_AVAIL.search(hdr[-1].group(0)) \
-                    else s[lo:m.start()]
+                near = s[section_start(s, m.start(), lo):m.start()]
                 e["pos"] += bool(OWN_POS.search(near))
                 e["strong"] += bool(OWN_STRONG.search(near))
             e["third"] += bool(THIRD.search(s[max(0, m.start() - 120): m.start()]))
@@ -314,9 +334,11 @@ def extract_links(fulltext: str, cand: dict) -> tuple[list[dict], dict]:
             m = rx.search(str(u))
             if m:
                 key, info = canon(kind, m)
+                info.pop("alt_repo", None)              # structured metadata: never rewritten
                 e = found.setdefault(key, dict(key=key, host=kind, n=0, ctxs=[], in_refs_only=False, pos=0, strong=0,
                                                third=0, in_code_avail=False, from_meta=False, **info))
                 e["from_meta"] = True
+                e.pop("alt_repo", None)
                 break
     gh_readme = {str(u).lower().rstrip("/").removeprefix("https://") for u in
                  (cand.get("code_signals") or {}).get("gh_readme") or []}
@@ -374,6 +396,11 @@ def resolve(link: dict, cfg: dict, get=None, gh=None) -> dict:
     try:
         if h == "github":
             st, d = gh(f"repos/{link['owner']}/{link['repo']}")
+            if st == 404 and link.get("alt_repo"):
+                st2, d2 = gh(f"repos/{link['owner']}/{link['alt_repo']}")
+                if st2 == 200:
+                    st, d = st2, d2
+                    out.update(alt_used=link["alt_repo"], note="name as written does not exist; PDF-glued word cut")
             if st == 200 and isinstance(d, dict):
                 out.update(exists=True, empty=(d.get("size") or 0) == 0, size_kb=d.get("size"),
                            language=d.get("language"), archived=d.get("archived"), fork=d.get("fork"),
@@ -439,11 +466,12 @@ def resolve(link: dict, cfg: dict, get=None, gh=None) -> dict:
             out.update(exists=st == 200, empty=False if st == 200 else None)
             out["status"] = st
         else:
-            out.update(kind="unsupported", exists=None)
+            out.update(kind="unsupported", exists=None, status="unsupported")
     except Exception as e:  # noqa: BLE001
         out["error"] = f"{type(e).__name__}: {e}"[:200]
         out["status"] = 0
-    out["transient"] = not out.get("exists") and transient_status(out.get("status"))
+    out["transient"] = (not out.get("exists") and out.get("kind") != "unsupported"
+                        and transient_status(out.get("status")))
     return out
 
 
