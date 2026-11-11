@@ -144,7 +144,16 @@ def regate(P, it, reason: str, recalibrate: bool = False) -> dict:
         st["thresholds_locked"] = True
         st["revision_data_hash"] = review.pkg_data_hash(it.p("pkg"))
         st["post_regate"] = True
-        if recalibrate or not (P.cfg.get("review") or {}).get("rescore_scoring_only", True):
+        # the packaged statement would change (e.g. a harness note PKG adds): the kept calibration ran on another
+        # statement, so re-scoring its deliverables cannot stand in for it -> recalibrate
+        spec = read_json(it.p("_spec", "spec.json"), {}) or {}
+        try:
+            new_ins = package.instruction_text(P.cfg, spec, it.p("task", "instruction.md").read_text())
+            statement_changed = new_ins != it.p("pkg", "instruction.md").read_text()
+        except OSError:
+            statement_changed = True
+        rec["statement_changed"] = statement_changed
+        if recalibrate or statement_changed or not (P.cfg.get("review") or {}).get("rescore_scoring_only", True):
             # re-scoring switched off: the kept calibration cannot be checked against the new grader -> redo it
             rec["archived_epoch"] = _archive_calibration(it)
             st.pop("calib_label", None)
