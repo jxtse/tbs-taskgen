@@ -40,7 +40,7 @@ timeout_sec = {agent_sec}
 {agent_network}
 [environment]
 build_timeout_sec = 900.0
-cpus = 2
+cpus = {cpus}
 memory_mb = 4096
 storage_mb = 4096
 gpus = 0
@@ -133,7 +133,7 @@ def package(cfg: dict, item_dir: Path, gen0: Path, spec: dict, provenance: dict)
     (out / "solution").mkdir()
     shutil.copy(task / "solution" / "solve.py", out / "solution" / "solve.py")
     (out / "solution" / "solve.sh").write_text(SOLVE_SH)
-    (out / "instruction.md").write_text((task / "instruction.md").read_text())
+    (out / "instruction.md").write_text(instruction_text(cfg, spec, (task / "instruction.md").read_text()))
     pk = cfg["package"]
     (out / "environment" / "Dockerfile").write_text(dockerfile(cfg))
     (out / "task.toml").write_text(TASK_TOML.format(
@@ -141,7 +141,7 @@ def package(cfg: dict, item_dir: Path, gen0: Path, spec: dict, provenance: dict)
         keywords=json.dumps(spec.get("competencies", [])[:8], ensure_ascii=False),
         domain=_q(spec.get("domain", "")), field=_q(spec.get("field", "")), form=_q(spec.get("form", "")),
         expert_h=float(spec.get("expert_time_hours", 2.0)), verifier_sec=float(pk["verifier_timeout"]) + timing_budget(cfg, spec),
-        agent_sec=float(pk["agent_hours"] * 3600), **network_policy(cfg)))
+        agent_sec=float(pk["agent_hours"] * 3600), cpus=TASK_CPUS, **network_policy(cfg)))
     (out / "provenance.json").write_text(json.dumps(provenance, indent=1, ensure_ascii=False, default=str))
     for p in (out / "tests" / "test.sh", out / "solution" / "solve.sh"):
         p.chmod(0o755)
@@ -186,6 +186,36 @@ def verifier_time_errors(pkg: Path, overhead: float) -> list[str]:
         return [f"verifier time: scored {sc:.0f}s + timing repeats {tb:.0f}s + overhead {overhead:.0f}s "
                 f"> verifier timeout {vt:.0f}s"]
     return []
+
+
+TASK_CPUS = 2          # [environment].cpus of every packaged task (also stated in the instruction's time note)
+TIME_NOTE_MARK = "<!-- tbsgen:verifier-time -->"
+TIME_NOTE_END = "<!-- /tbsgen:verifier-time -->"
+
+
+def strip_time_note(text: str) -> str:
+    import re as _re
+    return _re.sub(r"\n*" + _re.escape(TIME_NOTE_MARK) + r".*?" + _re.escape(TIME_NOTE_END) + r"\n?", "\n", text,
+                   flags=_re.S)
+
+
+def instruction_text(cfg: dict, spec: dict, text: str) -> str:
+    """The packaged statement.  PROG: add the verifier's time limit for the agent program between two markers (the
+    first, scored run of solution_cli.py on each hidden input set together get runner.scored_budget() seconds on
+    TASK_CPUS cores; timed repeats have their own budget; a run cut off scores as a failed run) -- e2e-batch2
+    review: an unstated 780 s cap is a missing condition.  Only the marked block is replaced (text after it is
+    kept), so it is idempotent and safe if the marked statement was copied back into task/."""
+    from .runner import scored_budget
+    text = strip_time_note(text).rstrip() + "\n"
+    if spec.get("form") != "PROG":
+        return text
+    sb = f"{scored_budget(cfg):g}"
+    return (text + "\n" + TIME_NOTE_MARK + "\n## Verifier time limit\n"
+            f"The verifier runs `solution_cli.py` once on each hidden input set, on {TASK_CPUS} CPU cores. These scored "
+            f"runs together get at most {sb} seconds of wall time (timed repeats for runtime metrics, if any, have "
+            "their own allowance). A run still going when the time is used up is stopped and scored as a failed run "
+            "(missing or partial outputs). Make sure your program finishes well within this limit.\n" + TIME_NOTE_END
+            + "\n")
 
 
 def validate_pkg(pkg: Path, cfg: dict | None = None) -> dict:
