@@ -144,30 +144,40 @@ def trace_digest(trial: Path, max_chars: int = 150_000) -> str:
                 o = json.loads(line)
             except json.JSONDecodeError:
                 continue
+            if not isinstance(o, dict):
+                continue
             t = o.get("type")
             if t == "result":
                 final = o
                 continue
-            m = o.get("message") or {}
-            for b in m.get("content") or [] if isinstance(m.get("content"), list) else []:
+            if t == "system" and o.get("subtype") == "permission_denied":
+                # Claude Code safety check refused a tool call; `message` is a plain string here
+                calls.append(("tool", f"(denied) {o.get('tool_name')}: {_short(o.get('decision_reason'), 300)}"))
+                continue
+            m = o.get("message")
+            if not isinstance(m, dict):
+                continue
+            for b in m.get("content") if isinstance(m.get("content"), list) else []:
                 if not isinstance(b, dict):
                     continue
-                key = (m.get("id"), b.get("id") or b.get("text", "")[:80] or b.get("tool_use_id"))
+                txt = b.get("text") if isinstance(b.get("text"), str) else ""
+                key = (str(m.get("id")), str(b.get("id") or txt[:80] or b.get("tool_use_id")))
                 if t == "assistant" and key in seen:
                     continue
                 seen.add(key)
-                if t == "assistant" and b.get("type") == "text" and b.get("text", "").strip():
-                    calls.append(("say", _short(b["text"], 1500)))
+                if t == "assistant" and b.get("type") == "text" and txt.strip():
+                    calls.append(("say", _short(txt, 1500)))
                 elif t == "assistant" and b.get("type") == "tool_use":
-                    inp = b.get("input") or {}
-                    desc = inp.get("command") or inp.get("file_path") or inp.get("pattern") or json.dumps(inp)[:300]
-                    if b.get("name") in ("Write", "Edit") and inp.get("content"):
+                    inp = b.get("input") if isinstance(b.get("input"), dict) else {}
+                    desc = inp.get("command") or inp.get("file_path") or inp.get("pattern") or \
+                        json.dumps(b.get("input"), default=str)[:300]
+                    if b.get("name") in ("Write", "Edit") and isinstance(inp.get("content"), str):
                         desc = f"{inp.get('file_path')} ({len(inp['content'])} chars)"
                     calls.append(("tool", f"{b.get('name')}: {_short(desc, 400)}"))
                 elif t == "user" and b.get("type") == "tool_result":
                     c = b.get("content")
                     if isinstance(c, list):
-                        c = " ".join(x.get("text", "") for x in c if isinstance(x, dict))
+                        c = " ".join(x["text"] for x in c if isinstance(x, dict) and isinstance(x.get("text"), str))
                     results.append(_short(c, 600))
     out = [f"# Trace digest of {trial.name}", "", f"{sum(1 for k, _ in calls if k == 'tool')} tool calls, "
            f"{sum(1 for k, _ in calls if k == 'say')} assistant texts.", "", "## Steps (in order)"]
