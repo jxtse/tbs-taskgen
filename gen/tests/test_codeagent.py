@@ -384,3 +384,51 @@ def test_fetch_script_github_fallback_renders(tmp_path):
     f.write_text(sh)
     assert subprocess.run(["bash", "-n", str(f)]).returncode == 0
     assert "git ls-remote" in sh and "codeload.github.com/$GH/tar.gz/$SHA" in sh and "commits/${REF:-HEAD}" in sh
+
+
+def test_fetch_codeload_fallback_end_to_end(tmp_path):
+    """Fake git (probe fails) + fake curl (API SHA, codeload tarball): pinned to the SHA, links dropped, same-pin
+    re-fetch keeps the published tree, a wrong SHA from the API fails closed."""
+    import shlex, tarfile
+    bin_ = tmp_path / "bin"
+    bin_.mkdir()
+    src = tmp_path / "src" / "b-abc"
+    src.mkdir(parents=True)
+    (src / "m.R").write_text("f <- 1")
+    os.symlink("/etc/hosts", src / "evil")
+    tgz = tmp_path / "a.tgz"
+    with tarfile.open(tgz, "w:gz") as tf:
+        tf.add(src, arcname="b-abc")
+    sha = "a" * 40
+    (bin_ / "git").write_text("#!/bin/bash\nexit 128\n")
+    (bin_ / "curl").write_text(f"""#!/bin/bash
+out=""; url=""
+while [ $# -gt 0 ]; do case "$1" in -o) out=$2; shift 2;; -H|--max-filesize) shift 2;; -*) shift;; *) url=$1; shift;; esac; done
+case "$url" in
+  *api.github.com*) echo "$(cat {tmp_path}/sha)";;
+  *codeload.github.com*/{sha}) cp {tgz} "$out";;
+  *) exit 22;;
+esac
+""")
+    for f in ("git", "curl"):
+        (bin_ / f).chmod(0o755)
+    (tmp_path / "sha").write_text(sha)
+    root = tmp_path / "remote"
+
+    def fetch():
+        sh = codeagent.FETCH_SH.format(root=shlex.quote(str(root)), dir=shlex.quote(str(root / "r" / "it")),
+                                       url=shlex.quote("https://github.com/a/b.git"), kind="git", maxmb=500,
+                                       ref="''", tmo=60)
+        p = subprocess.run(["bash", "-c", sh], capture_output=True, text=True, timeout=120,
+                           env=dict(os.environ, PATH=f"{bin_}:{os.environ['PATH']}"))
+        line = [x for x in p.stdout.splitlines() if x.startswith("TBSGEN_RESULT ")]
+        return json.loads(line[-1][14:]) if line else {"stdout": p.stdout, "stderr": p.stderr}
+    r = fetch()
+    assert r.get("ok") and r["pin"] == sha and r["via"] == "codeload", r
+    pd = Path(r["remote_dir"])
+    assert (pd / "repo" / "m.R").exists() and not (pd / "repo" / "evil").exists()
+    (pd / "repo" / "marker").write_text("x")
+    assert fetch()["remote_dir"] == str(pd) and (pd / "repo" / "marker").exists()
+    (tmp_path / "sha").write_text("not-a-sha")
+    r = fetch()
+    assert r.get("ok") is False and r.get("why") == "clone_failed"

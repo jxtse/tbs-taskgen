@@ -98,7 +98,7 @@ def remote_item_dir(cfg: dict, item_id: str) -> str:
 # ----------------------------------------------------------------------------------------------- S3c
 FETCH_SH = r"""
 set -uo pipefail
-ROOT={root}; D={dir}; URL={url}; KIND={kind}; MAXMB={maxmb}; REF={ref}; VIA=""
+ROOT={root}; D={dir}; URL={url}; KIND={kind}; MAXMB={maxmb}; REF={ref}; VIA={kind}
 emit() {{ echo "TBSGEN_RESULT $1"; }}
 case "$D" in "$ROOT"/*) ;; *) emit '{{"ok": false, "why": "bad_dir"}}'; exit 0 ;; esac
 mkdir -p "$D" && cd "$D" || {{ emit '{{"ok": false, "why": "fetch_error", "err": "cannot create item dir"}}'; exit 0; }}
@@ -150,6 +150,7 @@ else
   find "$W/repo.tmp" -type l -delete
 fi
 cd "$W/repo.tmp/.." || exit 1
+find "$W/repo.tmp" -type l -delete                 # links can point anywhere on the build host (both branches)
 MB=$(python3 -c 'import os,sys;print(int(sum(os.path.getsize(os.path.join(d,f)) for d,ds,fs in os.walk("repo.tmp") if not (ds.remove(".git") if ".git" in ds else None) for f in fs if not os.path.islink(os.path.join(d,f)))/1048576+0.999))')
 if [ "$MB" -gt "$MAXMB" ]; then rm -rf "$W/repo.tmp"; emit "{{\"ok\": false, \"why\": \"too_large\", \"mb\": $MB}}"; exit 0; fi
 # immutable per pin: <item>/<pin>/repo is never replaced (another run / fetch of the same pin reuses it)
@@ -239,7 +240,8 @@ def s3c_fetch(cfg: dict, item_id: str, primary: dict, runner=None) -> dict:
     sh = FETCH_SH.format(root=shlex.quote(str(_c(cfg)["remote_root"]).rstrip("/")), dir=shlex.quote(d),
                          url=shlex.quote(str(spec["url"])), kind=spec["kind"], maxmb=mx,
                          ref=shlex.quote(spec.get("ref") or ""), tmo=tmo)
-    r = run(sh, tmo + 120)
+    # probe (30 s) + clone (tmo) + API (60 s) + codeload download (tmo) + unpack / size / publish
+    r = run(sh, 2 * tmo + 300)
     res = None
     for line in reversed((r.get("out") or "").splitlines()):
         if line.startswith("TBSGEN_RESULT "):
