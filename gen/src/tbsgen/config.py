@@ -357,7 +357,7 @@ DEFAULTS: dict[str, Any] = {
         "max_exploit_repair_rounds": 2,     # S8 rounds when exploit_valid is the only blocking gate: only the broken
                                             # baselines/exploit_*.py are rewritten (allowed with locked thresholds)
         "blocking": ["oracle", "hidden_shift", "leak", "isolation", "infeasible", "determinism", "truth_isolation",
-                     "cli_contract", "tdm_verbatim", "readymade"],
+                     "cli_contract", "output_contract", "tdm_verbatim", "readymade"],
         # readymade (prerelease.readymade_check): the task image installs, or the reference / a baseline imports,
         # the paper's own implementation (code_links repo names, method_names of the S5 spec).  Rules only.
         # TDM terms (Elsevier: quotes <= 200 chars; Wiley: no redistribution): longest verbatim overlap between

@@ -18,6 +18,9 @@ gates/attempt-<n>.json = {"gates": {name: bool}, "blocking": [names], "details":
                 via _metrics.run_solution and read nothing; catches verifiers that exec agent code themselves
                 (as root, truth readable) -- found in e2e-iter1 where a truth-reading CLI got reward 1
   thresholds_stated  every threshold appears numerically in instruction.md
+  output_contract every CSV header the statement gives for an output file equals (as a column set) the header the
+                reference wrote there -- the verifier reads the reference's format, so a mismatch fails every agent
+                that follows the statement (v2.7, blocking -> S8)
   leak          L1-L4a (leakcheck.leak_report, with depgraph)
   isolation     no tests/, truth, generator under environment/; no python oracle module in public data for
                 non-INTERACT forms that reads a non-public file
@@ -34,6 +37,57 @@ from .spec import metric_family
 
 
 CLI_RE = re.compile(r"solution_cli\.py\s+<input_dir>\s+<output_dir>")
+_HEADER_RE = re.compile(r"^[A-Za-z_][\w.\-]*(?:,[A-Za-z_][\w.\-]*)+$")
+
+
+def stated_csv_headers(ins: str, names: list[str]) -> dict[str, list[str]]:
+    """CSV headers the statement gives for these output files: the first backticked comma-separated column list
+    (e.g. `material,rate,H_fit_GPa`) on the line that names the file or on the next 3 lines, stopping at a line that
+    names another of the files.  Files without a stated header are left out."""
+    lines = ins.splitlines()
+    out = {}
+    for name in names:
+        pat = re.compile(r"(?<![\w.])" + re.escape(name) + r"(?![\w])")
+        for k, line in enumerate(lines):
+            if not pat.search(line):
+                continue
+            found = None
+            for j in range(k, min(k + 4, len(lines))):
+                if j > k and any(o != name and re.search(r"(?<![\w.])" + re.escape(o) + r"(?![\w])", lines[j])
+                                 for o in names):
+                    break
+                for cand in re.findall(r"`([^`\n]+)`", lines[j]):
+                    c = cand.replace(" ", "")
+                    if _HEADER_RE.match(c):
+                        found = c.split(",")
+                        break
+                if found:
+                    break
+            if found:
+                out[name] = found
+                break
+    return out
+
+
+def output_contract(ins: str, ref_out: Path) -> dict:
+    """The statement's CSV headers must match what the reference writes (and the verifier, which the reference
+    passes, reads).  e2e-batch2 (nano): the statement said `material,rate,depth_nm,H_fit_GPa` while the scorer
+    merged on obs_id / H_fit, so every agent that followed the text scored inf -- including Opus.  -> {ok, mismatch}"""
+    files = sorted(p for p in Path(ref_out).rglob("*.csv") if p.is_file()) if Path(ref_out).exists() else []
+    names = sorted({p.name for p in files})
+    stated = stated_csv_headers(ins, names)
+    mismatch = {}
+    for p in files:
+        if p.name not in stated or p.name in mismatch:
+            continue
+        try:
+            with open(p, newline="") as fh:
+                hdr = [h.strip() for h in (fh.readline().strip().split(","))]
+        except OSError:
+            continue
+        if set(hdr) != set(stated[p.name]):
+            mismatch[p.name] = dict(stated=stated[p.name], reference=hdr)
+    return dict(ok=not mismatch, mismatch=mismatch, checked=sorted(stated))
 
 
 def numbers_in(text: str) -> set[float]:
@@ -178,6 +232,10 @@ def run_gates(cfg: dict, item_dir: Path, spec: dict, thresholds: dict, attempt: 
         # `solution_cli.py <input_dir> <output_dir>`: an agent following the text fails every hidden check
         g["cli_contract"] = bool(CLI_RE.search(ins)) and not re.search(r"solution_cli\.py\s+--\w", ins)
         det["cli_contract"] = dict(found=bool(CLI_RE.search(ins)))
+    # output contract: CSV headers in the statement == the reference's (= what the verifier reads)
+    oc = output_contract(ins, work / f"out-ref{seeds[0]}")
+    g["output_contract"] = oc["ok"]
+    det["output_contract"] = oc
     # leak gates on seed 0 artefacts
     gen0 = work / "detA"
     lr = leak_report(gen0 / "environment" / "data", [gen0 / "tests" / "truth"], ins, cfg,
