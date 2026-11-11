@@ -18,6 +18,9 @@ gates/attempt-<n>.json = {"gates": {name: bool}, "blocking": [names], "details":
                 via _metrics.run_solution and read nothing; catches verifiers that exec agent code themselves
                 (as root, truth readable) -- found in e2e-iter1 where a truth-reading CLI got reward 1
   thresholds_stated  every threshold appears numerically in instruction.md
+  output_contract every CSV header the statement gives for an output file equals (as a column set) the header the
+                reference wrote there -- the verifier reads the reference's format, so a mismatch fails every agent
+                that follows the statement (v2.7, blocking -> S8)
   leak          L1-L4a (leakcheck.leak_report, with depgraph)
   isolation     no tests/, truth, generator under environment/; no python oracle module in public data for
                 non-INTERACT forms that reads a non-public file
@@ -34,6 +37,98 @@ from .spec import metric_family
 
 
 CLI_RE = re.compile(r"solution_cli\.py\s+<input_dir>\s+<output_dir>")
+# a declaration is "Header: `a,b,c`" / "Columns: `a,b,c`": the keyword, a colon, then directly the backticked list
+_DECL = re.compile(r"(?:^|[\s(*_|>-])(?:header|columns)\s*:\s*`([^`\n]+)`", re.I)
+def _split_header(text: str) -> list[str] | None:
+    """A backticked CSV header `a,b,c` -> ["a", "b", "c"] (csv rules; surrounding spaces trimmed, inner kept);
+    None unless it is at least two plain column names."""
+    import csv
+    try:
+        cols = next(csv.reader([text]))
+    except (StopIteration, csv.Error):
+        return None
+    cols = [c.strip() for c in cols]
+    if len(cols) < 2 or any(not c or len(c) > 64 or not re.match(r"^[A-Za-z_][\w .\-()/]*$", c) for c in cols):
+        return None
+    return cols
+
+
+# any file-like token: name.ext, including multi-part extensions (input.csv.gz) and <output_dir>/ prefixes
+_FILE_TOK = re.compile(r"(?<![\w./<>-])(?:<\w+>/)?[\w./-]*\w\.[A-Za-z][\w]*(?:\.[A-Za-z][\w]*)*(?![\w-])")
+_PARTIAL = re.compile(r"(?:\b(?:includ\w*|at least|additional|extra|optional|among|such as|for example|subset|"
+                      r"other columns|more columns|may also|derived from|same as|like|whose|corresponds?)\b|"
+                      r"\be\.g\.|\bi\.e\.)", re.I)
+_OUT_PREFIX = re.compile(r"^(?:\./|/app/output/|output/|<output_dir>/)")
+
+
+def _norm_path(tok: str) -> str:
+    return _OUT_PREFIX.sub("", tok.strip())
+
+
+def stated_csv_headers(ins: str, names: list[str]) -> dict[str, list[dict]]:
+    """Explicit, exhaustive CSV header declarations in the statement, per output file.  Strict on purpose (a false
+    positive would block a good task):
+      - anchor: a line that names exactly one of the outputs (relative path; ./, /app/output/, output/,
+        <output_dir>/ stripped; or its basename when unique among the outputs).  File tokens are any name.ext.
+      - declaration: `Header: `a,b,c`` / `Columns: `a,b,c`` -- the keyword, a colon, then directly ONE backticked
+        comma list -- on the anchor line (only if it names no other file) or on one of the next 2 lines, which
+        must name no file at all.
+      - the anchor line and the declaration line must not use partial / attributing wording (includes, at least,
+        additional, e.g., i.e., derived from, same as, like, whose, corresponds ...).
+    -> {file: [{"cols": [...], "line": n}, ...]} -- every declaration in the window."""
+    lines = ins.splitlines()
+    by_base: dict[str, list[str]] = {}
+    for n in names:
+        by_base.setdefault(n.rsplit("/", 1)[-1], []).append(n)
+
+    def resolve(tok: str) -> str | None:
+        t = _norm_path(tok)
+        if t in names:
+            return t
+        same = by_base.get(t.rsplit("/", 1)[-1]) or []
+        return same[0] if "/" not in t and len(same) == 1 else None
+
+    files_on = [{_norm_path(m.group(0)) for m in _FILE_TOK.finditer(line)} for line in lines]
+    out: dict[str, list[dict]] = {}
+    for k, toks in enumerate(files_on):
+        outs = {r for r in (resolve(t) for t in toks) if r is not None}
+        if len(outs) != 1 or _PARTIAL.search(lines[k]):
+            continue
+        n = outs.pop()
+        for j in range(k, min(k + 3, len(lines))):
+            if j > k and files_on[j]:
+                break                                   # another file is named: its own declaration window
+            if j == k and len(toks) > 1:
+                continue                                # the anchor line names an input too
+            if _PARTIAL.search(lines[j]):
+                continue
+            decl = [c for c in (_split_header(x) for x in _DECL.findall(lines[j])) if c]
+            if len(decl) == 1:
+                out.setdefault(n, []).append(dict(cols=decl[0], line=j + 1))
+    return out
+
+
+def output_contract(ins: str, ref_out: Path) -> dict:
+    """The statement's explicit CSV header declarations must match what the reference writes (and the verifier,
+    which the reference passes, reads), as column sets.  e2e-batch2 (nano): the statement said
+    `material,rate,depth_nm,H_fit_GPa` while the scorer merged on obs_id / H_fit, so every agent that followed the
+    text scored inf -- including Opus.  -> {ok, mismatch: {file: {stated, line, reference}}, checked}"""
+    import csv
+    ref_out = Path(ref_out)
+    files = sorted(p for p in ref_out.rglob("*.csv") if p.is_file()) if ref_out.exists() else []
+    rel = {str(p.relative_to(ref_out)): p for p in files}
+    stated = stated_csv_headers(ins, sorted(rel))
+    mismatch = {}
+    for name, decls in stated.items():
+        try:
+            with open(rel[name], newline="") as fh:
+                hdr = [c.strip() for c in next(csv.reader(fh), [])]
+        except (OSError, csv.Error, UnicodeDecodeError):
+            continue
+        bad = [d for d in decls if set(d["cols"]) != set(hdr)]
+        if bad:
+            mismatch[name] = dict(stated=bad[0]["cols"], line=bad[0]["line"], reference=hdr)
+    return dict(ok=not mismatch, mismatch=mismatch, checked=sorted(stated))
 
 
 def numbers_in(text: str) -> set[float]:
@@ -178,6 +273,10 @@ def run_gates(cfg: dict, item_dir: Path, spec: dict, thresholds: dict, attempt: 
         # `solution_cli.py <input_dir> <output_dir>`: an agent following the text fails every hidden check
         g["cli_contract"] = bool(CLI_RE.search(ins)) and not re.search(r"solution_cli\.py\s+--\w", ins)
         det["cli_contract"] = dict(found=bool(CLI_RE.search(ins)))
+    # output contract: CSV headers in the statement == the reference's (= what the verifier reads)
+    oc = output_contract(ins, work / f"out-ref{seeds[0]}")
+    g["output_contract"] = oc["ok"]
+    det["output_contract"] = oc
     # leak gates on seed 0 artefacts
     gen0 = work / "detA"
     lr = leak_report(gen0 / "environment" / "data", [gen0 / "tests" / "truth"], ins, cfg,

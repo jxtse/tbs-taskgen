@@ -72,7 +72,18 @@ def s8(P, it):
         # a gate failed after a review revision or a regate: the ordinary S8 may change the reference / baselines
         # and is not bound by the revision limit, so it must not run — the review revision is retried (feedback)
         # while rounds remain, else the item is dropped (review.allow_human restores the old park)
-        return _revision_retry(P, it, f"after the review revision: {it.state.get('repair_from')}")
+        why = f"after the review revision: {it.state.get('repair_from')}"
+        last = sorted(it.p("gates").glob("attempt-*.json"),
+                      key=lambda q: int(q.stem.split("-")[-1]) if q.stem.split("-")[-1].isdigit() else -1) \
+            if it.p("gates").exists() else []
+        oc = ((read_json(last[-1], {}) or {}).get("details") or {}).get("output_contract") if last else None
+        if oc and not oc.get("ok"):
+            # compact per-file difference first, so the budget never cuts the columns that matter
+            diff = {f: dict(missing_in_statement=sorted(set(m["reference"]) - set(m["stated"])),
+                            not_in_reference=sorted(set(m["stated"]) - set(m["reference"])), line=m.get("line"))
+                    for f, m in (oc.get("mismatch") or {}).items()}
+            why += " output_contract mismatch (statement vs reference header): " + json.dumps(diff)[:1700]
+        return _revision_retry(P, it, why)
     rounds = it.state.get("repair_rounds", 0)
     if rounds >= P.cfg["gates"]["max_repair_rounds"]:
         return it.finish("dropped", f"repair_limit:{it.state.get('repair_from')}")
@@ -216,6 +227,11 @@ def _slim(g):
             out["fix_hint"] = ("tests/measure.py must execute /app/output/solution_cli.py ONLY via "
                                "`from _metrics import run_solution, hidden_sets` (one call per hidden set dir); "
                                "never subprocess it directly: run_solution drops privileges and locks /tests/truth.")
+        if "output_contract" in out.get("blocking", []):
+            out["details"]["output_contract"] = det.get("output_contract")
+            out["fix_hint"] = ("instruction.md states a CSV header that differs from what the reference writes and "
+                               "tests/measure.py reads (details.output_contract: file, stated columns, reference "
+                               "columns): make the statement, the reference and the scorer agree on one format.")
         if "readymade" in out.get("blocking", []):
             out["details"]["readymade"] = det.get("readymade")
             out["fix_hint"] = ("the task depends on the paper's own published implementation (see details.readymade): "
@@ -941,7 +957,7 @@ def _revision_retry(P, it, why: str):
     verdict = read_json(it.p("review", "verdict.json"), {}) or {}
     routed = verdict.get("round") == rnd and (verdict.get("_normalized") or {}).get("verdict") == "revise"
     if it.state.get("post_revision") and n < int(rv.get("max_revisions", 3)) and routed:
-        it.state["revision_feedback"] = str(why)[:500]
+        it.state["revision_feedback"] = str(why)[:2000]
         it.state["repair_from"] = f"review:r{rnd}"
         return it.goto("S8", f"review revision retry: {why[:160]}")
     return it.finish("dropped", f"review:gate_failed ({why[:300]})")

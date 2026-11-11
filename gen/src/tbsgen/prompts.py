@@ -3,7 +3,7 @@ S8 local repair).  Outputs are machine-parsed: S5 -> one JSON object; S6A/S6C/S8
 "=== FILE: <rel path> ===" ... "=== END ===".  Kept short on purpose: the contract (file layout + rules)
 matters more than prose.  Version strings go into provenance so prompt changes are traceable.
 """
-PROMPT_VERSION = "v2.6-2026-11-11"
+PROMPT_VERSION = "v2.7-2026-11-11"
 
 METRICS_API = """Verifier helper module `_metrics` (provided, importable from tests/; exact signatures):
   check(name: str, value: float, threshold: float, direction: "<=" | ">=") -> None   # records + asserts
@@ -133,7 +133,9 @@ Write (generator, solution and mid/naive baselines already exist and are fixed):
   /app/output/solution_cli.py taking <input_dir> <output_dir> that handles every hidden input layout, e.g. a
   single case).  S7 rejects an exploit that crashes or produces no scorable output, since it tests nothing.
 - instruction.md: the task statement for an expert agent.  States the scientific problem and the data files
-  (columns, units); deliverables and file formats exact (must agree with what tests/measure.py reads); for PROG
+  (columns, units); deliverables and file formats exact (must agree with what tests/measure.py reads and what
+  solution/solve.py writes: give each CSV output's header as `Header: `col1,col2,...`` listing exactly the
+  reference's columns -- S7 checks it); for PROG
   include verbatim the line `python /app/output/solution_cli.py <input_dir> <output_dir>` (positional args,
   <input_dir> laid out like /app/data) and say what may change on the hidden inputs (qualitatively, no hidden
   parameter values); every metric defined precisely and
