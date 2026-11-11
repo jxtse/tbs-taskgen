@@ -51,6 +51,8 @@ DEFAULTS: dict[str, Any] = {
             "tests": "teacher",             # S6C
             "repair": "teacher",            # S8
             "review": "rules",              # S8 preservation review (mechanical diff; cheap model 待定)
+            "code_owner": "rules",          # S3b ambiguous code links: "rules" (keep as own) | "jev" (cheap; never
+                                            # the teacher model)
             "invert": None,                 # S7 L4b cheap-agent inversion attack (待定; disabled)
         },
         # The teacher model (S5 / S6 / S8): an Anthropic-compatible /v1/messages endpoint.  No default URL: set
@@ -278,6 +280,22 @@ DEFAULTS: dict[str, Any] = {
         # within a target, a paper whose title shares >= this fraction of content words (Jaccard) with a paper
         # already placed earlier in that target is moved behind the others (method near-duplicates); 0 disables
         "similar_title_jaccard": 0.5,
+    },
+    # ---------------------------------------------------------------- code-grounded generation
+    # Tasks are built from the paper AND its authors' published code (decision 2026-11-11).  grounded=true:
+    # S1 -> S2a (code signal, no download quota) -> S2 -> S3 (full text) -> S3b (own code confirmed on its host)
+    # -> S4.  A paper without the authors' code is dropped (no exception route).  Licences are recorded only.
+    # See codegate.py for the drop reasons.  grounded=false keeps the paper-only pipeline unchanged.
+    "code": {
+        "grounded": False,
+        "prescreen": True,                  # S2a on (needs grounded)
+        "openalex_flag": True,              # S2a: one OpenAlex full-text flag call when nothing else signals code
+        "fulltext_terms": ["github.com", "zenodo.org", "gitlab"],
+        "pwc_path": None,                   # Papers-with-Code archive TSV(.gz) (see retrieval README)
+        "github_client": "gh",              # "gh": gh CLI (its own auth) | "rest": anonymous api.github.com
+        "proxy": "env",                     # "env": honour HTTPS_PROXY | "none": direct
+        "mailto": "jxtse@users.noreply.github.com",
+        "jev_own_threshold": 0.5,           # roles.code_owner = "jev": ambiguous links own if P(own) >= this
     },
     "probe": {
         "tbs_tasks_root": None,             # TB-Science task texts (<task>/instruction.md ...); None -> no dedup

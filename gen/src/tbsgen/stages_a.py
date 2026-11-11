@@ -9,7 +9,7 @@ import shutil
 import re
 from pathlib import Path
 
-from . import blocklist, intake, runner, screen_jev
+from . import blocklist, codegate, intake, runner, screen_jev
 from .budget import BudgetStop
 from .config import resolve_role
 from .models import ModelError, extract_json, parse_files  # noqa: F401
@@ -22,7 +22,50 @@ def s1(P, it):
     c = read_json(it.p("S1_candidate.json"))
     if not c:
         return it.finish("dropped", "no_candidate")
-    it.advance("S1", "S2")
+    it.advance("S1", codegate.after_s1(P.cfg))
+
+
+def s2a(P, it):
+    """Code-grounded pre-screen (before any full-text download): any code signal, else drop no_code_signal."""
+    c = read_json(it.p("S1_candidate.json")) or {}
+    sig = codegate.s2a_signals(c, P.cfg)
+    write_json(it.p("S2a_code_signal.json"), dict(sig, ts=time.time()))
+    if not sig["any"]:
+        if sig.get("openalex_fulltext_error"):     # OpenAlex unreachable / rate-limited: undecided, retry later
+            return it.finish("paused", "code:openalex_unavailable", paused_stage="S2a")
+        return it.finish("dropped", "no_code_signal")
+    it.advance("S2a", "S2", signals=[k for k in ("meta", "retrieval", "pwc", "openalex_fulltext") if sig.get(k)])
+
+
+def s3b(P, it):
+    """Code-grounded confirmation on the full text: the authors' own code exists and resolves on its host."""
+    c = read_json(it.p("S1_candidate.json")) or {}
+    # S2a's findings (e.g. a PwC archive repo) are evidence for S3b too
+    sig = read_json(it.p("S2a_code_signal.json"), {}) or {}
+    cs = dict(c.get("code_signals") or {})
+    for k in ("pwc", "pwc_mentioned"):
+        cs[k] = sorted(set(cs.get(k) or []) | set(sig.get(k) or []))
+    c = dict(c, code_signals=cs)
+    txt = it.p("fulltext.txt").read_text(errors="replace")
+    jev = None
+    if resolve_role(P.cfg, "code_owner") == "jev":
+        client = P.jev_client()
+
+        def jev(link):
+            try:
+                return codegate.jev_own(client, it, c, link)
+            except (ModelError, BudgetStop) as e:
+                P.store.event("code_owner_jev_unavailable", item=it.item_id, err=str(e)[:200])
+                return None
+    rec = codegate.s3b_record(txt, c, P.cfg, jev=jev)
+    write_json(it.p("S3b_code.json"), rec)
+    if rec.get("pause"):          # host / Jev could not answer now: retry later (`tbsgen resume --reason code:`)
+        return it.finish("paused", f"code:{rec['pause']}", paused_stage="S3b")
+    if not rec["keep"]:
+        return it.finish("dropped", rec["reason"])
+    p = rec["primary"]
+    it.advance("S3b", "S4", repo=p.get("url"),
+               license=p.get("license"), language=p.get("language"))
 
 
 def screen_paper(P, it, c: dict, stage: str, fulltext_head: str | None = None) -> dict | None:
@@ -81,7 +124,7 @@ def s3(P, it):
         # 1. intent record, 2. park, 3. queue.  A crash between 2 and 3 is repaired by `tbsgen fetch`, which
         # first re-queues every item parked with fulltext_unavailable from its S3_queue.json (fulltext.reconcile).
         write_json(it.p("S3_queue.json"), dict(entry, route="tbsgen fetch", errors=rec.get("errors"),
-                                               skipped=rec.get("skipped")))
+                                               skipped=rec.get("skipped"), next_stage=codegate.after_s3(P.cfg)))
         it.finish("parked", "fulltext_unavailable")
         if it.state.get("blocklist_trial"):
             blocklist.resolve(P.store, it)        # trial decided: no full text (stays pending if still queued)
@@ -93,7 +136,7 @@ def s3(P, it):
     if it.state.get("blocklist_trial"):
         blocklist.resolve(P.store, it)            # trial decided: full text obtained
         blocklist.reevaluate(P.store, P.cfg, P.store.event)
-    it.advance("S3", "S4", source=rec.get("source"), chars=len(txt))
+    it.advance("S3", codegate.after_s3(P.cfg), source=rec.get("source"), chars=len(txt))
 
 
 def failed_channels(rec: dict) -> set[str]:

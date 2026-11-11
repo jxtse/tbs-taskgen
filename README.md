@@ -215,6 +215,21 @@ The key is read from the named variable at call time, sent only in a request hea
 from error messages. Without `key_env`, no key is sent (useful behind a local gateway that holds
 credentials). The built-in price table is a placeholder; set prices for your model.
 
+### Code-grounded generation (`code.grounded`)
+
+With `[code] grounded = true` a task is built from the paper **and its authors' published code**; a paper without
+the authors' code is dropped. Two filters run before any model call: **S2a** (before the full-text download) keeps a
+paper only if some code signal exists — code links in the metadata, the retrieval layer's `code_signals` (OpenAlex
+full-text search for code hosts, the frozen Papers-with-Code archive, GitHub repositories whose README cites the
+DOI / arXiv id) or an OpenAlex full-text flag; **S3b** (after the full text) scores every code link for ownership
+(Code Availability section, link context, reference list, README citing the paper), asks the cheap Jev model only
+for ambiguous links (`roles.code_owner = "jev"`), resolves the authors' links on their host and drops with a
+specific reason (`code_on_request`, `third_party_code_only`, `code_repo_unavailable`, `data_only_no_code`,
+`code_host_unsupported`, `no_code_link`). Licences are recorded, not filtered. The retrieval side
+(`retrieval/`, `code.enabled`) adds an OpenAlex full-text code channel, widens the fused head
+(`code.top_n_factor`, default 2.75) and prefers papers from `code.min_year` (default 2018) on. Details:
+[`gen/README.md`](gen/README.md) §0.
+
 ### S2 abstract screen
 
 S2 decides from the bibliographic record (title, abstract, venue, year, code/data links) whether a paper is worth

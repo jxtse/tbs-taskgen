@@ -328,7 +328,10 @@ def _fetch(P: Pipeline, a) -> int:
         if st.get("stage") == "S3" and st.get("status") == "parked" and st.get("reason") == "fulltext_unavailable":
             write_json(it.p("S3_fulltext.json"), dict(out.rec, delivered_by="tbsgen fetch"))
             it.p("fulltext.txt").write_text(out.text)
-            it.advance("S3", "S4", source=out.rec.get("source"), chars=len(out.text), via="tbsgen fetch")
+            # the next stage belongs to the subscriber's run (its own config), not to this fetch process:
+            # S3 records it in S3_queue.json when it parks; an item parked before code-grounding goes to S4
+            nxt = (read_json(it.p("S3_queue.json"), {}) or {}).get("next_stage") or "S4"
+            it.advance("S3", nxt, source=out.rec.get("source"), chars=len(out.text), via="tbsgen fetch")
         return True                                        # delivered now, or already past S3 / not waiting
 
     readded = fulltext.reconcile(P.store, fulltext.queue_path(P.cfg)) if not a.dry_run else 0
