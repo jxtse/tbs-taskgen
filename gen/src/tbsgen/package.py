@@ -133,7 +133,7 @@ def package(cfg: dict, item_dir: Path, gen0: Path, spec: dict, provenance: dict)
     (out / "solution").mkdir()
     shutil.copy(task / "solution" / "solve.py", out / "solution" / "solve.py")
     (out / "solution" / "solve.sh").write_text(SOLVE_SH)
-    (out / "instruction.md").write_text((task / "instruction.md").read_text())
+    (out / "instruction.md").write_text(instruction_text(cfg, spec, (task / "instruction.md").read_text()))
     pk = cfg["package"]
     (out / "environment" / "Dockerfile").write_text(dockerfile(cfg))
     (out / "task.toml").write_text(TASK_TOML.format(
@@ -186,6 +186,26 @@ def verifier_time_errors(pkg: Path, overhead: float) -> list[str]:
         return [f"verifier time: scored {sc:.0f}s + timing repeats {tb:.0f}s + overhead {overhead:.0f}s "
                 f"> verifier timeout {vt:.0f}s"]
     return []
+
+
+TIME_NOTE_MARK = "<!-- tbsgen:verifier-time -->"
+
+
+def instruction_text(cfg: dict, spec: dict, text: str) -> str:
+    """The packaged statement.  PROG: append the verifier's time limit for the agent program (all scored runs of
+    solution_cli.py share runner.scored_budget() seconds on the grader's CPU allowance; a run cut off by it scores
+    like a failed run) -- e2e-batch2 review: an unstated 780 s cap is a missing condition.  Idempotent."""
+    from .runner import scored_budget
+    text = text.split("\n" + TIME_NOTE_MARK)[0].rstrip() + "\n"
+    if spec.get("form") != "PROG":
+        return text
+    sb = int(scored_budget(cfg))
+    cpus = (cfg.get("sandbox") or {}).get("cpus")
+    cpu = f" on {cpus} CPU cores" if cpus else ""
+    return (text + "\n" + TIME_NOTE_MARK + "\n## Verifier time limit\n"
+            f"The verifier runs `solution_cli.py` once per hidden input set{cpu}. All these runs together get at most "
+            f"{sb} seconds of wall time; a run still going when that time is used up is stopped and scored as a failed "
+            "run (missing or partial outputs). Make sure your program finishes well within this limit.\n")
 
 
 def validate_pkg(pkg: Path, cfg: dict | None = None) -> dict:
