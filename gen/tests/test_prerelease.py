@@ -187,7 +187,7 @@ def _pkg_toml(tmp_path, **net):
     cfg = load_config(overrides={"package": {"network": net}} if net else None)
     pol = package.network_policy(cfg)
     txt = package.TASK_TOML.format(task_id="t", desc='"d"', keywords="[]", domain='"x"', field='"x"', form='"ANS"',
-                                   expert_h=1.0, verifier_sec=60.0, agent_sec=60.0, **pol)
+                                   expert_h=1.0, verifier_sec=60.0, agent_sec=60.0, cpus=package.TASK_CPUS, **pol)
     return tomllib.loads(txt)
 
 
@@ -235,7 +235,7 @@ def _pkg_task(item, **net):
     cfg = load_config(overrides={"package": {"network": net}} if net else None)
     (item / "pkg" / "task.toml").write_text(package.TASK_TOML.format(
         task_id="t", desc='"d"', keywords="[]", domain='"x"', field='"x"', form='"ANS"', expert_h=1.0,
-        verifier_sec=60.0, agent_sec=60.0, **package.network_policy(cfg)))
+        verifier_sec=60.0, agent_sec=60.0, cpus=package.TASK_CPUS, **package.network_policy(cfg)))
 
 
 def test_calib_refuses_to_launch_an_allowlisted_task_without_a_model_host(tmp_path):

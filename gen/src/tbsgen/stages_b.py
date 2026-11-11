@@ -260,19 +260,25 @@ def pkg(P, it):
                 spec_sha=_sha_file(it.p("_spec", "spec.json")), gates=gate["gates"],
                 thresholds=read_json(it.p("thresholds.json"))["thresholds"],
                 model_cost=P.item_cost(it.item_id), packaged=time.time())
-    try:
-        old_ins = it.p("pkg", "instruction.md").read_text()
-    except OSError:
-        old_ins = None
+    import hashlib
+    if it.state.get("rescore_pending") and not it.state.get("pkg_statement_sha"):
+        # persisted before pkg/ is overwritten, so a crash between overwrite and archive still compares correctly
+        try:
+            it.state["pkg_statement_sha"] = hashlib.sha256(it.p("pkg", "instruction.md").read_bytes()).hexdigest()
+            it.save()
+        except OSError:
+            pass
+    old_sha = it.state.get("pkg_statement_sha")
     out = package.package(P.cfg, it.dir, gen0, spec, prov)
     v = package.validate_pkg(out, P.cfg)
-    if it.state.get("rescore_pending") and old_ins is not None and \
-            (out / "instruction.md").read_text() != old_ins:
+    new_sha = hashlib.sha256((out / "instruction.md").read_bytes()).hexdigest()
+    if it.state.get("rescore_pending") and old_sha and new_sha != old_sha:
         # a scoring-only revision / regate would re-score the kept calibration, but the packaged statement changed
         # (e.g. a note PKG adds, a criteria table S7 appended): those runs read another statement -> recalibrate
         epoch = _archive_calibration(it)
         it.state.pop("rescore_pending", None)
         P.store.event("calib_archived", item=it.item_id, epoch=epoch, reason="packaged statement changed")
+    it.state.pop("pkg_statement_sha", None)
     # the packaged image (Dockerfile written here, not by the model) gets the same ready-made check
     rm = prerelease.readymade_check(out, cand, spec)
     if not rm["ok"]:

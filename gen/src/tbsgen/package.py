@@ -193,17 +193,20 @@ TIME_NOTE_MARK = "<!-- tbsgen:verifier-time -->"
 TIME_NOTE_END = "<!-- /tbsgen:verifier-time -->"
 
 
+def strip_time_note(text: str) -> str:
+    import re as _re
+    return _re.sub(r"\n*" + _re.escape(TIME_NOTE_MARK) + r".*?" + _re.escape(TIME_NOTE_END) + r"\n?", "\n", text,
+                   flags=_re.S)
+
+
 def instruction_text(cfg: dict, spec: dict, text: str) -> str:
     """The packaged statement.  PROG: add the verifier's time limit for the agent program between two markers (the
     first, scored run of solution_cli.py on each hidden input set together get runner.scored_budget() seconds on
     TASK_CPUS cores; timed repeats have their own budget; a run cut off scores as a failed run) -- e2e-batch2
     review: an unstated 780 s cap is a missing condition.  Only the marked block is replaced (text after it is
     kept), so it is idempotent and safe if the marked statement was copied back into task/."""
-    import re as _re
     from .runner import scored_budget
-    text = _re.sub(r"\n*" + _re.escape(TIME_NOTE_MARK) + r".*?" + _re.escape(TIME_NOTE_END) + r"\n?", "\n", text,
-                   flags=_re.S)
-    text = text.rstrip() + "\n"
+    text = strip_time_note(text).rstrip() + "\n"
     if spec.get("form") != "PROG":
         return text
     sb = f"{scored_budget(cfg):g}"

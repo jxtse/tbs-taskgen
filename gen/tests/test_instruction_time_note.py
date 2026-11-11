@@ -37,7 +37,7 @@ def test_fractional_budget_kept_and_task_toml_cpus_match():
 
 
 
-def _pkg_item(tmp_path, monkeypatch, old_ins, new_ins, rescore=True):
+def _pkg_item(tmp_path, monkeypatch, old_ins, new_ins, rescore=True, pre_sha=None):
     """An item at PKG with a kept calibration and (optionally) a pending re-score; package.package is replaced by a
     stub that writes `new_ins` as the packaged statement."""
     import json
@@ -54,6 +54,8 @@ def _pkg_item(tmp_path, monkeypatch, old_ins, new_ins, rescore=True):
     state = dict(stage="PKG", status="active", calib_label="hard", calib_epoch=0, history=[])
     if rescore:
         state["rescore_pending"] = dict(reason="regate")
+    if pre_sha:
+        state["pkg_statement_sha"] = pre_sha
     (d / "state.json").write_text(json.dumps(state))
     from tbsgen.state import Item
     it = Item(tmp_path / "run", "doi-x").load()
@@ -85,3 +87,18 @@ def test_pkg_recalibrates_when_the_statement_changed_under_a_pending_rescore(tmp
 def test_pkg_keeps_the_rescore_when_the_statement_is_unchanged(tmp_path, monkeypatch):
     it, ev = _pkg_item(tmp_path, monkeypatch, "# T\n", "# T\n")
     assert it.state.get("calib_epoch", 0) == 0 and it.state.get("rescore_pending") and it.state["calib_label"] == "hard"
+
+
+def test_pkg_crash_between_overwrite_and_archive_still_recalibrates(tmp_path, monkeypatch):
+    """Codex r3: the old statement's hash is persisted before pkg/ is overwritten; a retry after a crash (pkg/
+    already holds the new statement) still sees the change."""
+    import hashlib
+    old = hashlib.sha256(b"# T\n").hexdigest()
+    it, _ = _pkg_item(tmp_path, monkeypatch, "# T\n\nnote\n", "# T\n\nnote\n", pre_sha=old)
+    assert it.state["calib_epoch"] == 1 and "pkg_statement_sha" not in it.state
+
+
+def test_generated_note_is_not_evidence_for_thresholds_stated():
+    cfg = load_config(None)
+    t = package.instruction_text(cfg, {"form": "PROG"}, "# Task\n")
+    assert "780" in t and "780" not in package.strip_time_note(t)

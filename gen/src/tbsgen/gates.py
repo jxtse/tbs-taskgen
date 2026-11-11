@@ -263,6 +263,9 @@ def run_gates(cfg: dict, item_dir: Path, spec: dict, thresholds: dict, attempt: 
     g.update(ok)
     # thresholds stated
     ins = (task / "instruction.md").read_text() if (task / "instruction.md").exists() else ""
+    # the verifier-time note PKG generates is not the task author's text: never evidence for a stated threshold
+    from .package import strip_time_note
+    ins = strip_time_note(ins)
     nums = numbers_in(ins)
     unstated = [k for k, t in thresholds.items()
                 if not any(math.isclose(v, abs(t["threshold"]), rel_tol=1e-6, abs_tol=1e-12) for v in nums)]
