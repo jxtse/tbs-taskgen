@@ -1,4 +1,4 @@
-"""Code-grounded stages that run on the build host (gu26): S3c (fetch the authors' code), S4c (runnability gate) and
+"""Code-grounded stages that run on the build host: S3c (fetch the authors' code), S4c (runnability gate) and
 S5G (task authoring by a Claude Code agent).
 
 Where things run

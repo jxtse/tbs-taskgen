@@ -76,7 +76,7 @@ def test_s3c_stage_drop_and_advance(tmp_path):
 
 
 class FakeLauncher:
-    """Stands in for tmux + the gu26 launcher: writes a finished Harbor job with the given /app/out files."""
+    """Stands in for tmux + the build-host launcher: writes a finished Harbor job with the given /app/out files."""
 
     def __init__(self, files: dict, cost=3.5):
         self.files, self.cost, self.calls = files, cost, []
