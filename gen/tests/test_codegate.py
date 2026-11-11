@@ -289,3 +289,50 @@ def test_r3_regressions():
     r = codegate.s3b_record(ft, {"title": "Paper"}, {"code": {}}, get=fake_get({}), gh=fake_gh({}),
                             gh_raw=fake_gh({}))
     assert not r["keep"] and r["reason"] == "code_host_unsupported" and not r.get("pause")
+
+
+def test_link_not_in_paper_is_never_own():
+    """e2e 2026-11-12: a course demo whose README cites the paper (GitHub README search) was confirmed by Jev although
+    the paper never mentions it.  A link absent from the full text is not the authors' code unless PwC marks it
+    official."""
+    ft = "We study pricing.  Methods.  Our labeling algorithm is new.\nReferences\n[1] Someone. A book. 2001.\n"
+    asked = []
+    gh = fake_gh({"repos/someone/pricing-demo": (200, {"size": 10, "html_url": "https://github.com/someone/pricing-demo"}),
+                  "repos/alice/labeling": (200, {"size": 10, "html_url": "https://github.com/alice/labeling"})})
+    c = {"title": "Learning dominant states in pricing",
+         "code_signals": {"gh_readme": ["https://github.com/someone/pricing-demo"]}}
+    rec = codegate.s3b_record(ft, c, {"code": {}}, jev=lambda l: asked.append(l["key"]) or 0.99, gh=gh,
+                              gh_raw=fake_gh({}))
+    assert not rec["keep"] and rec["reason"] == "third_party_code_only" and not asked
+    by = {l["key"]: l for l in rec["links"]}
+    assert by["github.com/someone/pricing-demo"]["verdict_by"] == "rules:not_in_paper"
+    # PwC official (the archive's own-code flag) still counts without a mention in the text
+    c2 = {"title": "Learning dominant states in pricing", "code_signals": {"pwc": ["https://github.com/alice/labeling"]}}
+    rec2 = codegate.s3b_record(ft, c2, {"code": {}}, jev=lambda l: 0.99, gh=gh, gh_raw=fake_gh({}))
+    assert rec2["keep"] and rec2["primary"]["url"] == "https://github.com/alice/labeling"
+    # a link written in the abstract (publisher metadata) is in the paper: Jev decides
+    c3 = {"title": "Learning dominant states in pricing", "abstract": "Code: https://github.com/alice/labeling .",
+          "code_links": ["https://github.com/alice/labeling"]}
+    rec3 = codegate.s3b_record(ft, c3, {"code": {}}, jev=lambda l: 0.99, gh=gh, gh_raw=fake_gh({}))
+    assert rec3["keep"]
+
+
+def test_not_in_paper_uses_canonical_keys():
+    ft = "We study pricing.  Methods.  Our labeling algorithm is new.\nReferences\n[1] Someone. A book. 2001.\n"
+    gh = fake_gh({"repos/alice/solver": (200, {"size": 10, "html_url": "https://github.com/alice/solver"})})
+    get = fake_get({"zenodo.org/api/records/1234567": (200, {"metadata": {"resource_type": {"type": "software"}},
+                                                              "files": [{"key": "s.zip", "size": 9}]})})
+    # path-substring look-alike in the abstract does not count
+    c = {"title": "Pricing", "abstract": "See github.com/malice/solver-course for a course.",
+         "code_signals": {"gh_readme": ["https://github.com/alice/solver"]}}
+    r = codegate.s3b_record(ft, c, {"code": {}}, jev=lambda l: 0.99, gh=gh, gh_raw=fake_gh({}))
+    assert not r["keep"]
+    # a Zenodo record written in the abstract is in the paper (Jev decides)
+    c = {"title": "Pricing", "abstract": "Code: https://zenodo.org/records/1234567 .",
+         "code_signals": {"gh_readme": []}, "code_links": ["https://zenodo.org/records/1234567"]}
+    r = codegate.s3b_record(ft, c, {"code": {}}, jev=lambda l: 0.99, gh=gh, get=get, gh_raw=fake_gh({}))
+    assert r["keep"] and r["primary"]["key"] == "zenodo:1234567"
+    # PwC official given as http://...git keeps its exemption
+    c = {"title": "Pricing", "code_signals": {"pwc": ["http://github.com/alice/solver.git"]}}
+    r = codegate.s3b_record(ft, c, {"code": {}}, jev=lambda l: 0.99, gh=gh, gh_raw=fake_gh({}))
+    assert r["keep"]
