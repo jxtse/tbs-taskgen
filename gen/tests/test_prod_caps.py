@@ -1,6 +1,7 @@
 """Production throttles: per-paper authoring USD cap (budget.item_usd_cap), papers admitted to S4c / S5G per
 day (code.daily_new_*), concurrent agent jobs (code.max_concurrent_agent_jobs).  No network, fake launcher."""
 import json
+from pathlib import Path
 
 import pytest
 
@@ -171,3 +172,25 @@ def test_reserved_without_launch_rechecks_admission_and_admit_uses_launch_day(tm
         stages_a._agent_admit(P, P.store.item(it.item_id), "S5G")
     rows = [json.loads(x) for x in (P.store.root / "s5g-admissions.jsonl").read_text().splitlines()]
     assert rows[-1]["item"] == it.item_id and rows[-1]["day"] != stages_a._cst_day()
+
+
+def test_launcher_failed_job_with_its_own_log_is_not_charged(tmp_path, monkeypatch):
+    """A relay preflight 503 ends the launcher before Harbor creates the job: no model ran, so the per-paper /
+    per-round allowance (spent.json) must not be charged the job's whole max_usd."""
+    import subprocess as sp
+    from tbsgen import codeagent
+    P, it, fl = _agent_item(tmp_path, monkeypatch, _files(design=None), stage="S5G")
+    monkeypatch.setattr(codeagent.subprocess, "run", lambda args, **kw: sp.CompletedProcess(args, 0, "", ""))
+    P.run(max_steps=1, until="S5G")                 # tmux started; the launcher then fails before Harbor runs
+    rec = read_json(it.p("S5G", "run.json"))
+    assert rec["state"] == "launched" and Path(rec["log"]).name.startswith(rec["job_name"])
+    Path(rec["log"]).write_text("relay preflight http=503\nharbor exit 3\n")
+    Path(rec["log"] + ".exit").write_text("3")
+    monkeypatch.setattr(codeagent.subprocess, "run", fl)
+    P.run(max_steps=1, until="S5G")                 # poll -> launcher_failed -> infra retry
+    st = P.store.item(it.item_id).state
+    assert st["status"] == "active" and st["stage"] == "S5G", st
+    P.run(max_steps=1, until="S5G")                 # next job: the failed one is charged first
+    spent = read_json(it.p("S5G", "spent.json"))
+    assert spent[rec["job_name"]]["usd"] == 0.0, spent
+    assert read_json(it.p("S5G", "run.json"))["job_name"] != rec["job_name"]

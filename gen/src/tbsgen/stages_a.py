@@ -551,6 +551,12 @@ def _agent_stage(P, it, kind: str, instruction: str, need: list[str], timeout_s:
         if rec is not None and rec.get("job_name") and rec["job_name"] not in charges:
             if rec.get("not_started") or not rec.get("launch_attempted"):
                 usd, sec = 0.0, 0.0             # confirmed never started
+            elif rec.get("outcome") == "launcher_failed" and Path(str(rec.get("log", ""))).name.startswith(
+                    str(rec.get("job_name"))):
+                # this job's own launcher log ended and Harbor never created the job (no config.json; e.g. a relay
+                # preflight 503): the agent never ran, so no model cost; wall time of the attempt only
+                usd = 0.0
+                sec = max(0.0, float(rec.get("finished_ts") or time.time()) - float(rec["launch_attempted"]))
             else:
                 # a job that may have run: unknown cost counts as its whole allowance, unknown time as wall time
                 # since the launch (never as zero)
