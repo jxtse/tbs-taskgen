@@ -83,3 +83,27 @@ def test_daily_new_authoring_and_concurrency(tmp_path, monkeypatch):
     P.run(max_steps=1, only=[other], until="S5G")
     so = P.store.item(other).state
     assert so["status"] == "waiting" and "agent slots full" in so["reason"] and len(fl.calls) == 2
+
+
+def test_reservation_is_the_job_allowance_and_admission_only_on_launch(tmp_path, monkeypatch):
+    """With a paper cap the ledger reserves the whole job allowance (an unknown final cost cannot under-count), a
+    resumed intent reuses that amount, and a paper is counted for the day only once its job really started."""
+    P, it, fl = _agent_item(tmp_path, monkeypatch, _files(design=None), stage="S5G")
+    P.cfg["budget"]["item_usd_cap"] = 10.0
+    P.cfg["code"]["daily_new_authoring"] = 1
+    from tbsgen import codeagent
+    import subprocess as sp
+    monkeypatch.setattr(codeagent.subprocess, "run", lambda args, **kw: sp.CompletedProcess(args, 1, "", "no tmux"))
+    P.run(max_steps=1, until="S5G")                              # tmux fails: never started
+    st = P.store.item(it.item_id).state
+    assert st["status"] == "paused" and st["reason"] == "code:S5G:launch_failed"
+    assert not (P.store.root / "s5g-admissions.jsonl").exists()  # not admitted: nothing started
+    with P.ledger._db() as db:
+        rows = db.execute("SELECT est_usd, usd, status FROM calls WHERE item=? AND stage='S5G'", (it.item_id,)).fetchall()
+    assert rows == [(10.0, 0.0, "error")]                        # reserved at the allowance, released at 0
+    monkeypatch.setattr(codeagent.subprocess, "run", fl)
+    P.resume(("code:",))
+    P.run(max_steps=1, until="S5G")
+    rec = read_json(it.p("S5G", "run.json"))
+    assert rec["state"] == "launched" and rec["est_usd"] == 10.0
+    assert len((P.store.root / "s5g-admissions.jsonl").read_text().splitlines()) == 1

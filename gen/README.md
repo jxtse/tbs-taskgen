@@ -119,7 +119,9 @@ regate 不复查（它们不改科学内容）。
   模型不停）；S4c/S5G 作业的 `--max-budget-usd` 夹到剩余额度，剩余不足 $1 时 `s5g_budget_exhausted`。
 - `code.daily_new_runnability` / `code.daily_new_authoring`：每天（北京时间）首次进入 S4c / S5G 的论文数上限，
   记在 run 目录 `s4c-admissions.jsonl` / `s5g-admissions.jsonl`（同一篇的重出题、加难轮次不重复计数）；
-  超出时条目暂停 `budget:daily_s5g_papers`，次日 `tbsgen resume --reason budget:daily` 恢复。
+  超出时条目暂停 `budget:daily_s5g_papers`，次日 `tbsgen resume --reason budget:daily` 恢复（驱动跨日时执行）。只有作业真正启动才计入当天名额；
+  设了单篇上限时，作业在账本里按整份额度预留（成本未知时不会少算），恢复时沿用同一预留额。准入检查、预留和启动在 run 级锁
+  `.agent-slots.lock` 下完成。
 - `code.max_concurrent_agent_jobs`：同时运行的 S4c + S5G 作业上限；满时条目 waiting（`queued: agent slots full`），
   下一轮自动重试。
 

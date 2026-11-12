@@ -2,6 +2,7 @@
 P is the Pipeline (cfg, store, ledger, clients).  Handlers write outputs before committing state."""
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import time
 import json
@@ -579,31 +580,49 @@ def _agent_stage(P, it, kind: str, instruction: str, need: list[str], timeout_s:
         if left_s < floor[0] or (left_usd is not None and left_usd < floor[1]):
             it.finish("dropped", f"{kind.lower()}_budget_exhausted", spent=spent, item_usd_left=cap_left)
             return None
-        why = _agent_admission(P, it, kind)
-        if why:
-            it.finish("paused" if why.startswith("budget:") else "waiting", why, paused_stage=kind)
-            return None
         timeout_s, max_usd, est_usd = left_s, left_usd, min(est_usd, left_usd) if left_usd is not None else est_usd
-        n = it.bump(f"{kind}:job")
-        work = it.p(kind, "work")
-        codeagent.stage_inputs(P.cfg, it, work, with_contract)
-        task = codeagent.build_agent_task(P.cfg, kind, it.item_id, work, it.p(kind, "task"), instruction, need,
-                                          timeout_s)
-        jobs = Path(codeagent._c(P.cfg).get("agent_jobs_dir") or it.p(kind, "jobs"))
-        conf = codeagent.agent_job_config(P.cfg, task, f"tbsgen-{it.item_id}-{kind.lower()}{n}", jobs, max_usd)
-        extra = dict(budget=dict(timeout_s=timeout_s, max_usd=max_usd))
-        if rnd is not None:
-            extra["harden_round"] = rnd["round"]
-        rec = codeagent.launch_agent(P.cfg, it, kind, conf, P.ledger, est_usd, extra=extra)
-        rec.update(extra)
-        write_json(recp, rec)
+        if cap_left is not None and max_usd is not None:
+            # with a per-paper cap the ledger reserves the job's whole allowance: an unknown final cost then counts
+            # as that allowance in the ledger too (the same bound spent.json uses), never as a smaller estimate
+            est_usd = float(max_usd)
+        with _agent_slot_lock(P):
+            # admission check, job number, intent, reservation and launch under one run-level lock: two processes
+            # stepping different papers cannot both take the last slot / daily admission
+            why = _agent_admission(P, it, kind)
+            if why:
+                it.finish("paused" if why.startswith("budget:") else "waiting", why, paused_stage=kind)
+                return None
+            n = it.bump(f"{kind}:job")
+            work = it.p(kind, "work")
+            codeagent.stage_inputs(P.cfg, it, work, with_contract)
+            task = codeagent.build_agent_task(P.cfg, kind, it.item_id, work, it.p(kind, "task"), instruction, need,
+                                              timeout_s)
+            jobs = Path(codeagent._c(P.cfg).get("agent_jobs_dir") or it.p(kind, "jobs"))
+            conf = codeagent.agent_job_config(P.cfg, task, f"tbsgen-{it.item_id}-{kind.lower()}{n}", jobs, max_usd)
+            extra = dict(budget=dict(timeout_s=timeout_s, max_usd=max_usd), est_usd=est_usd)
+            if rnd is not None:
+                extra["harden_round"] = rnd["round"]
+            rec = codeagent.launch_agent(P.cfg, it, kind, conf, P.ledger, est_usd, extra=extra)
+            rec.update(extra)
+            write_json(recp, rec)
+            if rec.get("state") == "launched":
+                _agent_admit(P, it, kind)       # counted only once a job of this paper really started
         if rec.get("state") == "launch_failed":
             it.finish("paused", f"code:{kind}:launch_failed", paused_stage=kind)
             return None
         it.finish("waiting", f"{kind}:agent_running", job=rec["job_name"])
         return None
     if rec.get("state") in ("intent", "reserved"):
-        rec = codeagent.launch_agent(P.cfg, it, kind, json.loads(Path(rec["config"]).read_text()), P.ledger, est_usd)
+        # resumed: reuse the persisted reservation amount (clamped to the paper cap when the job was set up); the
+        # record already holds its slot (intent / reserved count as running) and its admission is per paper
+        with _agent_slot_lock(P):
+            rec = codeagent.launch_agent(P.cfg, it, kind, json.loads(Path(rec["config"]).read_text()), P.ledger,
+                                         float(rec.get("est_usd", est_usd)))
+            if rec.get("state") == "launched":
+                _agent_admit(P, it, kind)
+        if rec.get("state") == "launch_failed":
+            it.finish("paused", f"code:{kind}:launch_failed", paused_stage=kind)
+            return None
         it.finish("waiting", f"{kind}:agent_running", job=rec.get("job_name"))
         return None
     if rec.get("state") == "launched":
@@ -825,13 +844,33 @@ def _admissions_path(P, kind: str) -> Path:
     return P.store.root / f"{kind.lower()}-admissions.jsonl"
 
 
-def _agent_admission(P, it, kind: str) -> str | None:
-    """Production throttles before a new S4c / S5G job: code.max_concurrent_agent_jobs (running S4c + S5G jobs of
-    this run; "queued:" -> the item waits and is polled again) and code.daily_new_runnability /
-    daily_new_authoring (papers admitted per Asia/Shanghai day; "budget:daily_*" -> paused, resumed by the next
-    day's `resume --reason budget:daily`).  A paper is admitted once (<kind>-admissions.jsonl); later jobs of the
-    same paper (re-authoring, hardening rounds) are not counted again."""
+@contextlib.contextmanager
+def _agent_slot_lock(P):
     import fcntl
+    with open(P.store.root / ".agent-slots.lock", "a") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+
+
+def _admissions(P, kind: str) -> list[dict]:
+    path = _admissions_path(P, kind)
+    return [json.loads(x) for x in path.read_text().splitlines() if x.strip()] if path.exists() else []
+
+
+def _cst_day() -> str:
+    return time.strftime("%Y-%m-%d", time.gmtime(time.time() + 8 * 3600))
+
+
+def _agent_admission(P, it, kind: str) -> str | None:
+    """Production throttles before a new S4c / S5G job (call under _agent_slot_lock): code.max_concurrent_agent_jobs
+    (S4c + S5G records of this run in intent / reserved / launched; "queued:" -> the item waits and is polled
+    again) and code.daily_new_runnability / daily_new_authoring (papers whose first job of that stage STARTED on
+    this Asia/Shanghai day; "budget:daily_*" -> paused until the next day's `resume --reason budget:daily`).  A
+    paper is recorded when its job starts (_agent_admit); later jobs of the same paper (re-authoring, hardening
+    rounds) are not counted again."""
     c = codegate.ccfg(P.cfg)
     cap = c.get("max_concurrent_agent_jobs")
     if cap is not None:
@@ -841,27 +880,31 @@ def _agent_admission(P, it, kind: str) -> str | None:
                 continue
             for k in ("S4c", "S5G"):
                 r = read_json(other.p(k, "run.json"), None) or {}
-                if r.get("state") in ("reserved", "launched"):
+                if r.get("state") in ("intent", "reserved", "launched"):
                     running += 1
         if running >= int(cap):
             return f"{kind}:queued: agent slots full ({running}/{cap})"
     lim = c.get({"S4c": "daily_new_runnability", "S5G": "daily_new_authoring"}[kind])
     if lim is None:
         return None
-    day = time.strftime("%Y-%m-%d", time.gmtime(time.time() + 8 * 3600))
-    path = _admissions_path(P, kind)
-    with open(str(path) + ".lock", "a") as lk:
-        fcntl.flock(lk, fcntl.LOCK_EX)
-        rows = [json.loads(x) for x in path.read_text().splitlines() if x.strip()] if path.exists() else []
-        if any(r.get("item") == it.item_id for r in rows):
-            return None
-        today = [r for r in rows if r.get("day") == day]
-        if len(today) >= int(lim):
-            return f"budget:daily_{kind.lower()}_papers ({len(today)}/{lim} on {day})"
-        with path.open("a") as f:
-            f.write(json.dumps(dict(day=day, item=it.item_id, ts=time.time())) + "\n")
-    P.store.event(f"{kind.lower()}_admitted", item=it.item_id, day=day, n=len(today) + 1, limit=lim)
+    rows = _admissions(P, kind)
+    if any(r.get("item") == it.item_id for r in rows):
+        return None
+    day = _cst_day()
+    today = [r for r in rows if r.get("day") == day]
+    if len(today) >= int(lim):
+        return f"budget:daily_{kind.lower()}_papers ({len(today)}/{lim} on {day})"
     return None
+
+
+def _agent_admit(P, it, kind: str) -> None:
+    """Record that this paper's first job of `kind` started (idempotent; call under _agent_slot_lock)."""
+    if any(r.get("item") == it.item_id for r in _admissions(P, kind)):
+        return
+    day = _cst_day()
+    with _admissions_path(P, kind).open("a") as f:
+        f.write(json.dumps(dict(day=day, item=it.item_id, ts=time.time())) + "\n")
+    P.store.event(f"{kind.lower()}_admitted", item=it.item_id, day=day)
 
 
 def _agent_reauthor(P, it, why: str, force: bool = False) -> bool:
