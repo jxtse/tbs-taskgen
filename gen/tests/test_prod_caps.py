@@ -107,3 +107,43 @@ def test_reservation_is_the_job_allowance_and_admission_only_on_launch(tmp_path,
     rec = read_json(it.p("S5G", "run.json"))
     assert rec["state"] == "launched" and rec["est_usd"] == 10.0
     assert len((P.store.root / "s5g-admissions.jsonl").read_text().splitlines()) == 1
+
+
+def test_intent_holds_no_slot_and_resumed_intent_is_readmitted(tmp_path, monkeypatch):
+    P, it, fl = _agent_item(tmp_path, monkeypatch, _files(design=None), stage="S5G")
+    [b] = P.ingest([{"doi": "10.1/b", "title": "Other"}])
+    itb = P.store.item(b)
+    itb.p("fulltext.txt").write_text("paper")
+    from tbsgen.state import write_json
+    write_json(itb.p("S3c_code.json"), {"ok": True, "pin": "p", "remote_dir": "/r/y"})
+    itb.state["stage"] = "S5G"
+    itb.save()
+    # item A: budget stop at reservation -> intent left behind
+    P.cfg["budget"]["daily_usd_per_model"] = {"claude-opus-5-5": 1.0}
+    P.run(max_steps=1, only=[it.item_id], until="S5G")
+    assert read_json(it.p("S5G", "run.json"))["state"] == "intent"
+    assert P.store.item(it.item_id).state["reason"].startswith("budget:")
+    # the intent holds no slot: B starts with max_concurrent_agent_jobs = 1
+    P.cfg["budget"]["daily_usd_per_model"] = {}
+    P.cfg["code"]["max_concurrent_agent_jobs"] = 1
+    P.cfg["code"]["daily_new_authoring"] = 1
+    P.stopped_models.clear()
+    P.run(max_steps=1, only=[b], until="S5G")
+    assert read_json(itb.p("S5G", "run.json"))["state"] == "launched"
+    # A resumed: its intent goes through admission again -> daily cap (1) reached by B
+    P.resume(("budget:",))
+    P.cfg["code"]["max_concurrent_agent_jobs"] = None
+    P.run(max_steps=1, only=[it.item_id], until="S5G")
+    st = P.store.item(it.item_id).state
+    assert st["status"] == "paused" and st["reason"].startswith("budget:daily_s5g_papers"), st
+    assert len(fl.calls) == 1
+
+
+def test_admission_backfilled_after_a_crash(tmp_path, monkeypatch):
+    P, it, fl = _agent_item(tmp_path, monkeypatch, _files(design=None), stage="S5G")
+    P.cfg["code"]["daily_new_authoring"] = 5
+    P.run(max_steps=1, until="S5G")
+    (P.store.root / "s5g-admissions.jsonl").unlink()               # lost: crash after "launched"
+    P.run(max_steps=1, until="S5G")                                # the launched branch re-records it
+    rows = (P.store.root / "s5g-admissions.jsonl").read_text().splitlines()
+    assert len(rows) == 1 and it.item_id in rows[0]

@@ -616,6 +616,12 @@ def _agent_stage(P, it, kind: str, instruction: str, need: list[str], timeout_s:
         # resumed: reuse the persisted reservation amount (clamped to the paper cap when the job was set up); the
         # record already holds its slot (intent / reserved count as running) and its admission is per paper
         with _agent_slot_lock(P):
+            if rec.get("state") == "intent":
+                # never reserved (e.g. a budget stop): it holds no slot and no admission -> same checks as new
+                why = _agent_admission(P, it, kind)
+                if why:
+                    it.finish("paused" if why.startswith("budget:") else "waiting", why, paused_stage=kind)
+                    return None
             rec = codeagent.launch_agent(P.cfg, it, kind, json.loads(Path(rec["config"]).read_text()), P.ledger,
                                          float(rec.get("est_usd", est_usd)))
             if rec.get("state") == "launched":
@@ -626,6 +632,9 @@ def _agent_stage(P, it, kind: str, instruction: str, need: list[str], timeout_s:
         it.finish("waiting", f"{kind}:agent_running", job=rec.get("job_name"))
         return None
     if rec.get("state") == "launched":
+        if codegate.ccfg(P.cfg).get({"S4c": "daily_new_runnability", "S5G": "daily_new_authoring"}[kind]) is not None:
+            with _agent_slot_lock(P):
+                _agent_admit(P, it, kind)       # idempotent: a crash between "launched" and the admission line
         rec = codeagent.poll_agent(P.cfg, it, kind, P.ledger)
         if rec is None or rec.get("state") != "finished":
             if it.state.get("status") != "waiting":
@@ -880,13 +889,14 @@ def _agent_admission(P, it, kind: str) -> str | None:
                 continue
             for k in ("S4c", "S5G"):
                 r = read_json(other.p(k, "run.json"), None) or {}
-                if r.get("state") in ("intent", "reserved", "launched"):
+                if r.get("state") in ("reserved", "launched"):      # an intent holds no reservation / slot
                     running += 1
         if running >= int(cap):
             return f"{kind}:queued: agent slots full ({running}/{cap})"
     lim = c.get({"S4c": "daily_new_runnability", "S5G": "daily_new_authoring"}[kind])
     if lim is None:
         return None
+    _backfill_admissions(P, kind)
     rows = _admissions(P, kind)
     if any(r.get("item") == it.item_id for r in rows):
         return None
@@ -895,6 +905,20 @@ def _agent_admission(P, it, kind: str) -> str | None:
     if len(today) >= int(lim):
         return f"budget:daily_{kind.lower()}_papers ({len(today)}/{lim} on {day})"
     return None
+
+
+def _backfill_admissions(P, kind: str) -> None:
+    """Papers whose job of `kind` started (launch_attempted, state launched / finished) but whose admission line is
+    missing (crash in between): record them on the day of their launch."""
+    have = {r.get("item") for r in _admissions(P, kind)}
+    for other in P.store.items():
+        if other.item_id in have:
+            continue
+        r = read_json(other.p(kind, "run.json"), None) or {}
+        if r.get("launch_attempted") and r.get("state") in ("launched", "finished") and not r.get("not_started"):
+            day = time.strftime("%Y-%m-%d", time.gmtime(float(r["launch_attempted"]) + 8 * 3600))
+            with _admissions_path(P, kind).open("a") as f:
+                f.write(json.dumps(dict(day=day, item=other.item_id, ts=time.time(), backfilled=True)) + "\n")
 
 
 def _agent_admit(P, it, kind: str) -> None:
