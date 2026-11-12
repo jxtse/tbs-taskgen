@@ -55,11 +55,19 @@ def load_profile(cfg: dict) -> dict | None:
         raise ValueError(f"weakness profile {path.name}: no '## <ID> <title>' entries")
     pid = dcfg(cfg).get("profile_id")
     m = _FM_RE.match(text)
-    if not pid and m:
-        for line in m.group(1).splitlines():
-            if line.strip().startswith("profile_id:"):
-                pid = line.split(":", 1)[1].strip()
-    return dict(id=pid or path.stem, sha=hashlib.sha256(text.encode()).hexdigest()[:16], ids=ids, text=text)
+    preferred: list[str] = []
+    for line in (m.group(1).splitlines() if m else []):
+        k, _, v = line.partition(":")
+        if k.strip() == "profile_id" and not pid:
+            pid = v.strip()
+        elif k.strip() == "preferred":
+            # `preferred: [ID, ID]`: levers to use first (hardening rounds must use at least one of them)
+            preferred = [x.strip().strip("'\"") for x in v.strip().strip("[]").split(",") if x.strip()]
+    bad = [x for x in preferred if x not in ids]
+    if bad:
+        raise ValueError(f"weakness profile {path.name}: preferred ids {bad} are not profile entries")
+    return dict(id=pid or path.stem, sha=hashlib.sha256(text.encode()).hexdigest()[:16], ids=ids, text=text,
+                preferred=preferred)
 
 
 def profile_problem(cfg: dict) -> str | None:
@@ -105,6 +113,9 @@ def validate_design(design, prof: dict, spec: dict, harden_round: int = 0) -> li
                 errs.append(f"levers[{i}].metrics {bad} are not metrics of the spec")
     if not str(design.get("artificial_difficulty_check") or "").strip():
         errs.append("artificial_difficulty_check is empty")
+    pref = prof.get("preferred") or []
+    if harden_round and pref and not any(isinstance(lv, dict) and lv.get("weakness_id") in pref for lv in levers):
+        errs.append(f"a hardening round must use at least one preferred lever ({', '.join(pref)})")
     if harden_round:
         h = design.get("hardening")
         if not isinstance(h, dict) or not str(h.get("changes") or "").strip() or \
@@ -315,6 +326,17 @@ def _sha_parts(task: Path, parts) -> str:
     return h.hexdigest()[:16]
 
 
+def preferred_problem(chk: dict, prof: dict | None, hround: int) -> list[str]:
+    """S7 rule of a hardening round when the profile lists `preferred:` ids: at least one preferred lever must be
+    shown by the measurements (check_lever_separation's per-lever `shown`)."""
+    pref = (prof or {}).get("preferred") or []
+    if not hround or not pref:
+        return []
+    if any(lv.get("shown") and lv.get("weakness_id") in pref for lv in chk.get("levers") or []):
+        return []
+    return [f"hardening round {hround}: no preferred lever ({', '.join(pref)}) is shown by the measurements"]
+
+
 # ------------------------------------------------------------------ hardening loop
 def harden_enabled(cfg: dict, it) -> bool:
     d = dcfg(cfg)
@@ -332,9 +354,40 @@ def decisive(runs: list[dict], cfg: dict) -> list[dict] | None:
         return None
 
 
+def rounds_used(it) -> int:
+    """Hardening rounds that count against harden_max_rounds: every start except those reverted for
+    infrastructure (state.harden_reverted[].infra)."""
+    k = int(it.state.get("harden_round", 0))
+    return k - sum(1 for r in it.state.get("harden_reverted") or [] if r.get("infra"))
+
+
 def rounds_left(cfg: dict, it) -> bool:
-    return not it.state.get("harden_exhausted") and \
-        int(it.state.get("harden_round", 0)) < int(dcfg(cfg).get("harden_max_rounds", 2))
+    d = dcfg(cfg)
+    return not it.state.get("harden_exhausted") and rounds_used(it) < int(d.get("harden_max_rounds", 2)) and \
+        int(it.state.get("harden_round", 0)) < int(d.get("harden_max_attempts", 4))
+
+
+# reasons of a failed hardened version that are infrastructure, not the round's science or budget
+_INFRA_EXC = {"NonZeroAgentExitCodeError", "AgentSetupTimeoutError", "EnvironmentStartTimeoutError"}
+_INFRA_MODEL = re.compile(r"^model_error:[^:]+:(network|stream|empty)$")
+
+
+def revert_infra(it, stage: str | None, reason: str | None) -> str | None:
+    """Why a hardened version that failed to build is an infrastructure failure (None = a real round): the S5G
+    agent exited non-zero / never set up and delivered no files, the launcher or the job died without a result, a
+    launch failed, or a model call failed on the network.  Budget stops (s5g_budget_exhausted, item_*_usd_cap,
+    s5g_jobs_exhausted) and agent time-outs are real rounds."""
+    reason = str(reason or "")
+    if reason == "s5g_missing_files" and stage == "S5G":
+        r = read_json(it.p("S5G_result.json"), {}) or {}
+        if r.get("outcome") in ("launcher_failed", "no_result"):
+            return f"s5g:{r['outcome']}"
+        if r.get("exception") in _INFRA_EXC:
+            return f"s5g:{r['exception']}"
+        return None
+    if reason.endswith(":launch_failed") or _INFRA_MODEL.match(reason):
+        return reason
+    return None
 
 
 def should_harden(cfg: dict, it, runs: list[dict]) -> bool:

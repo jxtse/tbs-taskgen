@@ -736,7 +736,8 @@ def _s5g(P, it):
     paper really supports and records them in _spec/difficulty_design.json; in a hardening round (difficulty.py)
     it gets the previous version and the student's passing-run summary and makes the task harder."""
     from . import codeagent, difficulty
-    from .prompts_code import CODE_PROMPT_VERSION, S5G_AUTHOR, S5G_DIFFICULTY, S5G_HARDEN
+    from .prompts_code import (CODE_PROMPT_VERSION, S5G_AUTHOR, S5G_DIFFICULTY, S5G_HARDEN, S5G_HARDEN_PREFERRED,
+                               S5G_PREFERRED)
     c = codegate.ccfg(P.cfg)
     d = difficulty.dcfg(P.cfg)
     tmo = float(c.get("authoring_timeout_s", 7200))
@@ -750,10 +751,16 @@ def _s5g(P, it):
                                     hours_lo=lo, hours_hi=hi)
     need = list(S5G_FILES)
     if prof:
-        instruction += S5G_DIFFICULTY.format(profile_id=prof["id"])
+        pref = ", ".join(prof.get("preferred") or [])
+        instruction += S5G_DIFFICULTY.format(profile_id=prof["id"],
+                                             preferred=S5G_PREFERRED.format(ids=pref) if pref else "")
         need.append("_spec/" + difficulty.DESIGN_FILE)
     if hround:
-        instruction += S5G_HARDEN.format(round=hround, max_rounds=int(d.get("harden_max_rounds", 2)))
+        pref = ", ".join((prof or {}).get("preferred") or [])
+        # the round as counted against harden_max_rounds (an infra-reverted attempt does not count)
+        instruction += S5G_HARDEN.format(round=max(1, difficulty.rounds_used(it)),
+                                         max_rounds=int(d.get("harden_max_rounds", 2)),
+                                         preferred=S5G_HARDEN_PREFERRED.format(ids=pref) if pref else "")
     rnd = None
     if hround:
         ht, hu = d.get("harden_authoring_timeout_s"), d.get("harden_authoring_max_usd")

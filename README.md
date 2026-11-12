@@ -250,8 +250,13 @@ difficulty (vague wording, hidden requirements, format traps, edge thresholds, t
 `difficulty.harden` (default on, `harden_max_rounds = 2`) a task the student solves on its first S9 attempt goes
 back to S5G with the previous version and a sanitised summary of the passing run (its own final message, minutes,
 per-metric margins; never verifier output or truth), is rebuilt and re-gated from S6A_run, and is recalibrated from
-scratch; a hardened version that fails to build reverts to the previous one. `tbsgen harden --item ID` starts a
-round by hand. Details: [`gen/README.md`](gen/README.md) §0b (Chinese).
+scratch; a hardened version that fails to build reverts to the previous one. A revert caused by infrastructure
+(the authoring agent exited without deliverables, a launcher / relay failure, a network model error) does not use
+up a round; `harden_max_attempts` (default 4) bounds all hardening starts of an item. `budget.item_harden_usd_cap`
+(default unset = the rounds share `item_usd_cap`) gives all hardening rounds of a paper one separate allowance
+(S5G..S8 and S7 calls of a round are tagged in the ledger). A profile may list `preferred: [ID, ...]` in its front
+matter: S5G is asked to use them first, and a hardening round must use and show at least one of them (S5G design
+check and S7). `tbsgen harden --item ID` starts a round by hand. Details: [`gen/README.md`](gen/README.md) §0b (Chinese).
 
 ### S2 abstract screen
 

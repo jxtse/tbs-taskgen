@@ -37,6 +37,10 @@ DEFAULTS: dict[str, Any] = {
         # settled + reserved USD of one item.  Agent jobs (S4c / S5G) get --max-budget-usd clamped to what is left
         "item_usd_cap": None,
         "item_usd_cap_stages": ["S4c", "S5", "S5G", "S6A", "S6M", "S6C", "S8"],
+        # separate cap for all hardening rounds of one item together (difficulty.py; those stages + S7, reservations
+        # tagged with the round).  None = the hardening rounds share item_usd_cap (the original rule); set: the
+        # first version keeps item_usd_cap to itself and the rounds get this one
+        "item_harden_usd_cap": None,
         "run_calls_per_model": {},
         "max_calls_per_item": 24,           # all stages, all attempts, one item
         "breaker_consecutive_errors": 4,    # N consecutive failed calls -> breaker opens for that model
@@ -497,7 +501,10 @@ DEFAULTS: dict[str, Any] = {
         "profile_id": None,                 # default: front matter profile_id, else the file stem
         "design_gate": "block",             # S7 check of _spec/difficulty_design.json: block | warn | off
         "harden": True,                     # hardening loop on (code-grounded items only)
-        "harden_max_rounds": 2,             # per item; then S9 calibrates under the original rule
+        "harden_max_rounds": 2,             # per item; then S9 calibrates under the original rule.  A round
+                                            # reverted for infrastructure (agent died without deliverables,
+                                            # launcher / relay failure, model network errors) is not counted
+        "harden_max_attempts": 4,           # all hardening starts of one item incl. infra-reverted ones (no loop)
         "harden_authoring_timeout_s": None, # extra S5G time per round (None = code.authoring_timeout_s)
         "harden_authoring_max_usd": None,   # extra S5G spend per round (None = code.authoring_max_usd)
         "harden_exclude": [],               # item ids never hardened

@@ -15,7 +15,7 @@ import traceback
 from pathlib import Path
 
 from . import blocklist, intake, screen_jev, stages_a as A, stages_b as B
-from .budget import BudgetStop, Ledger, today
+from .budget import BudgetStop, Ledger, harden_scope, today
 from .config import resolve_role
 from .models import ModelError, get_client
 from .state import STAGES, Store, read_json, write_json
@@ -129,6 +129,12 @@ class Pipeline:
 
     # ------------------------------------------------------------------ run loop
     def step(self, it) -> str:
+        # a hardening round's reservations are tagged with the round (budget.item_harden_usd_cap)
+        hk = int(it.state.get("harden_round", 0) or 0) if it.state.get("harden_active") else 0
+        with harden_scope(hk):
+            return self._step(it)
+
+    def _step(self, it) -> str:
         st = it.state["stage"]
         role = MODEL_STAGES.get(st)
         alias = resolve_role(self.cfg, role) if role else None
@@ -146,10 +152,10 @@ class Pipeline:
                 if B.harden_needs_step(it):
                     B.harden_step(self, it)     # a hardened version that failed to build: back to the old one
         except BudgetStop as e:
-            if e.reason == "item_usd":
-                # this paper's authoring allowance (budget.item_usd_cap) is used up: final for the paper, and the
-                # model stays available for the other papers
-                it.finish("dropped", "item_usd_cap", detail=e.detail)
+            if e.reason in ("item_usd", "item_harden_usd"):
+                # this paper's authoring allowance (budget.item_usd_cap, or item_harden_usd_cap in a hardening
+                # round) is used up: final for the paper / the round, and the model stays available for the others
+                it.finish("dropped", e.reason + "_cap", detail=e.detail)
                 if B.harden_needs_step(it):
                     B.harden_step(self, it)     # a hardened version: back to the previous one
                 self.store.event("budget_stop", item=it.item_id, stage=st, reason=e.reason, detail=e.detail)
