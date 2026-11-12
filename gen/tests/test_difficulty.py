@@ -507,3 +507,23 @@ def test_agent_jobs_have_their_own_launch_log_and_resume_never_starts_twice(tmp_
     out = codeagent.launch_agent(P.cfg, it, "S5G", conf, None, 1.0)
     assert out["state"] == "launched" and [a[1] for a in calls][-2:] == ["has-session", "new-session"]
     assert out["log"].endswith("-s5g2.launch.log")
+
+
+def test_poll_does_not_trust_a_shared_logs_exit_while_the_session_lives(tmp_path, monkeypatch):
+    from tbsgen import codeagent
+    P, it, fl = _profiled(tmp_path, monkeypatch, _files())
+    d = it.p("S5G")
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "launch.log").write_text("old")
+    (d / "launch.log.exit").write_text("0")                       # written by an earlier job's launcher
+    jd = tmp_path / "jobs" / "J-s5g2"
+    jd.mkdir(parents=True)
+    write_json(d / "run.json", dict(job_name="J-s5g2", state="launched", job_dir=str(jd), log=str(d / "launch.log"),
+                                    tmux="J-s5g2", kind="S5G", launch_attempted=1.0))
+    rc = {"v": 0}
+    monkeypatch.setattr(codeagent.subprocess, "run", lambda args, **kw:
+                        __import__("subprocess").CompletedProcess(args, rc["v"], "", "can't find session"))
+    assert codeagent.poll_agent(P.cfg, it, "S5G", None) is None    # session alive: still running
+    rc["v"] = 1
+    out = codeagent.poll_agent(P.cfg, it, "S5G", None)             # session gone, no Harbor job: launcher failed
+    assert out["outcome"] == "launcher_failed"

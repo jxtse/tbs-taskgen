@@ -467,6 +467,12 @@ def poll_agent(cfg: dict, it, kind: str, ledger) -> dict | None:
     jd = Path(rec["job_dir"])
     res = read_json(jd / "result.json", {}) or {}
     exitf = Path(str(rec.get("log", "")) + ".exit")
+    if not Path(str(rec.get("log", ""))).name.startswith(str(rec.get("job_name"))) and exitf.exists():
+        # a pre-fix record on the shared <stage>/launch.log: that .exit may be an earlier job's; trust it only once
+        # this job's tmux session is gone (alive or unknown -> keep waiting)
+        from .calib import session_alive
+        if session_alive(cfg["calib"], rec) is not False:
+            return None
     if not res.get("finished_at"):
         if exitf.exists() and not (jd / "config.json").exists():
             rec.update(state="finished", outcome="launcher_failed",
