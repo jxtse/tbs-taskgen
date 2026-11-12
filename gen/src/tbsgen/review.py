@@ -62,10 +62,10 @@ PROBLEM_CLASSES = {
     "calibration": "fundamental",       # the label cannot be trusted and no local edit changes that
 }
 CHECKLIST = ("a_consistency", "b_missing_conditions", "c_thresholds", "d_stability", "e_shortcuts_leaks",
-             "f_network_readymade", "g_calibration", "h_timing_gate", "i_author_code")
+             "f_network_readymade", "g_calibration", "h_timing_gate", "i_author_code", "j_genuine_difficulty")
 CATEGORIES = {"a": "consistency", "b": "missing_conditions", "c": "thresholds", "d": "stability",
               "e": "shortcuts_leaks", "f": "network_readymade", "g": "calibration", "h": "timing_gate",
-              "i": "author_code"}
+              "i": "author_code", "j": "genuine_difficulty"}
 VERDICT_PATH = "/app/review_out/verdict.json"
 # files a review revision (S8) may change: the statement, the data format notes (written by the generator), the
 # test / scoring scripts, and the exploit baselines.  Never the reference solution, the baselines' mid / naive,
@@ -233,6 +233,19 @@ def write_bundle(item_dir: Path, dest: Path, state: dict, digest_kb: int = 150) 
         shutil.copy2(item_dir / "_spec" / "spec.json", rec / "spec.json")
     if (item_dir / "_spec" / "author_code.json").exists():         # code-grounded: names only, never the code
         shutil.copy2(item_dir / "_spec" / "author_code.json", rec / "author_code.json")
+    for name in ("difficulty_design.json",):                       # the author's difficulty design (S5G)
+        if (item_dir / "_spec" / name).exists():
+            shutil.copy2(item_dir / "_spec" / name, rec / name)
+    if (item_dir / "gates" / "difficulty.json").exists():
+        shutil.copy2(item_dir / "gates" / "difficulty.json", rec / "difficulty_check.json")
+    hr = sorted((item_dir / "harden").glob("round-*/record.json")) if (item_dir / "harden").exists() else []
+    for h in hr:                    # hardening rounds: what changed and why (never the student's feedback)
+        (rec / "hardening").mkdir(exist_ok=True)
+        shutil.copy2(h, rec / "hardening" / f"{h.parent.name}-record.json")
+        prev_task = h.parent / "prev" / "task"
+        if prev_task.is_dir() and (item_dir / "task").is_dir():
+            from .difficulty import version_diff
+            (rec / "hardening" / f"{h.parent.name}-diff.patch").write_text(version_diff(prev_task, item_dir / "task"))
     gates = sorted((item_dir / "gates").glob("attempt-*.json")) if (item_dir / "gates").exists() else []
     if gates:
         (rec / "s7_gates").mkdir()
@@ -491,6 +504,19 @@ i. **Authors' code (code-grounded tasks; `records/author_code.json` exists, else
    leak the authors' implementation (repository / package / function / file names, vendored code, an installable
    package)?  A leak of the authors' implementation is blocking (`statement` if only the wording names it,
    `core_invalid` if the task is only a re-run).
+j. **Genuine difficulty.**  Does the difficulty come from the science itself (a real structure in the data, a
+   real limitation of the obvious method, a real numerical / boundary issue of the paper's method, a scientifically
+   motivated and disclosed shift of the hidden cases)?  If `records/difficulty_design.json` exists, check each
+   lever it claims against the statement, the generator, the reference and the measurements (and
+   `records/difficulty_check.json`); if `records/hardening/` exists, also check what the hardening changed
+   (`round-k-diff.patch`: previous vs current version): a hardening that only moves thresholds (e.g. a weaker
+   mid baseline), makes the wording vaguer or adds a format trap is artificial difficulty.
+   **Artificial difficulty is blocking**: ambiguous or underspecified wording, hidden requirements, conventions
+   that cannot be inferred from the statement / data notes / standard practice, output-format traps, thresholds
+   at the reference's own edge or decided by luck across seeds, or pure time pressure.  Use `statement` /
+   `missing_conditions`-type fixes (problem `statement`) when a wording edit removes it, `core_invalid` when the
+   difficulty exists only because of the artificial element (category j).  The statement must not mention a "weakness
+   profile" or the targeting.  Answer "na" only when nothing in the task is designed to be hard.
 h. **Timing in the verdict.**  Should the resource metric(s) (wall time / memory) count toward the reward
    (`resource_metric_gating` in the spec: true = they gate, false = they are recorded but never decide a run)?
    They should gate only when speed itself is the paper's contribution; otherwise a slower machine would fail a
@@ -543,11 +569,12 @@ Write `{verdict_path}` (JSON, exactly these keys) and optionally `/app/review_ou
     "e_shortcuts_leaks": {{"status": "...", "note": "..."}},
     "f_network_readymade": {{"status": "...", "note": "..."}},
     "i_author_code": {{"status": "...", "note": "..."}},
+    "j_genuine_difficulty": {{"status": "...", "note": "..."}},
     "g_calibration": {{"status": "...", "note": "..."}},
     "h_timing_gate": {{"status": "...", "note": "..."}}
   }},
   "issues": [
-    {{"id": "I1", "category": "a|b|c|d|e|f|g|h", "severity": "blocking | minor",
+    {{"id": "I1", "category": "a|b|c|d|e|f|g|h|i|j", "severity": "blocking | minor",
       "problem": "statement | format_notes | grader_io | exploit_baseline | test_gap | timing_gate | reference_wrong | truth_regen | core_invalid | calibration",
       "leak": false, "title": "...",
       "evidence": ["instruction.md:53 says ... ; tests/measure.py:42 reads ...", "ran X -> output Y"],

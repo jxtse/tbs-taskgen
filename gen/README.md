@@ -59,6 +59,60 @@ PKG 打包时同样检查。S9R 审核清单新增 `i_author_code`：任务是�
 `agent_effort`、`agent_allowed_hosts`、`install_hosts`、`agent_base_image`、`agent_cpus`、`agent_memory_mb`、
 `agent_jobs_dir`、`agent_hints`。检索侧见 `retrieval/README.md` 的“代码通道”。
 
+### 0b. 针对校准学生薄弱点出题与加难回路（`[difficulty]`，2026-11-12 起，仅代码驱动条目）
+
+**弱点画像**：`difficulty.profile_path` 指向一份**内部** markdown 画像（不进仓库）。每条以 `## <ID> <标题>` 开头，
+写清模型在什么情形下容易错、科学计算任务里合法考察它的出题杠杆、如何用 naive/mid/参考解证明杠杆起作用、禁止的假难度
+做法。画像 id 取 front matter 的 `profile_id`（或 `difficulty.profile_id`，否则文件名），连同 sha256 前 16 位记入每题
+`_spec/provenance.json`（`difficulty_profile`、`difficulty_levers`）和发布清单的 `difficulty` 字段。仓库只提供通用示例
+`gen/examples/weakness_profile.example.md`。画像只能写抽象机制，**不得**写入任何评测题的题名、数据、方法细节、阈值或例子。
+
+**S5G 针对性出题**：配了画像时，S5G 作业多一个输入 `/work/weakness_profile.md`，指令要求 agent 先读论文和作者代码、
+找出本文真实存在的关键难点，再挑 1–3 个与画像匹配的杠杆，并把 mid/naive 设计成“漏掉该杠杆”的做法、实测分离；
+另写 `_spec/difficulty_design.json`（`profile`、`levers[]`：`weakness_id`、`lever`、`paper_evidence`、`code_evidence`、
+`why_naive_fails`、`why_mid_fails`、`reference_handles`、`metrics`；`artificial_difficulty_check`）。该文件只在内部，
+不进任务包。结构不合格（id 不在画像里、指标不在 spec 里、1–3 条之外、字段为空）→ 带反馈退回 S5G，用完
+`code.authoring_max_jobs` 后淘汰（`s5g_jobs_exhausted:difficulty_design_invalid`）。
+
+**S7 完整性检查**（`difficulty.design_gate = "block" | "warn" | "off"`，默认 block；产物 `gates/difficulty.json`）：
+每个杠杆至少有一个所列的非资源类指标，在所有种子上参考解过阈值、且 mid 或 naive 在所有种子上不过；题面不得出现画像
+id 或“weakness profile / difficulty design”等字样；加难轮次中题目（生成器、参考解、度量、基线）必须与上一版不同。
+不通过 → 退回 S5G 一次（`difficulty_reauthored`），再不通过淘汰（`difficulty_design_unproven`）。锁定阈值的审核修订 /
+regate 不复查（它们不改科学内容）。
+
+**S9R**：清单新增 `j_genuine_difficulty`：难度是否来自科学本身；审核包里附 `records/difficulty_design.json`、
+`records/difficulty_check.json`、`records/hardening/round-k-record.json`（不含学生轨迹反馈）。含糊题面、隐藏规格、
+不可推断的约定、格式陷阱、压在参考解边缘或靠运气的阈值、单纯时间压力都判 **blocking**。
+
+**加难回路**（`difficulty.harden`，默认开；`harden_max_rounds = 2`）：S9 中学生（DeepSeek，内部角色仍叫 `glm`）**第 1 次
+有效尝试就通过**时，不再跑第 2 次，而是：
+1. 先持久化 `state.harden_pending`（轮次、触发作业、epoch），再写 `harden/round-k/feedback.json`：学生自己的最终总结
+   （claude-code.txt 的 result 文本，截断 4000 字）、用时、费用、解题程序运行秒数、各指标的值/阈值/相对余量。**不给**
+   verifier 输出、学生交付文件、逐对象结果、隐藏输入或真值；
+2. 快照当前版本到 `harden/round-k/prev/`（task、_spec、pkg、gates、thresholds、测量、S5G 报告；`DONE` 标记完成），记录
+   `harden/round-k/record.json`（上一版 task/pkg 哈希、标签、各次运行），撤下已发布条目，归档本轮校准
+   （`calib/epoch-<e>/`，新版本作业名带 `-e<e+1>`，不同版本的结果不合并）；
+3. 清掉上一版的构建计数与过期产物，回到 S5G。S5G 额外得到 `/work/previous_version/`、`/work/student_feedback.json`
+   （以及更早轮次的用时与余量 `earlier_rounds.json`），指令要求按画像从科学上加难，不允许只收紧阈值、把题面写含糊、
+   加格式陷阱或缩短时限；`difficulty_design.json` 必须写 `hardening.changes` 和 `why_previous_solution_fails_now`。
+   每轮另给一份 S5G 额度（`harden_authoring_timeout_s` / `harden_authoring_max_usd`，默认等于 `code.authoring_*`）和一份
+   `authoring_max_jobs`；
+4. 新版本照常 S6A_run → S6B（阈值按新测量和分离规则重推）→ S6C → S7（含上面的完整性检查）→ PKG → S9（从学生重新校准）；
+5. 新版本在 S5G..PKG 被淘汰 / 搁置（且尚未进入 S9R）时自动**回退**到上一版（`harden_revert`：文件从 `prev/` 还原，
+   失败版本移到 `round-k/failed/`，上一版的校准记录从 epoch 归档移回），`harden_exhausted=true`，按原规则继续校准；
+6. 轮次用尽（或 `harden_exhausted`）后按原规则：第 2 次学生运行 → easy / unstable。
+
+可中断、可恢复、幂等：每一步先写状态再动文件；快照有 `DONE` 标记；epoch 只在仍为当前 epoch 时归档；重跑 S9 时用
+`harden_pending` 继续同一轮，不会再次付费。账本里加难作业仍记为阶段 `S5G`；事件 `harden_start`、`harden_authored`、
+`harden_reverted`、`difficulty_design_invalid`、`difficulty_design_failed`；每轮费用在 `harden/round-k/record.json`
+（`author_jobs`、`author_cost_usd`）。旧的非代码驱动条目不走回路。
+
+手动送入：`tbsgen harden --run R --config C --item ID --reason TEXT`，用于回路上线前已判 easy 的条目（要求当前校准有
+学生通过记录、没有进行中的作业、尚未做过 S9R 审核）。
+
+配置（`[difficulty]`）：`profile_path`、`profile_id`、`design_gate`、`harden`、`harden_max_rounds`、
+`harden_authoring_timeout_s`、`harden_authoring_max_usd`、`harden_exclude`。
+
 ## 1. 架构
 
 ```
@@ -70,7 +124,8 @@ src/tbsgen/
   pipeline.py      编排：逐条推进、断点续跑、预算/熔断暂停、resume
   codegate.py      代码驱动出题：S2a 代码信号预筛、S3b 作者代码确认与仓库解析（§0）
   codeagent.py     代码驱动出题：S3c 构建机获取代码、S4c / S5G 构建机 Claude Code agent 作业（§0）
-  prompts_code.py  S4c 可运行性、S5G 出题 agent 的指令
+  prompts_code.py  S4c 可运行性、S5G 出题 agent 的指令（含针对性出题、加难轮次附加段）
+  difficulty.py    弱点画像加载、difficulty_design 校验、S7 杠杆完整性检查、加难回路的反馈 / 快照 / 回退（§0b）
   intake.py        S1 读检索层输出；S2 规则筛选（rules-v2）；S3 全文（调 fulltext.py）；S4 可行性（规则部分 + 官方题去重）
   blocklist.py     S2 前置黑名单：按 DOI 前缀（可加发表年份）直接丢弃拿不到全文的论文，配置 screen.blocklist；
                    自动复查（screen.blocklist_recheck）：每周少量试取，成功率够高自动解除规则

@@ -241,6 +241,18 @@ repository. `sandbox.backend = "ssh"` runs the generator / reference / baselines
 (`code.top_n_factor`, default 2.75) and prefers papers from `code.min_year` (default 2018) on. Details:
 [`gen/README.md`](gen/README.md) §0.
 
+**Difficulty targeting** (`[difficulty]`, code-grounded items only). `difficulty.profile_path` points to an
+internal weakness profile of the calibration student (abstract failure mechanisms with legitimate authoring levers;
+a generic example is `gen/examples/weakness_profile.example.md`). S5G then asks the agent to find the paper's real
+difficulties first and target 1-3 matching weaknesses, recorded in `_spec/difficulty_design.json` (internal); S7
+checks that each lever shows in the measured reference / mid / naive values, and the S9R checklist treats artificial
+difficulty (vague wording, hidden requirements, format traps, edge thresholds, time pressure) as blocking. With
+`difficulty.harden` (default on, `harden_max_rounds = 2`) a task the student solves on its first S9 attempt goes
+back to S5G with the previous version and a sanitised summary of the passing run (its own final message, minutes,
+per-metric margins; never verifier output or truth), is rebuilt and re-gated from S6A_run, and is recalibrated from
+scratch; a hardened version that fails to build reverts to the previous one. `tbsgen harden --item ID` starts a
+round by hand. Details: [`gen/README.md`](gen/README.md) §0b (Chinese).
+
 ### S2 abstract screen
 
 S2 decides from the bibliographic record (title, abstract, venue, year, code/data links) whether a paper is worth

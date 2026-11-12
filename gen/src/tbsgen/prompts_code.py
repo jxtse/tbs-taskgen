@@ -1,6 +1,6 @@
 """Instructions for the code-grounded agent jobs (S4c runnability, S5G task authoring).  Versioned like prompts.py."""
 
-CODE_PROMPT_VERSION = "cg-v1-2026-11-12"
+CODE_PROMPT_VERSION = "cg-v2-2026-11-12"   # v2: difficulty targeting + hardening rounds
 
 S4C_RUNNABILITY = """# Runnability check of a paper's published code ({item})
 
@@ -110,4 +110,65 @@ finishes in < 15 min on 2 CPUs; the generator in < 5 min.  If they do not separa
 mid_drop, hidden shift), not the numbers.  Record the measured values in report.md.
 
 Do not write thresholds; the pipeline measures and sets them.  Do not upload anything.
+"""
+
+
+# appended to S5G_AUTHOR when difficulty.profile_path is set (difficulty.py)
+S5G_DIFFICULTY = """
+## Target the solver's known weak points (difficulty design)
+`/work/weakness_profile.md` (profile `{profile_id}`) lists mechanisms by which the AI agents this benchmark is
+calibrated on tend to fail, each with a legitimate authoring lever, how to show the lever works, and the forbidden
+shortcuts.  Use it like this:
+1. **First** read the paper and the authors' code and list the difficulties this scientific problem really has
+   (what the paper says is hard, what the authors' code handles specially: residual structure, a richer model than
+   the obvious one, coupled estimation, a regime / boundary / stability treatment, an estimator for an unknown
+   setting, a discriminating diagnostic, ...).
+2. **Then** pick 1-3 profile entries whose lever matches one of those real difficulties, and build the task so that
+   the scored metrics depend on getting that point right.  Do not force a lever the paper does not support; do not
+   make the task harder in any way the profile forbids (ambiguous wording, hidden requirements, conventions that
+   cannot be inferred, format traps, thresholds at the reference's edge, pure time pressure).
+3. Make `mid_drop` / the naive baseline the approach that misses the lever (e.g. the generic method, the first
+   plausible model without the residual-driven extension, the public-data-tuned setting), and **measure** it: the
+   reference must pass and mid or naive must fail on the lever's metrics on every seed.  Put the measured values in
+   report.md.
+4. The statement must stay complete and fair: everything a careful expert needs is in the statement, the data notes
+   or standard practice; a solver who investigates anomalies, validates independently and models from the paper's
+   principles can pass.  Never mention the profile, weak points, ids or "traps" in any task file.
+
+Also write `/app/out/_spec/difficulty_design.json` (internal; never shipped to solvers):
+```
+{{"profile": "{profile_id}",
+ "levers": [{{"weakness_id": "<id from the profile>", "lever": "<what in this task exercises it>",
+             "paper_evidence": "<section / equation / figure>", "code_evidence": "<authors' file:line / function>",
+             "why_naive_fails": "...", "why_mid_fails": "...", "reference_handles": "...",
+             "metrics": ["<spec metric names on which the lever shows>"]}}],
+ "artificial_difficulty_check": "<why none of the forbidden shortcuts is used>"}}
+```
+The pipeline checks the design against the measured reference / mid / naive values; a lever that does not show in
+the measurements sends the task back.
+"""
+
+# appended in a hardening round (the student solved the previous version on its first attempt)
+S5G_HARDEN = """
+## Hardening round {round} of at most {max_rounds}: the previous version was too easy
+The calibration student solved the previous version of this task on its first attempt.  You get:
+- `/work/previous_version/` — the previous task (`task/`: statement, generator, reference, metric script,
+  baselines), its `spec.json`, `difficulty_design.json` (if any), `thresholds.json` (as derived from the reference /
+  mid / naive measurements), `S6A_measure.json` and the previous `report.md`.
+- `/work/student_feedback.json` — the student's own final summary of its method, its elapsed minutes and, per scored
+  metric, its value, the threshold and the relative margin.  (`/work/earlier_rounds.json`: earlier rounds, if any.)
+Make the task harder **scientifically**, using the profile: find where the student's method got through (large
+margins = the metric does not depend on the hard part; a generic method that passed = the task does not need the
+paper's principle) and change the task so that the decisive part needs what the paper really does (a regime where
+the generic method breaks, residual structure that matters for the score, a disclosed hidden shift, a per-object /
+per-parameter criterion on the scientifically hard object, a setting that must be estimated, ...).  Rules:
+- Keep it the same paper and the same core scientific problem; keep the statement complete and fair.
+- **Not allowed**: only tightening thresholds or moving them towards the reference (thresholds are derived by the
+  pipeline from your measured reference / mid / naive values, with the usual separation rules), making the wording
+  vaguer, hiding requirements, format traps, shortening the time limit, inflating data sizes without a scientific
+  reason.
+- Rebuild and re-measure everything (reference, mid, naive, on seeds 0 and 1) as in a normal authoring job.
+- In `difficulty_design.json` add `"hardening": {{"changes": "<what you changed>",
+  "why_previous_solution_fails_now": "<why the student's method (as summarised) would now fail, with the measured
+  evidence from your own baselines>"}}`.
 """

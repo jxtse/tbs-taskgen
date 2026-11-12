@@ -520,14 +520,21 @@ def s3c(P, it):
 
 
 def _agent_stage(P, it, kind: str, instruction: str, need: list[str], timeout_s: float, max_usd: float | None,
-                 est_usd: float, with_contract: bool):
+                 est_usd: float, with_contract: bool, rnd: dict | None = None):
     """Shared S4c / S5G driver: build + launch the job once, then (later steps) poll it.  Returns the finished
     run record, or None while it runs (the item is left `waiting`)."""
     from . import codeagent
     recp = it.p(kind, "run.json")
     rec = read_json(recp, None)
-    if rec is not None and rec.get("state") == "finished" and it.state.pop(f"{kind}_rerun", None):
+    if rec is not None and rec.get("state") == "finished" and it.state.get(f"{kind}_rerun"):
         rec["retry"] = True                     # S6B sent the task back: author it again (with feedback)
+        write_json(recp, rec)                   # persisted before the flag is dropped (crash / pause safe)
+        it.state.pop(f"{kind}_rerun", None)
+        it.save()
+    if rnd is not None and rec is not None and rec.get("state") == "finished" and not rec.get("retry") and \
+            rec.get("harden_round", 0) != rnd["round"]:
+        rec["retry"] = True                     # a finished job of another version never counts for this round
+        write_json(recp, rec)
     if rec is not None and rec.get("state") == "launch_failed":
         rec["retry"] = True                     # infrastructure: a resumed item launches a fresh job
         rec["state"] = "finished"
@@ -555,6 +562,11 @@ def _agent_stage(P, it, kind: str, instruction: str, need: list[str], timeout_s:
             write_json(sp, charges)
         spent = dict(usd=sum(c["usd"] for c in charges.values()), sec=sum(c["sec"] for c in charges.values()))
         it.state[f"{kind}_spent"] = spent
+        if rnd is not None:
+            # a hardening round (difficulty.py) has its own allowance: spend since the round started
+            base = rnd["base"]
+            spent = dict(usd=spent["usd"] - float(base["usd"]), sec=spent["sec"] - float(base["sec"]))
+            timeout_s, max_usd = float(rnd["timeout_s"]), rnd["max_usd"]
         left_s = timeout_s - spent["sec"]
         left_usd = None if max_usd is None else float(max_usd) - spent["usd"]
         floor = (600.0, 1.0) if spent["sec"] or spent["usd"] else (1.0, 0.01)   # first job: the configured caps
@@ -569,8 +581,11 @@ def _agent_stage(P, it, kind: str, instruction: str, need: list[str], timeout_s:
                                           timeout_s)
         jobs = Path(codeagent._c(P.cfg).get("agent_jobs_dir") or it.p(kind, "jobs"))
         conf = codeagent.agent_job_config(P.cfg, task, f"tbsgen-{it.item_id}-{kind.lower()}{n}", jobs, max_usd)
-        rec = codeagent.launch_agent(P.cfg, it, kind, conf, P.ledger, est_usd)
-        rec["budget"] = dict(timeout_s=timeout_s, max_usd=max_usd)
+        extra = dict(budget=dict(timeout_s=timeout_s, max_usd=max_usd))
+        if rnd is not None:
+            extra["harden_round"] = rnd["round"]
+        rec = codeagent.launch_agent(P.cfg, it, kind, conf, P.ledger, est_usd, extra=extra)
+        rec.update(extra)
         write_json(recp, rec)
         if rec.get("state") == "launch_failed":
             it.finish("paused", f"code:{kind}:launch_failed", paused_stage=kind)
@@ -661,24 +676,59 @@ S5G_FILES = ["_spec/spec.json", "_spec/author_code.json", "task/instruction.md",
 
 
 def s5g(P, it):
-    """Task authoring by a Claude Code agent on the build host (replaces S5 + S6A; same artefacts)."""
-    from . import codeagent
-    from .prompts_code import CODE_PROMPT_VERSION, S5G_AUTHOR
+    """Serialised per item (`run` and `calib watch` may both step it): the job number, inputs, launch and the
+    acceptance of the result happen under the item lock, on a freshly loaded state."""
+    from .stages_b import item_lock
+    with item_lock(it):
+        it.load()
+        if it.state.get("stage") != "S5G" or it.state.get("status") not in ("active", "waiting"):
+            return None
+        return _s5g(P, it)
+
+
+def _s5g(P, it):
+    """Task authoring by a Claude Code agent on the build host (replaces S5 + S6A; same artefacts).  With a
+    weakness profile (difficulty.profile_path) the agent also targets 1-3 of the student's weak points that the
+    paper really supports and records them in _spec/difficulty_design.json; in a hardening round (difficulty.py)
+    it gets the previous version and the student's passing-run summary and makes the task harder."""
+    from . import codeagent, difficulty
+    from .prompts_code import CODE_PROMPT_VERSION, S5G_AUTHOR, S5G_DIFFICULTY, S5G_HARDEN
     c = codegate.ccfg(P.cfg)
+    d = difficulty.dcfg(P.cfg)
     tmo = float(c.get("authoring_timeout_s", 7200))
     lo, hi = P.cfg["spec"].get("expert_hours", [2, 6])
-    rec = _agent_stage(P, it, "S5G", S5G_AUTHOR.format(item=it.item_id, minutes=int(tmo // 60),
-                                                       forms=P.cfg["spec"]["allowed_forms"], hours_lo=lo, hours_hi=hi),
-                       S5G_FILES, tmo, c.get("authoring_max_usd", 20.0), float(c.get("authoring_est_usd", 15.0)),
-                       with_contract=True)
+    try:
+        prof = difficulty.load_profile(P.cfg)
+    except (OSError, ValueError) as e:
+        return it.finish("paused", f"code:config:difficulty_profile:{type(e).__name__}", paused_stage="S5G")
+    hround = int(it.state.get("harden_round", 0)) if it.state.get("harden_active") else 0
+    instruction = S5G_AUTHOR.format(item=it.item_id, minutes=int(tmo // 60), forms=P.cfg["spec"]["allowed_forms"],
+                                    hours_lo=lo, hours_hi=hi)
+    need = list(S5G_FILES)
+    if prof:
+        instruction += S5G_DIFFICULTY.format(profile_id=prof["id"])
+        need.append("_spec/" + difficulty.DESIGN_FILE)
+    if hround:
+        instruction += S5G_HARDEN.format(round=hround, max_rounds=int(d.get("harden_max_rounds", 2)))
+    rnd = None
+    if hround:
+        ht, hu = d.get("harden_authoring_timeout_s"), d.get("harden_authoring_max_usd")
+        base = it.state.get("harden_base") or {}
+        if base.get("round") != hround:
+            return it.finish("parked", f"harden:no_round_base:{hround}")
+        rnd = dict(round=hround, base=base, timeout_s=float(tmo if ht is None else ht),
+                   max_usd=c.get("authoring_max_usd", 20.0) if hu is None else hu)
+    rec = _agent_stage(P, it, "S5G", instruction, need, tmo, c.get("authoring_max_usd", 20.0),
+                       float(c.get("authoring_est_usd", 15.0)), with_contract=True, rnd=rnd)
     if rec is None:
         return
     out = codeagent.deliverable(rec)
-    miss = [f for f in S5G_FILES if not (out and codeagent.safe_read(out / f, root=Path(rec["trial"])) is not None)]
+    miss = [f for f in need if not (out and codeagent.safe_read(out / f, root=Path(rec["trial"])) is not None)]
     write_json(it.p("S5G_result.json"), dict(job=rec.get("job_name"), outcome=rec.get("outcome"),
                                              exception=rec.get("exception"), cost_usd=rec.get("cost_usd"),
                                              cost_kind=rec.get("cost_kind"), minutes=rec.get("minutes"),
-                                             missing=miss, prompt_version=CODE_PROMPT_VERSION))
+                                             missing=miss, prompt_version=CODE_PROMPT_VERSION,
+                                             difficulty_profile=difficulty.provenance(prof), harden_round=hround))
     if miss:
         if rec.get("outcome") in ("launcher_failed", "no_result") and it.bump("S5G:infra") < 2:
             rec["retry"] = True
@@ -693,6 +743,20 @@ def s5g(P, it):
     write_json(it.p("_spec", "spec_errors.json"), errs)
     if errs:
         return it.finish("dropped", "spec_invalid")
+    design = None
+    if prof:
+        try:
+            design = json.loads(codeagent.safe_read(out / "_spec" / difficulty.DESIGN_FILE,
+                                                    root=Path(rec["trial"])) or "")
+        except ValueError:
+            design = None
+        derrs = difficulty.validate_design(design, prof, spec, hround)
+        write_json(it.p("_spec", "difficulty_errors.json"), derrs)
+        if derrs:
+            write_json(it.p("S6_failure.json"), dict(why="difficulty_design_invalid", info=dict(errors=derrs)))
+            P.store.event("difficulty_design_invalid", item=it.item_id, errors=derrs[:5], harden_round=hround)
+            _agent_reauthor(P, it, "difficulty_design_invalid", force=True)
+            return
     task = it.p("task")
     if task.exists():
         shutil.rmtree(task)
@@ -700,9 +764,16 @@ def s5g(P, it):
     if refused:
         shutil.rmtree(task, ignore_errors=True)
         return it.finish("dropped", "s5g_unsafe_files", refused=refused[:10])
-    for extra in ("environment",):                 # the task image is built by PKG only (no agent-made env files)
-        if (task / extra).exists():
-            shutil.rmtree(task / extra)
+    for extra_dir in ("environment",):             # the task image is built by PKG only (no agent-made env files)
+        if (task / extra_dir).exists():
+            shutil.rmtree(task / extra_dir)
+    # S6C products (tests with the thresholds, exploit baselines) are always rebuilt for a new authored version:
+    # an agent that started from an earlier version must not carry its thresholds into the verifier
+    if (task / "tests" / "test_outputs.py").exists():
+        (task / "tests" / "test_outputs.py").unlink()
+    for x in (task / "baselines").glob("exploit_*") if (task / "baselines").is_dir() else []:
+        x.unlink()
+    it.state["regen_6c"] = True
     try:
         author = json.loads(codeagent.safe_read(out / "_spec" / "author_code.json", root=Path(rec["trial"])) or "")
     except ValueError:
@@ -712,6 +783,14 @@ def s5g(P, it):
     write_json(it.p("_spec", "author_code.json"), author)
     write_json(it.p("_spec", "spec.json"), spec)
     write_json(it.p("_spec", "depgraph.json"), spec["depgraph"])
+    if design is not None:
+        if hround:
+            hr = read_json(it.p("harden", f"round-{hround}", "record.json"), {}) or {}
+            design.setdefault("hardening", {})
+            design["hardening"].update(round=hround, prev_task_sha=hr.get("prev_task_sha"))
+        write_json(it.p("_spec", difficulty.DESIGN_FILE), design)
+    elif it.p("_spec", difficulty.DESIGN_FILE).exists():
+        it.p("_spec", difficulty.DESIGN_FILE).unlink()          # never keep a design of an earlier version
     write_json(it.p("_spec", "coverage.json"), dict(form=spec.get("form"), domain=spec.get("domain"),
                                                     field=spec.get("field"), competencies=spec.get("competencies")))
     c1 = read_json(it.p("S1_candidate.json"), {}) or {}
@@ -719,20 +798,31 @@ def s5g(P, it):
         doi=c1.get("doi"), title=c1.get("title"), target=c1.get("_target"), prompt_version=CODE_PROMPT_VERSION,
         authoring="agent", agent_job=rec.get("job_name"), fulltext=read_json(it.p("S3_fulltext.json")),
         fulltext_sha=hashlib.sha256(it.p("fulltext.txt").read_bytes()).hexdigest()[:16],
-        author_code=dict(repo=s3c.get("primary_url"), pin=s3c.get("pin"), license=s3c.get("license"))))
+        author_code=dict(repo=s3c.get("primary_url"), pin=s3c.get("pin"), license=s3c.get("license")),
+        difficulty_profile=difficulty.provenance(prof),
+        difficulty_levers=[lv.get("weakness_id") for lv in (design or {}).get("levers") or [] if isinstance(lv, dict)],
+        harden_round=hround))
     rep = codeagent.safe_read(out / "report.md", root=Path(rec["trial"]))
     if rep is not None:
         it.p("S5G", "report.md").write_text(rep)
+    if hround:
+        from .stages_b import harden_authored
+        harden_authored(P, it)
     it.advance("S5G", "S6A_run", form=spec.get("form"), cost_usd=rec.get("cost_usd"), minutes=rec.get("minutes"))
 
 
-def _agent_reauthor(P, it, why: str) -> bool:
+def _agent_reauthor(P, it, why: str, force: bool = False) -> bool:
     """Code-grounded items authored by the S5G agent go back to S5G (not to the single-call S5 / S6A) when S6B
-    asks for a new spec or a regenerated reference; at most code.authoring_max_jobs jobs per item."""
-    if not it.p("_spec", "author_code.json").exists() or codegate.ccfg(P.cfg).get("authoring", "agent") != "agent":
+    asks for a new spec or a regenerated reference; at most code.authoring_max_jobs jobs per item (plus that many
+    per hardening round).  force: called from S5G itself (no author_code.json yet)."""
+    if not force and (not it.p("_spec", "author_code.json").exists() or
+                      codegate.ccfg(P.cfg).get("authoring", "agent") != "agent"):
         return False
     n = it.state.get("attempts", {}).get("S5G:job", 0)
-    if n >= int(codegate.ccfg(P.cfg).get("authoring_max_jobs", 2)):
+    per = int(codegate.ccfg(P.cfg).get("authoring_max_jobs", 2))
+    if it.state.get("harden_active"):               # each hardening round gets its own authoring_max_jobs
+        n -= int((it.state.get("harden_base") or {}).get("jobs", 0))
+    if n >= per:
         it.finish("dropped", f"s5g_jobs_exhausted:{why}")
         return True
     it.state.pop("regen_6a", None)

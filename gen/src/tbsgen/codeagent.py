@@ -392,15 +392,17 @@ def agent_job_config(cfg: dict, task: Path, job_name: str, jobs_dir: Path, max_u
             "verifier": {"disable": False}, "agents": [agent], "tasks": [{"path": str(task.resolve())}]}
 
 
-def launch_agent(cfg: dict, it, kind: str, conf: dict, ledger, est_usd: float) -> dict:
-    """intent -> reserved -> launched, persisted in <item>/<kind>/run.json (one job per stage attempt)."""
+def launch_agent(cfg: dict, it, kind: str, conf: dict, ledger, est_usd: float, extra: dict | None = None) -> dict:
+    """intent -> reserved -> launched, persisted in <item>/<kind>/run.json (one job per stage attempt).  extra:
+    fields stored with the intent (e.g. budget, harden_round) so a resumed job keeps them."""
     d = it.p(kind)
     d.mkdir(parents=True, exist_ok=True)
     recp = d / "run.json"
     rec = read_json(recp, None) or {}
     if rec.get("job_name") != conf["job_name"]:
         rec = dict(job_name=conf["job_name"], state="intent", ts=time.time(), kind=kind,
-                   job_dir=str(Path(conf["jobs_dir"]) / conf["job_name"]), config=str((d / "job.json").resolve()))
+                   job_dir=str(Path(conf["jobs_dir"]) / conf["job_name"]), config=str((d / "job.json").resolve()),
+                   **(extra or {}))
         (d / "job.json").write_text(json.dumps(conf, indent=1))
         write_json(recp, rec)
     if rec["state"] == "intent":
@@ -525,12 +527,16 @@ def stage_inputs(cfg: dict, it, work: Path, with_contract: bool) -> dict:
                                                   pin=s3c.get("pin")))
     # a re-authoring job (S6B sent the task back) sees why the previous attempt failed
     fb = {n: read_json(it.p(n), None) for n in ("S6A_measure.json", "S6B_decisions.json", "S6_failure.json")}
+    if it.state.get("harden_active") and not it.state.get("harden_built"):
+        fb = {n: v for n, v in fb.items() if n == "S6_failure.json"}   # the old version's are in previous_version/
     if any(v is not None for v in fb.values()) and with_contract:
         write_json(work / "previous_attempt.json", {k: v for k, v in fb.items() if v is not None})
     if (it.p("S4c") / "HOWTO.md").exists():
         shutil.copy(it.p("S4c") / "HOWTO.md", work / "HOWTO.md")
         if (it.p("S4c") / "runnability.json").exists():
             shutil.copy(it.p("S4c") / "runnability.json", work / "runnability.json")
+    if with_contract:
+        _stage_difficulty(cfg, it, work)
     if with_contract:
         from .prompts import METRICS_API, S5_SPEC, S6A_GEN
         (work / "contract").mkdir()
@@ -540,6 +546,42 @@ def stage_inputs(cfg: dict, it, work: Path, with_contract: bool) -> dict:
         from .runner import METRICS_HELPER
         shutil.copy(METRICS_HELPER, work / "contract" / "_metrics_template.py")
     return dict(work=str(work))
+
+
+def _stage_difficulty(cfg: dict, it, work: Path) -> None:
+    """S5G inputs of the difficulty targeting (difficulty.py): the weakness profile (/work/weakness_profile.md),
+    and in a hardening round the previous version (/work/previous_version/: its task files, spec, difficulty
+    design, thresholds, measurements, authoring report) plus the student's passing-run summary
+    (/work/student_feedback.json).  Nothing from the verifier beyond per-metric aggregates is staged."""
+    from . import difficulty
+    prof = difficulty.load_profile(cfg)
+    if prof:
+        (work / "weakness_profile.md").write_text(prof["text"])
+    if not it.state.get("harden_active"):
+        return
+    k = int(it.state.get("harden_round", 0))
+    rd = it.p("harden", f"round-{k}")
+    prev = rd / "prev"
+    if not (prev / "DONE").exists():
+        return
+    dst = work / "previous_version"
+    dst.mkdir()
+    if (prev / "task").is_dir():
+        safe_copytree(prev / "task", dst / "task", root=prev)
+    for rel in ("_spec/spec.json", "_spec/difficulty_design.json", "thresholds.json", "S6A_measure.json",
+                "S5G/report.md"):
+        if (prev / rel).is_file():
+            (dst / Path(rel).name).write_bytes((prev / rel).read_bytes())
+    for f in ("feedback.json",):
+        if (rd / f).is_file():
+            shutil.copy(rd / f, work / "student_feedback.json")
+    earlier = []
+    for j in range(1, k):
+        fb = read_json(it.p("harden", f"round-{j}", "feedback.json"), None)
+        if fb:
+            earlier.append(dict(round=j, **{x: fb.get(x) for x in ("minutes", "metric_margins")}))
+    if earlier:
+        write_json(work / "earlier_rounds.json", earlier)
 
 
 def sha_tree(d: Path) -> str:
