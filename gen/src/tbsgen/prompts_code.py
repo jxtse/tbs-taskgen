@@ -1,6 +1,6 @@
 """Instructions for the code-grounded agent jobs (S4c runnability, S5G task authoring).  Versioned like prompts.py."""
 
-CODE_PROMPT_VERSION = "cg-v2-2026-11-12"   # v2: difficulty targeting + hardening rounds
+CODE_PROMPT_VERSION = "cg-v3-2026-11-12"   # v2: difficulty targeting + hardening rounds; v3: process-kill guard
 
 S4C_RUNNABILITY = """# Runnability check of a paper's published code ({item})
 
@@ -42,6 +42,10 @@ Work in this container (you are root; network access is allowed while you instal
 
 Do not modify `/work/repo` in place (copy it to /app/repo if you need to patch something, and list the patches in
 HOWTO.md).  Do not upload anything anywhere.
+
+Process hygiene: this agent itself runs as a process in the container.  Never kill by pattern (`pkill -f`, `killall`,
+`ps | grep ... | xargs kill`): record the PID of each background job you start (`cmd & echo $! >> /app/work/pids`) and
+kill only those PIDs.  A pattern kill once matched the agent and ended the job without its results.
 """
 
 S5G_AUTHOR = """# Build a benchmark task from a paper and its authors' code ({item})
@@ -110,6 +114,10 @@ finishes in < 15 min on 2 CPUs; the generator in < 5 min.  If they do not separa
 mid_drop, hidden shift), not the numbers.  Record the measured values in report.md.
 
 Do not write thresholds; the pipeline measures and sets them.  Do not upload anything.
+
+Process hygiene: this agent itself runs as a process in the container.  Never kill by pattern (`pkill -f`, `killall`,
+`ps | grep ... | xargs kill`): record the PID of each background job you start (`cmd & echo $! >> /app/work/pids`) and
+kill only those PIDs.  A pattern kill once matched the agent and ended the job without its results.
 """
 
 

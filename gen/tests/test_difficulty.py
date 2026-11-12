@@ -527,3 +527,9 @@ def test_poll_does_not_trust_a_shared_logs_exit_while_the_session_lives(tmp_path
     rc["v"] = 1
     out = codeagent.poll_agent(P.cfg, it, "S5G", None)             # session gone, no Harbor job: launcher failed
     assert out["outcome"] == "launcher_failed"
+
+
+def test_agent_prompts_forbid_pattern_kills():
+    from tbsgen import prompts_code
+    for name in ("S4C_RUNNABILITY", "S5G_AUTHOR"):
+        assert "Never kill by pattern" in getattr(prompts_code, name)
