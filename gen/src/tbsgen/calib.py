@@ -52,10 +52,9 @@ def role(c: dict, who: str, key: str):
     return c.get(key)
 
 
-def next_action(runs: list[dict], cfg: dict) -> tuple[str, str | None]:
-    """runs: [{"who": "glm"|"teacher", "outcome": "pass"|"fail"|"infra", "minutes": float,
-    "result_type": optional}] in order.
-    Returns ("run", "glm"|"teacher") or ("label", "hard"|"unstable"|"easy"|"parked:<why>")."""
+def decisive_runs(runs: list[dict], cfg: dict) -> list[dict]:
+    """The runs that count as attempts (infra runs and retried student timeouts without output removed).  Raises
+    _Park(<label>) when the timeout_no_output policy parks the item."""
     c = cfg["calib"]
     pol = c.get("timeout_no_output") or "fail"
     if pol not in TNO_POLICIES:
@@ -66,11 +65,28 @@ def next_action(runs: list[dict], cfg: dict) -> tuple[str, str | None]:
             continue
         if r["who"] == "glm" and r["outcome"] == "fail" and r.get("result_type") == "timeout_no_output":
             if pol == "park":
-                return "label", "parked:timeout_no_output"
+                raise _Park("parked:timeout_no_output")
             if pol == "retry" and skipped < int(c.get("timeout_no_output_retries", 1)):
                 skipped += 1                # not decisive: the student is run again
                 continue
         real.append(r)
+    return real
+
+
+class _Park(Exception):
+    pass
+
+
+def next_action(runs: list[dict], cfg: dict) -> tuple[str, str | None]:
+    """runs: [{"who": "glm"|"teacher", "outcome": "pass"|"fail"|"infra", "minutes": float,
+    "result_type": optional}] in order.
+    Returns ("run", "glm"|"teacher") or ("label", "hard"|"unstable"|"easy"|"parked:<why>").
+    (The hardening loop -- difficulty.should_harden -- is checked by S9 before this rule.)"""
+    c = cfg["calib"]
+    try:
+        real = decisive_runs(runs, cfg)
+    except _Park as e:
+        return "label", str(e)
     trailing_infra = 0
     for r in reversed(runs):
         if r["outcome"] != "infra":

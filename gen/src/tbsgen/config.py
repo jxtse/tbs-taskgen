@@ -480,6 +480,19 @@ DEFAULTS: dict[str, Any] = {
         "variant_depth": 0,                 # S9b harder variants; 待定 (e.g. <=2); 0 = off in MVP
     },
     # ---------------------------------------------------------------- task review (S9R, after S9, before S10)
+    # difficulty targeting of code-grounded tasks (difficulty.py): S5G targets the calibration student's weak points
+    # listed in an internal weakness profile, and a task the student solves on its first S9 attempt goes back to
+    # S5G for a hardening round
+    "difficulty": {
+        "profile_path": None,               # internal markdown profile ("## <ID> <title>" entries); None = off
+        "profile_id": None,                 # default: front matter profile_id, else the file stem
+        "design_gate": "block",             # S7 check of _spec/difficulty_design.json: block | warn | off
+        "harden": True,                     # hardening loop on (code-grounded items only)
+        "harden_max_rounds": 2,             # per item; then S9 calibrates under the original rule
+        "harden_authoring_timeout_s": None, # extra S5G time per round (None = code.authoring_timeout_s)
+        "harden_authoring_max_usd": None,   # extra S5G spend per round (None = code.authoring_max_usd)
+        "harden_exclude": [],               # item ids never hardened
+    },
     "review": {
         # A Claude Code agent (fresh context, inside the task's own image, model endpoint only) audits every task
         # S9 would keep (calib.keep_labels) and, as a diagnosis, the labels in review_parked.  Verdicts pass /

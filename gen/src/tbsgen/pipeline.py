@@ -140,6 +140,8 @@ class Pipeline:
         t0 = time.time()
         try:
             HANDLERS[st](self, it)
+            if it.state.get("harden_active") and it.state.get("status") in ("dropped", "parked"):
+                B.harden_revert(self, it)       # a hardened version that failed to build: back to the old one
         except BudgetStop as e:
             it.finish("paused", f"budget:{e.reason}", detail=e.detail, paused_stage=st)
             self.stopped_models.add(alias if role else st)

@@ -23,6 +23,8 @@
                                                                  failed preparation)
   tbsgen ping    --run DIR --calls N                             real teacher-model connectivity check (needs budget)
   tbsgen harbor-local --run DIR [--item ID]                       local Harbor oracle+nop on packaged items
+  tbsgen harden  --run DIR --item ID --reason TEXT                             code-grounded item whose student passed:
+                                                                 start a hardening round (back to S5G; difficulty.py)
   tbsgen regate  --run DIR --item ID --reason TEXT [--recalibrate]             a released / reviewed item after a harness change
                                                                  (tests/_metrics.py, test.sh): withdraw it, re-measure
                                                                  and re-gate with locked thresholds, repackage, S9R
@@ -77,7 +79,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser(prog="tbsgen")
     sub = ap.add_subparsers(dest="cmd", required=True)
     for name in ("ingest", "run", "resume", "status", "report", "ledger", "breaker", "calib-ingest", "ping", "reset",
-                 "harbor-local", "fetch", "remote", "fulltext", "calib", "review", "regate"):
+                 "harbor-local", "fetch", "remote", "fulltext", "calib", "review", "regate", "harden"):
         s = sub.add_parser(name)
         s.add_argument("--run", required=True)
         s.add_argument("--config", default=None)
@@ -120,6 +122,9 @@ def main(argv=None):
             s.add_argument("--item", required=True)
             s.add_argument("--reason", required=True, help="why (e.g. 'grader template v2.5')")
             s.add_argument("--recalibrate", action="store_true", help="archive the calibration epoch, S9 from GLM")
+        if name == "harden":
+            s.add_argument("--item", required=True)
+            s.add_argument("--reason", required=True, help="why (operator note recorded in the round)")
         if name == "calib-ingest":
             s.add_argument("--item", required=True)
             s.add_argument("--job-dir", default=None)   # default: the pending run's own job dir
@@ -240,6 +245,13 @@ def main(argv=None):
         from .stages_b import regate
         try:
             out = regate(P, P.store.item(a.item), a.reason, recalibrate=a.recalibrate)
+        except ValueError as e:
+            sys.exit(str(e))
+        print(json.dumps(out, ensure_ascii=False))
+    elif a.cmd == "harden":
+        from .stages_b import harden_cmd
+        try:
+            out = harden_cmd(P, P.store.item(a.item), a.reason)
         except ValueError as e:
             sys.exit(str(e))
         print(json.dumps(out, ensure_ascii=False))
