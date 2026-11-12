@@ -490,3 +490,20 @@ def test_agent_jobs_have_their_own_launch_log_and_resume_never_starts_twice(tmp_
     conf = json.loads(Path(rec["config"]).read_text())
     out = codeagent.launch_agent(P.cfg, it, "S5G", conf, None, 1.0)
     assert out["state"] == "launched" and [a[1] for a in calls] == ["new-session", "has-session"]
+    # tmux cannot tell (e.g. socket permission error): the reservation is kept, nothing is started
+    rec["state"] = "reserved"
+    write_json(it.p("S5G", "run.json"), rec)
+    monkeypatch.setattr(codeagent.subprocess, "run", lambda args, **kw: calls.append(args) or
+                        __import__("subprocess").CompletedProcess(args, 1, "", "permission denied"))
+    out = codeagent.launch_agent(P.cfg, it, "S5G", conf, None, 1.0)
+    assert out["state"] == "reserved" and [a[1] for a in calls][-1] == "has-session"
+    # a pre-fix record pointing at the shared launch.log: its .exit is not evidence; session gone -> start
+    rec.update(state="reserved", log=str(it.p("S5G", "launch.log")))
+    write_json(it.p("S5G", "run.json"), rec)
+    (it.p("S5G", "launch.log.exit")).write_text("0")
+    monkeypatch.setattr(codeagent.subprocess, "run", lambda args, **kw: calls.append(args) or
+                        __import__("subprocess").CompletedProcess(args, 0 if args[1] == "new-session" else 1, "",
+                                                              "can't find session"))
+    out = codeagent.launch_agent(P.cfg, it, "S5G", conf, None, 1.0)
+    assert out["state"] == "launched" and [a[1] for a in calls][-2:] == ["has-session", "new-session"]
+    assert out["log"].endswith("-s5g2.launch.log")

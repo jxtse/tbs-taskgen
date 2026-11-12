@@ -431,12 +431,16 @@ def launch_agent(cfg: dict, it, kind: str, conf: dict, ledger, est_usd: float, e
         tmux_bin = cfg["calib"].get("tmux_bin", "tmux")
         if rec.get("launch_attempted") and rec.get("tmux"):
             # resumed after a crash between the tmux start and saving "launched": never start it twice
-            alive = subprocess.run([tmux_bin, "has-session", "-t", "=" + rec["tmux"]], capture_output=True,
-                                   text=True, timeout=60).returncode == 0
-            if alive or Path(str(rec.get("log", log)) + ".exit").exists():
+            from .calib import session_alive
+            alive = session_alive(cfg["calib"], rec)
+            own_exit = rec.get("log") and Path(rec["log"]).name.startswith(conf["job_name"]) and \
+                Path(str(rec["log"]) + ".exit").exists()       # a shared (pre-fix) log's .exit proves nothing
+            if alive or own_exit:
                 rec["state"] = "launched"
                 write_json(recp, rec)
                 return rec
+            if alive is None:
+                return rec                      # cannot tell: keep the reservation, try again on the next step
         inner = (f"cd {shlex.quote(root)} && env -u PYTHONPATH -u VIRTUAL_ENV ./{launcher} run "
                  f"{shlex.quote(rec['config'])} > {shlex.quote(str(log))} 2>&1; echo $? > {shlex.quote(str(log))}.exit")
         rec.update(launch_attempted=time.time(), log=str(log), tmux=conf["job_name"][-60:])
