@@ -570,8 +570,18 @@ def _agent_stage(P, it, kind: str, instruction: str, need: list[str], timeout_s:
         left_s = timeout_s - spent["sec"]
         left_usd = None if max_usd is None else float(max_usd) - spent["usd"]
         floor = (600.0, 1.0) if spent["sec"] or spent["usd"] else (1.0, 0.01)   # first job: the configured caps
+        from .budget import item_usd_left
+        cap_left = item_usd_left(P.ledger, P.cfg, it.item_id) if kind in \
+            (P.cfg["budget"].get("item_usd_cap_stages") or []) else None
+        if cap_left is not None:                # budget.item_usd_cap: the paper's whole authoring allowance
+            left_usd = cap_left if left_usd is None else min(left_usd, cap_left)
+            floor = (floor[0], max(floor[1], 1.0))
         if left_s < floor[0] or (left_usd is not None and left_usd < floor[1]):
-            it.finish("dropped", f"{kind.lower()}_budget_exhausted", spent=spent)
+            it.finish("dropped", f"{kind.lower()}_budget_exhausted", spent=spent, item_usd_left=cap_left)
+            return None
+        why = _agent_admission(P, it, kind)
+        if why:
+            it.finish("paused" if why.startswith("budget:") else "waiting", why, paused_stage=kind)
             return None
         timeout_s, max_usd, est_usd = left_s, left_usd, min(est_usd, left_usd) if left_usd is not None else est_usd
         n = it.bump(f"{kind}:job")
@@ -809,6 +819,49 @@ def _s5g(P, it):
         from .stages_b import harden_authored
         harden_authored(P, it)
     it.advance("S5G", "S6A_run", form=spec.get("form"), cost_usd=rec.get("cost_usd"), minutes=rec.get("minutes"))
+
+
+def _admissions_path(P, kind: str) -> Path:
+    return P.store.root / f"{kind.lower()}-admissions.jsonl"
+
+
+def _agent_admission(P, it, kind: str) -> str | None:
+    """Production throttles before a new S4c / S5G job: code.max_concurrent_agent_jobs (running S4c + S5G jobs of
+    this run; "queued:" -> the item waits and is polled again) and code.daily_new_runnability /
+    daily_new_authoring (papers admitted per Asia/Shanghai day; "budget:daily_*" -> paused, resumed by the next
+    day's `resume --reason budget:daily`).  A paper is admitted once (<kind>-admissions.jsonl); later jobs of the
+    same paper (re-authoring, hardening rounds) are not counted again."""
+    import fcntl
+    c = codegate.ccfg(P.cfg)
+    cap = c.get("max_concurrent_agent_jobs")
+    if cap is not None:
+        running = 0
+        for other in P.store.items():
+            if other.item_id == it.item_id:
+                continue
+            for k in ("S4c", "S5G"):
+                r = read_json(other.p(k, "run.json"), None) or {}
+                if r.get("state") in ("reserved", "launched"):
+                    running += 1
+        if running >= int(cap):
+            return f"{kind}:queued: agent slots full ({running}/{cap})"
+    lim = c.get({"S4c": "daily_new_runnability", "S5G": "daily_new_authoring"}[kind])
+    if lim is None:
+        return None
+    day = time.strftime("%Y-%m-%d", time.gmtime(time.time() + 8 * 3600))
+    path = _admissions_path(P, kind)
+    with open(str(path) + ".lock", "a") as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        rows = [json.loads(x) for x in path.read_text().splitlines() if x.strip()] if path.exists() else []
+        if any(r.get("item") == it.item_id for r in rows):
+            return None
+        today = [r for r in rows if r.get("day") == day]
+        if len(today) >= int(lim):
+            return f"budget:daily_{kind.lower()}_papers ({len(today)}/{lim} on {day})"
+        with path.open("a") as f:
+            f.write(json.dumps(dict(day=day, item=it.item_id, ts=time.time())) + "\n")
+    P.store.event(f"{kind.lower()}_admitted", item=it.item_id, day=day, n=len(today) + 1, limit=lim)
+    return None
 
 
 def _agent_reauthor(P, it, why: str, force: bool = False) -> bool:
