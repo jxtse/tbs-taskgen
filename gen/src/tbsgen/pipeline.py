@@ -146,6 +146,14 @@ class Pipeline:
                 if B.harden_needs_step(it):
                     B.harden_step(self, it)     # a hardened version that failed to build: back to the old one
         except BudgetStop as e:
+            if e.reason == "item_usd":
+                # this paper's authoring allowance (budget.item_usd_cap) is used up: final for the paper, and the
+                # model stays available for the other papers
+                it.finish("dropped", "item_usd_cap", detail=e.detail)
+                if B.harden_needs_step(it):
+                    B.harden_step(self, it)     # a hardened version: back to the previous one
+                self.store.event("budget_stop", item=it.item_id, stage=st, reason=e.reason, detail=e.detail)
+                return "ok"
             it.finish("paused", f"budget:{e.reason}", detail=e.detail, paused_stage=st)
             self.stopped_models.add(alias if role else st)
             self.store.event("budget_stop", item=it.item_id, stage=st, reason=e.reason, detail=e.detail)

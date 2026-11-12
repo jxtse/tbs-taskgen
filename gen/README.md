@@ -113,6 +113,18 @@ regate 不复查（它们不改科学内容）。
 配置（`[difficulty]`）：`profile_path`、`profile_id`、`design_gate`、`harden`、`harden_max_rounds`、
 `harden_authoring_timeout_s`、`harden_authoring_max_usd`、`harden_exclude`。
 
+### 0c. 生产限流（2026-11-12 起，默认关）
+- `budget.item_usd_cap`：单篇出题阶段（`budget.item_usd_cap_stages`，默认 S4c、S5、S5G、S6A、S6M、S6C、S8，含加难轮次；
+  不含 S9 校准和 S9R 审核）的已结算 + 预留费用上限。账本预留时检查，超出即 `dropped:item_usd_cap`（只影响该篇，
+  模型不停）；S4c/S5G 作业的 `--max-budget-usd` 夹到剩余额度，剩余不足 $1 时 `s5g_budget_exhausted`。
+- `code.daily_new_runnability` / `code.daily_new_authoring`：每天（北京时间）首次进入 S4c / S5G 的论文数上限，
+  记在 run 目录 `s4c-admissions.jsonl` / `s5g-admissions.jsonl`（同一篇的重出题、加难轮次不重复计数）；
+  超出时条目暂停 `budget:daily_s5g_papers`，次日 `tbsgen resume --reason budget:daily` 恢复（驱动跨日时执行）。只有作业真正启动才计入当天名额；
+  设了单篇上限时，作业在账本里按整份额度预留（成本未知时不会少算），恢复时沿用同一预留额。准入检查、预留和启动在 run 级锁
+  `.agent-slots.lock` 下完成。
+- `code.max_concurrent_agent_jobs`：同时运行的 S4c + S5G 作业上限；满时条目 waiting（`queued: agent slots full`），
+  下一轮自动重试。
+
 ## 1. 架构
 
 ```

@@ -33,6 +33,10 @@ DEFAULTS: dict[str, Any] = {
         "daily_usd_per_stage": {},          # e.g. {"S6A": 20.0}
         "daily_calls_per_model": {},        # hard call caps, e.g. {"claude-opus-5-5": 6}
         "run_usd_total": None,              # whole-run caps (all days; daily caps reset at 0:00 UTC+8)
+        # per-paper cap on the authoring stages (S4c..S8, incl. hardening rounds; not S9 calibration / S9R review):
+        # settled + reserved USD of one item.  Agent jobs (S4c / S5G) get --max-budget-usd clamped to what is left
+        "item_usd_cap": None,
+        "item_usd_cap_stages": ["S4c", "S5", "S5G", "S6A", "S6M", "S6C", "S8"],
         "run_calls_per_model": {},
         "max_calls_per_item": 24,           # all stages, all attempts, one item
         "breaker_consecutive_errors": 4,    # N consecutive failed calls -> breaker opens for that model
@@ -327,6 +331,11 @@ DEFAULTS: dict[str, Any] = {
         "agent_base_image": "python:3.11-slim",
         "agent_cpus": 4, "agent_memory_mb": 16384,
         "agent_jobs_dir": None,             # default <item>/<stage>/jobs
+        # production throttles (None = off): papers whose FIRST S4c / S5G job starts per day (Asia/Shanghai; hardening
+        # rounds and re-authoring jobs of a paper already admitted do not count), and running S4c + S5G jobs
+        "daily_new_runnability": None,
+        "daily_new_authoring": None,
+        "max_concurrent_agent_jobs": None,
     },
     "probe": {
         "tbs_tasks_root": None,             # TB-Science task texts (<task>/instruction.md ...); None -> no dedup

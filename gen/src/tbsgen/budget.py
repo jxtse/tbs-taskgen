@@ -121,6 +121,14 @@ class Ledger:
                 n = db.execute("SELECT count(*) FROM calls WHERE day=? AND model=?", (day, model)).fetchone()[0]
                 if n >= int(cap_c):
                     raise BudgetStop("daily_calls", f"{model} {cap_c} calls")
+            cap_u = b.get("item_usd_cap")
+            if cap_u is not None and item and stage in (b.get("item_usd_cap_stages") or []):
+                st = list(b.get("item_usd_cap_stages") or [])
+                q = (f"SELECT COALESCE(SUM(COALESCE(usd, est_usd)),0) FROM calls WHERE item=? AND real=1 AND "
+                     f"stage IN ({','.join('?' * len(st))})")
+                used = db.execute(q, (item, *st)).fetchone()[0]
+                if used + est > float(cap_u) + 1e-9:
+                    raise BudgetStop("item_usd", f"{item} {used:.2f}+{est:.2f} > {cap_u} USD")
             cap_i = b.get("max_calls_per_item")
             # authoring calls only: S9 runs have their own caps; S2/S4 screening calls (Jev, ~$0.0001) do not
             # use up an item's authoring budget
@@ -231,3 +239,16 @@ class Ledger:
         with self._db() as db:
             rows = db.execute(q.format("AND day=?" if day else ""), (day,) if day else ()).fetchall()
         return {k: round(v or 0, 4) for k, v in rows}
+
+
+def item_usd_left(ledger, cfg: dict, item: str) -> float | None:
+    """budget.item_usd_cap minus the item's settled + reserved spend on the capped stages (None = no cap)."""
+    b = cfg["budget"]
+    cap = b.get("item_usd_cap")
+    if cap is None:
+        return None
+    st = list(b.get("item_usd_cap_stages") or [])
+    with ledger._db() as db:
+        used = db.execute(f"SELECT COALESCE(SUM(COALESCE(usd, est_usd)),0) FROM calls WHERE item=? AND real=1 AND "
+                          f"stage IN ({','.join('?' * len(st))})", (item, *st)).fetchone()[0]
+    return float(cap) - float(used)
