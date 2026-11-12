@@ -392,15 +392,17 @@ def agent_job_config(cfg: dict, task: Path, job_name: str, jobs_dir: Path, max_u
             "verifier": {"disable": False}, "agents": [agent], "tasks": [{"path": str(task.resolve())}]}
 
 
-def launch_agent(cfg: dict, it, kind: str, conf: dict, ledger, est_usd: float) -> dict:
-    """intent -> reserved -> launched, persisted in <item>/<kind>/run.json (one job per stage attempt)."""
+def launch_agent(cfg: dict, it, kind: str, conf: dict, ledger, est_usd: float, extra: dict | None = None) -> dict:
+    """intent -> reserved -> launched, persisted in <item>/<kind>/run.json (one job per stage attempt).  extra:
+    fields stored with the intent (e.g. budget, harden_round) so a resumed job keeps them."""
     d = it.p(kind)
     d.mkdir(parents=True, exist_ok=True)
     recp = d / "run.json"
     rec = read_json(recp, None) or {}
     if rec.get("job_name") != conf["job_name"]:
         rec = dict(job_name=conf["job_name"], state="intent", ts=time.time(), kind=kind,
-                   job_dir=str(Path(conf["jobs_dir"]) / conf["job_name"]), config=str((d / "job.json").resolve()))
+                   job_dir=str(Path(conf["jobs_dir"]) / conf["job_name"]), config=str((d / "job.json").resolve()),
+                   **(extra or {}))
         (d / "job.json").write_text(json.dumps(conf, indent=1))
         write_json(recp, rec)
     if rec["state"] == "intent":

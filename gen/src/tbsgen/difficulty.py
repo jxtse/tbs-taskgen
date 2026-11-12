@@ -196,37 +196,57 @@ def check_hardening(item_dir: Path, rnd: int) -> list[str]:
     return []
 
 
-_TEXT_EXT = {".md", ".txt", ".csv", ".tsv", ".json", ".yaml", ".yml", ".toml", ".py", ".r", ".R", ".ini", ".cfg", ""}
+_SKIP_EXT = {".npy", ".npz", ".pkl", ".pickle", ".h5", ".hdf5", ".nc", ".parquet", ".feather", ".png", ".jpg",
+             ".jpeg", ".tif", ".tiff", ".gif", ".bmp", ".mat", ".gz", ".zip", ".bz2", ".xz", ".zst", ".tar", ".pt",
+             ".pth", ".bin", ".dat", ".fits", ".fit"}
 
 
 def targeting_leaks(paths: list[Path], prof: dict | None, design: dict | None) -> list[str]:
     """Files under `paths` (the statement and every public file a solver gets) that reveal the difficulty
-    targeting: the profile id, a weakness id, or profile / design wording.  Text-like files up to 5 MB."""
+    targeting: the profile id, a weakness id, or profile / design wording.  Every file is scanned as bytes in
+    overlapping 1 MB chunks (whatever its extension or size), except well-known binary array / image / archive
+    formats; a file that cannot be read is reported."""
     ids = set((prof or {}).get("ids") or [])
     ids |= {str(lv.get("weakness_id")) for lv in (design or {}).get("levers") or []
             if isinstance(lv, dict) and lv.get("weakness_id")}
     pid = (prof or {}).get("id") or (design or {}).get("profile")
-    pats = [re.compile(rf"(?<![A-Za-z0-9]){re.escape(i)}(?![A-Za-z0-9])") for i in sorted(ids) if i]
+    pats = [re.compile(rb"(?<![A-Za-z0-9])" + re.escape(i.encode()) + rb"(?![A-Za-z0-9])") for i in sorted(ids) if i]
     if pid:
-        pats.append(re.compile(re.escape(str(pid)), re.I))
-    pats.append(_STATEMENT_BANNED)
+        pats.append(re.compile(re.escape(str(pid).encode()), re.I))
+    pats.append(re.compile(_STATEMENT_BANNED.pattern.encode(), re.I))
     out = []
     for root in paths:
         files = [root] if root.is_file() else (sorted(x for x in root.rglob("*") if x.is_file()) if root.is_dir()
                                                else [])
         for f in files:
-            if f.is_symlink() or f.suffix not in _TEXT_EXT or f.stat().st_size > 5_000_000:
+            if f.suffix.lower() in _SKIP_EXT:
+                continue
+            if f.is_symlink():
+                out.append(f"{f.name}: symlink")
                 continue
             try:
-                text = f.read_text(errors="replace")
-            except OSError:
+                hit = _scan_bytes(f, pats)
+            except OSError as e:
+                out.append(f"{f.name}: unreadable ({type(e).__name__})")
                 continue
-            for pat in pats:
-                m = pat.search(text)
-                if m:
-                    out.append(f"{f.name}: {m.group(0)!r}")
-                    break
+            if hit:
+                out.append(f"{f.name}: {hit!r}")
     return out
+
+
+def _scan_bytes(f: Path, pats: list) -> str | None:
+    tail = b""
+    with f.open("rb") as fh:
+        while True:
+            chunk = fh.read(1 << 20)
+            if not chunk:
+                return None
+            buf = tail + chunk
+            for pat in pats:
+                m = pat.search(buf)
+                if m:
+                    return m.group(0).decode(errors="replace")
+            tail = buf[-256:]
 
 
 def science_sha(task: Path) -> str:
@@ -304,6 +324,8 @@ def should_harden(cfg: dict, it, runs: list[dict]) -> bool:
     """The student passed its first decisive attempt of this calibration epoch and nothing else ran yet."""
     if not harden_enabled(cfg, it) or not rounds_left(cfg, it):
         return False
+    if it.state.get("rescore_pending") or it.state.get("thresholds_locked"):
+        return False        # a re-score / regate in progress decides first
     if read_json(it.p("review", "runs.json"), []):
         return False        # an S9R-reviewed item: review job names follow the review round (not supported)
     real = decisive(runs, cfg)

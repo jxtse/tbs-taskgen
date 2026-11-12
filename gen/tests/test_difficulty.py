@@ -321,6 +321,10 @@ def test_targeting_leak_in_public_files_and_package(tmp_path):
     assert difficulty.targeting_leaks([tmp_path / "env"], prof, None)
     (pub / "README.md").write_text("Plain notes; EX020 is a sample id; FLEX02B too.")
     assert difficulty.targeting_leaks([tmp_path / "env"], prof, None) == []
+    (pub / "rows.jsonl").write_text('{"note": "weakness profile EX02"}\n')            # any extension
+    assert difficulty.targeting_leaks([tmp_path / "env"], prof, None)
+    (pub / "rows.jsonl").write_bytes(b"x" * (3 << 20) + b" EX01 ")                     # large file, chunk edge
+    assert difficulty.targeting_leaks([tmp_path / "env"], prof, None) == ["rows.jsonl: 'EX01'"]
 
 
 def test_hardening_must_change_the_science(tmp_path):
@@ -410,3 +414,25 @@ def test_round_allowance_and_rerun_survive_a_pause(tmp_path, monkeypatch):
     conf = json.loads(Path(read_json(it.p("S5G", "run.json"))["config"]).read_text())
     assert conf["agents"][0]["kwargs"]["max_budget_usd"] == "2.00"
     assert read_json(it.p("S5G", "run.json"))["harden_round"] == 1
+
+
+def test_watch_follows_a_hardening_round_and_harden_refuses_pending_rescore(tmp_path, monkeypatch):
+    from tbsgen.stages_b import harden_cmd, watch_tick
+    P, iid, counter, jobs = _calib_item(tmp_path, monkeypatch)
+    watch_tick(P, only=[iid])
+    it = P.store.item(iid)
+    assert it.state["stage"] == "S5G" and it.state["harden_active"]
+    it.state.update(status="waiting", reason="S5G:agent_running")    # as with a running authoring job
+    it.save()
+    polled = []
+    monkeypatch.setattr("tbsgen.stages_a.s5g", lambda P_, it_: polled.append(it_.item_id))
+    from tbsgen import pipeline
+    monkeypatch.setitem(pipeline.HANDLERS, "S5G", lambda P_, it_: polled.append(it_.item_id))
+    out = watch_tick(P, only=[iid])
+    assert iid in out["open"] and iid not in out["settled"] and polled == [iid]   # the S5G job is polled
+    P2, iid2, _, jobs2 = _calib_item(tmp_path / "b" if (tmp_path / "b").mkdir() is None else None, monkeypatch)
+    it = P2.store.item(iid2)
+    it.state["rescore_pending"] = dict(reason="regate")
+    it.save()
+    with pytest.raises(ValueError):
+        harden_cmd(P2, P2.store.item(iid2), "op")

@@ -581,10 +581,11 @@ def _agent_stage(P, it, kind: str, instruction: str, need: list[str], timeout_s:
                                           timeout_s)
         jobs = Path(codeagent._c(P.cfg).get("agent_jobs_dir") or it.p(kind, "jobs"))
         conf = codeagent.agent_job_config(P.cfg, task, f"tbsgen-{it.item_id}-{kind.lower()}{n}", jobs, max_usd)
-        rec = codeagent.launch_agent(P.cfg, it, kind, conf, P.ledger, est_usd)
-        rec["budget"] = dict(timeout_s=timeout_s, max_usd=max_usd)
+        extra = dict(budget=dict(timeout_s=timeout_s, max_usd=max_usd))
         if rnd is not None:
-            rec["harden_round"] = rnd["round"]
+            extra["harden_round"] = rnd["round"]
+        rec = codeagent.launch_agent(P.cfg, it, kind, conf, P.ledger, est_usd, extra=extra)
+        rec.update(extra)
         write_json(recp, rec)
         if rec.get("state") == "launch_failed":
             it.finish("paused", f"code:{kind}:launch_failed", paused_stage=kind)

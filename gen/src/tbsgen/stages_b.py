@@ -793,17 +793,25 @@ def watch_tick(P, only: list[str] | None = None, max_steps: int = 50) -> dict:
                 it.save()
             did.append(dict(item=it.item_id, action=kind, job=rec["job_name"]))
     s9 = [i.item_id for i in P.store.items() if (not only or i.item_id in only) and
-          (i.state.get("stage") in ("S9", "S9R") or (_in_revision(i) and i.state.get("status") == "active"))]
+          (i.state.get("stage") in ("S9", "S9R") or (_in_revision(i) and i.state.get("status") == "active") or
+           _in_hardening(i))]
     if s9:
         P.run(max_steps=max_steps, only=s9)
     open_ = {}
     for i in P.store.items():
-        if (not only or i.item_id in only) and i.state.get("status") in ("waiting", "active") and \
-                (i.state.get("stage") in ("S9", "S9R") or _in_revision(i)):
+        if (not only or i.item_id in only) and (
+                (i.state.get("status") in ("waiting", "active") and
+                 (i.state.get("stage") in ("S9", "S9R") or _in_revision(i) or _in_hardening(i))) or
+                harden_needs_step(i)):
             open_[i.item_id] = dict(stage=i.state["stage"], status=i.state["status"], reason=i.state.get("reason"))
     done = {i.item_id: dict(stage=i.state["stage"], status=i.state["status"], label=i.state.get("calib_label"))
             for i in P.store.items() if i.item_id in s9 and i.item_id not in open_}
     return dict(actions=did, open=open_, settled=done, ts=time.time())
+
+
+def _in_hardening(it) -> bool:
+    """A hardening round in progress (S5G..PKG of the new version) or an unfinished hardening transaction."""
+    return bool(it.state.get("harden_active") or harden_needs_step(it))
 
 
 def _in_revision(it) -> bool:
@@ -1449,6 +1457,8 @@ def harden_cmd(P, it, reason: str) -> dict:
         runs = read_json(it.p("calib", "runs.json"), []) or []
         if any(r.get("outcome") is None for r in runs):
             raise ValueError("harden: a calibration run is still pending")
+        if st.get("rescore_pending") or st.get("thresholds_locked") or st.get("review_revision_pending"):
+            raise ValueError("harden: finish the pending re-score / revision / regate first")
         rv = read_json(it.p("review", "runs.json"), []) or []
         if rv:
             # review job names follow the review round; a reviewed item would reuse them after hardening
