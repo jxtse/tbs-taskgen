@@ -347,6 +347,12 @@ def pkg(P, it):
     it.state.pop("thresholds_locked", None)     # a review revision's lock ends with the new package
     it.state.pop("post_revision", None)
     it.state.pop("post_regate", None)
+    if it.state.pop("harden_active", None):    # the hardened version is built: from here it is an ordinary item
+        k = int(it.state.get("harden_round", 0))
+        for key in ("harden_base", "harden_built"):
+            it.state.pop(key, None)
+        difficulty.write_round(it, k, packaged=time.time(), pkg_sha=calib.pkg_sha(it.p("pkg")))
+        P.store.event("harden_packaged", item=it.item_id, round=k)
     it.advance("PKG", "S9")
 
 
@@ -1351,12 +1357,13 @@ HARDEN_REVERT_STAGES = {"S5", "S5G", "S6A", "S6A_run", "S6B", "S6M", "S6C", "S7"
 
 
 def harden_needs_step(it) -> bool:
-    """An unfinished hardening transaction (start or revert) that must be completed whatever the item's status."""
+    """An unfinished hardening transaction (start or revert) that must be completed whatever the item's status.
+    Same eligibility as harden_revert (a version that never reached S9: no review runs)."""
     st = it.state
     if st.get("harden_pending") or st.get("harden_revert_pending"):
         return True
     return bool(st.get("harden_active") and st.get("status") in ("dropped", "parked") and
-                st.get("stage") in HARDEN_REVERT_STAGES)
+                st.get("stage") in HARDEN_REVERT_STAGES and not read_json(it.p("review", "runs.json"), []))
 
 
 def harden_step(P, it) -> None:

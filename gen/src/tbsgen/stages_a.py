@@ -676,6 +676,17 @@ S5G_FILES = ["_spec/spec.json", "_spec/author_code.json", "task/instruction.md",
 
 
 def s5g(P, it):
+    """Serialised per item (`run` and `calib watch` may both step it): the job number, inputs, launch and the
+    acceptance of the result happen under the item lock, on a freshly loaded state."""
+    from .stages_b import item_lock
+    with item_lock(it):
+        it.load()
+        if it.state.get("stage") != "S5G" or it.state.get("status") not in ("active", "waiting"):
+            return None
+        return _s5g(P, it)
+
+
+def _s5g(P, it):
     """Task authoring by a Claude Code agent on the build host (replaces S5 + S6A; same artefacts).  With a
     weakness profile (difficulty.profile_path) the agent also targets 1-3 of the student's weak points that the
     paper really supports and records them in _spec/difficulty_design.json; in a hardening round (difficulty.py)

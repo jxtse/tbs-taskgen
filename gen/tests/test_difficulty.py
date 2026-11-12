@@ -325,6 +325,13 @@ def test_targeting_leak_in_public_files_and_package(tmp_path):
     assert difficulty.targeting_leaks([tmp_path / "env"], prof, None)
     (pub / "rows.jsonl").write_bytes(b"x" * (3 << 20) + b" EX01 ")                     # large file, chunk edge
     assert difficulty.targeting_leaks([tmp_path / "env"], prof, None) == ["rows.jsonl: 'EX01'"]
+    (pub / "rows.jsonl").unlink()
+    (pub / "obs.dat").write_text("1 2 3 # weakness profile\n")                           # no extension skipped
+    assert difficulty.targeting_leaks([tmp_path / "env"], prof, None) == ["obs.dat: 'weakness profile'"]
+    (pub / "obs.dat").unlink()
+    import gzip
+    (pub / "obs.csv.gz").write_bytes(gzip.compress(b"a,b\n1,EX02\n"))                    # compressed content
+    assert difficulty.targeting_leaks([tmp_path / "env"], prof, None) == ["obs.csv.gz: 'EX02'"]
 
 
 def test_hardening_must_change_the_science(tmp_path):
@@ -436,3 +443,13 @@ def test_watch_follows_a_hardening_round_and_harden_refuses_pending_rescore(tmp_
     it.save()
     with pytest.raises(ValueError):
         harden_cmd(P2, P2.store.item(iid2), "op")
+
+
+def test_harden_active_ends_at_pkg_and_revision_failure_is_not_a_revert(tmp_path):
+    from tbsgen.stages_b import harden_needs_step
+    from tbsgen.state import Item
+    it = Item(tmp_path, "x").load()
+    it.p().mkdir(parents=True, exist_ok=True)
+    it.state.update(harden_active=True, stage="S8", status="dropped")
+    write_json(it.p("review", "runs.json"), [{"job_name": "r1", "outcome": "pass"}])
+    assert not harden_needs_step(it)                  # reviewed already: no revert, the item is not kept open

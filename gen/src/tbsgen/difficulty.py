@@ -196,16 +196,11 @@ def check_hardening(item_dir: Path, rnd: int) -> list[str]:
     return []
 
 
-_SKIP_EXT = {".npy", ".npz", ".pkl", ".pickle", ".h5", ".hdf5", ".nc", ".parquet", ".feather", ".png", ".jpg",
-             ".jpeg", ".tif", ".tiff", ".gif", ".bmp", ".mat", ".gz", ".zip", ".bz2", ".xz", ".zst", ".tar", ".pt",
-             ".pth", ".bin", ".dat", ".fits", ".fit"}
-
-
 def targeting_leaks(paths: list[Path], prof: dict | None, design: dict | None) -> list[str]:
     """Files under `paths` (the statement and every public file a solver gets) that reveal the difficulty
-    targeting: the profile id, a weakness id, or profile / design wording.  Every file is scanned as bytes in
-    overlapping 1 MB chunks (whatever its extension or size), except well-known binary array / image / archive
-    formats; a file that cannot be read is reported."""
+    targeting: the profile id, a weakness id, or profile / design wording.  Every file is scanned as raw bytes in
+    overlapping 1 MB chunks whatever its extension or size; gzip / bz2 / xz files and zip members are scanned
+    decompressed too.  A file that cannot be read is reported."""
     ids = set((prof or {}).get("ids") or [])
     ids |= {str(lv.get("weakness_id")) for lv in (design or {}).get("levers") or []
             if isinstance(lv, dict) and lv.get("weakness_id")}
@@ -219,14 +214,15 @@ def targeting_leaks(paths: list[Path], prof: dict | None, design: dict | None) -
         files = [root] if root.is_file() else (sorted(x for x in root.rglob("*") if x.is_file()) if root.is_dir()
                                                else [])
         for f in files:
-            if f.suffix.lower() in _SKIP_EXT:
-                continue
             if f.is_symlink():
                 out.append(f"{f.name}: symlink")
                 continue
             try:
-                hit = _scan_bytes(f, pats)
-            except OSError as e:
+                with f.open("rb") as fh:
+                    hit = _scan_stream(fh, pats)
+                if hit is None:
+                    hit = _scan_compressed(f, pats)
+            except Exception as e:  # noqa: BLE001  (unreadable / corrupt archive: report, never pass silently)
                 out.append(f"{f.name}: unreadable ({type(e).__name__})")
                 continue
             if hit:
@@ -234,19 +230,40 @@ def targeting_leaks(paths: list[Path], prof: dict | None, design: dict | None) -
     return out
 
 
-def _scan_bytes(f: Path, pats: list) -> str | None:
-    tail = b""
+def _scan_compressed(f: Path, pats: list) -> str | None:
+    import bz2
+    import gzip
+    import lzma
+    import zipfile
     with f.open("rb") as fh:
-        while True:
-            chunk = fh.read(1 << 20)
-            if not chunk:
-                return None
-            buf = tail + chunk
-            for pat in pats:
-                m = pat.search(buf)
-                if m:
-                    return m.group(0).decode(errors="replace")
-            tail = buf[-256:]
+        magic = fh.read(6)
+    opener = {b"\x1f\x8b": gzip.open, b"BZh": bz2.open, b"\xfd7zXZ": lzma.open}
+    for m, op in opener.items():
+        if magic.startswith(m):
+            with op(f, "rb") as fh:
+                return _scan_stream(fh, pats)
+    if magic.startswith(b"PK\x03\x04"):
+        with zipfile.ZipFile(f) as z:
+            for name in z.namelist():
+                with z.open(name) as fh:
+                    hit = _scan_stream(fh, pats)
+                if hit:
+                    return f"{name}: {hit}"
+    return None
+
+
+def _scan_stream(fh, pats: list) -> str | None:
+    tail = b""
+    while True:
+        chunk = fh.read(1 << 20)
+        if not chunk:
+            return None
+        buf = tail + chunk
+        for pat in pats:
+            m = pat.search(buf)
+            if m:
+                return m.group(0).decode(errors="replace")
+        tail = buf[-256:]
 
 
 def science_sha(task: Path) -> str:
