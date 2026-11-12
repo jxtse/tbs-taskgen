@@ -426,6 +426,11 @@ def launch_agent(cfg: dict, it, kind: str, conf: dict, ledger, est_usd: float, e
             write_json(recp, rec)
             return rec
         log = d / "launch.log"
+        # the previous job of this stage used the same log: its exit file would make poll_agent see this job as
+        # a launcher that already failed (before Harbor writes config.json)
+        for stale in (log, Path(str(log) + ".exit")):
+            if stale.exists():
+                stale.replace(d / f"{stale.name}.{rec.get('job_name', 'prev')}.prev")
         inner = (f"cd {shlex.quote(root)} && env -u PYTHONPATH -u VIRTUAL_ENV ./{launcher} run "
                  f"{shlex.quote(rec['config'])} > {shlex.quote(str(log))} 2>&1; echo $? > {shlex.quote(str(log))}.exit")
         rec.update(launch_attempted=time.time(), log=str(log), tmux=conf["job_name"][-60:])
@@ -454,7 +459,7 @@ def poll_agent(cfg: dict, it, kind: str, ledger) -> dict | None:
     exitf = Path(str(rec.get("log", "")) + ".exit")
     if not res.get("finished_at"):
         if exitf.exists() and not (jd / "config.json").exists():
-            rec.update(state="finished", outcome="launcher_failed",
+            rec.update(state="finished", outcome="launcher_failed", not_started=True,
                        error=Path(rec["log"]).read_text(errors="replace")[-400:] if Path(rec["log"]).exists() else "")
             if ledger is not None and rec.get("ledger_call"):
                 ledger.settle(rec["ledger_call"], 0.0, status="error", kind="not_launched", note=rec["error"][:300])

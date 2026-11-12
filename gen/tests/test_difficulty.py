@@ -453,3 +453,25 @@ def test_harden_active_ends_at_pkg_and_revision_failure_is_not_a_revert(tmp_path
     it.state.update(harden_active=True, stage="S8", status="dropped")
     write_json(it.p("review", "runs.json"), [{"job_name": "r1", "outcome": "pass"}])
     assert not harden_needs_step(it)                  # reviewed already: no revert, the item is not kept open
+
+
+def test_second_agent_job_ignores_the_previous_jobs_exit_file(tmp_path, monkeypatch):
+    """A re-authoring job reuses <stage>/launch.log: the earlier job's .exit must not make the new, still
+    starting job look like a failed launcher (it would also be charged its whole allowance)."""
+    P, it, fl = _profiled(tmp_path, monkeypatch, _files())
+    P.run(max_steps=2, until="S5G")
+    it = P.store.item(it.item_id)
+    assert it.state["stage"] == "S6A_run"
+    (it.p("S5G", "launch.log.exit")).write_text("0")             # left by the first job's launcher
+    from tbsgen import codeagent
+    calls = []
+    monkeypatch.setattr(codeagent.subprocess, "run", lambda args, **kw: calls.append(args) or
+                        __import__("subprocess").CompletedProcess(args, 0, "", ""))   # job starts, nothing yet
+    it.state.update(stage="S5G", status="active", S5G_rerun=True)
+    it.save()
+    P.run(max_steps=1, until="S5G")
+    P.run(max_steps=1, until="S5G")
+    it = P.store.item(it.item_id)
+    rec = read_json(it.p("S5G", "run.json"))
+    assert rec["state"] == "launched" and it.state["status"] == "waiting", (rec, it.state)
+    assert not (it.p("S5G", "launch.log.exit")).exists() and len(calls) == 1
