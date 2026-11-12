@@ -174,23 +174,41 @@ def test_reserved_without_launch_rechecks_admission_and_admit_uses_launch_day(tm
     assert rows[-1]["item"] == it.item_id and rows[-1]["day"] != stages_a._cst_day()
 
 
-def test_launcher_failed_job_with_its_own_log_is_not_charged(tmp_path, monkeypatch):
-    """A relay preflight 503 ends the launcher before Harbor creates the job: no model ran, so the per-paper /
-    per-round allowance (spent.json) must not be charged the job's whole max_usd."""
+def _fail_launch(P, it, monkeypatch, fl, log_text, exit_code="3"):
     import subprocess as sp
     from tbsgen import codeagent
-    P, it, fl = _agent_item(tmp_path, monkeypatch, _files(design=None), stage="S5G")
     monkeypatch.setattr(codeagent.subprocess, "run", lambda args, **kw: sp.CompletedProcess(args, 0, "", ""))
-    P.run(max_steps=1, until="S5G")                 # tmux started; the launcher then fails before Harbor runs
+    P.run(max_steps=1, until="S5G")                 # tmux started; the launcher then ends without a Harbor job
     rec = read_json(it.p("S5G", "run.json"))
     assert rec["state"] == "launched" and Path(rec["log"]).name.startswith(rec["job_name"])
-    Path(rec["log"]).write_text("relay preflight http=503\nharbor exit 3\n")
-    Path(rec["log"] + ".exit").write_text("3")
+    Path(rec["log"]).write_text(log_text)
+    Path(rec["log"] + ".exit").write_text(exit_code)
     monkeypatch.setattr(codeagent.subprocess, "run", fl)
     P.run(max_steps=1, until="S5G")                 # poll -> launcher_failed -> infra retry
     st = P.store.item(it.item_id).state
     assert st["status"] == "active" and st["stage"] == "S5G", st
     P.run(max_steps=1, until="S5G")                 # next job: the failed one is charged first
-    spent = read_json(it.p("S5G", "spent.json"))
+    return rec, read_json(it.p("S5G", "spent.json"))
+
+
+def test_launcher_failed_at_relay_preflight_is_not_charged(tmp_path, monkeypatch):
+    """The relay preflight refused (explicit evidence in the job's own log, exit 3): no model ran, so the
+    per-paper / per-round allowance (spent.json) is not charged the job's whole max_usd."""
+    P, it, fl = _agent_item(tmp_path, monkeypatch, _files(design=None), stage="S5G")
+    rec, spent = _fail_launch(P, it, monkeypatch, fl, "x: started on h\nrelay preflight try 6 http=503; retry in 30 s\n"
+                              "relay preflight http=503\n2026 J: harbor exit 3\n")
     assert spent[rec["job_name"]]["usd"] == 0.0, spent
-    assert read_json(it.p("S5G", "run.json"))["job_name"] != rec["job_name"]
+    assert read_json(it.p("S5G", "run.json"))["job_name"] != rec["job_name"]     # retried with the full allowance
+    with P.ledger._db() as db:
+        row = db.execute("SELECT usd, status FROM calls WHERE id=?", (rec["ledger_call"],)).fetchone()
+    assert row == (0.0, "error")
+
+
+def test_launcher_failed_without_preflight_evidence_stays_conservative(tmp_path, monkeypatch):
+    """No config.json copied back but no pre-start evidence (e.g. the copy-back failed after a real run): the job
+    is charged its whole allowance as before."""
+    P, it, fl = _agent_item(tmp_path, monkeypatch, _files(design=None), stage="S5G")
+    rec, spent = _fail_launch(P, it, monkeypatch, fl, "relay preflight http=200\nrsync failed\nJ: harbor exit 1\n", "1")
+    assert spent[rec["job_name"]]["usd"] == float(rec["budget"]["max_usd"]) > 0, spent
+    # the whole allowance is used up: the paper is not re-authored on an unknown spend
+    assert P.store.item(it.item_id).state["reason"] == "s5g_budget_exhausted"

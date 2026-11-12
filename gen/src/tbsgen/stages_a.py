@@ -551,10 +551,9 @@ def _agent_stage(P, it, kind: str, instruction: str, need: list[str], timeout_s:
         if rec is not None and rec.get("job_name") and rec["job_name"] not in charges:
             if rec.get("not_started") or not rec.get("launch_attempted"):
                 usd, sec = 0.0, 0.0             # confirmed never started
-            elif rec.get("outcome") == "launcher_failed" and Path(str(rec.get("log", ""))).name.startswith(
-                    str(rec.get("job_name"))):
-                # this job's own launcher log ended and Harbor never created the job (no config.json; e.g. a relay
-                # preflight 503): the agent never ran, so no model cost; wall time of the attempt only
+            elif _failed_before_harbor(rec):
+                # explicit pre-start failure evidence in this job's own launcher log (the relay preflight refused,
+                # so Harbor never ran and no model was called): no model cost; wall time of the attempt only
                 usd = 0.0
                 sec = max(0.0, float(rec.get("finished_ts") or time.time()) - float(rec["launch_attempted"]))
             else:
@@ -854,6 +853,28 @@ def _s5g(P, it):
         from .stages_b import harden_authored
         harden_authored(P, it)
     it.advance("S5G", "S6A_run", form=spec.get("form"), cost_usd=rec.get("cost_usd"), minutes=rec.get("minutes"))
+
+
+# the build-host runner writes "relay preflight http=<code>" and exits 3 before starting Harbor when the model relay
+# is down; the launcher copies that log tail and "<job>: harbor exit 3" into the job's own launcher log
+_PREFLIGHT_FAIL = re.compile(r"relay preflight http=(?!200\b)\d+\s*$", re.M)
+
+
+def _failed_before_harbor(rec: dict) -> bool:
+    """True only with explicit evidence that the job never reached Harbor: launcher_failed (no Harbor config.json),
+    the job's OWN launcher log (not a shared one), exit status 3, and the relay-preflight refusal in that log.  A
+    missing config.json alone is not enough (a failed copy-back of a job that really ran looks the same)."""
+    if rec.get("outcome") != "launcher_failed":
+        return False
+    log = Path(str(rec.get("log", "")))
+    if not log.name.startswith(str(rec.get("job_name"))) or not log.exists():
+        return False
+    try:
+        code = Path(str(log) + ".exit").read_text().strip()
+        text = log.read_text(errors="replace")
+    except OSError:
+        return False
+    return code == "3" and bool(_PREFLIGHT_FAIL.search(text)) and "harbor exit 3" in text
 
 
 def _admissions_path(P, kind: str) -> Path:
