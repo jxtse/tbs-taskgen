@@ -616,8 +616,9 @@ def _agent_stage(P, it, kind: str, instruction: str, need: list[str], timeout_s:
         # resumed: reuse the persisted reservation amount (clamped to the paper cap when the job was set up); the
         # record already holds its slot (intent / reserved count as running) and its admission is per paper
         with _agent_slot_lock(P):
-            if rec.get("state") == "intent":
-                # never reserved (e.g. a budget stop): it holds no slot and no admission -> same checks as new
+            if rec.get("state") == "intent" or (rec.get("state") == "reserved" and not rec.get("launch_attempted")):
+                # never started (budget stop before the reservation, or a crash before the launch): no admission
+                # yet -> the same checks as a new job (a held reservation keeps its slot meanwhile)
                 why = _agent_admission(P, it, kind)
                 if why:
                     it.finish("paused" if why.startswith("budget:") else "waiting", why, paused_stage=kind)
@@ -922,10 +923,13 @@ def _backfill_admissions(P, kind: str) -> None:
 
 
 def _agent_admit(P, it, kind: str) -> None:
-    """Record that this paper's first job of `kind` started (idempotent; call under _agent_slot_lock)."""
+    """Record that this paper's first job of `kind` started (idempotent; call under _agent_slot_lock).  The day is
+    the Asia/Shanghai day of the job's launch (launch_attempted), whenever the record is written."""
     if any(r.get("item") == it.item_id for r in _admissions(P, kind)):
         return
-    day = _cst_day()
+    r = read_json(it.p(kind, "run.json"), None) or {}
+    ts = float(r.get("launch_attempted") or time.time())
+    day = time.strftime("%Y-%m-%d", time.gmtime(ts + 8 * 3600))
     with _admissions_path(P, kind).open("a") as f:
         f.write(json.dumps(dict(day=day, item=it.item_id, ts=time.time())) + "\n")
     P.store.event(f"{kind.lower()}_admitted", item=it.item_id, day=day)

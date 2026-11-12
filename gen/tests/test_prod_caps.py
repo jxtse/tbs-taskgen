@@ -147,3 +147,27 @@ def test_admission_backfilled_after_a_crash(tmp_path, monkeypatch):
     P.run(max_steps=1, until="S5G")                                # the launched branch re-records it
     rows = (P.store.root / "s5g-admissions.jsonl").read_text().splitlines()
     assert len(rows) == 1 and it.item_id in rows[0]
+
+
+def test_reserved_without_launch_rechecks_admission_and_admit_uses_launch_day(tmp_path, monkeypatch):
+    P, it, fl = _agent_item(tmp_path, monkeypatch, _files(design=None), stage="S5G")
+    P.cfg["code"]["daily_new_authoring"] = 1
+    from tbsgen import stages_a
+    # another paper already took today's slot
+    (P.store.root / "s5g-admissions.jsonl").write_text(json.dumps(dict(day=stages_a._cst_day(), item="x")) + "\n")
+    from tbsgen.state import write_json
+    (it.p("S5G")).mkdir(parents=True, exist_ok=True)
+    write_json(it.p("S5G", "job.json"), {"job_name": "J", "jobs_dir": str(tmp_path), "agents": [{"model_name": "m"}]})
+    write_json(it.p("S5G", "run.json"), dict(job_name="J", state="reserved", config=str(it.p("S5G", "job.json")),
+                                             job_dir=str(tmp_path / "J"), kind="S5G", est_usd=1.0))
+    P.run(max_steps=1, until="S5G")                 # crash before the launch, resumed: admission checked again
+    st = P.store.item(it.item_id).state
+    assert st["status"] == "paused" and st["reason"].startswith("budget:daily_s5g_papers") and not fl.calls
+    # a job launched yesterday whose admission line was lost is recorded on yesterday's date
+    rec = read_json(it.p("S5G", "run.json"))
+    rec.update(state="launched", launch_attempted=__import__("time").time() - 86400)
+    write_json(it.p("S5G", "run.json"), rec)
+    with stages_a._agent_slot_lock(P):
+        stages_a._agent_admit(P, P.store.item(it.item_id), "S5G")
+    rows = [json.loads(x) for x in (P.store.root / "s5g-admissions.jsonl").read_text().splitlines()]
+    assert rows[-1]["item"] == it.item_id and rows[-1]["day"] != stages_a._cst_day()
