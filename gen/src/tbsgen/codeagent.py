@@ -425,17 +425,23 @@ def launch_agent(cfg: dict, it, kind: str, conf: dict, ledger, est_usd: float, e
                 ledger.settle(rec["ledger_call"], 0.0, status="error", kind="not_launched", note=rec["error"])
             write_json(recp, rec)
             return rec
-        log = d / "launch.log"
-        # the previous job of this stage used the same log: its exit file would make poll_agent see this job as
-        # a launcher that already failed (before Harbor writes config.json)
-        for stale in (log, Path(str(log) + ".exit")):
-            if stale.exists():
-                stale.replace(d / f"{stale.name}.{rec.get('job_name', 'prev')}.prev")
+        # one log / exit file per job: an earlier job's launcher (it may exit after its result.json appeared) can
+        # never write the exit status this job is judged by
+        log = d / f"{conf['job_name']}.launch.log"
+        tmux_bin = cfg["calib"].get("tmux_bin", "tmux")
+        if rec.get("launch_attempted") and rec.get("tmux"):
+            # resumed after a crash between the tmux start and saving "launched": never start it twice
+            alive = subprocess.run([tmux_bin, "has-session", "-t", "=" + rec["tmux"]], capture_output=True,
+                                   text=True, timeout=60).returncode == 0
+            if alive or Path(str(rec.get("log", log)) + ".exit").exists():
+                rec["state"] = "launched"
+                write_json(recp, rec)
+                return rec
         inner = (f"cd {shlex.quote(root)} && env -u PYTHONPATH -u VIRTUAL_ENV ./{launcher} run "
                  f"{shlex.quote(rec['config'])} > {shlex.quote(str(log))} 2>&1; echo $? > {shlex.quote(str(log))}.exit")
         rec.update(launch_attempted=time.time(), log=str(log), tmux=conf["job_name"][-60:])
         write_json(recp, rec)
-        r = subprocess.run([cfg["calib"].get("tmux_bin", "tmux"), "new-session", "-d", "-s", rec["tmux"], "bash", "-lc",
+        r = subprocess.run([tmux_bin, "new-session", "-d", "-s", rec["tmux"], "bash", "-lc",
                             inner], capture_output=True, text=True, timeout=60)
         if r.returncode != 0:
             # tmux could not create the session: the job never started (nothing spent)
@@ -459,7 +465,7 @@ def poll_agent(cfg: dict, it, kind: str, ledger) -> dict | None:
     exitf = Path(str(rec.get("log", "")) + ".exit")
     if not res.get("finished_at"):
         if exitf.exists() and not (jd / "config.json").exists():
-            rec.update(state="finished", outcome="launcher_failed", not_started=True,
+            rec.update(state="finished", outcome="launcher_failed",
                        error=Path(rec["log"]).read_text(errors="replace")[-400:] if Path(rec["log"]).exists() else "")
             if ledger is not None and rec.get("ledger_call"):
                 ledger.settle(rec["ledger_call"], 0.0, status="error", kind="not_launched", note=rec["error"][:300])

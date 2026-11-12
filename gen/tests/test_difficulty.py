@@ -455,23 +455,38 @@ def test_harden_active_ends_at_pkg_and_revision_failure_is_not_a_revert(tmp_path
     assert not harden_needs_step(it)                  # reviewed already: no revert, the item is not kept open
 
 
-def test_second_agent_job_ignores_the_previous_jobs_exit_file(tmp_path, monkeypatch):
-    """A re-authoring job reuses <stage>/launch.log: the earlier job's .exit must not make the new, still
-    starting job look like a failed launcher (it would also be charged its whole allowance)."""
+def test_agent_jobs_have_their_own_launch_log_and_resume_never_starts_twice(tmp_path, monkeypatch):
+    """Each agent job writes its own <job>.launch.log(.exit): an earlier job's launcher that exits late cannot make
+    a new, still starting job look like a failed launcher (which would also charge its whole allowance); a reserved
+    record resumed after a crash between the tmux start and saving "launched" is not started twice."""
     P, it, fl = _profiled(tmp_path, monkeypatch, _files())
     P.run(max_steps=2, until="S5G")
     it = P.store.item(it.item_id)
     assert it.state["stage"] == "S6A_run"
-    (it.p("S5G", "launch.log.exit")).write_text("0")             # left by the first job's launcher
+    first = read_json(it.p("S5G", "run.json"))
+    assert first["log"].endswith("-s5g1.launch.log")
     from tbsgen import codeagent
     calls = []
-    monkeypatch.setattr(codeagent.subprocess, "run", lambda args, **kw: calls.append(args) or
-                        __import__("subprocess").CompletedProcess(args, 0, "", ""))   # job starts, nothing yet
+
+    def fake(args, **kw):
+        calls.append(args)
+        rc = 1 if args[1] == "has-session" else 0
+        return __import__("subprocess").CompletedProcess(args, rc, "", "")
+    monkeypatch.setattr(codeagent.subprocess, "run", fake)     # the new job starts but writes nothing yet
     it.state.update(stage="S5G", status="active", S5G_rerun=True)
     it.save()
     P.run(max_steps=1, until="S5G")
+    Path(first["log"] + ".exit").write_text("0")               # the first job's launcher exits late
     P.run(max_steps=1, until="S5G")
     it = P.store.item(it.item_id)
     rec = read_json(it.p("S5G", "run.json"))
-    assert rec["state"] == "launched" and it.state["status"] == "waiting", (rec, it.state)
-    assert not (it.p("S5G", "launch.log.exit")).exists() and len(calls) == 1
+    assert rec["job_name"].endswith("-s5g2") and rec["state"] == "launched" and it.state["status"] == "waiting"
+    assert [a[1] for a in calls] == ["new-session"]
+    # crash after the tmux start, before "launched" was saved: the session is alive -> adopted, not restarted
+    rec["state"] = "reserved"
+    write_json(it.p("S5G", "run.json"), rec)
+    monkeypatch.setattr(codeagent.subprocess, "run", lambda args, **kw: calls.append(args) or
+                        __import__("subprocess").CompletedProcess(args, 0, "", ""))
+    conf = json.loads(Path(rec["config"]).read_text())
+    out = codeagent.launch_agent(P.cfg, it, "S5G", conf, None, 1.0)
+    assert out["state"] == "launched" and [a[1] for a in calls] == ["new-session", "has-session"]
