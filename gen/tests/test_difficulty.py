@@ -453,3 +453,77 @@ def test_harden_active_ends_at_pkg_and_revision_failure_is_not_a_revert(tmp_path
     it.state.update(harden_active=True, stage="S8", status="dropped")
     write_json(it.p("review", "runs.json"), [{"job_name": "r1", "outcome": "pass"}])
     assert not harden_needs_step(it)                  # reviewed already: no revert, the item is not kept open
+
+
+def test_agent_jobs_have_their_own_launch_log_and_resume_never_starts_twice(tmp_path, monkeypatch):
+    """Each agent job writes its own <job>.launch.log(.exit): an earlier job's launcher that exits late cannot make
+    a new, still starting job look like a failed launcher (which would also charge its whole allowance); a reserved
+    record resumed after a crash between the tmux start and saving "launched" is not started twice."""
+    P, it, fl = _profiled(tmp_path, monkeypatch, _files())
+    P.run(max_steps=2, until="S5G")
+    it = P.store.item(it.item_id)
+    assert it.state["stage"] == "S6A_run"
+    first = read_json(it.p("S5G", "run.json"))
+    assert first["log"].endswith("-s5g1.launch.log")
+    from tbsgen import codeagent
+    calls = []
+
+    def fake(args, **kw):
+        calls.append(args)
+        rc = 1 if args[1] == "has-session" else 0
+        return __import__("subprocess").CompletedProcess(args, rc, "", "")
+    monkeypatch.setattr(codeagent.subprocess, "run", fake)     # the new job starts but writes nothing yet
+    it.state.update(stage="S5G", status="active", S5G_rerun=True)
+    it.save()
+    P.run(max_steps=1, until="S5G")
+    Path(first["log"] + ".exit").write_text("0")               # the first job's launcher exits late
+    P.run(max_steps=1, until="S5G")
+    it = P.store.item(it.item_id)
+    rec = read_json(it.p("S5G", "run.json"))
+    assert rec["job_name"].endswith("-s5g2") and rec["state"] == "launched" and it.state["status"] == "waiting"
+    assert [a[1] for a in calls] == ["new-session"]
+    # crash after the tmux start, before "launched" was saved: the session is alive -> adopted, not restarted
+    rec["state"] = "reserved"
+    write_json(it.p("S5G", "run.json"), rec)
+    monkeypatch.setattr(codeagent.subprocess, "run", lambda args, **kw: calls.append(args) or
+                        __import__("subprocess").CompletedProcess(args, 0, "", ""))
+    conf = json.loads(Path(rec["config"]).read_text())
+    out = codeagent.launch_agent(P.cfg, it, "S5G", conf, None, 1.0)
+    assert out["state"] == "launched" and [a[1] for a in calls] == ["new-session", "has-session"]
+    # tmux cannot tell (e.g. socket permission error): the reservation is kept, nothing is started
+    rec["state"] = "reserved"
+    write_json(it.p("S5G", "run.json"), rec)
+    monkeypatch.setattr(codeagent.subprocess, "run", lambda args, **kw: calls.append(args) or
+                        __import__("subprocess").CompletedProcess(args, 1, "", "permission denied"))
+    out = codeagent.launch_agent(P.cfg, it, "S5G", conf, None, 1.0)
+    assert out["state"] == "reserved" and [a[1] for a in calls][-1] == "has-session"
+    # a pre-fix record pointing at the shared launch.log: its .exit is not evidence; session gone -> start
+    rec.update(state="reserved", log=str(it.p("S5G", "launch.log")))
+    write_json(it.p("S5G", "run.json"), rec)
+    (it.p("S5G", "launch.log.exit")).write_text("0")
+    monkeypatch.setattr(codeagent.subprocess, "run", lambda args, **kw: calls.append(args) or
+                        __import__("subprocess").CompletedProcess(args, 0 if args[1] == "new-session" else 1, "",
+                                                              "can't find session"))
+    out = codeagent.launch_agent(P.cfg, it, "S5G", conf, None, 1.0)
+    assert out["state"] == "launched" and [a[1] for a in calls][-2:] == ["has-session", "new-session"]
+    assert out["log"].endswith("-s5g2.launch.log")
+
+
+def test_poll_does_not_trust_a_shared_logs_exit_while_the_session_lives(tmp_path, monkeypatch):
+    from tbsgen import codeagent
+    P, it, fl = _profiled(tmp_path, monkeypatch, _files())
+    d = it.p("S5G")
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "launch.log").write_text("old")
+    (d / "launch.log.exit").write_text("0")                       # written by an earlier job's launcher
+    jd = tmp_path / "jobs" / "J-s5g2"
+    jd.mkdir(parents=True)
+    write_json(d / "run.json", dict(job_name="J-s5g2", state="launched", job_dir=str(jd), log=str(d / "launch.log"),
+                                    tmux="J-s5g2", kind="S5G", launch_attempted=1.0))
+    rc = {"v": 0}
+    monkeypatch.setattr(codeagent.subprocess, "run", lambda args, **kw:
+                        __import__("subprocess").CompletedProcess(args, rc["v"], "", "can't find session"))
+    assert codeagent.poll_agent(P.cfg, it, "S5G", None) is None    # session alive: still running
+    rc["v"] = 1
+    out = codeagent.poll_agent(P.cfg, it, "S5G", None)             # session gone, no Harbor job: launcher failed
+    assert out["outcome"] == "launcher_failed"

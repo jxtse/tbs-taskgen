@@ -425,12 +425,27 @@ def launch_agent(cfg: dict, it, kind: str, conf: dict, ledger, est_usd: float, e
                 ledger.settle(rec["ledger_call"], 0.0, status="error", kind="not_launched", note=rec["error"])
             write_json(recp, rec)
             return rec
-        log = d / "launch.log"
+        # one log / exit file per job: an earlier job's launcher (it may exit after its result.json appeared) can
+        # never write the exit status this job is judged by
+        log = d / f"{conf['job_name']}.launch.log"
+        tmux_bin = cfg["calib"].get("tmux_bin", "tmux")
+        if rec.get("launch_attempted") and rec.get("tmux"):
+            # resumed after a crash between the tmux start and saving "launched": never start it twice
+            from .calib import session_alive
+            alive = session_alive(cfg["calib"], rec)
+            own_exit = rec.get("log") and Path(rec["log"]).name.startswith(conf["job_name"]) and \
+                Path(str(rec["log"]) + ".exit").exists()       # a shared (pre-fix) log's .exit proves nothing
+            if alive or own_exit:
+                rec["state"] = "launched"
+                write_json(recp, rec)
+                return rec
+            if alive is None:
+                return rec                      # cannot tell: keep the reservation, try again on the next step
         inner = (f"cd {shlex.quote(root)} && env -u PYTHONPATH -u VIRTUAL_ENV ./{launcher} run "
                  f"{shlex.quote(rec['config'])} > {shlex.quote(str(log))} 2>&1; echo $? > {shlex.quote(str(log))}.exit")
         rec.update(launch_attempted=time.time(), log=str(log), tmux=conf["job_name"][-60:])
         write_json(recp, rec)
-        r = subprocess.run([cfg["calib"].get("tmux_bin", "tmux"), "new-session", "-d", "-s", rec["tmux"], "bash", "-lc",
+        r = subprocess.run([tmux_bin, "new-session", "-d", "-s", rec["tmux"], "bash", "-lc",
                             inner], capture_output=True, text=True, timeout=60)
         if r.returncode != 0:
             # tmux could not create the session: the job never started (nothing spent)
@@ -452,6 +467,12 @@ def poll_agent(cfg: dict, it, kind: str, ledger) -> dict | None:
     jd = Path(rec["job_dir"])
     res = read_json(jd / "result.json", {}) or {}
     exitf = Path(str(rec.get("log", "")) + ".exit")
+    if not Path(str(rec.get("log", ""))).name.startswith(str(rec.get("job_name"))) and exitf.exists():
+        # a pre-fix record on the shared <stage>/launch.log: that .exit may be an earlier job's; trust it only once
+        # this job's tmux session is gone (alive or unknown -> keep waiting)
+        from .calib import session_alive
+        if session_alive(cfg["calib"], rec) is not False:
+            return None
     if not res.get("finished_at"):
         if exitf.exists() and not (jd / "config.json").exists():
             rec.update(state="finished", outcome="launcher_failed",
