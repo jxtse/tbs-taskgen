@@ -139,9 +139,12 @@ class Pipeline:
         self.store.event("stage_start", item=it.item_id, stage=st)
         t0 = time.time()
         try:
-            HANDLERS[st](self, it)
-            if it.state.get("harden_active") and it.state.get("status") in ("dropped", "parked"):
-                B.harden_revert(self, it)       # a hardened version that failed to build: back to the old one
+            if B.harden_needs_step(it):
+                B.harden_step(self, it)         # finish an interrupted hardening start / revert first
+            else:
+                HANDLERS[st](self, it)
+                if B.harden_needs_step(it):
+                    B.harden_step(self, it)     # a hardened version that failed to build: back to the old one
         except BudgetStop as e:
             it.finish("paused", f"budget:{e.reason}", detail=e.detail, paused_stage=st)
             self.stopped_models.add(alias if role else st)
@@ -238,6 +241,8 @@ class Pipeline:
                 return False
             if it.state["status"] == "active":
                 return True
+            if B.harden_needs_step(it):         # an interrupted hardening transaction (any status)
+                return it.item_id not in polled
             # code-grounded agent job (S4c / S5G) running on the build host: poll it once per run
             if it.state["status"] == "waiting" and it.state["stage"] in AGENT_STAGES:
                 return it.item_id not in polled
@@ -250,7 +255,9 @@ class Pipeline:
             for it in self.order([i for i in self.store.items() if runnable(i)]):
                 if not runnable(it):            # its status may have changed since the snapshot
                     continue
-                if it.state["status"] == "waiting" and it.state["stage"] in AGENT_STAGES:
+                if B.harden_needs_step(it):
+                    polled.add(it.item_id)
+                elif it.state["status"] == "waiting" and it.state["stage"] in AGENT_STAGES:
                     polled.add(it.item_id)
                 elif it.state["status"] == "waiting":
                     rewoken.add(it.item_id)

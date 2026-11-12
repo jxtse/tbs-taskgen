@@ -49,17 +49,21 @@ def s7(P, it):
             return it.finish("paused", f"code:config:{why}", paused_stage="S7")
     spec = read_json(it.p("_spec", "spec.json"))
     th = read_json(it.p("thresholds.json"))["thresholds"]
-    if it.p("_spec", difficulty.DESIGN_FILE).exists() and not it.state.get("thresholds_locked"):
+    hround = int(it.state.get("harden_round", 0)) if it.state.get("harden_active") else 0
+    if (it.p("_spec", difficulty.DESIGN_FILE).exists() or hround) and not it.state.get("thresholds_locked"):
         # (a review revision / regate never changes the science, so the design is not re-checked there)
         mode = difficulty.dcfg(P.cfg).get("design_gate", "block")
-        if mode != "off":
+        if mode != "off" or hround:
             try:
                 prof = difficulty.load_profile(P.cfg)
             except (OSError, ValueError):
                 prof = None
-            chk = difficulty.check_lever_separation(it.dir, spec, th, prof)
+            chk = difficulty.check_lever_separation(it.dir, spec, th, prof) \
+                if it.p("_spec", difficulty.DESIGN_FILE).exists() and mode != "off" else dict(ok=True, problems=[])
+            hp = difficulty.check_hardening(it.dir, hround) if hround else []
+            chk = dict(chk, ok=chk["ok"] and not hp, problems=list(chk["problems"]) + hp, hardening=hp)
             write_json(it.p("gates", "difficulty.json"), dict(chk, mode=mode, ts=time.time()))
-            if not chk["ok"] and mode == "block":
+            if not chk["ok"] and (mode == "block" or hp):
                 P.store.event("difficulty_design_failed", item=it.item_id, problems=chk["problems"][:5],
                               harden_round=it.state.get("harden_round", 0))
                 write_json(it.p("S6_failure.json"), dict(why="difficulty_design", info=chk))
@@ -319,6 +323,15 @@ def pkg(P, it):
                                                                                for f in al["findings"]])
     if not rm["ok"]:
         v = dict(v, ok=False, errors=list(v.get("errors") or []) + [f"readymade: {rm['findings'][:3]}"])
+    if it.p("_spec", difficulty.DESIGN_FILE).exists() or difficulty.dcfg(P.cfg).get("profile_path"):
+        try:
+            prof = difficulty.load_profile(P.cfg)
+        except (OSError, ValueError):
+            prof = None
+        tl = difficulty.targeting_leaks([out / "instruction.md", out / "environment", out / "task.toml"], prof,
+                                        read_json(it.p("_spec", difficulty.DESIGN_FILE), None))
+        if tl:
+            v = dict(v, ok=False, errors=list(v.get("errors") or []) + [f"targeting_leak: {tl[:3]}"])
     write_json(it.p("PKG_check.json"), v)
     if not v["ok"]:
         raw = v.get("errors")
@@ -1246,13 +1259,27 @@ def _first_student_pass(runs: list[dict], cfg: dict) -> dict | None:
     return next((r for r in real if r["who"] == "glm" and r["outcome"] == "pass"), None)
 
 
+def _s5g_base(it, k: int) -> dict:
+    """S5G spend and job count before hardening round k (the round's own allowance starts from here)."""
+    charges = dict(read_json(it.p("S5G", "spent.json"), {}) or {})
+    rec = read_json(it.p("S5G", "run.json"), None) or {}
+    if rec.get("job_name") and rec["job_name"] not in charges and rec.get("launch_attempted"):
+        b = rec.get("budget") or {}
+        usd = rec.get("cost_usd")
+        charges[rec["job_name"]] = dict(usd=float(usd) if usd is not None else float(b.get("max_usd") or 0.0),
+                                        sec=60.0 * float(rec["minutes"]) if rec.get("minutes") is not None else 0.0)
+    return dict(round=k, usd=sum(c["usd"] for c in charges.values()), sec=sum(c["sec"] for c in charges.values()),
+                jobs=int((it.state.get("attempts") or {}).get("S5G:job", 0)))
+
+
 def start_hardening(P, it, operator: str | None = None):
-    """Send the current version back to S5G for a hardening round.  Crash-safe and idempotent: the round number
-    and the trigger are persisted (state.harden_pending) before anything moves; a resumed S9 finishes the same
-    round without another model call.  Steps: snapshot the version (harden/round-k/prev), write the feedback the
-    author may see (harden/round-k/feedback.json: the student's own summary, minutes, per-metric margins), archive
-    this calibration epoch (records kept under calib/epoch-<e>/; never pooled with the next version), reset the
-    per-version build counters, -> S5G (a new authoring job with the previous version and the feedback)."""
+    """Send the current version back to S5G for a hardening round.  Crash-safe and idempotent: the round number,
+    the trigger and the epoch are persisted (state.harden_pending) before anything moves; an item with a pending
+    round is scheduled whatever its stage / status (pipeline.runnable) and finishes the same round without another
+    model call.  Steps: feedback the author may see (harden/round-k/feedback.json: the student's own summary,
+    minutes, per-metric aggregate margins), snapshot of the version (harden/round-k/prev), round record, release
+    withdrawal, archive of this calibration epoch (never pooled with the next version), reset of the per-version
+    build state, -> S5G (a new authoring job with the previous version and the feedback; its own allowance)."""
     st = it.state
     pend = st.get("harden_pending")
     if not pend:
@@ -1261,11 +1288,12 @@ def start_hardening(P, it, operator: str | None = None):
         if trig is None:
             raise ValueError("hardening needs a passing student run in the current calibration")
         k = int(st.get("harden_round", 0)) + 1
-        pend = dict(round=k, trigger=trig["job_name"], epoch=int(st.get("calib_epoch", 0)), operator=operator,
-                    ts=time.time())
+        th = (read_json(it.p("thresholds.json"), {}) or {}).get("thresholds") or {}
         rd = it.p("harden", f"round-{k}")
         rd.mkdir(parents=True, exist_ok=True)
-        write_json(rd / "feedback.json", difficulty.feedback(trig))
+        write_json(rd / "feedback.json", difficulty.feedback(trig, th))
+        pend = dict(round=k, trigger=trig["job_name"], epoch=int(st.get("calib_epoch", 0)), operator=operator,
+                    from_stage=st.get("stage"), from_status=st.get("status"), base=_s5g_base(it, k), ts=time.time())
         st["harden_pending"] = pend
         it.save()
     k = int(pend["round"])
@@ -1274,16 +1302,18 @@ def start_hardening(P, it, operator: str | None = None):
     rec = read_json(rd / "record.json", {}) or {}
     if "prev_task_sha" not in rec:                     # written once, before the epoch is archived
         runs = read_json(it.p("calib", "runs.json"), []) or []
-        rec = difficulty.write_round(
+        difficulty.write_round(
             it, k, round=k, trigger=pend["trigger"], operator=pend.get("operator"),
-            prev_task_sha=difficulty.task_sha(it.p("task")),
+            prev_task_sha=difficulty.task_sha(it.p("task")), prev_science_sha=difficulty.science_sha(it.p("task")),
             prev_pkg_sha=calib.pkg_sha(it.p("pkg")) if it.p("pkg").exists() else None,
             prev_label=st.get("calib_label"), archived_epoch=pend["epoch"],
             prev_runs=[{x: r.get(x) for x in ("job_name", "who", "outcome", "minutes", "cost_usd")} for r in runs],
             started=time.time())
     withdraw(P, it.item_id, f"hardening round {k}")     # no-op unless released
     if int(st.get("calib_epoch", 0)) == int(pend["epoch"]):
-        _archive_calibration(it)                         # idempotent: only while the epoch is still current
+        _archive_calibration(it)                         # only while the epoch is still current (idempotent)
+    for p in it.p("calib").glob("prepare*.json") if it.p("calib").exists() else []:
+        p.unlink()                                       # the prepared sandbox copy is of the old package
     for d in ("gates", "runs"):                         # the previous version's copies are in round-k/prev
         if it.p(d).exists():
             shutil.rmtree(it.p(d))
@@ -1291,12 +1321,14 @@ def start_hardening(P, it, operator: str | None = None):
         if it.p(f).is_file():
             it.p(f).unlink()
     for key in ("thresholds_locked", "repair_rounds", "back_to_spec", "ref_rewrite", "avoid_mid_drop", "regen_6a",
-                "regen_6c", "s6a_feedback", "repair_from", "calib_label", "rescore_pending", "post_revision",
+                "s6a_feedback", "repair_from", "calib_label", "rescore_pending", "post_revision",
                 "post_regate", "difficulty_reauthored", "harden_built", "harden_pending"):
         st.pop(key, None)
     st.setdefault("attempts", {}).pop("S7", None)
+    st["regen_6c"] = True
     st["harden_round"] = k
     st["harden_active"] = True
+    st["harden_base"] = pend["base"]
     st["S5G_rerun"] = True
     st.setdefault("history", []).append(dict(stage=st.get("stage"), result="harden", to="S5G", round=k,
                                              trigger=pend["trigger"], ts=time.time()))
@@ -1307,46 +1339,77 @@ def start_hardening(P, it, operator: str | None = None):
     return None
 
 
-HARDEN_REVERT_STAGES = {"S5G", "S6A", "S6A_run", "S6B", "S6M", "S6C", "S7", "S8", "PKG"}
+HARDEN_REVERT_STAGES = {"S5", "S5G", "S6A", "S6A_run", "S6B", "S6M", "S6C", "S7", "S8", "PKG"}
 
 
-def harden_revert(P, it) -> bool:
-    """A hardened version that could not be built (dropped / parked in S5G..PKG, before any S9R review): put the
-    previous version back (its files from harden/round-k/prev and its calibration records), stop hardening this
-    item and continue its calibration under the original rule.  The failed version is kept under
-    harden/round-k/failed/ and its calibration epoch stays archived."""
+def harden_needs_step(it) -> bool:
+    """An unfinished hardening transaction (start or revert) that must be completed whatever the item's status."""
     st = it.state
-    if not st.get("harden_active") or st.get("status") not in ("dropped", "parked") or \
-            st.get("stage") not in HARDEN_REVERT_STAGES or str(st.get("reason", "")).startswith("review:infra"):
-        return False
-    k = int(st.get("harden_round", 0))
-    rd = it.p("harden", f"round-{k}")
-    rec = read_json(rd / "record.json", {}) or {}
-    if not (rd / "prev" / "DONE").exists() or rec.get("archived_epoch") is None:
-        return False
-    if read_json(it.p("review", "runs.json"), []):
-        return False        # reviewed already (S9R job names follow the review round): the verdict stands
-    why = f"{st.get('stage')}:{st.get('reason')}"
+    if st.get("harden_pending") or st.get("harden_revert_pending"):
+        return True
+    return bool(st.get("harden_active") and st.get("status") in ("dropped", "parked") and
+                st.get("stage") in HARDEN_REVERT_STAGES)
+
+
+def harden_step(P, it) -> None:
+    """Complete a pending hardening start or revert (pipeline.step calls this before the stage handler)."""
     with item_lock(it):
-        difficulty.restore_version(it, rd / "prev", rd / "failed")
-        if any(p.is_file() and p.name != ".lock" for p in it.p("calib").glob("*")) if it.p("calib").exists() \
-                else False:
-            _archive_calibration(it)                 # the hardened version's own runs stay archived
-        _move_records(it.p("calib", f"epoch-{rec['archived_epoch']}"), it.p("calib"))
-        for p in it.p("calib").glob("prepare*.json"):
-            p.unlink()                               # the prepared sandbox copy may be of the hardened version
-        st["calib_epoch"] = int(st.get("calib_epoch", 0)) + 1
-        for key in ("harden_active", "calib_label", "thresholds_locked", "repair_from", "rescore_pending"):
-            st.pop(key, None)
-        st["harden_exhausted"] = True
-        st.setdefault("harden_reverted", []).append(dict(round=k, why=why, ts=time.time()))
-        st.setdefault("history", []).append(dict(stage=st.get("stage"), result="harden_revert", to="S9", reason=why,
-                                                 ts=time.time()))
-        st.update(stage="S9", status="active")
-        st.pop("reason", None)
+        it.load()
+        if it.state.get("harden_pending"):
+            start_hardening(P, it)
+        elif harden_needs_step(it):
+            harden_revert(P, it, locked=True)
+
+
+def harden_revert(P, it, locked: bool = False) -> bool:
+    """A hardened version that could not be built (dropped / parked before S9, never reviewed): put the previous
+    version back (files from harden/round-k/prev, calibration records from its archived epoch), stop hardening
+    this item and continue its calibration under the original rule.  The failed version's files go to
+    harden/round-k/failed/; its own calibration records (if any) stay archived.  A replayable transaction:
+    state.harden_revert_pending fixes the round and both epochs before anything moves, every step is idempotent."""
+    if not locked:
+        with item_lock(it):
+            it.load()
+            return harden_revert(P, it, locked=True)
+    st = it.state
+    pend = st.get("harden_revert_pending")
+    if not pend:
+        if not st.get("harden_active") or st.get("status") not in ("dropped", "parked") or \
+                st.get("stage") not in HARDEN_REVERT_STAGES:
+            return False
+        k = int(st.get("harden_round", 0))
+        rd = it.p("harden", f"round-{k}")
+        rec = read_json(rd / "record.json", {}) or {}
+        if not (rd / "prev" / "DONE").exists() or rec.get("archived_epoch") is None or \
+                read_json(it.p("review", "runs.json"), []):
+            return False
+        pend = dict(round=k, why=f"{st.get('stage')}:{st.get('reason')}", prev_epoch=int(rec["archived_epoch"]),
+                    failed_epoch=int(st.get("calib_epoch", 0)), ts=time.time())
+        st["harden_revert_pending"] = pend
         it.save()
-    difficulty.write_round(it, k, reverted=dict(why=why, ts=time.time()))
-    P.store.event("harden_reverted", item=it.item_id, round=k, why=why)
+    k = int(pend["round"])
+    rd = it.p("harden", f"round-{k}")
+    difficulty.restore_version(it, rd / "prev", rd / "failed")
+    if not pend.get("failed_archived"):
+        if int(st.get("calib_epoch", 0)) == pend["failed_epoch"]:
+            _archive_calibration(it)                    # the failed version's own records (normally none)
+        pend["failed_archived"] = True
+        it.save()
+    _move_records(it.p("calib", f"epoch-{pend['prev_epoch']}"), it.p("calib"))
+    for p in it.p("calib").glob("prepare*.json"):
+        p.unlink()                                       # a prepared sandbox copy may be of the hardened version
+    for key in ("harden_active", "calib_label", "thresholds_locked", "repair_from", "rescore_pending", "harden_base",
+                "harden_built", "regen_6c", "harden_revert_pending"):
+        st.pop(key, None)
+    st["harden_exhausted"] = True
+    st.setdefault("harden_reverted", []).append(dict(round=k, why=pend["why"], ts=time.time()))
+    st.setdefault("history", []).append(dict(stage=st.get("stage"), result="harden_revert", to="S9",
+                                             reason=pend["why"], ts=time.time()))
+    st.update(stage="S9", status="active")
+    st.pop("reason", None)
+    it.save()
+    difficulty.write_round(it, k, reverted=dict(why=pend["why"], ts=time.time()))
+    P.store.event("harden_reverted", item=it.item_id, round=k, why=pend["why"])
     return True
 
 
@@ -1373,6 +1436,9 @@ def harden_cmd(P, it, reason: str) -> dict:
     with item_lock(it):
         it.load()
         st = it.state
+        if st.get("harden_pending"):                 # an interrupted start: finish the same round
+            start_hardening(P, it)
+            return dict(item=it.item_id, stage=it.state["stage"], round=it.state.get("harden_round"), resumed=True)
         if st.get("stage") not in ("S9", "S9R", "S10") or st.get("status") not in ("active", "done", "waiting",
                                                                                      "parked"):
             raise ValueError(f"harden: item at {st.get('stage')}/{st.get('status')}")

@@ -239,9 +239,13 @@ def write_bundle(item_dir: Path, dest: Path, state: dict, digest_kb: int = 150) 
     if (item_dir / "gates" / "difficulty.json").exists():
         shutil.copy2(item_dir / "gates" / "difficulty.json", rec / "difficulty_check.json")
     hr = sorted((item_dir / "harden").glob("round-*/record.json")) if (item_dir / "harden").exists() else []
-    for h in hr:                    # hardening rounds: what changed and why (not the earlier versions' files)
+    for h in hr:                    # hardening rounds: what changed and why (never the student's feedback)
         (rec / "hardening").mkdir(exist_ok=True)
         shutil.copy2(h, rec / "hardening" / f"{h.parent.name}-record.json")
+        prev_task = h.parent / "prev" / "task"
+        if prev_task.is_dir() and (item_dir / "task").is_dir():
+            from .difficulty import version_diff
+            (rec / "hardening" / f"{h.parent.name}-diff.patch").write_text(version_diff(prev_task, item_dir / "task"))
     gates = sorted((item_dir / "gates").glob("attempt-*.json")) if (item_dir / "gates").exists() else []
     if gates:
         (rec / "s7_gates").mkdir()
@@ -504,7 +508,9 @@ j. **Genuine difficulty.**  Does the difficulty come from the science itself (a 
    real limitation of the obvious method, a real numerical / boundary issue of the paper's method, a scientifically
    motivated and disclosed shift of the hidden cases)?  If `records/difficulty_design.json` exists, check each
    lever it claims against the statement, the generator, the reference and the measurements (and
-   `records/difficulty_check.json`); if `records/hardening/` exists, also check what the hardening changed.
+   `records/difficulty_check.json`); if `records/hardening/` exists, also check what the hardening changed
+   (`round-k-diff.patch`: previous vs current version): a hardening that only moves thresholds (e.g. a weaker
+   mid baseline), makes the wording vaguer or adds a format trap is artificial difficulty.
    **Artificial difficulty is blocking**: ambiguous or underspecified wording, hidden requirements, conventions
    that cannot be inferred from the statement / data notes / standard practice, output-format traps, thresholds
    at the reference's own edge or decided by luck across seeds, or pure time pressure.  Use `statement` /

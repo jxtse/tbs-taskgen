@@ -148,7 +148,10 @@ def _calib_item(tmp_path, monkeypatch):
     tr = jd / "trial__a"
     (tr / "verifier" / "metrics.jsonl").write_text("\n".join(json.dumps(x) for x in (
         {"name": "_solution_cli_run", "value": 12.0, "aux": True},
-        {"name": "m", "value": 0.8, "threshold": 0.5, "direction": ">=", "passed": True})) + "\n")
+        {"name": "m", "value": 0.8, "threshold": 0.5, "direction": ">=", "passed": True},
+        {"name": "m", "value": 0.1},                                           # duplicate: first wins
+        {"name": "per_object_detail", "value": [1, 2, 3], "objects": {"a": "truth-label-x"}},
+        {"name": "unknown_metric", "value": 0.4})) + "\n")
     (tr / "verifier" / "test-stdout.txt").write_text("SECRET-VERIFIER-OUTPUT per-object truth 0.123")
     (tr / "agent").mkdir(parents=True, exist_ok=True)
     (tr / "agent" / "claude-code.txt").write_text(json.dumps({"type": "result", "result": "I used method X."}) + "\n")
@@ -168,9 +171,10 @@ def test_first_pass_triggers_hardening_with_sanitised_feedback(tmp_path, monkeyp
     fb = read_json(it.p("harden", "round-1", "feedback.json"))
     assert fb["student_final_message"] == "I used method X." and fb["solution_runtime_sec"] == 12.0
     assert fb["metric_margins"] == [{"metric": "m", "value": 0.8, "threshold": 0.5, "direction": ">=",
-                                     "passed": True, "relative_margin": 0.6}]
+                                     "relative_margin": 0.6}]
     blob = json.dumps(fb)
     assert "SECRET-VERIFIER-OUTPUT" not in blob and "truth" not in blob
+    assert "per_object_detail" not in blob and "unknown_metric" not in blob
     rec = read_json(it.p("harden", "round-1", "record.json"))
     assert rec["archived_epoch"] == 0 and rec["prev_runs"][0]["outcome"] == "pass"
     assert (it.p("harden", "round-1", "prev", "DONE")).exists()
@@ -304,3 +308,105 @@ def test_next_action_unchanged():
     assert calib.next_action([p, f], cfg) == ("label", "unstable")
     assert calib.next_action([p, p], cfg) == ("label", "easy")
     assert calib.next_action([f, dict(who="teacher", outcome="pass")], cfg) == ("label", "hard")
+
+
+def test_targeting_leak_in_public_files_and_package(tmp_path):
+    prof = dict(id="example-weakness-v0", ids=["EX01", "EX02"])
+    pub = tmp_path / "env" / "data"
+    pub.mkdir(parents=True)
+    (pub / "README.md").write_text("Data notes. (designed for EX02)")
+    (pub / "x.csv").write_text("a,b\n1,2\n")
+    assert difficulty.targeting_leaks([tmp_path / "env"], prof, None) == ["README.md: 'EX02'"]
+    (pub / "README.md").write_text("Notes: example-weakness-v0")
+    assert difficulty.targeting_leaks([tmp_path / "env"], prof, None)
+    (pub / "README.md").write_text("Plain notes; EX020 is a sample id; FLEX02B too.")
+    assert difficulty.targeting_leaks([tmp_path / "env"], prof, None) == []
+
+
+def test_hardening_must_change_the_science(tmp_path):
+    d = tmp_path / "item"
+    for root in (d / "task", d / "harden" / "round-1" / "prev" / "task"):
+        for rel in ("generator/generate.py", "solution/solve.py", "tests/measure.py", "baselines/mid.py"):
+            (root / rel).parent.mkdir(parents=True, exist_ok=True)
+            (root / rel).write_text("same " + rel)
+    (d / "task" / "baselines" / "mid.py").write_text("weaker mid -> tighter thresholds")
+    (d / "task" / "instruction.md").write_text("vaguer")
+    assert difficulty.check_hardening(d, 1)                     # baseline / wording only: rejected
+    (d / "task" / "generator" / "generate.py").write_text("new regime")
+    assert difficulty.check_hardening(d, 1) == []
+    assert "new regime" in difficulty.version_diff(d / "harden" / "round-1" / "prev" / "task", d / "task")
+
+
+def test_revert_is_replayable_after_a_crash(tmp_path, monkeypatch):
+    from tbsgen import stages_b
+    from tbsgen.stages_b import watch_tick
+    P, iid, counter, jobs = _calib_item(tmp_path, monkeypatch)
+    watch_tick(P, only=[iid])
+    it = P.store.item(iid)
+    (it.p("task", "solution", "solve.py")).write_text("v2 broken")
+    it.state.update(stage="S6B")
+    it.finish("dropped", "not_separable")
+    real = stages_b._move_records
+    monkeypatch.setattr(stages_b, "_move_records", lambda a, b: (_ for _ in ()).throw(RuntimeError("crash")))
+    with pytest.raises(RuntimeError):
+        stages_b.harden_revert(P, P.store.item(iid))
+    assert P.store.item(iid).state["harden_revert_pending"]["prev_epoch"] == 0
+    monkeypatch.setattr(stages_b, "_move_records", real)
+    P.run(only=[iid], until="S9")                               # a dropped item with a pending revert is resumed
+    it = P.store.item(iid)
+    assert it.state["stage"] == "S9" and "harden_revert_pending" not in it.state
+    assert (it.p("task", "solution", "solve.py")).read_text() == "v1 solution/solve.py"
+    assert (it.p("harden", "round-1", "failed", "task", "solution", "solve.py")).read_text() == "v2 broken"
+    runs = read_json(it.p("calib", "runs.json"))
+    assert runs[0]["outcome"] == "pass" and counter.read_text().count("x") == 2
+
+
+def test_harden_cmd_resumes_an_interrupted_start(tmp_path, monkeypatch):
+    from tbsgen import stages_b
+    from tbsgen.stages_b import harden_cmd, watch_tick
+    from test_calib_s9 import _finish, _runs
+    P, iid, counter, jobs = _calib_item(tmp_path, monkeypatch)
+    P.cfg["difficulty"]["harden"] = False
+    watch_tick(P, only=[iid])
+    _finish(jobs, _runs(P, iid)[1]["job_name"], reward=1.0, cost=5.0)
+    watch_tick(P, only=[iid])
+    assert P.store.item(iid).state["status"] == "done"
+    P.cfg["difficulty"]["harden"] = True
+    real = stages_b._archive_calibration
+    monkeypatch.setattr(stages_b, "_archive_calibration", lambda it_: (_ for _ in ()).throw(RuntimeError("x")))
+    with pytest.raises(RuntimeError):
+        harden_cmd(P, P.store.item(iid), "op")
+    monkeypatch.setattr(stages_b, "_archive_calibration", real)
+    st = P.store.item(iid).state
+    assert st["status"] == "done" and st["harden_pending"]["round"] == 1
+    P.run(only=[iid])                                           # the scheduler finishes the pending start
+    st = P.store.item(iid).state
+    assert st["stage"] == "S5G" and st["harden_round"] == 1 and "harden_pending" not in st
+
+
+def test_round_allowance_and_rerun_survive_a_pause(tmp_path, monkeypatch):
+    """S5G of a hardening round: the old version's finished job is never accepted, the rerun intent survives a
+    pause, and the round's allowance is its own (not the unspent rest of earlier rounds)."""
+    P, it, fl = _profiled(tmp_path, monkeypatch, _files(design=dict(DESIGN, hardening={
+        "changes": "c", "why_previous_solution_fails_now": "w"})),
+        harden_authoring_timeout_s=900, harden_authoring_max_usd=2.0)
+    P.run(max_steps=2, until="S5G")                             # round-0 authoring job
+    it = P.store.item(it.item_id)
+    assert it.state["stage"] == "S6A_run" and len(fl.calls) == 1
+    from tbsgen.stages_b import _s5g_base
+    it.state.update(stage="S5G", status="active", harden_round=1, harden_active=True, S5G_rerun=True,
+                    harden_base=_s5g_base(it, 1))
+    it.save()
+    (it.p("harden", "round-1", "prev", "task")).mkdir(parents=True)
+    (it.p("harden", "round-1", "prev", "DONE")).write_text("x")
+    monkeypatch.setattr("tbsgen.codeagent.env_ok", lambda cfg, agent=False: "paused for the test")
+    P.run(max_steps=1, until="S5G")
+    it = P.store.item(it.item_id)
+    assert it.state["status"] == "paused" and read_json(it.p("S5G", "run.json"))["retry"] is True
+    monkeypatch.setattr("tbsgen.codeagent.env_ok", lambda cfg, agent=False: None)
+    P.resume(("code:",))
+    P.run(max_steps=1, until="S5G")
+    assert len(fl.calls) == 2                                   # a new job, not the old version's result
+    conf = json.loads(Path(read_json(it.p("S5G", "run.json"))["config"]).read_text())
+    assert conf["agents"][0]["kwargs"]["max_budget_usd"] == "2.00"
+    assert read_json(it.p("S5G", "run.json"))["harden_round"] == 1

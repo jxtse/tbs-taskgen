@@ -176,25 +176,98 @@ def check_lever_separation(item_dir: Path, spec: dict, thresholds: dict, prof: d
         per.append(rec)
     if not per:
         problems.append("no levers")
-    ins = item_dir / "task" / "instruction.md"
-    text = ins.read_text(errors="replace") if ins.exists() else ""
-    ids = (prof or {}).get("ids") or [lv.get("weakness_id") for lv in design.get("levers") or []
-                                      if isinstance(lv, dict) and lv.get("weakness_id")]
-    named = sorted({i for i in ids if i and re.search(rf"\b{re.escape(str(i))}\b", text)})
-    if named or _STATEMENT_BANNED.search(text):
-        problems.append(f"the statement reveals the difficulty targeting ({named or 'profile wording'})")
-    h = design.get("hardening")
-    if isinstance(h, dict) and h.get("prev_task_sha"):
-        if h["prev_task_sha"] == task_sha(item_dir / "task"):
-            problems.append("hardening round: the task is unchanged from the previous version")
+    leaks = targeting_leaks([item_dir / "task" / "instruction.md"], prof, design)
+    if leaks:
+        problems.append(f"the statement reveals the difficulty targeting: {leaks[:3]}")
     return dict(ok=not problems, problems=problems, levers=per)
 
 
+def check_hardening(item_dir: Path, rnd: int) -> list[str]:
+    """A hardening round must change the science (generator / reference / metric script), not only the baselines
+    (that would only move the derived thresholds) or the wording."""
+    rec = read_json(item_dir / "harden" / f"round-{rnd}" / "record.json", {}) or {}
+    prev = item_dir / "harden" / f"round-{rnd}" / "prev" / "task"
+    if not prev.is_dir():
+        return [f"hardening round {rnd}: previous version missing"]
+    if science_sha(prev) == science_sha(item_dir / "task"):
+        return [f"hardening round {rnd}: generator, reference and metric script are unchanged (only baselines / "
+                "wording changed): thresholds would merely move"]
+    _ = rec
+    return []
+
+
+_TEXT_EXT = {".md", ".txt", ".csv", ".tsv", ".json", ".yaml", ".yml", ".toml", ".py", ".r", ".R", ".ini", ".cfg", ""}
+
+
+def targeting_leaks(paths: list[Path], prof: dict | None, design: dict | None) -> list[str]:
+    """Files under `paths` (the statement and every public file a solver gets) that reveal the difficulty
+    targeting: the profile id, a weakness id, or profile / design wording.  Text-like files up to 5 MB."""
+    ids = set((prof or {}).get("ids") or [])
+    ids |= {str(lv.get("weakness_id")) for lv in (design or {}).get("levers") or []
+            if isinstance(lv, dict) and lv.get("weakness_id")}
+    pid = (prof or {}).get("id") or (design or {}).get("profile")
+    pats = [re.compile(rf"(?<![A-Za-z0-9]){re.escape(i)}(?![A-Za-z0-9])") for i in sorted(ids) if i]
+    if pid:
+        pats.append(re.compile(re.escape(str(pid)), re.I))
+    pats.append(_STATEMENT_BANNED)
+    out = []
+    for root in paths:
+        files = [root] if root.is_file() else (sorted(x for x in root.rglob("*") if x.is_file()) if root.is_dir()
+                                               else [])
+        for f in files:
+            if f.is_symlink() or f.suffix not in _TEXT_EXT or f.stat().st_size > 5_000_000:
+                continue
+            try:
+                text = f.read_text(errors="replace")
+            except OSError:
+                continue
+            for pat in pats:
+                m = pat.search(text)
+                if m:
+                    out.append(f"{f.name}: {m.group(0)!r}")
+                    break
+    return out
+
+
+def science_sha(task: Path) -> str:
+    """Hash of what defines the science of a version: generator (and assets), reference, metric script."""
+    return _sha_parts(task, ("generator", "solution", "tests/measure.py"))
+
+
 def task_sha(task: Path) -> str:
-    """Hash of the authored task files that define the science (generator, reference, metric script, baselines);
-    the statement and the S6C tests are excluded (S6C rewrites them)."""
+    """Science plus the baselines (generator, reference, metric script, mid / naive)."""
+    return _sha_parts(task, ("generator", "solution", "tests/measure.py", "baselines/mid.py", "baselines/naive.py"))
+
+
+def version_diff(prev: Path, cur: Path, limit: int = 200_000) -> str:
+    """Unified diff of the authored files of two versions (for the S9R reviewer)."""
+    import difflib
+    out = []
+    rels = set()
+    for root in (prev, cur):
+        for sub in ("instruction.md", "generator", "solution", "tests/measure.py", "baselines/mid.py",
+                    "baselines/naive.py"):
+            p = root / sub
+            if p.is_file():
+                rels.add(sub)
+            elif p.is_dir():
+                rels |= {str(x.relative_to(root)) for x in p.rglob("*") if x.is_file() and "__pycache__" not in x.parts}
+    for rel in sorted(rels):
+        a, b = prev / rel, cur / rel
+        try:
+            ta = a.read_text(errors="replace").splitlines(True) if a.is_file() else []
+            tb = b.read_text(errors="replace").splitlines(True) if b.is_file() else []
+        except OSError:
+            continue
+        if ta != tb:
+            out += list(difflib.unified_diff(ta, tb, f"prev/{rel}", f"new/{rel}"))
+    text = "".join(out)
+    return text if len(text) <= limit else text[:limit] + f"\n... [diff truncated, {len(text)} chars]\n"
+
+
+def _sha_parts(task: Path, parts) -> str:
     h = hashlib.sha256()
-    for sub in ("generator", "solution", "tests/measure.py", "baselines/mid.py", "baselines/naive.py"):
+    for sub in parts:
         p = task / sub
         files = sorted(x for x in p.rglob("*") if x.is_file()) if p.is_dir() else ([p] if p.is_file() else [])
         for f in files:
@@ -253,7 +326,7 @@ def _final_message(trial: Path | None, limit: int = 4000) -> str:
     if trial is None:
         return ""
     p = trial / "agent" / "claude-code.txt"
-    if not p.exists():
+    if not p.exists() or not _inside_trial(trial, p):
         return ""
     last = ""
     try:
@@ -270,36 +343,61 @@ def _final_message(trial: Path | None, limit: int = 4000) -> str:
     return last if len(last) <= limit else last[:limit] + f" ...[+{len(last) - limit} chars]"
 
 
-def feedback(rec: dict) -> dict:
+def feedback(rec: dict, allowed: dict) -> dict:
     """What the authoring agent may learn from the student's passing run: its own summary of the method (final
-    message), elapsed minutes, cost, and per-metric value / threshold / relative margin (aggregates the author
-    could compute itself from its own truth).  Never: the verifier's stdout, the student's output files, per-object
-    results, hidden inputs or truth."""
+    message), elapsed minutes, cost, the solution's run time, and for each scored metric of this version
+    (`allowed` = thresholds.json "thresholds": name -> {threshold, direction}) the student's aggregate value and its
+    relative margin.  Only names in `allowed`, only finite numbers, one value per metric; the threshold and the
+    direction come from `allowed` (the author's own file), not from the verifier.  Never: the verifier's stdout,
+    unknown or structured metric rows, the student's output files, per-object results, hidden inputs or truth."""
+    import math
     trial = _trial_dir(rec)
-    margins = []
+    vals, runtime = {}, None
     mp = trial / "verifier" / "metrics.jsonl" if trial else None
-    runtime = None
-    if mp and mp.exists():
+    if mp and mp.exists() and _inside_trial(trial, mp):
         for line in mp.read_text(errors="replace").splitlines():
             try:
                 m = json.loads(line)
             except ValueError:
                 continue
-            if m.get("aux"):
-                if m.get("name") == "_solution_cli_run":
-                    runtime = m.get("value")
+            if not isinstance(m, dict):
                 continue
-            v, t, d = m.get("value"), m.get("threshold"), m.get("direction")
-            rel = None
-            if isinstance(v, (int, float)) and isinstance(t, (int, float)) and t != 0:
-                rel = round(((v - t) if d == ">=" else (t - v)) / abs(t), 4)
-            margins.append(dict(metric=m.get("name"), value=v, threshold=t, direction=d, passed=m.get("passed"),
-                                relative_margin=rel))
+            name, v = m.get("name"), m.get("value")
+            if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(float(v)):
+                continue
+            if name == "_solution_cli_run" and runtime is None:
+                runtime = round(float(v), 3)
+            elif isinstance(name, str) and name in allowed and name not in vals:
+                vals[name] = float(v)
+    margins = []
+    for name in sorted(vals):
+        t = allowed[name] or {}
+        thr, d = t.get("threshold"), t.get("direction")
+        rel = None
+        if isinstance(thr, (int, float)) and thr != 0 and d in (">=", "<="):
+            rel = round(((vals[name] - thr) if d == ">=" else (thr - vals[name])) / abs(thr), 4)
+        margins.append(dict(metric=name, value=round(vals[name], 6), threshold=thr, direction=d,
+                            relative_margin=rel))
     t = rec.get("trial") or {}
+    mins = rec.get("minutes", t.get("minutes"))
+    cost = rec.get("cost_usd", t.get("cost_usd"))
     return dict(job=rec.get("job_name"), model=rec.get("model"), outcome=rec.get("outcome"),
-                minutes=rec.get("minutes", t.get("minutes")), cost_usd=rec.get("cost_usd", t.get("cost_usd")),
+                minutes=round(float(mins), 1) if isinstance(mins, (int, float)) else None,
+                cost_usd=round(float(cost), 2) if isinstance(cost, (int, float)) else None,
                 solution_runtime_sec=runtime, metric_margins=margins,
                 student_final_message=_final_message(trial))
+
+
+def _inside_trial(trial: Path, p: Path) -> bool:
+    try:
+        cur = p
+        while cur != trial:
+            if cur.is_symlink():
+                return False
+            cur = cur.parent
+        return True
+    except OSError:
+        return False
 
 
 VERSION_FILES = ("task", "_spec", "pkg", "gates", "thresholds.json", "S6A_measure.json", "S6B_decisions.json",
@@ -327,16 +425,26 @@ def snapshot_version(it, dest: Path) -> None:
 
 
 def restore_version(it, src: Path, failed: Path) -> None:
-    """Put a snapshot back as the current version; the current files move to `failed` first."""
-    failed.mkdir(parents=True, exist_ok=True)
+    """Put a snapshot back as the current version (idempotent): the current files move to `failed` once
+    (failed/DONE marks it), then every snapshot file replaces the current one."""
+    if not (failed / "DONE").exists():
+        failed.mkdir(parents=True, exist_ok=True)
+        for rel in VERSION_FILES:
+            cur = it.p(rel)
+            if cur.exists():
+                (failed / rel).parent.mkdir(parents=True, exist_ok=True)
+                if (failed / rel).is_dir():
+                    shutil.rmtree(failed / rel)
+                elif (failed / rel).exists():
+                    (failed / rel).unlink()
+                shutil.move(str(cur), str(failed / rel))
+        (failed / "DONE").write_text(str(time.time()))
     for rel in VERSION_FILES:
-        cur = it.p(rel)
-        if cur.exists():
-            (failed / rel).parent.mkdir(parents=True, exist_ok=True)
-            if (failed / rel).exists():
-                (shutil.rmtree if (failed / rel).is_dir() else Path.unlink)(failed / rel)
-            shutil.move(str(cur), str(failed / rel))
-        s = src / rel
+        cur, s = it.p(rel), src / rel
+        if cur.is_dir():
+            shutil.rmtree(cur)
+        elif cur.exists():
+            cur.unlink()
         if s.is_dir():
             shutil.copytree(s, cur, symlinks=True)
         elif s.is_file():

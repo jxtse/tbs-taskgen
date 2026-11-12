@@ -520,14 +520,21 @@ def s3c(P, it):
 
 
 def _agent_stage(P, it, kind: str, instruction: str, need: list[str], timeout_s: float, max_usd: float | None,
-                 est_usd: float, with_contract: bool, extra: tuple[float, float] = (0.0, 0.0)):
+                 est_usd: float, with_contract: bool, rnd: dict | None = None):
     """Shared S4c / S5G driver: build + launch the job once, then (later steps) poll it.  Returns the finished
     run record, or None while it runs (the item is left `waiting`)."""
     from . import codeagent
     recp = it.p(kind, "run.json")
     rec = read_json(recp, None)
-    if rec is not None and rec.get("state") == "finished" and it.state.pop(f"{kind}_rerun", None):
+    if rec is not None and rec.get("state") == "finished" and it.state.get(f"{kind}_rerun"):
         rec["retry"] = True                     # S6B sent the task back: author it again (with feedback)
+        write_json(recp, rec)                   # persisted before the flag is dropped (crash / pause safe)
+        it.state.pop(f"{kind}_rerun", None)
+        it.save()
+    if rnd is not None and rec is not None and rec.get("state") == "finished" and not rec.get("retry") and \
+            rec.get("harden_round", 0) != rnd["round"]:
+        rec["retry"] = True                     # a finished job of another version never counts for this round
+        write_json(recp, rec)
     if rec is not None and rec.get("state") == "launch_failed":
         rec["retry"] = True                     # infrastructure: a resumed item launches a fresh job
         rec["state"] = "finished"
@@ -555,10 +562,13 @@ def _agent_stage(P, it, kind: str, instruction: str, need: list[str], timeout_s:
             write_json(sp, charges)
         spent = dict(usd=sum(c["usd"] for c in charges.values()), sec=sum(c["sec"] for c in charges.values()))
         it.state[f"{kind}_spent"] = spent
-        # hardening rounds (difficulty.py) add their own allowance on top of the per-paper caps
-        cap_s, cap_usd = timeout_s + extra[0], None if max_usd is None else float(max_usd) + extra[1]
-        left_s = min(timeout_s, cap_s - spent["sec"])
-        left_usd = None if cap_usd is None else min(float(max_usd), cap_usd - spent["usd"])
+        if rnd is not None:
+            # a hardening round (difficulty.py) has its own allowance: spend since the round started
+            base = rnd["base"]
+            spent = dict(usd=spent["usd"] - float(base["usd"]), sec=spent["sec"] - float(base["sec"]))
+            timeout_s, max_usd = float(rnd["timeout_s"]), rnd["max_usd"]
+        left_s = timeout_s - spent["sec"]
+        left_usd = None if max_usd is None else float(max_usd) - spent["usd"]
         floor = (600.0, 1.0) if spent["sec"] or spent["usd"] else (1.0, 0.01)   # first job: the configured caps
         if left_s < floor[0] or (left_usd is not None and left_usd < floor[1]):
             it.finish("dropped", f"{kind.lower()}_budget_exhausted", spent=spent)
@@ -573,6 +583,8 @@ def _agent_stage(P, it, kind: str, instruction: str, need: list[str], timeout_s:
         conf = codeagent.agent_job_config(P.cfg, task, f"tbsgen-{it.item_id}-{kind.lower()}{n}", jobs, max_usd)
         rec = codeagent.launch_agent(P.cfg, it, kind, conf, P.ledger, est_usd)
         rec["budget"] = dict(timeout_s=timeout_s, max_usd=max_usd)
+        if rnd is not None:
+            rec["harden_round"] = rnd["round"]
         write_json(recp, rec)
         if rec.get("state") == "launch_failed":
             it.finish("paused", f"code:{kind}:launch_failed", paused_stage=kind)
@@ -686,11 +698,16 @@ def s5g(P, it):
         need.append("_spec/" + difficulty.DESIGN_FILE)
     if hround:
         instruction += S5G_HARDEN.format(round=hround, max_rounds=int(d.get("harden_max_rounds", 2)))
-    ht, hu = d.get("harden_authoring_timeout_s"), d.get("harden_authoring_max_usd")
-    extra = (hround * float(tmo if ht is None else ht),
-             hround * float(c.get("authoring_max_usd", 20.0) if hu is None else hu))
+    rnd = None
+    if hround:
+        ht, hu = d.get("harden_authoring_timeout_s"), d.get("harden_authoring_max_usd")
+        base = it.state.get("harden_base") or {}
+        if base.get("round") != hround:
+            return it.finish("parked", f"harden:no_round_base:{hround}")
+        rnd = dict(round=hround, base=base, timeout_s=float(tmo if ht is None else ht),
+                   max_usd=c.get("authoring_max_usd", 20.0) if hu is None else hu)
     rec = _agent_stage(P, it, "S5G", instruction, need, tmo, c.get("authoring_max_usd", 20.0),
-                       float(c.get("authoring_est_usd", 15.0)), with_contract=True, extra=extra)
+                       float(c.get("authoring_est_usd", 15.0)), with_contract=True, rnd=rnd)
     if rec is None:
         return
     out = codeagent.deliverable(rec)
@@ -738,6 +755,13 @@ def s5g(P, it):
     for extra_dir in ("environment",):             # the task image is built by PKG only (no agent-made env files)
         if (task / extra_dir).exists():
             shutil.rmtree(task / extra_dir)
+    # S6C products (tests with the thresholds, exploit baselines) are always rebuilt for a new authored version:
+    # an agent that started from an earlier version must not carry its thresholds into the verifier
+    if (task / "tests" / "test_outputs.py").exists():
+        (task / "tests" / "test_outputs.py").unlink()
+    for x in (task / "baselines").glob("exploit_*") if (task / "baselines").is_dir() else []:
+        x.unlink()
+    it.state["regen_6c"] = True
     try:
         author = json.loads(codeagent.safe_read(out / "_spec" / "author_code.json", root=Path(rec["trial"])) or "")
     except ValueError:
@@ -784,8 +808,9 @@ def _agent_reauthor(P, it, why: str, force: bool = False) -> bool:
         return False
     n = it.state.get("attempts", {}).get("S5G:job", 0)
     per = int(codegate.ccfg(P.cfg).get("authoring_max_jobs", 2))
-    hround = int(it.state.get("harden_round", 0)) if it.state.get("harden_active") else 0
-    if n >= per * (1 + hround):                     # each hardening round gets its own authoring_max_jobs
+    if it.state.get("harden_active"):               # each hardening round gets its own authoring_max_jobs
+        n -= int((it.state.get("harden_base") or {}).get("jobs", 0))
+    if n >= per:
         it.finish("dropped", f"s5g_jobs_exhausted:{why}")
         return True
     it.state.pop("regen_6a", None)

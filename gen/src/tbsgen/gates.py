@@ -310,6 +310,17 @@ def run_gates(cfg: dict, item_dir: Path, spec: dict, thresholds: dict, attempt: 
         al = prerelease.author_name_leaks(task, spec_a, public_env=gen0 / "environment")
         g["author_leak"] = al["ok"]
         det["author_leak"] = al
+    if (item_dir / "_spec" / "difficulty_design.json").exists() or (cfg.get("difficulty") or {}).get("profile_path"):
+        # the difficulty targeting (profile ids / wording) must not reach the statement or any public file
+        from . import difficulty
+        try:
+            prof = difficulty.load_profile(cfg)
+        except (OSError, ValueError):
+            prof = None
+        tl = difficulty.targeting_leaks([task / "instruction.md", gen0 / "environment"], prof,
+                                        read_json(item_dir / "_spec" / "difficulty_design.json", None))
+        g["targeting_leak"] = not tl
+        det["targeting_leak"] = tl
     blocking = [k for k, v in g.items() if not v and k in _blocking(cfg)]
     nonblocking = [k for k, v in g.items() if not v and k not in _blocking(cfg)]
     return dict(attempt=attempt, gates=g, blocking=blocking, nonblocking=nonblocking, ok=all(g.values()),
@@ -320,4 +331,4 @@ def _blocking(cfg) -> set[str]:
     b = set(cfg["gates"]["blocking"])
     if "oracle" in b:
         b.add("oracle_margin")
-    return b | {"nop", "naive", "mid", "exploit", "exploit_valid"}
+    return b | {"nop", "naive", "mid", "exploit", "exploit_valid", "targeting_leak"}
