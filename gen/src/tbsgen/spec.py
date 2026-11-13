@@ -21,13 +21,28 @@ import re
 FORMS_ALL = {"ANS", "PROG", "DOMF", "CODE", "MULTI", "DESIGN", "INTERACT", "TRAJ", "PROOF"}
 
 
-def validate_spec(spec: dict, cfg: dict) -> list[str]:
+def validate_spec(spec, cfg: dict) -> list[str]:
+    if not isinstance(spec, dict):
+        return ["spec is not a JSON object"]
     errs = []
     form = spec.get("form")
     if form not in cfg["spec"]["allowed_forms"]:
         errs.append(f"form {form!r} not allowed in this phase")
+    # Agent-written specs can be malformed (prod-code 2026-11-12: depgraph.nodes a list of strings, mid_drop a string):
+    # report them as spec errors (-> spec_invalid drop) instead of crashing the stage.
     g = spec.get("depgraph") or {}
+    if not isinstance(g, dict):
+        return errs + ["depgraph must be an object"]
     nodes = g.get("nodes") or []
+    if not isinstance(nodes, list) or not all(isinstance(n, dict) for n in nodes):
+        return errs + ["depgraph.nodes must be a list of objects"]
+    for k in ("edges", "mid_drop", "naive_drop"):
+        if not isinstance(g.get(k) or [], list):
+            errs.append(f"depgraph.{k} must be a list")
+    if not isinstance(spec.get("metrics") or [], list) or not all(isinstance(m, dict) for m in spec.get("metrics") or []):
+        errs.append("metrics must be a list of objects")
+    if errs and any(e.startswith(("depgraph.", "metrics must")) for e in errs):
+        return errs
     ids = [n.get("id") for n in nodes]
     if len(set(ids)) != len(ids) or not ids:
         errs.append("depgraph node ids missing or duplicated")
