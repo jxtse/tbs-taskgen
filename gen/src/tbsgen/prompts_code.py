@@ -132,7 +132,7 @@ shortcuts.  Use it like this:
    the obvious one, coupled estimation, a regime / boundary / stability treatment, an estimator for an unknown
    setting, a discriminating diagnostic, ...).
 2. **Then** pick 1-3 profile entries whose lever matches one of those real difficulties, and build the task so that
-   the scored metrics depend on getting that point right.  Do not force a lever the paper does not support; do not
+   the scored metrics depend on getting that point right.{preferred}  Do not force a lever the paper does not support; do not
    make the task harder in any way the profile forbids (ambiguous wording, hidden requirements, conventions that
    cannot be inferred, format traps, thresholds at the reference's edge, pure time pressure).
 3. Make `mid_drop` / the naive baseline the approach that misses the lever (e.g. the generic method, the first
@@ -157,6 +157,14 @@ the measurements sends the task back.
 """
 
 # appended in a hardening round (the student solved the previous version on its first attempt)
+# filled in by stages_a._s5g when the profile front matter lists `preferred:` ids (empty otherwise)
+S5G_PREFERRED = """
+   Preferred levers for this solver: {ids}.  Use one of them when the paper has a real difficulty of that kind
+   (never invent one); otherwise use another entry."""
+S5G_HARDEN_PREFERRED = """**This round must use at least one preferred lever ({ids})**, on a difficulty the paper really has; the
+pipeline checks it in difficulty_design.json and in the measured separation.
+"""
+
 S5G_HARDEN = """
 ## Hardening round {round} of at most {max_rounds}: the previous version was too easy
 The calibration student solved the previous version of this task on its first attempt.  You get:
@@ -165,7 +173,7 @@ The calibration student solved the previous version of this task on its first at
   mid / naive measurements), `S6A_measure.json` and the previous `report.md`.
 - `/work/student_feedback.json` — the student's own final summary of its method, its elapsed minutes and, per scored
   metric, its value, the threshold and the relative margin.  (`/work/earlier_rounds.json`: earlier rounds, if any.)
-Make the task harder **scientifically**, using the profile: find where the student's method got through (large
+{preferred}Make the task harder **scientifically**, using the profile: find where the student's method got through (large
 margins = the metric does not depend on the hard part; a generic method that passed = the task does not need the
 paper's principle) and change the task so that the decisive part needs what the paper really does (a regime where
 the generic method breaks, residual structure that matters for the score, a disclosed hidden shift, a per-object /

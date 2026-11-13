@@ -613,8 +613,7 @@ def _agent_stage(P, it, kind: str, instruction: str, need: list[str], timeout_s:
             if rec.get("state") == "launched":
                 _agent_admit(P, it, kind)       # counted only once a job of this paper really started
         if rec.get("state") == "launch_failed":
-            it.finish("paused", f"code:{kind}:launch_failed", paused_stage=kind)
-            return None
+            return _launch_failed(it, kind)
         it.finish("waiting", f"{kind}:agent_running", job=rec["job_name"])
         return None
     if rec.get("state") in ("intent", "reserved"):
@@ -633,8 +632,7 @@ def _agent_stage(P, it, kind: str, instruction: str, need: list[str], timeout_s:
             if rec.get("state") == "launched":
                 _agent_admit(P, it, kind)
         if rec.get("state") == "launch_failed":
-            it.finish("paused", f"code:{kind}:launch_failed", paused_stage=kind)
-            return None
+            return _launch_failed(it, kind)
         it.finish("waiting", f"{kind}:agent_running", job=rec.get("job_name"))
         return None
     if rec.get("state") == "launched":
@@ -715,6 +713,16 @@ def s4c(P, it):
                language=res.get("language"), seconds=res.get("seconds"))
 
 
+def _launch_failed(it, kind):
+    """A launch that failed: paused for the operator; in a hardening round the hardened version is given up instead
+    (dropped -> harden_revert puts the previous version back; an infra revert does not use up a round, and
+    harden_max_attempts bounds the retries)."""
+    if kind == "S5G" and it.state.get("harden_active"):
+        return it.finish("dropped", f"code:{kind}:launch_failed")
+    it.finish("paused", f"code:{kind}:launch_failed", paused_stage=kind)
+    return None
+
+
 S5G_FILES = ["_spec/spec.json", "_spec/author_code.json", "task/instruction.md", "task/generator/generate.py",
              "task/solution/solve.py", "task/tests/measure.py", "task/baselines/mid.py", "task/baselines/naive.py"]
 
@@ -736,7 +744,8 @@ def _s5g(P, it):
     paper really supports and records them in _spec/difficulty_design.json; in a hardening round (difficulty.py)
     it gets the previous version and the student's passing-run summary and makes the task harder."""
     from . import codeagent, difficulty
-    from .prompts_code import CODE_PROMPT_VERSION, S5G_AUTHOR, S5G_DIFFICULTY, S5G_HARDEN
+    from .prompts_code import (CODE_PROMPT_VERSION, S5G_AUTHOR, S5G_DIFFICULTY, S5G_HARDEN, S5G_HARDEN_PREFERRED,
+                               S5G_PREFERRED)
     c = codegate.ccfg(P.cfg)
     d = difficulty.dcfg(P.cfg)
     tmo = float(c.get("authoring_timeout_s", 7200))
@@ -750,10 +759,16 @@ def _s5g(P, it):
                                     hours_lo=lo, hours_hi=hi)
     need = list(S5G_FILES)
     if prof:
-        instruction += S5G_DIFFICULTY.format(profile_id=prof["id"])
+        pref = ", ".join(prof.get("preferred") or [])
+        instruction += S5G_DIFFICULTY.format(profile_id=prof["id"],
+                                             preferred=S5G_PREFERRED.format(ids=pref) if pref else "")
         need.append("_spec/" + difficulty.DESIGN_FILE)
     if hround:
-        instruction += S5G_HARDEN.format(round=hround, max_rounds=int(d.get("harden_max_rounds", 2)))
+        pref = ", ".join((prof or {}).get("preferred") or [])
+        # the round as counted against harden_max_rounds (an infra-reverted attempt does not count)
+        instruction += S5G_HARDEN.format(round=max(1, difficulty.rounds_used(it)),
+                                         max_rounds=int(d.get("harden_max_rounds", 2)),
+                                         preferred=S5G_HARDEN_PREFERRED.format(ids=pref) if pref else "")
     rnd = None
     if hround:
         ht, hu = d.get("harden_authoring_timeout_s"), d.get("harden_authoring_max_usd")

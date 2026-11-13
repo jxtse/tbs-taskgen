@@ -281,6 +281,29 @@ def test_validate_spec_ok_and_bad():
     assert any("form" in e for e in errs) and any("mid_drop" in e for e in errs)
 
 
+def test_validate_spec_malformed_types_do_not_crash():
+    cfg = load_config()
+    bad = json.loads(json.dumps(SPEC))
+    bad["depgraph"]["nodes"] = ["a node as a string", "another"]
+    bad["depgraph"]["mid_drop"] = "a sentence"
+    assert validate_spec(bad, cfg) == ["depgraph.nodes must be a list of objects"]
+    for k, v in (("mid_drop", "a sentence"), ("mid_drop", ""), ("naive_drop", 0), ("edges", {}), ("edges", False),
+                 ("edges", [None]), ("edges", [[[], "out"]])):
+        bad = json.loads(json.dumps(SPEC))
+        bad["depgraph"][k] = v
+        errs = validate_spec(bad, cfg)
+        assert errs and any(k in e for e in errs), (k, v, errs)
+    bad = json.loads(json.dumps(SPEC))
+    bad["depgraph"]["nodes"][0]["id"] = 3
+    assert validate_spec(bad, cfg)
+    bad = json.loads(json.dumps(SPEC))
+    bad["metrics"] = ["rmse"]
+    assert "metrics must be a list of objects" in validate_spec(bad, cfg)
+    assert validate_spec([], cfg) == ["spec is not a JSON object"]
+    assert validate_spec({"form": "PROG", "depgraph": "x"}, cfg)[-1] == "depgraph must be an object"
+    assert validate_spec({"form": "PROG", "depgraph": {"nodes": {}}}, cfg)[-1] == "depgraph.nodes must be a list of objects"
+
+
 def test_thresholds_from_measurement():
     cfg = load_config()
     meas = {"ref": {"0": {"amp_median_rel_error": 0.0077, "rate_p90_rel_error": 0.09, "coverage": 1.0},

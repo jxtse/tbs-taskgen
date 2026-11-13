@@ -17,6 +17,8 @@ Rules
 """
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import datetime as dt
 import json
 import sqlite3
@@ -24,6 +26,32 @@ import time
 from pathlib import Path
 
 CN = dt.timezone(dt.timedelta(hours=8))
+# hardening round of the item being stepped (Pipeline.step sets it while state.harden_active; 0 = not a hardening
+# round).  Every reservation is tagged with it (calls.harden), so budget.item_harden_usd_cap can keep a hardening
+# round's authoring spend (S5G, S6A, S6M, S6C, S7, S8 ...) apart from the first version's budget.item_usd_cap.
+# the hardening round being stepped: an int, or a callable evaluated at reservation time (pipeline.step passes one
+# that reads the item's current state, so a handler that re-loads the item under its lock tags with the fresh round)
+HARDEN_ROUND: contextvars.ContextVar = contextvars.ContextVar("tbsgen_harden_round", default=0)
+
+
+def harden_round_now() -> int:
+    v = HARDEN_ROUND.get()
+    return int((v() if callable(v) else v) or 0)
+
+
+@contextlib.contextmanager
+def harden_scope(k):
+    tok = HARDEN_ROUND.set(k if callable(k) else int(k or 0))
+    try:
+        yield
+    finally:
+        HARDEN_ROUND.reset(tok)
+
+
+def _harden_stages(b: dict) -> list[str]:
+    """Stages charged to budget.item_harden_usd_cap in a hardening round: the authoring stages plus S7."""
+    st = list(b.get("item_usd_cap_stages") or [])
+    return st + [s for s in ("S7",) if s not in st]
 
 
 class BudgetStop(RuntimeError):
@@ -72,6 +100,8 @@ class Ledger:
             cols = {r[1] for r in db.execute("PRAGMA table_info(calls)")}
             if "cost_kind" not in cols:     # added for S9 runs: reported / tokens / reservation (older ledgers: NULL)
                 db.execute("ALTER TABLE calls ADD COLUMN cost_kind TEXT")
+            if "harden" not in cols:        # hardening round of the call (older ledgers: NULL = first version)
+                db.execute("ALTER TABLE calls ADD COLUMN harden INTEGER")
 
     def _db(self):
         db = sqlite3.connect(self.path, timeout=60, isolation_level=None)
@@ -83,6 +113,7 @@ class Ledger:
                 est_usd: float | None = None) -> int:
         b = self.cfg["budget"]
         est = (float(b.get("est_usd_per_call", 0.0)) if est_usd is None else float(est_usd)) if real else 0.0
+        hk = harden_round_now()
         day = today()
         db = self._db()
         try:
@@ -121,12 +152,18 @@ class Ledger:
                 n = db.execute("SELECT count(*) FROM calls WHERE day=? AND model=?", (day, model)).fetchone()[0]
                 if n >= int(cap_c):
                     raise BudgetStop("daily_calls", f"{model} {cap_c} calls")
-            cap_u = b.get("item_usd_cap")
-            if cap_u is not None and item and stage in (b.get("item_usd_cap_stages") or []):
+            cap_u, cap_h = b.get("item_usd_cap"), b.get("item_harden_usd_cap")
+            if item and hk and cap_h is not None:
+                # a hardening round with its own allowance: all its authoring spend, never the first version's
+                st = _harden_stages(b)
+                if stage in st:
+                    used = _item_used(db, item, st, "AND COALESCE(harden,0)>0")
+                    if used + est > float(cap_h) + 1e-9:
+                        raise BudgetStop("item_harden_usd", f"{item} {used:.2f}+{est:.2f} > {cap_h} USD (hardening)")
+            elif cap_u is not None and item and stage in (b.get("item_usd_cap_stages") or []):
                 st = list(b.get("item_usd_cap_stages") or [])
-                q = (f"SELECT COALESCE(SUM(COALESCE(usd, est_usd)),0) FROM calls WHERE item=? AND real=1 AND "
-                     f"stage IN ({','.join('?' * len(st))})")
-                used = db.execute(q, (item, *st)).fetchone()[0]
+                # without item_harden_usd_cap the hardening rounds share item_usd_cap (the original rule)
+                used = _item_used(db, item, st, "" if cap_h is None else "AND COALESCE(harden,0)=0")
                 if used + est > float(cap_u) + 1e-9:
                     raise BudgetStop("item_usd", f"{item} {used:.2f}+{est:.2f} > {cap_u} USD")
             cap_i = b.get("max_calls_per_item")
@@ -139,8 +176,9 @@ class Ledger:
                 if n >= int(cap_i):
                     raise BudgetStop("item_calls", f"{item} {cap_i} calls")
             cur = db.execute(
-                "INSERT INTO calls(day,started,model,real,stage,item,status,est_usd,prompt_sha) VALUES(?,?,?,?,?,?,?,?,?)",
-                (day, time.time(), model, int(real), stage, item, "reserved", est, prompt_sha))
+                "INSERT INTO calls(day,started,model,real,stage,item,status,est_usd,prompt_sha,harden) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (day, time.time(), model, int(real), stage, item, "reserved", est, prompt_sha, hk or None))
             db.execute("COMMIT")
             return cur.lastrowid
         except BaseException:
@@ -241,14 +279,26 @@ class Ledger:
         return {k: round(v or 0, 4) for k, v in rows}
 
 
-def item_usd_left(ledger, cfg: dict, item: str) -> float | None:
-    """budget.item_usd_cap minus the item's settled + reserved spend on the capped stages (None = no cap)."""
+def _item_used(db, item: str, stages: list[str], extra: str = "") -> float:
+    if not stages:
+        return 0.0
+    q = (f"SELECT COALESCE(SUM(COALESCE(usd, est_usd)),0) FROM calls WHERE item=? AND real=1 AND "
+         f"stage IN ({','.join('?' * len(stages))}) {extra}")
+    return float(db.execute(q, (item, *stages)).fetchone()[0])
+
+
+def item_usd_left(ledger, cfg: dict, item: str, harden: int | None = None) -> float | None:
+    """What is left of the item's authoring allowance (settled + reserved spend; None = no cap).  harden: the
+    hardening round (None = the round being stepped, budget.HARDEN_ROUND).  In a hardening round with
+    budget.item_harden_usd_cap set: that cap minus the spend of all hardening rounds; otherwise budget.item_usd_cap
+    minus the first version's spend (minus everything when item_harden_usd_cap is unset: the original rule)."""
     b = cfg["budget"]
-    cap = b.get("item_usd_cap")
-    if cap is None:
-        return None
-    st = list(b.get("item_usd_cap_stages") or [])
+    h = harden_round_now() if harden is None else int(harden)
+    cap_u, cap_h = b.get("item_usd_cap"), b.get("item_harden_usd_cap")
     with ledger._db() as db:
-        used = db.execute(f"SELECT COALESCE(SUM(COALESCE(usd, est_usd)),0) FROM calls WHERE item=? AND real=1 AND "
-                          f"stage IN ({','.join('?' * len(st))})", (item, *st)).fetchone()[0]
-    return float(cap) - float(used)
+        if h and cap_h is not None:
+            return float(cap_h) - _item_used(db, item, _harden_stages(b), "AND COALESCE(harden,0)>0")
+        if cap_u is None:
+            return None
+        return float(cap_u) - _item_used(db, item, list(b.get("item_usd_cap_stages") or []),
+                                         "" if cap_h is None else "AND COALESCE(harden,0)=0")

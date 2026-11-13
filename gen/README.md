@@ -99,8 +99,14 @@ regate 不复查（它们不改科学内容）。
    `authoring_max_jobs`；
 4. 新版本照常 S6A_run → S6B（阈值按新测量和分离规则重推）→ S6C → S7（含上面的完整性检查）→ PKG → S9（从学生重新校准）；
 5. 新版本在 S5G..PKG 被淘汰 / 搁置（且尚未进入 S9R）时自动**回退**到上一版（`harden_revert`：文件从 `prev/` 还原，
-   失败版本移到 `round-k/failed/`，上一版的校准记录从 epoch 归档移回），`harden_exhausted=true`，按原规则继续校准；
-6. 轮次用尽（或 `harden_exhausted`）后按原规则：第 2 次学生运行 → easy / unstable。
+   失败版本移到 `round-k/failed/`，上一版的校准记录从 epoch 归档移回），按原规则继续校准。回退原因若属于基础设施
+   （`difficulty.revert_infra`：S5G 作业 launcher_failed / no_result，或 agent 以 NonZeroAgentExitCodeError /
+   AgentSetupTimeoutError / EnvironmentStartTimeoutError 结束且缺交付文件；`code:*:launch_failed`；
+   `model_error:*:network|stream|empty`），记 `harden_reverted[].infra`，**不消耗** `harden_max_rounds`，也不设
+   `harden_exhausted`，上一版的学生通过记录会再触发一次加难；其他原因（费用上限 `s5g_budget_exhausted` /
+   `item_harden_usd_cap`、agent 超时、交付不全、分离不成立等）计为一轮并设 `harden_exhausted=true`；
+6. 轮次用尽（不计 infra 回退的轮数 ≥ `harden_max_rounds`，或总加难启动次数 ≥ `harden_max_attempts`，默认 4，防止
+   infra 死循环；或 `harden_exhausted`）后按原规则：第 2 次学生运行 → easy / unstable。
 
 可中断、可恢复、幂等：每一步先写状态再动文件；快照有 `DONE` 标记；epoch 只在仍为当前 epoch 时归档；重跑 S9 时用
 `harden_pending` 继续同一轮，不会再次付费。账本里加难作业仍记为阶段 `S5G`；事件 `harden_start`、`harden_authored`、
@@ -111,12 +117,22 @@ regate 不复查（它们不改科学内容）。
 学生通过记录、没有进行中的作业、尚未做过 S9R 审核）。
 
 配置（`[difficulty]`）：`profile_path`、`profile_id`、`design_gate`、`harden`、`harden_max_rounds`、
-`harden_authoring_timeout_s`、`harden_authoring_max_usd`、`harden_exclude`。
+`harden_max_attempts`、`harden_authoring_timeout_s`、`harden_authoring_max_usd`、`harden_exclude`。
+
+**首选杠杆**：画像 front matter 可写 `preferred: [ID, ...]`（必须是画像里的条目）。S5G 指令要求优先使用（仍须来自论文
+真实难点）；加难轮的 `difficulty_design.json` 必须至少含一个首选杠杆（S5G 设计校验），S7 还要求至少一个首选杠杆在
+reference / mid / naive 实测中成立（`difficulty.preferred_problem`），否则按设计不成立处理（退回 S5G 一次，再不过淘汰 →
+回退上一版）。首版出题不强制。
 
 ### 0c. 生产限流（2026-11-12 起，默认关）
-- `budget.item_usd_cap`：单篇出题阶段（`budget.item_usd_cap_stages`，默认 S4c、S5、S5G、S6A、S6M、S6C、S8，含加难轮次；
+- `budget.item_usd_cap`：单篇出题阶段（`budget.item_usd_cap_stages`，默认 S4c、S5、S5G、S6A、S6M、S6C、S8；
   不含 S9 校准和 S9R 审核）的已结算 + 预留费用上限。账本预留时检查，超出即 `dropped:item_usd_cap`（只影响该篇，
   模型不停）；S4c/S5G 作业的 `--max-budget-usd` 夹到剩余额度，剩余不足 $1 时 `s5g_budget_exhausted`。
+- `budget.item_harden_usd_cap`（默认 None = 加难轮次与首版共用 `item_usd_cap`，即旧规则）：设了以后，单篇**所有加难轮
+  合计**另有这份额度，首版不再与加难共用 `item_usd_cap`。`Pipeline.step` 在 `harden_active` 时把预留打上轮次标记
+  （账本 `calls.harden` 列；旧账本自动加列，旧行视为首版），加难轮里 `item_usd_cap_stages` 加 S7 的花费都计入加难额度；
+  超出即 `dropped:item_harden_usd_cap` → 回退上一版（计为一轮）。加难轮 S5G 的 `--max-budget-usd` 取
+  `harden_authoring_max_usd` 与加难剩余额度的较小值。
 - `code.daily_new_runnability` / `code.daily_new_authoring`：每天（北京时间）首次进入 S4c / S5G 的论文数上限，
   记在 run 目录 `s4c-admissions.jsonl` / `s5g-admissions.jsonl`（同一篇的重出题、加难轮次不重复计数）；
   超出时条目暂停 `budget:daily_s5g_papers`，次日 `tbsgen resume --reason budget:daily` 恢复（驱动跨日时执行）。只有作业真正启动才计入当天名额；

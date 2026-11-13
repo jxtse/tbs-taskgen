@@ -58,9 +58,15 @@ def s7(P, it):
                 prof = difficulty.load_profile(P.cfg)
             except (OSError, ValueError):
                 prof = None
+            # a hardening round needs the measured levers for its preferred-lever check even with design_gate="off"
             chk = difficulty.check_lever_separation(it.dir, spec, th, prof) \
-                if it.p("_spec", difficulty.DESIGN_FILE).exists() and mode != "off" else dict(ok=True, problems=[])
+                if it.p("_spec", difficulty.DESIGN_FILE).exists() and (mode != "off" or hround) \
+                else dict(ok=True, problems=[])
             hp = difficulty.check_hardening(it.dir, hround) if hround else []
+            if hround and it.p("_spec", difficulty.DESIGN_FILE).exists():
+                hp = hp + difficulty.preferred_problem(chk, prof, hround)
+            if mode == "off":
+                chk = dict(chk, ok=True, problems=[], off_problems=chk["problems"])   # off: only hp blocks
             chk = dict(chk, ok=chk["ok"] and not hp, problems=list(chk["problems"]) + hp, hardening=hp)
             write_json(it.p("gates", "difficulty.json"), dict(chk, mode=mode, ts=time.time()))
             if not chk["ok"] and (mode == "block" or hp):
@@ -1399,7 +1405,8 @@ def harden_revert(P, it, locked: bool = False) -> bool:
                 read_json(it.p("review", "runs.json"), []):
             return False
         pend = dict(round=k, why=f"{st.get('stage')}:{st.get('reason')}", prev_epoch=int(rec["archived_epoch"]),
-                    failed_epoch=int(st.get("calib_epoch", 0)), ts=time.time())
+                    failed_epoch=int(st.get("calib_epoch", 0)), ts=time.time(),
+                    infra=difficulty.revert_infra(it, st.get("stage"), st.get("reason")))
         st["harden_revert_pending"] = pend
         it.save()
     k = int(pend["round"])
@@ -1416,15 +1423,20 @@ def harden_revert(P, it, locked: bool = False) -> bool:
     for key in ("harden_active", "calib_label", "thresholds_locked", "repair_from", "rescore_pending", "harden_base",
                 "harden_built", "regen_6c", "harden_revert_pending"):
         st.pop(key, None)
-    st["harden_exhausted"] = True
-    st.setdefault("harden_reverted", []).append(dict(round=k, why=pend["why"], ts=time.time()))
+    infra = pend.get("infra")
+    if not infra:
+        st["harden_exhausted"] = True       # a real round failed: no more hardening, the original rule decides
+    # an infra revert does not use up harden_max_rounds; harden_max_attempts bounds the retries (rounds_left)
+    if not any(r.get("round") == k for r in st.get("harden_reverted") or []):
+        st.setdefault("harden_reverted", []).append(dict(round=k, why=pend["why"], infra=infra, ts=time.time()))
     st.setdefault("history", []).append(dict(stage=st.get("stage"), result="harden_revert", to="S9",
-                                             reason=pend["why"], ts=time.time()))
+                                             reason=pend["why"], infra=infra, ts=time.time()))
     st.update(stage="S9", status="active")
     st.pop("reason", None)
     it.save()
-    difficulty.write_round(it, k, reverted=dict(why=pend["why"], ts=time.time()))
-    P.store.event("harden_reverted", item=it.item_id, round=k, why=pend["why"])
+    difficulty.write_round(it, k, reverted=dict(why=pend["why"], infra=infra, ts=time.time()))
+    P.store.event("harden_reverted", item=it.item_id, round=k, why=pend["why"], infra=infra,
+                  rounds_used=difficulty.rounds_used(it), attempts=k)
     return True
 
 
