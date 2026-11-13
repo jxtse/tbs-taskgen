@@ -68,11 +68,19 @@ Crossref · arXiv · Europe PMC              → S5 spec (teacher) → S6 genera
    task files must not copy long passages of a TDM full text. Blocking failures go to a local repair
    loop (S8, at most two rounds).
 5. **Difficulty calibration** (S9). A student agent runs the packaged task in Harbor; if it fails, a
-   teacher agent tries. A task is kept if it is *unstable* (the student passes one of two runs) or
-   *hard* (the student fails and the teacher passes). By default S9 only writes job configs and
-   launch commands; submitting jobs must be enabled explicitly.
-5b. **Task review** (S9R). Every task S9 would keep, and every task whose teacher runs all failed (as a
-   diagnosis), is audited by a fresh code-executing agent (Claude Code, Opus by default) inside the task's own
+   teacher agent tries. Two kinds of task are released:
+   - **Student-boundary tasks** (channel `main`): *unstable* (the student passes one of two runs) or *hard*
+     (the student fails and the teacher passes).
+   - **Frontier tasks** (channel `frontier`): the student fails and both of the teacher's decisive attempts are
+     real failures (not infrastructure errors, not time-outs). They are released only when the S9R review
+     confirms that the task itself is correct: the reviewer's reproduction of the reference scores 1, the statement
+     is consistent and complete, there are no shortcuts or leaks, and the difficulty comes from the science of the
+     paper and its code. `calib.frontier = false` restores the old rule (park the task).
+
+   Frontier tasks have no passing trajectory, so keep them apart from SFT data. By default S9 only writes job
+   configs and launch commands; submitting jobs must be enabled explicitly.
+5b. **Task review** (S9R). Every task S9 would keep (including frontier candidates, under stricter release
+   conditions), and every parked task whose teacher runs all failed (as a diagnosis), is audited by a fresh code-executing agent (Claude Code, Opus by default) inside the task's own
    image, with the model endpoint as its only network. It sees the whole package, baselines, generator,
    threshold and gate records and a digest of every calibration trace, reruns the reference and tests, and
    returns `pass` / `revise` / `drop` with evidence per checklist item (consistency, missing conditions,

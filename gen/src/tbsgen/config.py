@@ -489,6 +489,10 @@ DEFAULTS: dict[str, Any] = {
         "teacher_runs_max": 2,
         "quick_pass_minutes": None,         # 待定: 1st-pass shortcut to "easy" (e.g. 30); None=off
         "keep_labels": ["hard", "unstable"],  # decision 2026-11-05: GLM 1/2, or GLM 0 + teacher pass
+        # GLM 0 + every teacher run a real (non-infra, non-timeout) fail -> "frontier": released on its own channel
+        # only after S9R confirms the task (reference reward 1, consistent / complete statement, no shortcut, genuine
+        # difficulty; review.frontier_*).  False: the old parked:teacher_failed.
+        "frontier": True,
         "infra_retries": 2,                 # API quota / sandbox errors do not count as attempts
         "variant_depth": 0,                 # S9b harder variants; 待定 (e.g. <=2); 0 = off in MVP
     },

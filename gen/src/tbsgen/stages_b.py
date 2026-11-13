@@ -578,6 +578,8 @@ def _s9(P, it):
             return it.goto("S9R", f"label:{what}")
         if what.startswith("parked"):
             return it.finish("parked", what)
+        if what == "frontier":
+            return it.finish("parked", "frontier:unreviewed (review disabled: never released without S9R)")
         if what in c["keep_labels"]:
             return it.advance("S9", "S10", label=what)
         return it.finish("done", f"label:{what} (not kept; S9b variants off)")
@@ -679,6 +681,15 @@ def _ingest(P, it, job_dir: str | None = None) -> dict:
     return t
 
 
+def _oracle_gate_ok(it) -> bool:
+    """The last S7 gate report of the current version passed the oracle (reference) gate."""
+    reps = sorted(it.p("gates").glob("attempt-*.json"), key=lambda p: int(p.stem.split("-")[-1]))
+    if not reps:
+        return False
+    g = (read_json(reps[-1], {}) or {}).get("gates") or {}
+    return g.get("oracle") is True
+
+
 def review_gate(P, it) -> str | None:
     """Why S10 must not release this item yet (None = may release): with review on and a reviewable label, the
     current package, calibration epoch and review round need a recorded pass."""
@@ -690,6 +701,10 @@ def review_gate(P, it) -> str | None:
     norm = v.get("_normalized") or {}
     if norm.get("verdict") != "pass":
         return f"review verdict {norm.get('verdict')}"
+    if it.state.get("calib_label") == "frontier":
+        fp = review.frontier_problems(norm, _oracle_gate_ok(it))
+        if fp:
+            return "frontier not confirmed: " + "; ".join(fp)[:200]
     if v.get("round") != it.state.get("review_round") or v.get("calib_epoch", 0) != it.state.get("calib_epoch", 0):
         return "review verdict of another round / calibration epoch"
     if v.get("pkg_sha") != calib.pkg_sha(it.p("pkg")):
@@ -714,7 +729,14 @@ def s10(P, it):
             minor=[dict(id=i.get("id"), category=i.get("category"), title=i.get("title"))
                    for i in nv.get("issues") or [] if i.get("severity") == "minor"],
             label_trustworthy=(nv.get("label_assessment") or {}).get("trustworthy"))
-        f.write(json.dumps(dict(item_id=it.item_id, pkg=str(it.p("pkg")), label=it.state.get("calib_label"),
+        label = it.state.get("calib_label")
+        extra = {}
+        if label == "frontier":
+            # a separate release channel: no model solved it (no passing trajectory); consumers keep it apart
+            extra = dict(frontier=calib.frontier_evidence(runs, P.cfg),
+                         reference_check=nv.get("reference_check") or {})
+        f.write(json.dumps(dict(item_id=it.item_id, pkg=str(it.p("pkg")), label=label,
+                                channel="frontier" if label == "frontier" else "main", **extra,
                                 calib_runs=summ, result_types=[x["result_type"] for x in summ],
                                 calib_epoch=it.state.get("calib_epoch", 0), review=rev,
                                 difficulty=_difficulty_summary(it), ts=time.time())) + "\n")
@@ -1073,6 +1095,10 @@ def _route_review(P, it, rec: dict, rnd: int):
                                                     pkg_sha=rec.get("pkg_sha"), job=rec.get("job_name")))
     label = it.state.get("calib_label") or ""
     kept = label in P.cfg["calib"]["keep_labels"]
+    fp = None
+    if label == "frontier" and verdict == "pass":
+        fp = review.frontier_problems(norm, _oracle_gate_ok(it))
+        kept = not fp
     it.state["review_verdict"] = verdict
     P.store.event("review_verdict", item=it.item_id, round=rnd, verdict=verdict, raw=norm.get("raw_verdict"),
                   blocking=norm.get("blocking"), minor=norm.get("minor"), label=label,
@@ -1080,6 +1106,9 @@ def _route_review(P, it, rec: dict, rnd: int):
     if verdict == "pass":
         if kept:
             return it.advance("S9R", "S10", review="pass", round=rnd)
+        if fp:
+            P.store.event("frontier_unconfirmed", item=it.item_id, round=rnd, why=fp[:8])
+            return it.finish("parked", f"frontier:unconfirmed (review r{rnd}: pass; {'; '.join(fp)[:300]})")
         return it.finish("parked", f"{label} (review r{rnd}: pass)")
     withdraw(P, it.item_id, f"review r{rnd}: {verdict}")
     if verdict == "human":                  # only reachable behind review.allow_human (explicit opt-in)

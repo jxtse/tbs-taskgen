@@ -223,7 +223,7 @@ items/<item_id>/
 | S8 | 门日志 + 依赖图 + 相关文件 | `repair/round-n/`（补丁 + 审查结论） | Opus 修复；审查为机械 diff | 审查不过算用掉 1 轮；2 轮后 `dropped: repair_limit` |
 | PKG | 通过 S7 的题 + 种子 0 产物 | `pkg/` + `PKG_check.json` | 无 | `parked: package_invalid` |
 | S9 | `pkg/` | `calib/*.json` 作业配置 + 启动命令；`runs.json` | 不调用（只调度） | 见 §5 |
-| S10 | 标签为 hard/unstable 的题 | `release/manifest.jsonl` | 无 | — |
+| S10 | 标签为 hard/unstable（channel main）或 frontier（channel frontier）的题 | `release/manifest.jsonl` | 无 | — |
 
 **S7 机械门**：determinism（同种子两次哈希一致）；oracle（参考解在每个种子上都通过）；oracle_margin（参考解至少留出一半余量）；nop（空交付不过）；naive（每个种子至少 2 项不过）；mid（1–2 项不过，且全部判据都被评估）；exploit（作弊尝试全不过）；exploit_valid（阻断，v2.5：每个作弊基线必须在相同调用方式下真正跑完并产出可评分的输出——解题步骤退出码 0、写出了交付物、PROG 的每次 `solution_cli.py` 调用退出码 0、参考解被评估的判据都被评估、且不是所有指标都等于空交付值；作弊基线崩溃或没产出时它“没通过”不算拦住，送 S8 修复）；hidden_shift（只对 PROG）；thresholds_stated（每个阈值都在题面中出现）；leak；isolation（`environment/` 下没有 tests/truth/generator）；tdm_verbatim（全文来自 Elsevier/Wiley TDM 的论文：题面和 `environment/data` 下的文本文件与全文的最长逐字重合，空白规范化后不超过 200 字符，见 `tdmgate.py`）。
 
@@ -367,7 +367,7 @@ allow_submit = false
 
 GLM-5.3 + Claude Code 2.1.280 先跑第 1 次：
 
-- 失败 → Opus 教师。教师通过记 **hard**；教师失败再跑 1 次，仍失败则暂存（`parked:teacher_failed`）。
+- 失败 → Opus 教师。教师通过记 **hard**；教师失败再跑 1 次。两次有效尝试都是真失败（不算 infra，也不能是超时）时记 **frontier**（`calib.frontier`，默认开启）；否则（含超时）暂存为 `parked:teacher_failed`。
 - 通过 → GLM 第 2 次。失败记 **unstable**，通过记 **easy**。
 
 hard 和 unstable 保留。reward=1 一律算通过，即使之后报了 API 错误。没有 reward 的 API/沙箱异常算 `infra`，不计入次数，连续超过 2 次则暂存。`allow_submit=false` 时只写出作业配置和启动命令，由人执行；`true` 时先在账本预留、再后台启动。结果用 `calib-ingest` 回填。
@@ -381,6 +381,15 @@ hard 和 unstable 保留。reward=1 一律算通过，即使之后报了 API 错
 ## 5b. S9R 审核（校准之后、发布之前）
 
 S9 打出标签后，**hard / unstable**（`calib.keep_labels`）必须先过审核才进 S10；**parked:teacher_failed** 也审核（`review.review_parked`，只作诊断，不会因此放行）；easy 不审。
+
+**frontier**（没有任何模型做对的题）必须通过审核，且审核比一般题更严，才能进 S10：
+- verdict 为 pass；
+- 审核者复现参考解，`reference_check.reward` = 1；
+- 清单 a（一致性）、b（条件完整）、e（无捷径/泄漏）、j（难度来自真实科学难度）都为 `ok`；
+- `label_assessment.trustworthy` = true；
+- S7 oracle 门禁通过。
+
+任一项不满足，记为 `parked`（`frontier:unconfirmed`）。审核关闭时，frontier 一律不发布。发布记录中 `channel = "frontier"`，与 hard/unstable（`channel = "main"`）分开；附带 `frontier`（教师有效、infra、超时的次数）和 `reference_check`。frontier 题没有通过轨迹，下游不要把它放进 SFT 主体。
 
 - **审核者**：能执行代码的 Claude Code agent（默认 Opus，`review.model` 未设则用 `calib.teacher_model`），全新上下文，在**题目自己的镜像**里运行（审核任务由 `review.build_task` 生成：原 Dockerfile 加 `COPY review /review`，`/tests`、`/solution` 照真实运行装好，可直接 `bash /solution/solve.sh && bash /tests/test.sh` 复现参考解）。网络与教师相同：agent 阶段只能连模型中继（`review.agent_allowed_hosts`，未设沿用教师的），verifier 阶段断网。
 - **能看到**（`/review`）：题包全部文件（含 hidden/truth、参考解）、`extra/`（baselines、generator）、`records/`（thresholds.json、S6A 实测、S6B 决策、S7 门报告、S8 修复记录、spec、阶段历史）、`calibration/`（当前校准轮次每次运行的 result 摘要、verifier 输出与逐项指标、trace 摘要：工具调用序列、助手文字、最后的工具输出和最终消息）。

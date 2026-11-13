@@ -3,8 +3,9 @@ Only scheduling + result collection.  Submitting is gated by cfg.calib.allow_sub
 pipeline writes a Harbor job config + the exact launcher command and the item waits in "S9/waiting".
 
 Decision rule:
-    GLM#1 fail  -> teacher#1; pass -> "hard" (keep); fail -> teacher#2 (teacher_runs_max) ; fail -> "parked"
-                   (possible defect or too hard; human spot check)
+    GLM#1 fail  -> teacher#1; pass -> "hard" (keep); fail -> teacher#2 (teacher_runs_max) ; fail ->
+                   "frontier" (calib.frontier on and every decisive teacher run a non-timeout fail: a task no model
+                   solved; released only after S9R confirms it is correct, see review.py) else "parked:teacher_failed"
     GLM#1 pass  -> (quick_pass_minutes set and duration below it -> "easy") else GLM#2
     GLM#2 fail  -> "unstable" (keep: GLM 1/2);  GLM#2 pass -> "easy" (S9b variants disabled in MVP)
 Infra outcomes (API quota/auth/stream errors with reward 0, sandbox start/setup timeouts, cancelled) are not
@@ -77,10 +78,28 @@ class _Park(Exception):
     pass
 
 
+def is_timeout(r: dict) -> bool:
+    """A run that ended on the agent time limit (a frontier label needs real failures, not slow ones)."""
+    return str(r.get("result_type") or "").startswith("timeout") or \
+        (r.get("trial") or {}).get("exception") in TIMEOUT_EXC
+
+
+FRONTIER_CHECKS = ("a_consistency", "b_missing_conditions", "e_shortcuts_leaks", "j_genuine_difficulty")
+
+
+def frontier_evidence(runs: list[dict], cfg: dict) -> dict:
+    """Release record of a frontier task: decisive / infra / timeout counts of the teacher runs of this epoch."""
+    tea = [r for r in runs if r.get("who") == "teacher" and r.get("outcome") is not None]
+    dec = [r for r in tea if r["outcome"] != "infra"]
+    return dict(teacher_runs=len(tea), teacher_decisive=len(dec), teacher_infra=len(tea) - len(dec),
+                teacher_timeouts=sum(1 for r in dec if is_timeout(r)),
+                teacher_result_types=[r.get("result_type") for r in dec])
+
+
 def next_action(runs: list[dict], cfg: dict) -> tuple[str, str | None]:
     """runs: [{"who": "glm"|"teacher", "outcome": "pass"|"fail"|"infra", "minutes": float,
     "result_type": optional}] in order.
-    Returns ("run", "glm"|"teacher") or ("label", "hard"|"unstable"|"easy"|"parked:<why>").
+    Returns ("run", "glm"|"teacher") or ("label", "hard"|"unstable"|"easy"|"frontier"|"parked:<why>").
     (The hardening loop -- difficulty.should_harden -- is checked by S9 before this rule.)"""
     c = cfg["calib"]
     try:
@@ -105,6 +124,8 @@ def next_action(runs: list[dict], cfg: dict) -> tuple[str, str | None]:
             if not c.get("teacher_available", True):
                 return "label", "parked:teacher_unavailable"
             return "run", "teacher"
+        if c.get("frontier", True) and tea and not any(is_timeout(t) for t in tea):
+            return "label", "frontier"
         return "label", "parked:teacher_failed"
     # GLM#1 passed
     q = c.get("quick_pass_minutes")

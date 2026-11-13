@@ -120,7 +120,32 @@ def reviewable(cfg: dict, label: str | None) -> bool:
     r = cfg.get("review") or {}
     if not r.get("enabled") or not label:
         return False
-    return label in cfg["calib"]["keep_labels"] or label in (r.get("review_parked") or [])
+    return label in cfg["calib"]["keep_labels"] or label == "frontier" or label in (r.get("review_parked") or [])
+
+
+def frontier_problems(norm: dict, gates_ok: bool) -> list[str]:
+    """Why a reviewed frontier task (no model solved it) may not be released although the verdict is pass: the
+    reviewer's own reproduction of the reference must score reward 1, the statement / conditions / shortcut /
+    genuine-difficulty checks must be "ok", and the reviewer must find the label trustworthy (failures caused by
+    the task's real difficulty, not by a defect); the S7 oracle gate must have passed."""
+    why = []
+    rc = norm.get("reference_check") or {}
+    try:
+        if float(rc.get("reward")) != 1.0:
+            why.append(f"reference_check.reward {rc.get('reward')}")
+    except (TypeError, ValueError):
+        why.append("reference_check.reward missing")
+    ck = norm.get("checklist") or {}
+    from .calib import FRONTIER_CHECKS
+    for k in FRONTIER_CHECKS:
+        st = (ck.get(k) or {}).get("status") if isinstance(ck.get(k), dict) else None
+        if st != "ok":
+            why.append(f"{k}={st}")
+    if (norm.get("label_assessment") or {}).get("trustworthy") is not True:
+        why.append("label not confirmed trustworthy")
+    if not gates_ok:
+        why.append("S7 oracle gate not passed")
+    return why
 
 
 # ------------------------------------------------------------------ trace digest
@@ -432,11 +457,27 @@ def instruction(cfg: dict, item_dir: Path, state: dict, rnd: int, info: dict) ->
                 "records/review_revisions/<n>/{{before,patch}}/, records/thresholds.relock.json) and recalibrated from "
                 "scratch.  Check that the revision fixed the earlier blocking issues without loosening the task, and "
                 "judge the task as it is now.\n").format(rnd=rnd)
+    if label == "frontier":
+        prev += FRONTIER_NOTE
     return REVIEW_PROMPT.format(item=item_dir.name, label=label, rnd=rnd, prev=prev,
                                 max_revisions=int((cfg.get("review") or {}).get("max_revisions", 3)),
                                 runs="\n".join(lines) or "- (no calibration runs recorded)",
                                 thresholds=_fmt_thresholds(item_dir), verdict_path=VERDICT_PATH,
                                 digests=", ".join(info.get("digests") or []) or "none")
+
+
+FRONTIER_NOTE = """
+
+**This is a `frontier` candidate: neither the student nor the teacher solved it (every teacher run was a real
+failure, not a time-out or an infrastructure error).**  It is released only if you confirm that the task itself is
+correct, so be strict here: reproduce the reference and report its reward in `reference_check.reward` (must be 1);
+the statement must be unambiguous and complete (a, b `ok`), there must be no shortcut or leak (e `ok`), and the
+difficulty must be the paper's / code's real scientific difficulty, not an artificial one (j `ok`).  Use the traces
+to explain why the teacher failed (g): if a careful solver following the statement literally could also fail
+because of the task (ambiguity, an unstated convention, a grader problem), that is a blocking issue, and
+`label_assessment.trustworthy` must be false.  Set it true only when the failures come from the task's genuine
+difficulty.
+"""
 
 
 REVIEW_PROMPT = """# Task review (S9R) — {item}
