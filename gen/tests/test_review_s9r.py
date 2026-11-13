@@ -394,6 +394,25 @@ def test_frontier_s10_gate_sends_it_back_to_review(tmp_path):
     assert not (P.store.root / "release" / "manifest.jsonl").exists()
 
 
+def test_released_frontier_with_a_changed_package_is_withdrawn_at_s10(tmp_path):
+    P, iid, jobs = _env(tmp_path)
+    _to_label(P, iid, jobs, seq=(0.0, 0.0, 0.0))
+    _oracle_ok(P, iid)
+    [rr] = _runs(P, iid, "review")
+    _finish(jobs, rr["job_name"], verdict=FRONTIER_OK)
+    watch_tick(P, only=[iid])
+    it = P.store.item(iid)
+    assert it.state["status"] == "done"
+    (it.p("pkg") / "instruction.md").write_text("changed after the review")   # stale verdict
+    it.state.update(stage="S10", status="active")                      # e.g. reset --stage S10
+    it.save()
+    from tbsgen import stages_b
+    stages_b.s10(P, P.store.item(iid))
+    assert P.store.item(iid).state["stage"] == "S9R"
+    last = json.loads((P.store.root / "release" / "manifest.jsonl").read_text().splitlines()[-1])
+    assert last["item_id"] == iid and last["withdrawn"]
+
+
 def test_frontier_review_disabled_is_never_released(tmp_path):
     P, iid, jobs = _env(tmp_path)
     P.cfg["review"]["enabled"] = False

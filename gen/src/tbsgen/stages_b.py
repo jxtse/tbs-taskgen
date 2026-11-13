@@ -722,6 +722,9 @@ def s10(P, it):
         withdraw(P, it.item_id, why)
         return it.finish("parked", f"frontier:unreviewed ({why})")
     if why:
+        # a release whose current package / epoch / round has no confirming pass must not stay published while the
+        # review runs again (no-op when the item was never released)
+        withdraw(P, it.item_id, f"S10 review gate: {why}")
         it.state["review_round"] = int(it.state.get("review_revisions", 0)) + 1
         return it.goto("S9R", f"S10 review gate: {why}")
     rel = P.store.root / "release"
