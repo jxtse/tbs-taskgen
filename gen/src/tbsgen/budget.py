@@ -29,12 +29,19 @@ CN = dt.timezone(dt.timedelta(hours=8))
 # hardening round of the item being stepped (Pipeline.step sets it while state.harden_active; 0 = not a hardening
 # round).  Every reservation is tagged with it (calls.harden), so budget.item_harden_usd_cap can keep a hardening
 # round's authoring spend (S5G, S6A, S6M, S6C, S7, S8 ...) apart from the first version's budget.item_usd_cap.
-HARDEN_ROUND: contextvars.ContextVar[int] = contextvars.ContextVar("tbsgen_harden_round", default=0)
+# the hardening round being stepped: an int, or a callable evaluated at reservation time (pipeline.step passes one
+# that reads the item's current state, so a handler that re-loads the item under its lock tags with the fresh round)
+HARDEN_ROUND: contextvars.ContextVar = contextvars.ContextVar("tbsgen_harden_round", default=0)
+
+
+def harden_round_now() -> int:
+    v = HARDEN_ROUND.get()
+    return int((v() if callable(v) else v) or 0)
 
 
 @contextlib.contextmanager
-def harden_scope(k: int):
-    tok = HARDEN_ROUND.set(int(k or 0))
+def harden_scope(k):
+    tok = HARDEN_ROUND.set(k if callable(k) else int(k or 0))
     try:
         yield
     finally:
@@ -106,7 +113,7 @@ class Ledger:
                 est_usd: float | None = None) -> int:
         b = self.cfg["budget"]
         est = (float(b.get("est_usd_per_call", 0.0)) if est_usd is None else float(est_usd)) if real else 0.0
-        hk = HARDEN_ROUND.get()
+        hk = harden_round_now()
         day = today()
         db = self._db()
         try:
@@ -286,7 +293,7 @@ def item_usd_left(ledger, cfg: dict, item: str, harden: int | None = None) -> fl
     budget.item_harden_usd_cap set: that cap minus the spend of all hardening rounds; otherwise budget.item_usd_cap
     minus the first version's spend (minus everything when item_harden_usd_cap is unset: the original rule)."""
     b = cfg["budget"]
-    h = HARDEN_ROUND.get() if harden is None else int(harden)
+    h = harden_round_now() if harden is None else int(harden)
     cap_u, cap_h = b.get("item_usd_cap"), b.get("item_harden_usd_cap")
     with ledger._db() as db:
         if h and cap_h is not None:

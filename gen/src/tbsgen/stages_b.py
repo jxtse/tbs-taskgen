@@ -58,11 +58,15 @@ def s7(P, it):
                 prof = difficulty.load_profile(P.cfg)
             except (OSError, ValueError):
                 prof = None
+            # a hardening round needs the measured levers for its preferred-lever check even with design_gate="off"
             chk = difficulty.check_lever_separation(it.dir, spec, th, prof) \
-                if it.p("_spec", difficulty.DESIGN_FILE).exists() and mode != "off" else dict(ok=True, problems=[])
+                if it.p("_spec", difficulty.DESIGN_FILE).exists() and (mode != "off" or hround) \
+                else dict(ok=True, problems=[])
             hp = difficulty.check_hardening(it.dir, hround) if hround else []
             if hround and it.p("_spec", difficulty.DESIGN_FILE).exists():
                 hp = hp + difficulty.preferred_problem(chk, prof, hround)
+            if mode == "off":
+                chk = dict(chk, ok=True, problems=[], off_problems=chk["problems"])   # off: only hp blocks
             chk = dict(chk, ok=chk["ok"] and not hp, problems=list(chk["problems"]) + hp, hardening=hp)
             write_json(it.p("gates", "difficulty.json"), dict(chk, mode=mode, ts=time.time()))
             if not chk["ok"] and (mode == "block" or hp):

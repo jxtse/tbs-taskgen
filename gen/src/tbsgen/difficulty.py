@@ -382,7 +382,9 @@ def revert_infra(it, stage: str | None, reason: str | None) -> str | None:
         r = read_json(it.p("S5G_result.json"), {}) or {}
         if r.get("outcome") in ("launcher_failed", "no_result"):
             return f"s5g:{r['outcome']}"
-        if r.get("exception") in _INFRA_EXC:
+        # the agent process died / never set up AND produced no spec at all (a version that got as far as its spec
+        # but missed other files is a real authoring failure); harden_max_attempts bounds repeated infra rounds
+        if r.get("exception") in _INFRA_EXC and "_spec/spec.json" in (r.get("missing") or []):
             return f"s5g:{r['exception']}"
         return None
     if reason.endswith(":launch_failed") or _INFRA_MODEL.match(reason):

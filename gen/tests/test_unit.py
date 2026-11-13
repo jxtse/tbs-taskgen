@@ -287,14 +287,21 @@ def test_validate_spec_malformed_types_do_not_crash():
     bad["depgraph"]["nodes"] = ["a node as a string", "another"]
     bad["depgraph"]["mid_drop"] = "a sentence"
     assert validate_spec(bad, cfg) == ["depgraph.nodes must be a list of objects"]
+    for k, v in (("mid_drop", "a sentence"), ("mid_drop", ""), ("naive_drop", 0), ("edges", {}), ("edges", False),
+                 ("edges", [None])):
+        bad = json.loads(json.dumps(SPEC))
+        bad["depgraph"][k] = v
+        errs = validate_spec(bad, cfg)
+        assert errs and any(k in e for e in errs), (k, v, errs)
     bad = json.loads(json.dumps(SPEC))
-    bad["depgraph"]["mid_drop"] = "a sentence"
-    assert "depgraph.mid_drop must be a list" in validate_spec(bad, cfg)
+    bad["depgraph"]["nodes"][0]["id"] = 3
+    assert validate_spec(bad, cfg)
     bad = json.loads(json.dumps(SPEC))
     bad["metrics"] = ["rmse"]
     assert "metrics must be a list of objects" in validate_spec(bad, cfg)
     assert validate_spec([], cfg) == ["spec is not a JSON object"]
     assert validate_spec({"form": "PROG", "depgraph": "x"}, cfg)[-1] == "depgraph must be an object"
+    assert validate_spec({"form": "PROG", "depgraph": {"nodes": {}}}, cfg)[-1] == "depgraph.nodes must be a list of objects"
 
 
 def test_thresholds_from_measurement():

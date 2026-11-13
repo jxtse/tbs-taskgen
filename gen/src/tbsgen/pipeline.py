@@ -129,8 +129,11 @@ class Pipeline:
 
     # ------------------------------------------------------------------ run loop
     def step(self, it) -> str:
-        # a hardening round's reservations are tagged with the round (budget.item_harden_usd_cap)
-        hk = int(it.state.get("harden_round", 0) or 0) if it.state.get("harden_active") else 0
+        # a hardening round's reservations are tagged with the round (budget.item_harden_usd_cap); evaluated at each
+        # reservation from it.state, which handlers re-load under the item lock (another run / watch may have moved it)
+        def hk():
+            s = it.state
+            return int(s.get("harden_round", 0) or 0) if s.get("harden_active") else 0
         with harden_scope(hk):
             return self._step(it)
 

@@ -613,8 +613,7 @@ def _agent_stage(P, it, kind: str, instruction: str, need: list[str], timeout_s:
             if rec.get("state") == "launched":
                 _agent_admit(P, it, kind)       # counted only once a job of this paper really started
         if rec.get("state") == "launch_failed":
-            it.finish("paused", f"code:{kind}:launch_failed", paused_stage=kind)
-            return None
+            return _launch_failed(it, kind)
         it.finish("waiting", f"{kind}:agent_running", job=rec["job_name"])
         return None
     if rec.get("state") in ("intent", "reserved"):
@@ -633,8 +632,7 @@ def _agent_stage(P, it, kind: str, instruction: str, need: list[str], timeout_s:
             if rec.get("state") == "launched":
                 _agent_admit(P, it, kind)
         if rec.get("state") == "launch_failed":
-            it.finish("paused", f"code:{kind}:launch_failed", paused_stage=kind)
-            return None
+            return _launch_failed(it, kind)
         it.finish("waiting", f"{kind}:agent_running", job=rec.get("job_name"))
         return None
     if rec.get("state") == "launched":
@@ -713,6 +711,16 @@ def s4c(P, it):
         return it.finish("dropped", reason, detail=why)
     it.advance("S4c", "S5G" if codegate.ccfg(P.cfg).get("authoring", "agent") == "agent" else "S5",
                language=res.get("language"), seconds=res.get("seconds"))
+
+
+def _launch_failed(it, kind):
+    """A launch that failed: paused for the operator; in a hardening round the hardened version is given up instead
+    (dropped -> harden_revert puts the previous version back; an infra revert does not use up a round, and
+    harden_max_attempts bounds the retries)."""
+    if kind == "S5G" and it.state.get("harden_active"):
+        return it.finish("dropped", f"code:{kind}:launch_failed")
+    it.finish("paused", f"code:{kind}:launch_failed", paused_stage=kind)
+    return None
 
 
 S5G_FILES = ["_spec/spec.json", "_spec/author_code.json", "task/instruction.md", "task/generator/generate.py",

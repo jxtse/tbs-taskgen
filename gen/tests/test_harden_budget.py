@@ -119,6 +119,7 @@ def test_infra_revert_does_not_use_a_round(tmp_path, monkeypatch):
     ("item_harden_usd_cap", None),
     ("s5g_missing_files", dict(AGENT_DIED, exception="AgentTimeoutError")),   # ran out of time: real
     ("s5g_missing_files", dict(AGENT_DIED, exception=None)),            # finished without the files: real
+    ("s5g_missing_files", dict(AGENT_DIED, missing=["task/baselines/naive.py"])),   # died after its spec: real
 ])
 def test_real_revert_uses_the_round(tmp_path, monkeypatch, reason, result):
     from tbsgen.stages_b import watch_tick
@@ -226,4 +227,55 @@ def test_s7_rejects_a_hardened_version_without_a_preferred_lever(tmp_path, monke
     stages_b.s7(P, P.store.item(iid))
     g = read_json(it.p("gates", "difficulty.json"))
     assert any("preferred lever (EX01)" in x for x in g["hardening"]), g
+    assert P.store.item(iid).state["reason"] == "difficulty_design_unproven"
+
+
+def test_harden_tag_follows_the_state_reloaded_by_the_handler(tmp_path):
+    """pipeline.step evaluates the round at reservation time: a handler that re-loads the item under its lock and
+    finds it in a hardening round (moved there by another run / watch) reserves against the hardening cap."""
+    from tbsgen.state import Item
+    cfg, L = _ledger(tmp_path, item_harden_usd_cap=15.0)
+    it = Item(tmp_path, "a").load()
+    with harden_scope(lambda: int(it.state.get("harden_round", 0)) if it.state.get("harden_active") else 0):
+        assert item_usd_left(L, cfg, "a") == pytest.approx(10.0)
+        it.state.update(harden_round=1, harden_active=True)               # "re-loaded" mid-step
+        L.settle(L.reserve("m", "S5G", "a", True, est_usd=4.0), 4.0)
+        assert item_usd_left(L, cfg, "a") == pytest.approx(11.0)
+    assert item_usd_left(L, cfg, "a") == pytest.approx(10.0)              # the first version's cap is untouched
+
+
+def test_launch_failed_in_a_hardening_round_is_reverted_as_infra(tmp_path):
+    from tbsgen.stages_a import _launch_failed
+    from tbsgen.state import Item
+    it = Item(tmp_path, "a").load()
+    it.state.update(stage="S5G", status="active")
+    _launch_failed(it, "S5G")
+    assert it.state["status"] == "paused"                                  # first version: the operator decides
+    it.state.update(status="active", harden_active=True, harden_round=1)
+    _launch_failed(it, "S5G")
+    assert it.state["status"] == "dropped" and it.state["reason"] == "code:S5G:launch_failed"
+    assert difficulty.revert_infra(it, "S5G", it.state["reason"])
+
+
+def test_s7_design_gate_off_still_measures_the_preferred_lever(tmp_path, monkeypatch):
+    """design_gate = "off" switches off the ordinary design gate, not the hardening round's preferred-lever check."""
+    P, iid, counter, jobs = _calib_item(tmp_path, monkeypatch)
+    P.cfg["difficulty"]["profile_path"] = str(_pref_profile(tmp_path, pref="EX01"))
+    P.cfg["difficulty"]["design_gate"] = "off"
+    it = P.store.item(iid)
+    for rel in ("generator/generate.py", "solution/solve.py", "tests/measure.py", "baselines/mid.py"):
+        p = it.p("harden", "round-1", "prev", "task", rel)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("old " + rel)
+    write_json(it.p("S6A_measure.json"), {w: {s: {"rmse": v} for s in ("0", "1")}
+                                          for w, v in (("ref", 0.1), ("mid", 0.5), ("naive", 0.9))})
+    write_json(it.p("thresholds.json"), {"thresholds": {"rmse": {"threshold": 0.3, "direction": "<="}}})
+    it.state.update(stage="S7", status="active", harden_round=1, harden_active=True)
+    it.save()
+    monkeypatch.setattr("tbsgen.stages_a._agent_reauthor", lambda P_, it_, why, force=False: False)
+    monkeypatch.setattr("tbsgen.codeagent.env_ok", lambda cfg, agent=False: None)
+    from tbsgen import stages_b
+    stages_b.s7(P, P.store.item(iid))
+    g = read_json(it.p("gates", "difficulty.json"))
+    assert g["mode"] == "off" and any("preferred lever (EX01)" in x for x in g["hardening"]), g
     assert P.store.item(iid).state["reason"] == "difficulty_design_unproven"

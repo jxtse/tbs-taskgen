@@ -29,21 +29,32 @@ def validate_spec(spec, cfg: dict) -> list[str]:
     if form not in cfg["spec"]["allowed_forms"]:
         errs.append(f"form {form!r} not allowed in this phase")
     # Agent-written specs can be malformed (prod-code 2026-11-12: depgraph.nodes a list of strings, mid_drop a string):
-    # report them as spec errors (-> spec_invalid drop) instead of crashing the stage.
-    g = spec.get("depgraph") or {}
-    if not isinstance(g, dict):
+    # report them as spec errors (-> spec_invalid drop) instead of crashing the stage.  Raw values are checked
+    # (an empty value of the wrong type is still wrong).
+    g = spec.get("depgraph")
+    if g is not None and not isinstance(g, dict):
         return errs + ["depgraph must be an object"]
-    nodes = g.get("nodes") or []
-    if not isinstance(nodes, list) or not all(isinstance(n, dict) for n in nodes):
+    g = g or {}
+    nodes = g.get("nodes")
+    if nodes is not None and (not isinstance(nodes, list) or not all(isinstance(n, dict) for n in nodes)):
         return errs + ["depgraph.nodes must be a list of objects"]
-    for k in ("edges", "mid_drop", "naive_drop"):
-        if not isinstance(g.get(k) or [], list):
-            errs.append(f"depgraph.{k} must be a list")
-    if not isinstance(spec.get("metrics") or [], list) or not all(isinstance(m, dict) for m in spec.get("metrics") or []):
-        errs.append("metrics must be a list of objects")
-    if errs and any(e.startswith(("depgraph.", "metrics must")) for e in errs):
-        return errs
+    nodes = nodes or []
+    bad = []
+    e_ = g.get("edges")
+    if e_ is not None and (not isinstance(e_, list) or not all(isinstance(e, list) for e in e_)):
+        bad.append("depgraph.edges must be a list of [from, to] lists")
+    for k in ("mid_drop", "naive_drop"):
+        v = g.get(k)
+        if v is not None and (not isinstance(v, list) or not all(isinstance(x, str) for x in v)):
+            bad.append(f"depgraph.{k} must be a list of node ids")
+    m_ = spec.get("metrics")
+    if m_ is not None and (not isinstance(m_, list) or not all(isinstance(m, dict) for m in m_)):
+        bad.append("metrics must be a list of objects")
+    if bad:
+        return errs + bad
     ids = [n.get("id") for n in nodes]
+    if not all(isinstance(x, str) for x in ids):
+        return errs + ["depgraph node ids must be strings"]
     if len(set(ids)) != len(ids) or not ids:
         errs.append("depgraph node ids missing or duplicated")
     by = {n.get("id"): n for n in nodes}
