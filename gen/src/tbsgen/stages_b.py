@@ -692,7 +692,10 @@ def _oracle_gate_ok(it) -> bool:
 
 def review_gate(P, it) -> str | None:
     """Why S10 must not release this item yet (None = may release): with review on and a reviewable label, the
-    current package, calibration epoch and review round need a recorded pass."""
+    current package, calibration epoch and review round need a recorded pass.  A frontier task always does (with
+    review disabled it can never be released)."""
+    if it.state.get("calib_label") == "frontier" and not (P.cfg.get("review") or {}).get("enabled"):
+        return "frontier needs an S9R review (review disabled)"
     if not review.reviewable(P.cfg, it.state.get("calib_label")):
         return None
     v = read_json(it.p("review", "verdict.json"), None)
@@ -714,6 +717,9 @@ def review_gate(P, it) -> str | None:
 
 def s10(P, it):
     why = review_gate(P, it)
+    if why and it.state.get("calib_label") == "frontier" and not (P.cfg.get("review") or {}).get("enabled"):
+        withdraw(P, it.item_id, why)
+        return it.finish("parked", f"frontier:unreviewed ({why})")
     if why:
         it.state["review_round"] = int(it.state.get("review_revisions", 0)) + 1
         return it.goto("S9R", f"S10 review gate: {why}")
@@ -1107,6 +1113,7 @@ def _route_review(P, it, rec: dict, rnd: int):
         if kept:
             return it.advance("S9R", "S10", review="pass", round=rnd)
         if fp:
+            withdraw(P, it.item_id, f"review r{rnd}: frontier not confirmed")
             P.store.event("frontier_unconfirmed", item=it.item_id, round=rnd, why=fp[:8])
             return it.finish("parked", f"frontier:unconfirmed (review r{rnd}: pass; {'; '.join(fp)[:300]})")
         return it.finish("parked", f"{label} (review r{rnd}: pass)")

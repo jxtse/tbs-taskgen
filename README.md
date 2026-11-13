@@ -192,6 +192,29 @@ are documented in [`gen/README.md`](gen/README.md) §3; calibrating only some it
 (`calib.prepare_command`), teacher-only routing (`calib.teacher_*`) and the S9R review settings (`review.*`, on by
 default; routed like the teacher unless set) are in §4–§5b there.
 
+### Running unattended
+
+A long-running deployment repeats one serial loop: `tbsgen calib watch --once` (collect finished calibration /
+review jobs and start the next ones), then `tbsgen run --max-steps N`, then sleep a few minutes. Run only one such
+loop per run directory, because both commands advance items. At each day change it also runs
+`tbsgen resume --reason budget:daily` and tops up candidates (`tbsretr run` + `tbsgen ingest`) when few papers are
+left in the front of the pipeline. Every cap is enforced inside tbsgen, so the loop never needs to relax one:
+- `budget.daily_usd_per_model`;
+- `budget.item_usd_cap` for a paper's first version;
+- `budget.item_harden_usd_cap` for all of its hardening rounds together;
+- `code.daily_new_authoring` papers per day into S5G;
+- agent / calibration concurrency.
+
+Job states are persisted, so the loop can be killed and restarted at any point.
+
+Keep the loop alive with something that can read the run directory:
+- On Linux, a systemd user service.
+- On macOS, a `tmux` session plus a periodic watchdog. The watchdog is a cron job or scheduler entry that restarts
+  the session when the loop's pid is gone and no stop file is present; stop the loop by creating that file, not by
+  killing it. launchd agents may be denied access to external volumes (TCC), so check that before you rely on one.
+- Start the loop from a directory that will not be deleted: `uv` refuses to run when the inherited working directory
+  no longer exists.
+
 ## Configuration
 
 Both packages start from built-in defaults, then apply an optional TOML file, then the environment

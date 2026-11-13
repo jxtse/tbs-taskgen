@@ -129,19 +129,22 @@ def frontier_problems(norm: dict, gates_ok: bool) -> list[str]:
     genuine-difficulty checks must be "ok", and the reviewer must find the label trustworthy (failures caused by
     the task's real difficulty, not by a defect); the S7 oracle gate must have passed."""
     why = []
-    rc = norm.get("reference_check") or {}
+    rc = norm.get("reference_check")
+    rc = rc if isinstance(rc, dict) else {}
     try:
         if float(rc.get("reward")) != 1.0:
             why.append(f"reference_check.reward {rc.get('reward')}")
     except (TypeError, ValueError):
         why.append("reference_check.reward missing")
-    ck = norm.get("checklist") or {}
+    ck = norm.get("checklist")
+    ck = ck if isinstance(ck, dict) else {}
     from .calib import FRONTIER_CHECKS
     for k in FRONTIER_CHECKS:
         st = (ck.get(k) or {}).get("status") if isinstance(ck.get(k), dict) else None
         if st != "ok":
             why.append(f"{k}={st}")
-    if (norm.get("label_assessment") or {}).get("trustworthy") is not True:
+    la = norm.get("label_assessment")
+    if not isinstance(la, dict) or la.get("trustworthy") is not True:
         why.append("label not confirmed trustworthy")
     if not gates_ok:
         why.append("S7 oracle gate not passed")
@@ -727,9 +730,14 @@ def normalize(raw: dict | None, reward: float | None = None, allow_human: bool =
             problems.append(f"raw verdict {rv!r} overridden by the blocking issues' fix_kinds -> {v}")
     return dict(verdict=v, raw_verdict=rv, issues=issues, blocking=[i["id"] for i in blocking],
                 minor=[i["id"] for i in issues if i["severity"] == "minor"], downgraded=downgraded,
-                escalated=escalated, label_assessment=raw.get("label_assessment") or {},
-                checklist=raw.get("checklist") or {}, reference_check=raw.get("reference_check") or {},
+                escalated=escalated, label_assessment=_obj(raw.get("label_assessment")),
+                checklist=_obj(raw.get("checklist")), reference_check=_obj(raw.get("reference_check")),
                 summary=str(raw.get("summary") or "")[:2000], problems=problems)
+
+
+def _obj(v) -> dict:
+    """A verdict sub-object as a dict (a reviewer may write a string or a list; treat that as absent)."""
+    return v if isinstance(v, dict) else {}
 
 
 def read_verdict(trial: Path) -> dict | None:
