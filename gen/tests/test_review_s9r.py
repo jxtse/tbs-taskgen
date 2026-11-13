@@ -4,6 +4,8 @@ from GLM), the second-review rule, manifest notes and withdrawal.  No Docker, no
 import json
 from pathlib import Path
 
+import pytest
+
 from tbsgen import review
 from tbsgen.config import load_config
 from tbsgen.models import FakeClient
@@ -172,7 +174,7 @@ def test_reviewable_labels():
     assert cfg["review"]["enabled"] is True and cfg["review"]["max_revisions"] == 3
     assert cfg["review"]["allow_human"] is False and cfg["review"]["rescore_scoring_only"] is True
     assert review.reviewable(cfg, "hard") and review.reviewable(cfg, "unstable")
-    assert review.reviewable(cfg, "parked:teacher_failed")
+    assert review.reviewable(cfg, "parked:teacher_failed") and review.reviewable(cfg, "frontier")
     assert not review.reviewable(cfg, "easy") and not review.reviewable(cfg, "parked:infra")
     assert not review.reviewable(load_config(None, {"review": {"enabled": False}}), "hard")
 
@@ -225,7 +227,9 @@ def test_hard_goes_through_review_before_release(tmp_path):
 
 
 def test_parked_teacher_failed_reviewed_but_never_released(tmp_path):
+    """calib.frontier off: the old rule (teacher failures parked, reviewed as a diagnosis only)."""
     P, iid, jobs = _env(tmp_path)
+    P.cfg["calib"]["frontier"] = False
     _to_label(P, iid, jobs, seq=(0.0, 0.0, 0.0))
     it = P.store.item(iid)
     assert it.state["calib_label"] == "parked:teacher_failed" and it.state["stage"] == "S9R"
@@ -235,6 +239,186 @@ def test_parked_teacher_failed_reviewed_but_never_released(tmp_path):
     st = P.store.item(iid).state
     assert st["status"] == "parked" and st["reason"].startswith("parked:teacher_failed")
     assert not (P.store.root / "release" / "manifest.jsonl").exists()
+
+
+FRONTIER_OK = dict(V("pass", [MINOR]), reference_check=dict(reward=1.0, notes="reproduced"),
+                   checklist={k: dict(status="ok", note="n") for k in
+                              ("a_consistency", "b_missing_conditions", "e_shortcuts_leaks", "j_genuine_difficulty")})
+
+
+def _oracle_ok(P, iid, ok=True):
+    it = P.store.item(iid)
+    write_json(it.p("gates", "attempt-9.json"), dict(ok=ok, gates=dict(oracle=ok)))
+
+
+def test_frontier_released_on_its_own_channel_after_a_confirming_review(tmp_path):
+    P, iid, jobs = _env(tmp_path)
+    _to_label(P, iid, jobs, seq=(0.0, 0.0, 0.0))                     # student fail, teacher fail x2 (real fails)
+    it = P.store.item(iid)
+    assert it.state["calib_label"] == "frontier" and it.state["stage"] == "S9R"
+    [rr] = _runs(P, iid, "review")
+    assert "This is a `frontier` candidate" in (Path(rr["task"]) / "instruction.md").read_text()
+    _oracle_ok(P, iid)
+    _finish(jobs, rr["job_name"], verdict=FRONTIER_OK)
+    watch_tick(P, only=[iid])
+    st = P.store.item(iid).state
+    assert st["stage"] == "S10" and st["status"] == "done", st
+    m = json.loads((P.store.root / "release" / "manifest.jsonl").read_text().splitlines()[-1])
+    assert m["label"] == "frontier" and m["channel"] == "frontier"
+    assert m["frontier"]["teacher_decisive"] == 2 and m["frontier"]["teacher_timeouts"] == 0
+    assert m["reference_check"]["reward"] == 1.0
+
+
+@pytest.mark.parametrize("change", ["no_reference", "reference_fails", "check_issue", "untrusted", "oracle_gate",
+                                    "bad_types"])
+def test_frontier_not_confirmed_stays_parked(tmp_path, change):
+    P, iid, jobs = _env(tmp_path)
+    _to_label(P, iid, jobs, seq=(0.0, 0.0, 0.0))
+    v = json.loads(json.dumps(FRONTIER_OK))
+    if change == "no_reference":
+        v.pop("reference_check")
+    elif change == "reference_fails":
+        v["reference_check"]["reward"] = 0.0
+    elif change == "check_issue":
+        v["checklist"]["b_missing_conditions"]["status"] = "na"
+    elif change == "untrusted":
+        v["label_assessment"]["trustworthy"] = None
+    elif change == "bad_types":
+        v.update(reference_check="unknown", checklist=["ok"], label_assessment="yes")
+    _oracle_ok(P, iid, ok=change != "oracle_gate")
+    [rr] = _runs(P, iid, "review")
+    _finish(jobs, rr["job_name"], verdict=v)
+    watch_tick(P, only=[iid])
+    st = P.store.item(iid).state
+    assert st["status"] == "parked" and st["reason"].startswith("frontier:unconfirmed"), st
+    assert not (P.store.root / "release" / "manifest.jsonl").exists()
+
+
+def test_frontier_needs_real_teacher_failures():
+    from tbsgen import calib
+    cfg = load_config()
+    run = lambda who, out, rt=None, exc=None: dict(who=who, outcome=out, result_type=rt or out,
+                                                   trial=dict(exception=exc))
+    g = run("glm", "fail", "fail_delivered")
+    t = run("teacher", "fail", "fail_delivered")
+    assert calib.next_action([g, t, t], cfg) == ("label", "frontier")
+    assert calib.next_action([g, t, run("teacher", "infra")], cfg) == ("run", "teacher")   # infra is no attempt
+    assert calib.next_action([g, t, run("teacher", "fail", "timeout_with_output")], cfg) == \
+        ("label", "parked:teacher_failed")
+    assert calib.next_action([g, t, run("teacher", "fail", "fail_delivered", "AgentTimeoutError")], cfg) == \
+        ("label", "parked:teacher_failed")
+    cfg["calib"]["frontier"] = False
+    assert calib.next_action([g, t, t], cfg) == ("label", "parked:teacher_failed")
+    ev = calib.frontier_evidence([g, t, run("teacher", "infra"), t], cfg)
+    assert (ev["teacher_runs"], ev["teacher_decisive"], ev["teacher_infra"], ev["teacher_timeouts"]) == (3, 2, 1, 0)
+
+
+def test_frontier_not_confirmed_withdraws_an_earlier_release(tmp_path):
+    """A released frontier task reviewed again (e.g. after a reset) whose new pass does not confirm it is withdrawn."""
+    P, iid, jobs = _env(tmp_path)
+    _to_label(P, iid, jobs, seq=(0.0, 0.0, 0.0))
+    _oracle_ok(P, iid)
+    [rr] = _runs(P, iid, "review")
+    _finish(jobs, rr["job_name"], verdict=FRONTIER_OK)
+    watch_tick(P, only=[iid])
+    assert P.store.item(iid).state["status"] == "done"
+    it = P.store.item(iid)
+    it.state.update(stage="S9R", status="active", review_round=2)
+    it.save()
+    P.run(only=[iid])
+    rr2 = [r for r in _runs(P, iid, "review") if r.get("n") == 2][0]
+    _finish(jobs, rr2["job_name"], verdict=dict(FRONTIER_OK, reference_check=dict(reward=0.0)))
+    watch_tick(P, only=[iid])
+    st = P.store.item(iid).state
+    assert st["status"] == "parked" and st["reason"].startswith("frontier:unconfirmed"), st
+    last = json.loads((P.store.root / "release" / "manifest.jsonl").read_text().splitlines()[-1])
+    assert last["item_id"] == iid and last["withdrawn"]
+
+
+def test_frontier_reaching_s10_with_review_disabled_is_not_released(tmp_path):
+    P, iid, jobs = _env(tmp_path)
+    _to_label(P, iid, jobs, seq=(0.0, 0.0, 0.0))
+    it = P.store.item(iid)
+    assert it.state["stage"] == "S9R"
+    P.cfg["review"]["enabled"] = False                                  # switched off mid-review, then S10
+    it.state.update(stage="S10", status="active")
+    it.save()
+    P.run(only=[iid])
+    st = P.store.item(iid).state
+    assert st["status"] == "parked" and st["reason"].startswith("frontier:unreviewed"), st
+    assert not (P.store.root / "release" / "manifest.jsonl").exists()
+
+
+def test_frontier_s10_without_a_confirming_verdict_goes_back_to_review(tmp_path):
+    from tbsgen import stages_b
+    P, iid, jobs = _env(tmp_path)
+    _to_label(P, iid, jobs, seq=(0.0, 0.0, 0.0))
+    it = P.store.item(iid)
+    assert stages_b.review_gate(P, it) == "no review verdict"
+    _oracle_ok(P, iid, ok=False)
+    write_json(it.p("review", "verdict.json"), dict(FRONTIER_OK, _normalized=review.normalize(FRONTIER_OK),
+                                                    round=it.state.get("review_round"), calib_epoch=0,
+                                                    pkg_sha=__import__("tbsgen.calib").calib.pkg_sha(it.p("pkg"))))
+    assert stages_b.review_gate(P, it).startswith("frontier not confirmed")
+
+
+def test_frontier_relabelled_with_review_disabled_withdraws_the_release(tmp_path):
+    P, iid, jobs = _env(tmp_path)
+    _to_label(P, iid, jobs, seq=(0.0, 0.0, 0.0))
+    _oracle_ok(P, iid)
+    [rr] = _runs(P, iid, "review")
+    _finish(jobs, rr["job_name"], verdict=FRONTIER_OK)
+    watch_tick(P, only=[iid])
+    assert P.store.item(iid).state["status"] == "done"
+    P.cfg["review"]["enabled"] = False
+    it = P.store.item(iid)
+    it.state.update(stage="S9", status="active")                       # e.g. reset --stage S9 (runs kept)
+    it.save()
+    P.run(only=[iid])
+    st = P.store.item(iid).state
+    assert st["status"] == "parked" and st["reason"].startswith("frontier:unreviewed"), st
+    last = json.loads((P.store.root / "release" / "manifest.jsonl").read_text().splitlines()[-1])
+    assert last["item_id"] == iid and last["withdrawn"]
+
+
+def test_frontier_s10_gate_sends_it_back_to_review(tmp_path):
+    P, iid, jobs = _env(tmp_path)
+    _to_label(P, iid, jobs, seq=(0.0, 0.0, 0.0))
+    it = P.store.item(iid)
+    it.state.update(stage="S10", status="active")                      # e.g. reset --stage S10 without a verdict
+    it.save()
+    from tbsgen import stages_b
+    stages_b.s10(P, P.store.item(iid))
+    st = P.store.item(iid).state
+    assert st["stage"] == "S9R" and "review gate" in st["history"][-1].get("reason", st.get("reason", "")), st
+    assert not (P.store.root / "release" / "manifest.jsonl").exists()
+
+
+def test_released_frontier_with_a_changed_package_is_withdrawn_at_s10(tmp_path):
+    P, iid, jobs = _env(tmp_path)
+    _to_label(P, iid, jobs, seq=(0.0, 0.0, 0.0))
+    _oracle_ok(P, iid)
+    [rr] = _runs(P, iid, "review")
+    _finish(jobs, rr["job_name"], verdict=FRONTIER_OK)
+    watch_tick(P, only=[iid])
+    it = P.store.item(iid)
+    assert it.state["status"] == "done"
+    (it.p("pkg") / "instruction.md").write_text("changed after the review")   # stale verdict
+    it.state.update(stage="S10", status="active")                      # e.g. reset --stage S10
+    it.save()
+    from tbsgen import stages_b
+    stages_b.s10(P, P.store.item(iid))
+    assert P.store.item(iid).state["stage"] == "S9R"
+    last = json.loads((P.store.root / "release" / "manifest.jsonl").read_text().splitlines()[-1])
+    assert last["item_id"] == iid and last["withdrawn"]
+
+
+def test_frontier_review_disabled_is_never_released(tmp_path):
+    P, iid, jobs = _env(tmp_path)
+    P.cfg["review"]["enabled"] = False
+    _to_label(P, iid, jobs, seq=(0.0, 0.0, 0.0))
+    st = P.store.item(iid).state
+    assert st["status"] == "parked" and st["reason"].startswith("frontier:unreviewed")
 
 
 def test_easy_not_reviewed_and_review_disabled(tmp_path):

@@ -333,7 +333,7 @@ def test_thresholds_not_separable():
     ([("glm", "fail")], ("run", "teacher")),
     ([("glm", "fail"), ("teacher", "pass")], ("label", "hard")),
     ([("glm", "fail"), ("teacher", "fail")], ("run", "teacher")),
-    ([("glm", "fail"), ("teacher", "fail"), ("teacher", "fail")], ("label", "parked:teacher_failed")),
+    ([("glm", "fail"), ("teacher", "fail"), ("teacher", "fail")], ("label", "frontier")),   # calib.frontier on
     ([("glm", "pass")], ("run", "glm")),
     ([("glm", "pass"), ("glm", "fail")], ("label", "unstable")),
     ([("glm", "pass"), ("glm", "pass")], ("label", "easy")),
