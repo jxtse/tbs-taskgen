@@ -194,11 +194,18 @@ default; routed like the teacher unless set) are in §4–§5b there.
 
 ### Running unattended
 
-A long-running deployment repeats one serial loop: `tbsgen calib watch --once` (collect finished calibration /
-review jobs and start the next ones), then `tbsgen run --max-steps N`, then sleep a few minutes. Run only one such
-loop per run directory, because both commands advance items. At each day change it also runs
-`tbsgen resume --reason budget:daily` and tops up candidates (`tbsretr run` + `tbsgen ingest`) when few papers are
-left in the front of the pipeline. Every cap is enforced inside tbsgen, so the loop never needs to relax one:
+A long-running deployment uses a small driver script, written for the deployment; the repository has no such
+script. The script repeats one serial loop:
+1. `tbsgen calib watch --run RUN --config CFG --once`: collect finished calibration / review jobs and start the next
+   ones.
+2. `tbsgen run --run RUN --config CFG --max-steps N`.
+3. Sleep a few minutes.
+
+Run only one such loop per run directory, because both commands advance items. At each day change the script also
+runs `tbsgen resume --run RUN --config CFG --reason budget:daily`. When few papers are left in the front of the
+pipeline, it tops up candidates: `tbsretr run --targets T.json --out DIR`, filter, then
+`tbsgen ingest --run RUN --candidates C.json`. Every cap is enforced inside tbsgen, so the loop never needs to relax
+one:
 - `budget.daily_usd_per_model`;
 - `budget.item_usd_cap` for a paper's first version;
 - `budget.item_harden_usd_cap` for all of its hardening rounds together;

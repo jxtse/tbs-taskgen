@@ -362,6 +362,38 @@ def test_frontier_s10_without_a_confirming_verdict_goes_back_to_review(tmp_path)
     assert stages_b.review_gate(P, it).startswith("frontier not confirmed")
 
 
+def test_frontier_relabelled_with_review_disabled_withdraws_the_release(tmp_path):
+    P, iid, jobs = _env(tmp_path)
+    _to_label(P, iid, jobs, seq=(0.0, 0.0, 0.0))
+    _oracle_ok(P, iid)
+    [rr] = _runs(P, iid, "review")
+    _finish(jobs, rr["job_name"], verdict=FRONTIER_OK)
+    watch_tick(P, only=[iid])
+    assert P.store.item(iid).state["status"] == "done"
+    P.cfg["review"]["enabled"] = False
+    it = P.store.item(iid)
+    it.state.update(stage="S9", status="active")                       # e.g. reset --stage S9 (runs kept)
+    it.save()
+    P.run(only=[iid])
+    st = P.store.item(iid).state
+    assert st["status"] == "parked" and st["reason"].startswith("frontier:unreviewed"), st
+    last = json.loads((P.store.root / "release" / "manifest.jsonl").read_text().splitlines()[-1])
+    assert last["item_id"] == iid and last["withdrawn"]
+
+
+def test_frontier_s10_gate_sends_it_back_to_review(tmp_path):
+    P, iid, jobs = _env(tmp_path)
+    _to_label(P, iid, jobs, seq=(0.0, 0.0, 0.0))
+    it = P.store.item(iid)
+    it.state.update(stage="S10", status="active")                      # e.g. reset --stage S10 without a verdict
+    it.save()
+    from tbsgen import stages_b
+    stages_b.s10(P, P.store.item(iid))
+    st = P.store.item(iid).state
+    assert st["stage"] == "S9R" and "review gate" in st["history"][-1].get("reason", st.get("reason", "")), st
+    assert not (P.store.root / "release" / "manifest.jsonl").exists()
+
+
 def test_frontier_review_disabled_is_never_released(tmp_path):
     P, iid, jobs = _env(tmp_path)
     P.cfg["review"]["enabled"] = False

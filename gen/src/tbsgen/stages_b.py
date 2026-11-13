@@ -579,6 +579,7 @@ def _s9(P, it):
         if what.startswith("parked"):
             return it.finish("parked", what)
         if what == "frontier":
+            withdraw(P, it.item_id, "frontier unreviewed (review disabled)")
             return it.finish("parked", "frontier:unreviewed (review disabled: never released without S9R)")
         if what in c["keep_labels"]:
             return it.advance("S9", "S10", label=what)
