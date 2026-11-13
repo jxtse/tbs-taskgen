@@ -41,7 +41,8 @@ def validate_spec(spec, cfg: dict) -> list[str]:
     nodes = nodes or []
     bad = []
     e_ = g.get("edges")
-    if e_ is not None and (not isinstance(e_, list) or not all(isinstance(e, list) for e in e_)):
+    if e_ is not None and (not isinstance(e_, list) or
+                           not all(isinstance(e, list) and all(isinstance(x, str) for x in e) for e in e_)):
         bad.append("depgraph.edges must be a list of [from, to] lists")
     for k in ("mid_drop", "naive_drop"):
         v = g.get(k)

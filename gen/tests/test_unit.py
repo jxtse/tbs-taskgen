@@ -288,7 +288,7 @@ def test_validate_spec_malformed_types_do_not_crash():
     bad["depgraph"]["mid_drop"] = "a sentence"
     assert validate_spec(bad, cfg) == ["depgraph.nodes must be a list of objects"]
     for k, v in (("mid_drop", "a sentence"), ("mid_drop", ""), ("naive_drop", 0), ("edges", {}), ("edges", False),
-                 ("edges", [None])):
+                 ("edges", [None]), ("edges", [[[], "out"]])):
         bad = json.loads(json.dumps(SPEC))
         bad["depgraph"][k] = v
         errs = validate_spec(bad, cfg)
