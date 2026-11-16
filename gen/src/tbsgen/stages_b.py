@@ -1388,6 +1388,7 @@ def start_hardening(P, it, operator: str | None = None, kind: str = "harden"):
         runs = read_json(it.p("calib", "runs.json"), []) or []
         difficulty.write_round(
             it, k, round=k, kind=kind, trigger=pend["trigger"], operator=pend.get("operator"),
+            prev_review_round=int(st.get("review_round") or 0),    # reviews above this round belong to the new build
             prev_task_sha=difficulty.task_sha(it.p("task")), prev_science_sha=difficulty.science_sha(it.p("task")),
             prev_pkg_sha=calib.pkg_sha(it.p("pkg")) if it.p("pkg").exists() else None,
             prev_label=st.get("calib_label"), archived_epoch=pend["epoch"],
@@ -1432,7 +1433,17 @@ HARDEN_REVERT_STAGES = {"S5", "S5G", "S6A", "S6A_run", "S6B", "S6M", "S6C", "S7"
 
 
 def _review_of_version(it) -> list[dict]:
-    return review.runs_of_version(it.dir, it.state)
+    """Review runs of the version a round is building (a round that reached PKG and failed): those of a review round
+    above the one the replaced version had (the round record's prev_review_round).  The replaced version's own
+    reviews, and any earlier version's, never block its revert.  Legacy round records (no prev_review_round) fall
+    back to the package hash."""
+    k = int(it.state.get("harden_round", 0) or 0)
+    rec = (read_json(it.p("harden", f"round-{k}", "record.json"), {}) or {}) if k else {}
+    prev = rec.get("prev_review_round")
+    if prev is None:
+        return review.runs_of_version(it.dir, it.state)
+    runs = read_json(it.p("review", "runs.json"), []) or []
+    return [r for r in runs if int(r.get("n") or 0) > int(prev)]
 
 
 def harden_needs_step(it) -> bool:
@@ -1602,6 +1613,10 @@ def variant_cmd(P, it, reason: str) -> dict:
         if st.get("rescore_pending") or st.get("thresholds_locked") or st.get("review_revision_pending"):
             raise ValueError("variant: finish the pending re-score / revision / regate first")
         dec = difficulty.decisive(runs, P.cfg) or []
+        act, what = calib.next_action(runs, P.cfg)
+        if (act, what) != ("label", "easy"):
+            raise ValueError(f"variant: the current calibration is not easy ({act}: {what}); "
+                             "a version needs both decisive student passes (or a quick pass)")
         glm = [r for r in dec if r.get("who") == "glm"]
         if not glm or any(r.get("outcome") != "pass" for r in glm):
             raise ValueError("variant: the student did not pass every decisive run (not an easy version)")

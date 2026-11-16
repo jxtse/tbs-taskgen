@@ -7,7 +7,8 @@ Decision rule:
                    "frontier" (calib.frontier on and every decisive teacher run a non-timeout fail: a task no model
                    solved; released only after S9R confirms it is correct, see review.py) else "parked:teacher_failed"
     GLM#1 pass  -> (quick_pass_minutes set and duration below it -> "easy") else GLM#2
-    GLM#2 fail  -> "unstable" (keep: GLM 1/2);  GLM#2 pass -> "easy" (S9b variants disabled in MVP)
+    GLM#2 fail  -> "unstable" (keep: GLM 1/2);  GLM#2 pass -> "easy" (S9b: with calib.variant_depth > 0 the item
+                   gets a harder variant round and is recalibrated instead of being finished, see stages_b.s9)
 Infra outcomes (API quota/auth/stream errors with reward 0, sandbox start/setup timeouts, cancelled) are not
 attempts; they are retried up to calib.infra_retries, then the item is parked "infra".
 A trial with reward 1 counts as a pass even if Claude Code later raised an API error (this happens: the task

@@ -298,6 +298,50 @@ def test_variant_cmd_refuses_a_non_code_grounded_item(tmp_path):
     assert "not code-grounded" in str(e.value) or "excluded" in str(e.value)
 
 
+def test_reviewed_item_variant_that_fails_to_build_reverts_to_the_reviewed_version(tmp_path):
+    """A reviewed version that gets a variant round can still be reverted when the variant fails to build (its
+    review is of the replaced version, never of the half-built one)."""
+    from tbsgen.stages_b import review_gate, variant_cmd
+    P, iid, jobs, _ = _reviewed_easy_item(tmp_path)
+    it = _s9(P, iid)
+    write_json(it.p("calib", "runs.json"), _two_passes())
+    variant_cmd(P, it, "S9b re-open")
+    _fail_round(P, iid, "s5g_missing_files", AGENT_DIED)         # dropped -> reverted by the scheduler
+    it = _s9(P, iid)
+    st = it.state
+    assert st["stage"] == "S9" and not st.get("harden_active")
+    assert (it.state.get("harden_reverted") or [])[0]["infra"] == "s5g:NonZeroAgentExitCodeError"
+    assert (it.p("task", "instruction.md")).read_text().startswith("Write out.csv")     # the reviewed version back
+    assert review_gate(P, it) is None                            # its review round 1 verdict still fits the package
+
+
+def test_reviewed_item_variant_dropped_after_pkg_reverts(tmp_path):
+    from tbsgen.stages_b import variant_cmd
+    P, iid, jobs, _ = _reviewed_easy_item(tmp_path)
+    it = _s9(P, iid)
+    write_json(it.p("calib", "runs.json"), _two_passes())
+    variant_cmd(P, it, "S9b re-open")
+    it.p("pkg", "instruction.md").write_text("do it, harder\n")          # the variant got as far as PKG
+    _s9(P, iid, stage="PKG").finish("dropped", "package_invalid")
+    P.run(only=[iid], until="S9", max_steps=1)
+    it = _s9(P, iid)
+    assert it.state["stage"] == "S9" and not it.state.get("harden_active")
+    assert it.state.get("variant_exhausted")                     # a real failed round
+    assert (it.p("pkg", "instruction.md")).read_text().startswith("Write out.csv")
+
+
+def test_variant_cmd_refuses_a_version_that_is_not_easy_yet(tmp_path):
+    from tbsgen.stages_b import variant_cmd
+    P, iid, jobs, _ = _reviewed_easy_item(tmp_path)
+    it = _s9(P, iid)
+    write_json(it.p("calib", "runs.json"), [dict(who="glm", outcome="pass", minutes=45, job_name="agent-9",
+                                                 result_type="pass", n=1)])            # one plain pass: not easy
+    with pytest.raises(ValueError) as e:
+        variant_cmd(P, it, "S9b re-open")
+    assert "not easy" in str(e.value)
+    assert not (P.store.root / "items" / iid / "harden" / "round-1").exists()
+
+
 # ------------------------------------------------------------------ config / review helpers
 def test_variant_config_defaults_and_fresh_review_rounds(tmp_path):
     cfg = load_config(None, {})

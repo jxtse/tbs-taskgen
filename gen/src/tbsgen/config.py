@@ -23,7 +23,7 @@ HARBOR_ROOT = os.environ.get("TBS_HARBOR_ROOT") or None     # directory holding 
 DEFAULTS: dict[str, Any] = {
     "run": {
         "root": None,                       # run directory; required
-        "tasks_per_paper": 1,               # MVP: 1 task per paper (variants = S9b, disabled)
+        "tasks_per_paper": 1,               # MVP: 1 task per paper (variants = S9b, calib.variant_depth)
     },
     # ---------------------------------------------------------------- budget / breaker
     "budget": {
