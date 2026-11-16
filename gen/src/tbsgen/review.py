@@ -239,6 +239,35 @@ def _calib_records(item_dir: Path) -> list[dict]:
         return []
 
 
+def runs_of_version(item_dir: Path, state: dict) -> list[dict]:
+    """Review runs bound to the current task version: the same package hash (a hardening / S9b variant round builds
+    a new package, so the earlier version's review runs and verdicts are never mistaken for the new version's).
+    Without a package yet: the runs of the current review round."""
+    try:
+        runs = json.loads((item_dir / "review" / "runs.json").read_text())
+    except (OSError, ValueError):
+        return []
+    if not isinstance(runs, list):
+        return []
+    pkg = item_dir / "pkg"
+    if not pkg.is_dir():                 # nothing to bind to: any review run keeps a revert from happening
+        return list(runs)
+    sha = calib.pkg_sha(pkg)
+    return [r for r in runs if r.get("pkg_sha") == sha]
+
+
+def next_round(item_dir: Path, state: dict) -> int:
+    """Review round number for the version now at S9/S10: always above the current round, the revision counter and
+    every r<k> verdict directory, so each version's review job names (review<rnd>) and verdict records are unique."""
+    rnd = int(state.get("review_round") or 0)
+    used = max(int(state.get("review_revisions", 0)) + 1, rnd + 1 if rnd else 1)
+    for p in (item_dir / "review").glob("r*") if (item_dir / "review").is_dir() else []:
+        q = p.name[1:]
+        if q.isdigit():
+            used = max(used, int(q) + 1)
+    return used
+
+
 def write_bundle(item_dir: Path, dest: Path, state: dict, digest_kb: int = 150) -> dict:
     """Everything the reviewer may read, under dest (becomes /review in the container)."""
     if dest.exists():

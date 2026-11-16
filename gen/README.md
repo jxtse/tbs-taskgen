@@ -141,6 +141,35 @@ reference / mid / naive 实测中成立（`difficulty.preferred_problem`），�
 - `code.max_concurrent_agent_jobs`：同时运行的 S4c + S5G 作业上限；满时条目 waiting（`queued: agent slots full`），
   下一轮自动重试。
 
+### 0d. S9b：easy 题目的更难变体（`calib.variant_depth`，2026-11-16 起，默认关 = 0，仅代码驱动条目）
+
+S9 把一版题判为 `easy`（学生两次判定性运行都通过）时，不再直接丢弃该版本：若 `calib.variant_depth > 0` 且该条
+还有 S9b 轮次，则**直接开一轮更难变体**（复用 §0b 的加难机制，`kind="variant"`）——同一篇论文、同一个科学问题，
+S5G 拿到上一版全部文件、弱点画像和**学生判定性通过那一次**的自述与逐指标余量（`harden/round-k/feedback.json` 取
+最后一次学生通过记录，加难回路取第一次），指令是 `prompts_code.S5G_VARIANT`（明确说明上一版被判定 easy、两次都
+通过），其余（快照 `prev/`、归档 epoch、S6A_run → S6B → S6C → S7 → PKG → S9 重新校准、回退规则）与加难轮相同。
+
+- **独立计数**：`state.variant_round` 是 S9b 轮数，`state.harden_round` 仍是所有轮次的目录编号（`harden/round-k`）。
+  `state.harden_kind = "variant"` 标明当前轮属于 S9b；`state.variant_exhausted` 与 `harden_exhausted` 分开。
+  `calib.variant_depth`（每篇最多几轮，prod-code 设 2）与 `calib.variant_max_attempts`（默认 4，含 infra 回退的启动
+  次数，防死循环）独立于 `harden_max_rounds` / `harden_max_attempts`：用尽加难轮次的条目照样有 S9b 轮次。
+- **预算独立**：`budget.item_variant_usd_cap`（默认 15）是单篇**所有 S9b 轮合计**的额度，账本里 S9b 轮的
+  `item_usd_cap_stages` + S7 预留打在 `calls.variant` 列（与 `calls.harden` 互斥），与首版 `item_usd_cap`、加难
+  `item_harden_usd_cap` 互不占用。超出即 `dropped:item_variant_usd_cap` → 回退上一版（计为真实一轮，设
+  `variant_exhausted`）。基础设施回退（`difficulty.revert_infra` 同 §0b）不消耗轮次。
+- **结局**：变体版本照常重新校准并按现有规则打标签（hard / unstable / frontier 走 S9R），label 不变；若仍 `easy`
+  且还有轮次则再开下一轮，轮次用尽后 `done: label:easy (S9b exhausted)`（S9b 关闭时仍是
+  `label:easy (not kept; S9b variants off)`）。
+- **已审核条目**：S9b 支持做过 S9R 的条目。每个新版本在自己的审核轮号上审核（`review.next_round`：大于当前
+  轮号、修订计数与已有 `review/r*` 目录），S9R 作业名 `tbsgen-<item>-review<rnd>` 因此不重复；旧版本的裁决记在
+  审核包 `records/previous_reviews/`（只作背景），`review_gate` 仍要求 round / calib_epoch / pkg_sha 全部匹配，
+  旧裁决不可能放行新包。回退资格按**当前包**的审核记录判断（`review.runs_of_version`）。
+- **重开历史 easy 条目**：`tbsgen variant --run R --config C [--item ID[,ID]] [--reason TEXT]`（省略 `--item` 即
+  扫描所有 `done` 且 reason 以 `label:easy` 开头的条目）。幂等：中断的启动续同一轮；同一轮进行中直接跳过（`state.
+  variant_reopened`）；只要求条目是代码驱动（`_spec/author_code.json` 存在）且当前校准学生的每次判定性运行都通过，
+  没有进行中的运行 / 重评 / 修订。事件 `s9b_reopen`、`harden_start`（`rkind="variant"`）、`harden_authored`、
+  `harden_packaged`、`harden_reverted` 都带 `rkind`。
+
 ## 1. 架构
 
 ```

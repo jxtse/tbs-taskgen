@@ -79,7 +79,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser(prog="tbsgen")
     sub = ap.add_subparsers(dest="cmd", required=True)
     for name in ("ingest", "run", "resume", "status", "report", "ledger", "breaker", "calib-ingest", "ping", "reset",
-                 "harbor-local", "fetch", "remote", "fulltext", "calib", "review", "regate", "harden"):
+                 "harbor-local", "fetch", "remote", "fulltext", "calib", "review", "regate", "harden", "variant"):
         s = sub.add_parser(name)
         s.add_argument("--run", required=True)
         s.add_argument("--config", default=None)
@@ -125,6 +125,9 @@ def main(argv=None):
         if name == "harden":
             s.add_argument("--item", required=True)
             s.add_argument("--reason", required=True, help="why (operator note recorded in the round)")
+        if name == "variant":
+            s.add_argument("--item", default=None, help="ID[,ID]; omit to re-open every item ended label:easy")
+            s.add_argument("--reason", default="S9b re-open", help="operator note recorded in the round")
         if name == "calib-ingest":
             s.add_argument("--item", required=True)
             s.add_argument("--job-dir", default=None)   # default: the pending run's own job dir
@@ -255,6 +258,18 @@ def main(argv=None):
         except ValueError as e:
             sys.exit(str(e))
         print(json.dumps(out, ensure_ascii=False))
+    elif a.cmd == "variant":
+        from .stages_b import variant_cmd
+        ids = _ids(a.item) or [i.item_id for i in P.store.items()
+                               if i.state.get("status") == "done" and
+                               str(i.state.get("reason") or "").startswith("label:easy")]
+        out, failed = [], []
+        for iid in ids:
+            try:
+                out.append(variant_cmd(P, P.store.item(iid), a.reason))
+            except ValueError as e:                 # report every item, never stop the batch
+                failed.append(dict(item=iid, error=str(e)))
+        print(json.dumps(dict(reopened=out, failed=failed), ensure_ascii=False))
     elif a.cmd == "calib-ingest":
         from .stages_b import ingest
         try:

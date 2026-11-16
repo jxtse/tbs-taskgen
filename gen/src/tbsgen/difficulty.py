@@ -357,14 +357,74 @@ def decisive(runs: list[dict], cfg: dict) -> list[dict] | None:
 def rounds_used(it) -> int:
     """Hardening rounds that count against harden_max_rounds: every start except those reverted for
     infrastructure (state.harden_reverted[].infra)."""
-    k = int(it.state.get("harden_round", 0))
-    return k - sum(1 for r in it.state.get("harden_reverted") or [] if r.get("infra"))
+    return rounds_used_kind(it, "harden")
 
 
 def rounds_left(cfg: dict, it) -> bool:
     d = dcfg(cfg)
     return not it.state.get("harden_exhausted") and rounds_used(it) < int(d.get("harden_max_rounds", 2)) and \
-        int(it.state.get("harden_round", 0)) < int(d.get("harden_max_attempts", 4))
+        attempts_used(it, KIND_HARDEN) < int(d.get("harden_max_attempts", 4))
+
+
+# ------------------------------------------------------------------ S9b variant rounds
+# A task the calibration student labels easy (it passed both decisive runs) is re-authored harder and re-calibrated:
+# the same S5G hardening design (weakness profile + the student's passing-run evidence), but with its own counters
+# (state.variant_round), its own per-item cap (budget.item_variant_usd_cap, calls.variant), its own depth
+# (calib.variant_depth) and its own exhaust flag.  state.harden_round stays the single attempt counter: it names the
+# round directory (harden/round-k) and state.harden_kind says which loop that round belongs to.
+KIND_HARDEN = "harden"
+KIND_VARIANT = "variant"
+KINDS = (KIND_HARDEN, KIND_VARIANT)
+
+
+def round_kind(it) -> str:
+    """Kind of the round in progress (state.harden_kind; absent = a first-pass hardening round)."""
+    return KIND_VARIANT if it.state.get("harden_kind") == KIND_VARIANT else KIND_HARDEN
+
+
+def attempts_used(it, kind: str = KIND_HARDEN) -> int:
+    """Round starts of this kind, infra-reverted ones included (variant rounds share state.harden_round)."""
+    total = int(it.state.get("harden_round", 0) or 0)
+    var = int(it.state.get("variant_round", 0) or 0)
+    return var if kind == KIND_VARIANT else max(0, total - var)
+
+
+def rounds_used_kind(it, kind: str = KIND_HARDEN) -> int:
+    """Rounds of this kind that count against its depth: every start except those reverted for infrastructure."""
+    return attempts_used(it, kind) - sum(1 for r in it.state.get("harden_reverted") or []
+                                         if r.get("infra") and (r.get("kind") or KIND_HARDEN) == kind)
+
+
+def max_rounds(cfg: dict, it, kind: str = KIND_HARDEN) -> int:
+    if kind == KIND_VARIANT:
+        return int((cfg.get("calib") or {}).get("variant_depth") or 0)
+    return int(dcfg(cfg).get("harden_max_rounds", 2))
+
+
+def max_attempts(cfg: dict, it, kind: str = KIND_HARDEN) -> int:
+    if kind == KIND_VARIANT:
+        return int((cfg.get("calib") or {}).get("variant_max_attempts", 4))
+    return int(dcfg(cfg).get("harden_max_attempts", 4))
+
+
+def rounds_left_kind(cfg: dict, it, kind: str = KIND_HARDEN) -> bool:
+    flags = ("harden_exhausted",) if kind == KIND_HARDEN else ("variant_exhausted",)
+    return not any(it.state.get(f) for f in flags) and rounds_used_kind(it, kind) < max_rounds(cfg, it, kind) and \
+        attempts_used(it, kind) < max_attempts(cfg, it, kind)
+
+
+def variant_enabled(cfg: dict, it) -> bool:
+    """S9b is on (calib.variant_depth > 0) for this code-grounded item.  Independent of difficulty.harden (the
+    first-pass loop): S9b is a separate loop with its own switch, depth and budget."""
+    if int((cfg.get("calib") or {}).get("variant_depth") or 0) <= 0:
+        return False
+    if it.item_id in (dcfg(cfg).get("harden_exclude") or []):
+        return False
+    return it.p("_spec", "author_code.json").exists()          # code-grounded (S5G) items only
+
+
+def variant_rounds_left(cfg: dict, it) -> bool:
+    return variant_enabled(cfg, it) and rounds_left_kind(cfg, it, KIND_VARIANT)
 
 
 # reasons of a failed hardened version that are infrastructure, not the round's science or budget
@@ -398,8 +458,9 @@ def should_harden(cfg: dict, it, runs: list[dict]) -> bool:
         return False
     if it.state.get("rescore_pending") or it.state.get("thresholds_locked"):
         return False        # a re-score / regate in progress decides first
-    if read_json(it.p("review", "runs.json"), []):
-        return False        # an S9R-reviewed item: review job names follow the review round (not supported)
+    from . import review
+    if review.runs_of_version(it.dir, it.state):
+        return False        # this version was already reviewed: S9R decides about it, not a fresh hardening round
     real = decisive(runs, cfg)
     return bool(real) and len(real) == 1 and real[0]["who"] == "glm" and real[0]["outcome"] == "pass"
 

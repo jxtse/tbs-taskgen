@@ -15,7 +15,7 @@ import traceback
 from pathlib import Path
 
 from . import blocklist, intake, screen_jev, stages_a as A, stages_b as B
-from .budget import BudgetStop, Ledger, harden_scope, today
+from .budget import BudgetStop, Ledger, harden_scope, today, variant_scope
 from .config import resolve_role
 from .models import ModelError, get_client
 from .state import STAGES, Store, read_json, write_json
@@ -133,8 +133,16 @@ class Pipeline:
         # reservation from it.state, which handlers re-load under the item lock (another run / watch may have moved it)
         def hk():
             s = it.state
-            return int(s.get("harden_round", 0) or 0) if s.get("harden_active") else 0
-        with harden_scope(hk):
+            if not s.get("harden_active") or s.get("harden_kind") == "variant":
+                return 0
+            return int(s.get("harden_round", 0) or 0)
+
+        def vk():
+            s = it.state
+            if not s.get("harden_active") or s.get("harden_kind") != "variant":
+                return 0
+            return int(s.get("harden_round", 0) or 0)
+        with harden_scope(hk), variant_scope(vk):
             return self._step(it)
 
     def _step(self, it) -> str:
@@ -155,9 +163,10 @@ class Pipeline:
                 if B.harden_needs_step(it):
                     B.harden_step(self, it)     # a hardened version that failed to build: back to the old one
         except BudgetStop as e:
-            if e.reason in ("item_usd", "item_harden_usd"):
-                # this paper's authoring allowance (budget.item_usd_cap, or item_harden_usd_cap in a hardening
-                # round) is used up: final for the paper / the round, and the model stays available for the others
+            if e.reason in ("item_usd", "item_harden_usd", "item_variant_usd"):
+                # this paper's authoring allowance (budget.item_usd_cap, item_harden_usd_cap in a hardening round,
+                # item_variant_usd_cap in an S9b variant round) is used up: final for the paper / the round, and
+                # the model stays available for the others
                 it.finish("dropped", e.reason + "_cap", detail=e.detail)
                 if B.harden_needs_step(it):
                     B.harden_step(self, it)     # a hardened version: back to the previous one
