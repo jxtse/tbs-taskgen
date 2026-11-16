@@ -355,10 +355,12 @@ def pkg(P, it):
     it.state.pop("post_regate", None)
     if it.state.pop("harden_active", None):    # the hardened version is built: from here it is an ordinary item
         k = int(it.state.get("harden_round", 0))
+        kind = difficulty.round_kind(it)
+        it.state.pop("harden_kind", None)
         for key in ("harden_base", "harden_built"):
             it.state.pop(key, None)
         difficulty.write_round(it, k, packaged=time.time(), pkg_sha=calib.pkg_sha(it.p("pkg")))
-        P.store.event("harden_packaged", item=it.item_id, round=k)
+        P.store.event("harden_packaged", item=it.item_id, round=k, rkind=kind)
     it.advance("PKG", "S9")
 
 
@@ -572,9 +574,15 @@ def _s9(P, it):
     if act == "label":
         it.state["calib_label"] = what
         it.save()
+        if what == "easy" and difficulty.variant_rounds_left(P.cfg, it):
+            # S9b: the student passed both decisive runs -> re-author a harder variant of this task and re-calibrate
+            # it instead of discarding the version (difficulty.start_hardening, kind="variant"; own depth + budget)
+            return start_hardening(P, it, kind=difficulty.KIND_VARIANT)
         if review.reviewable(P.cfg, what):
-            # S9R: kept labels must pass the review before S10; parked:teacher_failed is reviewed as a diagnosis
-            it.state["review_round"] = int(it.state.get("review_revisions", 0)) + 1
+            # S9R: kept labels must pass the review before S10; parked:teacher_failed is reviewed as a diagnosis.
+            # A fresh round number per version: review job names / verdict records never collide with an earlier
+            # version's (a hardened / variant version is reviewed again under its own round).
+            it.state["review_round"] = review.next_round(it.dir, it.state)
             return it.goto("S9R", f"label:{what}")
         if what.startswith("parked"):
             return it.finish("parked", what)
@@ -583,6 +591,8 @@ def _s9(P, it):
             return it.finish("parked", "frontier:unreviewed (review disabled: never released without S9R)")
         if what in c["keep_labels"]:
             return it.advance("S9", "S10", label=what)
+        if what == "easy" and difficulty.variant_enabled(P.cfg, it):
+            return it.finish("done", "label:easy (S9b exhausted)")
         return it.finish("done", f"label:{what} (not kept; S9b variants off)")
     n = sum(1 for r in runs if r["who"] == what) + 1
     full = _slots_full(P) if c.get("allow_submit") else None
@@ -725,7 +735,7 @@ def s10(P, it):
         # a release whose current package / epoch / round has no confirming pass must not stay published while the
         # review runs again (no-op when the item was never released)
         withdraw(P, it.item_id, f"S10 review gate: {why}")
-        it.state["review_round"] = int(it.state.get("review_revisions", 0)) + 1
+        it.state["review_round"] = review.next_round(it.dir, it.state)
         return it.goto("S9R", f"S10 review gate: {why}")
     rel = P.store.root / "release"
     rel.mkdir(exist_ok=True)
@@ -1311,12 +1321,21 @@ def _difficulty_summary(it) -> dict | None:
         return None
     return dict(profile=prov.get("difficulty_profile"),
                 weakness_ids=[lv.get("weakness_id") for lv in (d or {}).get("levers") or [] if isinstance(lv, dict)],
-                harden_round=int(it.state.get("harden_round", 0)), harden_reverted=it.state.get("harden_reverted"))
+                harden_round=int(it.state.get("harden_round", 0)), harden_kind=it.state.get("harden_kind"),
+                harden_reverted=it.state.get("harden_reverted"),
+                variant_round=int(it.state.get("variant_round", 0) or 0),
+                variant_exhausted=bool(it.state.get("variant_exhausted")))
 
 
 def _first_student_pass(runs: list[dict], cfg: dict) -> dict | None:
     real = difficulty.decisive(runs, cfg) or []
     return next((r for r in real if r["who"] == "glm" and r["outcome"] == "pass"), None)
+
+
+def _last_student_pass(runs: list[dict], cfg: dict) -> dict | None:
+    """The last decisive student pass (an S9b variant round: the run that made the version easy)."""
+    real = difficulty.decisive(runs, cfg) or []
+    return next((r for r in reversed(real) if r["who"] == "glm" and r["outcome"] == "pass"), None)
 
 
 def _s5g_base(it, k: int) -> dict:
@@ -1332,19 +1351,22 @@ def _s5g_base(it, k: int) -> dict:
                 jobs=int((it.state.get("attempts") or {}).get("S5G:job", 0)))
 
 
-def start_hardening(P, it, operator: str | None = None):
-    """Send the current version back to S5G for a hardening round.  Crash-safe and idempotent: the round number,
-    the trigger and the epoch are persisted (state.harden_pending) before anything moves; an item with a pending
-    round is scheduled whatever its stage / status (pipeline.runnable) and finishes the same round without another
-    model call.  Steps: feedback the author may see (harden/round-k/feedback.json: the student's own summary,
-    minutes, per-metric aggregate margins), snapshot of the version (harden/round-k/prev), round record, release
-    withdrawal, archive of this calibration epoch (never pooled with the next version), reset of the per-version
-    build state, -> S5G (a new authoring job with the previous version and the feedback; its own allowance)."""
+def start_hardening(P, it, operator: str | None = None, kind: str = "harden"):
+    """Send the current version back to S5G for a hardening round (kind="harden": the student solved it on its
+    first attempt; kind="variant": S9b, the student passed both decisive runs and the item was labelled easy).
+    Crash-safe and idempotent: the round number, the kind, the trigger and the epoch are persisted
+    (state.harden_pending) before anything moves; an item with a pending round is scheduled whatever its stage /
+    status (pipeline.runnable) and finishes the same round without another model call.  Steps: feedback the author
+    may see (harden/round-k/feedback.json: the student's own summary, minutes, per-metric aggregate margins),
+    snapshot of the version (harden/round-k/prev), round record, release withdrawal, archive of this calibration
+    epoch (never pooled with the next version), reset of the per-version build state, -> S5G (a new authoring job
+    with the previous version and the feedback; its own allowance)."""
     st = it.state
     pend = st.get("harden_pending")
     if not pend:
         runs = read_json(it.p("calib", "runs.json"), []) or []
-        trig = _first_student_pass(runs, P.cfg)
+        # a variant round feeds the author the decisive run that solved it; a hardening round its first attempt
+        trig = _last_student_pass(runs, P.cfg) if kind == difficulty.KIND_VARIANT else _first_student_pass(runs, P.cfg)
         if trig is None:
             raise ValueError("hardening needs a passing student run in the current calibration")
         k = int(st.get("harden_round", 0)) + 1
@@ -1352,10 +1374,12 @@ def start_hardening(P, it, operator: str | None = None):
         rd = it.p("harden", f"round-{k}")
         rd.mkdir(parents=True, exist_ok=True)
         write_json(rd / "feedback.json", difficulty.feedback(trig, th))
-        pend = dict(round=k, trigger=trig["job_name"], epoch=int(st.get("calib_epoch", 0)), operator=operator,
-                    from_stage=st.get("stage"), from_status=st.get("status"), base=_s5g_base(it, k), ts=time.time())
+        pend = dict(round=k, kind=kind, trigger=trig["job_name"], epoch=int(st.get("calib_epoch", 0)),
+                    operator=operator, from_stage=st.get("stage"), from_status=st.get("status"),
+                    base=_s5g_base(it, k), ts=time.time())
         st["harden_pending"] = pend
         it.save()
+    kind = str(pend.get("kind") or "harden")
     k = int(pend["round"])
     rd = it.p("harden", f"round-{k}")
     difficulty.snapshot_version(it, rd / "prev")
@@ -1363,7 +1387,8 @@ def start_hardening(P, it, operator: str | None = None):
     if "prev_task_sha" not in rec:                     # written once, before the epoch is archived
         runs = read_json(it.p("calib", "runs.json"), []) or []
         difficulty.write_round(
-            it, k, round=k, trigger=pend["trigger"], operator=pend.get("operator"),
+            it, k, round=k, kind=kind, trigger=pend["trigger"], operator=pend.get("operator"),
+            prev_review_round=int(st.get("review_round") or 0),    # reviews above this round belong to the new build
             prev_task_sha=difficulty.task_sha(it.p("task")), prev_science_sha=difficulty.science_sha(it.p("task")),
             prev_pkg_sha=calib.pkg_sha(it.p("pkg")) if it.p("pkg").exists() else None,
             prev_label=st.get("calib_label"), archived_epoch=pend["epoch"],
@@ -1387,29 +1412,48 @@ def start_hardening(P, it, operator: str | None = None):
     st.setdefault("attempts", {}).pop("S7", None)
     st["regen_6c"] = True
     st["harden_round"] = k
+    st["harden_kind"] = kind
     st["harden_active"] = True
     st["harden_base"] = pend["base"]
     st["S5G_rerun"] = True
-    st.setdefault("history", []).append(dict(stage=st.get("stage"), result="harden", to="S5G", round=k,
+    if kind == difficulty.KIND_VARIANT:
+        st["variant_round"] = int(st.get("variant_round", 0) or 0) + 1   # its own counter (state.harden_round is
+        # the shared attempt index that names harden/round-k); budget tagging and the depth check use this one
+    st.setdefault("history", []).append(dict(stage=st.get("stage"), result=kind, to="S5G", round=k,
                                              trigger=pend["trigger"], ts=time.time()))
     st.update(stage="S5G", status="active")
     st.pop("reason", None)
     it.save()
-    P.store.event("harden_start", item=it.item_id, round=k, trigger=pend["trigger"], operator=pend.get("operator"))
+    P.store.event("harden_start", item=it.item_id, round=k, rkind=kind, trigger=pend["trigger"],
+                  operator=pend.get("operator"))
     return None
 
 
 HARDEN_REVERT_STAGES = {"S5", "S5G", "S6A", "S6A_run", "S6B", "S6M", "S6C", "S7", "S8", "PKG"}
 
 
+def _review_of_version(it) -> list[dict]:
+    """Review runs of the version a round is building (a round that reached PKG and failed): those of a review round
+    above the one the replaced version had (the round record's prev_review_round).  The replaced version's own
+    reviews, and any earlier version's, never block its revert.  Legacy round records (no prev_review_round) fall
+    back to the package hash."""
+    k = int(it.state.get("harden_round", 0) or 0)
+    rec = (read_json(it.p("harden", f"round-{k}", "record.json"), {}) or {}) if k else {}
+    prev = rec.get("prev_review_round")
+    if prev is None:
+        return review.runs_of_version(it.dir, it.state)
+    runs = read_json(it.p("review", "runs.json"), []) or []
+    return [r for r in runs if int(r.get("n") or 0) > int(prev)]
+
+
 def harden_needs_step(it) -> bool:
-    """An unfinished hardening transaction (start or revert) that must be completed whatever the item's status.
-    Same eligibility as harden_revert (a version that never reached S9: no review runs)."""
+    """An unfinished hardening / S9b variant transaction (start or revert) that must be completed whatever the
+    item's status.  Same eligibility as harden_revert (a version that never reached S9: no review runs of it)."""
     st = it.state
     if st.get("harden_pending") or st.get("harden_revert_pending"):
         return True
     return bool(st.get("harden_active") and st.get("status") in ("dropped", "parked") and
-                st.get("stage") in HARDEN_REVERT_STAGES and not read_json(it.p("review", "runs.json"), []))
+                st.get("stage") in HARDEN_REVERT_STAGES and not _review_of_version(it))
 
 
 def harden_step(P, it) -> None:
@@ -1441,14 +1485,14 @@ def harden_revert(P, it, locked: bool = False) -> bool:
         k = int(st.get("harden_round", 0))
         rd = it.p("harden", f"round-{k}")
         rec = read_json(rd / "record.json", {}) or {}
-        if not (rd / "prev" / "DONE").exists() or rec.get("archived_epoch") is None or \
-                read_json(it.p("review", "runs.json"), []):
+        if not (rd / "prev" / "DONE").exists() or rec.get("archived_epoch") is None or _review_of_version(it):
             return False
-        pend = dict(round=k, why=f"{st.get('stage')}:{st.get('reason')}", prev_epoch=int(rec["archived_epoch"]),
-                    failed_epoch=int(st.get("calib_epoch", 0)), ts=time.time(),
+        pend = dict(round=k, kind=difficulty.round_kind(it), why=f"{st.get('stage')}:{st.get('reason')}",
+                    prev_epoch=int(rec["archived_epoch"]), failed_epoch=int(st.get("calib_epoch", 0)), ts=time.time(),
                     infra=difficulty.revert_infra(it, st.get("stage"), st.get("reason")))
         st["harden_revert_pending"] = pend
         it.save()
+    kind = str(pend.get("kind") or "harden")
     k = int(pend["round"])
     rd = it.p("harden", f"round-{k}")
     difficulty.restore_version(it, rd / "prev", rd / "failed")
@@ -1461,22 +1505,25 @@ def harden_revert(P, it, locked: bool = False) -> bool:
     for p in it.p("calib").glob("prepare*.json"):
         p.unlink()                                       # a prepared sandbox copy may be of the hardened version
     for key in ("harden_active", "calib_label", "thresholds_locked", "repair_from", "rescore_pending", "harden_base",
-                "harden_built", "regen_6c", "harden_revert_pending"):
+                "harden_built", "regen_6c", "harden_revert_pending", "harden_kind"):
         st.pop(key, None)
     infra = pend.get("infra")
     if not infra:
-        st["harden_exhausted"] = True       # a real round failed: no more hardening, the original rule decides
-    # an infra revert does not use up harden_max_rounds; harden_max_attempts bounds the retries (rounds_left)
+        # a real round failed: no more rounds of this kind, the original rule decides (S9b: label easy, exhausted)
+        st["variant_exhausted" if kind == difficulty.KIND_VARIANT else "harden_exhausted"] = True
+    # an infra revert does not use up the depth; the attempts cap bounds the retries (rounds_left_kind)
     if not any(r.get("round") == k for r in st.get("harden_reverted") or []):
-        st.setdefault("harden_reverted", []).append(dict(round=k, why=pend["why"], infra=infra, ts=time.time()))
+        st.setdefault("harden_reverted", []).append(dict(round=k, kind=kind, why=pend["why"], infra=infra,
+                                                         ts=time.time()))
     st.setdefault("history", []).append(dict(stage=st.get("stage"), result="harden_revert", to="S9",
-                                             reason=pend["why"], infra=infra, ts=time.time()))
+                                             reason=pend["why"], infra=infra, kind=kind, ts=time.time()))
     st.update(stage="S9", status="active")
     st.pop("reason", None)
     it.save()
     difficulty.write_round(it, k, reverted=dict(why=pend["why"], infra=infra, ts=time.time()))
-    P.store.event("harden_reverted", item=it.item_id, round=k, why=pend["why"], infra=infra,
-                  rounds_used=difficulty.rounds_used(it), attempts=k)
+    P.store.event("harden_reverted", item=it.item_id, round=k, rkind=kind, why=pend["why"], infra=infra,
+                  rounds_used=difficulty.rounds_used_kind(it, kind),
+                  attempts=difficulty.attempts_used(it, kind))
     return True
 
 
@@ -1494,7 +1541,9 @@ def harden_authored(P, it) -> None:
     difficulty.write_round(it, k, author_jobs=jobs, author_cost_usd=round(sum(float(j.get("cost_usd") or 0)
                                                                               for j in jobs), 4),
                            new_task_sha=difficulty.task_sha(it.p("task")), authored=time.time())
-    P.store.event("harden_authored", item=it.item_id, round=k, job=r.get("job"), cost_usd=r.get("cost_usd"))
+    P.store.event("harden_authored", item=it.item_id, round=k, rkind=difficulty.round_kind(it),
+                  job=r.get("job"),
+                  cost_usd=r.get("cost_usd"))
 
 
 def harden_cmd(P, it, reason: str) -> dict:
@@ -1526,3 +1575,55 @@ def harden_cmd(P, it, reason: str) -> dict:
             raise ValueError("harden: no passing student run in the current calibration")
         start_hardening(P, it, operator=reason)
     return dict(item=it.item_id, stage=it.state["stage"], round=it.state.get("harden_round"))
+
+
+def variant_cmd(P, it, reason: str) -> dict:
+    """`tbsgen variant --item ID`: start an S9b variant round on an item the calibration labelled easy (the student
+    passed every decisive run), e.g. a version finished `label:easy` before S9b existed.  Idempotent: an interrupted
+    start is finished, a variant round already in progress is reported as such (state.harden_active + kind).  Works
+    for an S9R-reviewed item: the new version gets a fresh review round (review.next_round at its label), so its
+    review job names and verdicts never collide with the earlier version's."""
+    with item_lock(it):
+        it.load()
+        st = it.state
+        if st.get("harden_pending") or st.get("harden_active"):
+            if not st.get("harden_pending") and difficulty.round_kind(it) != difficulty.KIND_VARIANT:
+                raise ValueError("variant: a first-pass hardening round is in progress")
+            if st.get("harden_pending"):
+                start_hardening(P, it)               # finish an interrupted start (kind is in the pending record)
+            if st.get("variant_reopened"):
+                return dict(item=it.item_id, stage=it.state["stage"], round=it.state.get("harden_round"),
+                            kind="variant", variant_round=it.state.get("variant_round"),
+                            skipped="already re-opened for S9b")
+            return dict(item=it.item_id, stage=it.state["stage"], round=it.state.get("harden_round"), kind="variant",
+                        resumed=True, variant_round=it.state.get("variant_round"))
+        if st.get("stage") not in ("S9", "S9R", "S10") or st.get("status") not in ("active", "done", "waiting",
+                                                                                "parked"):
+            raise ValueError(f"variant: item at {st.get('stage')}/{st.get('status')}")
+        if not difficulty.variant_enabled(P.cfg, it):
+            raise ValueError("variant: S9b off (calib.variant_depth), not code-grounded, or excluded")
+        if not difficulty.variant_rounds_left(P.cfg, it):
+            raise ValueError("variant: no S9b rounds left")
+        if st.get("variant_reopened"):
+            return dict(item=it.item_id, stage=st.get("stage"), round=it.state.get("harden_round"),
+                        variant_round=it.state.get("variant_round"), skipped="already re-opened for S9b")
+        runs = read_json(it.p("calib", "runs.json"), []) or []
+        if any(r.get("outcome") is None for r in runs):
+            raise ValueError("variant: a calibration run is still pending")
+        if st.get("rescore_pending") or st.get("thresholds_locked") or st.get("review_revision_pending"):
+            raise ValueError("variant: finish the pending re-score / revision / regate first")
+        dec = difficulty.decisive(runs, P.cfg) or []
+        act, what = calib.next_action(runs, P.cfg)
+        if (act, what) != ("label", "easy"):
+            raise ValueError(f"variant: the current calibration is not easy ({act}: {what}); "
+                             "a version needs both decisive student passes (or a quick pass)")
+        glm = [r for r in dec if r.get("who") == "glm"]
+        if not glm or any(r.get("outcome") != "pass" for r in glm):
+            raise ValueError("variant: the student did not pass every decisive run (not an easy version)")
+        start_hardening(P, it, operator=reason, kind=difficulty.KIND_VARIANT)
+        it.state["variant_reopened"] = True
+        it.save()
+        P.store.event("s9b_reopen", item=it.item_id, round=it.state.get("harden_round"),
+                      variant_round=it.state.get("variant_round"), reason=reason)
+    return dict(item=it.item_id, stage=it.state["stage"], round=it.state.get("harden_round"),
+                variant_round=it.state.get("variant_round"), kind=difficulty.KIND_VARIANT)

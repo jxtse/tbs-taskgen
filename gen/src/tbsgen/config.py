@@ -23,7 +23,7 @@ HARBOR_ROOT = os.environ.get("TBS_HARBOR_ROOT") or None     # directory holding 
 DEFAULTS: dict[str, Any] = {
     "run": {
         "root": None,                       # run directory; required
-        "tasks_per_paper": 1,               # MVP: 1 task per paper (variants = S9b, disabled)
+        "tasks_per_paper": 1,               # MVP: 1 task per paper (variants = S9b, calib.variant_depth)
     },
     # ---------------------------------------------------------------- budget / breaker
     "budget": {
@@ -41,6 +41,10 @@ DEFAULTS: dict[str, Any] = {
         # tagged with the round).  None = the hardening rounds share item_usd_cap (the original rule); set: the
         # first version keeps item_usd_cap to itself and the rounds get this one
         "item_harden_usd_cap": None,
+        # separate cap for all S9b variant rounds of one item together (a task the student labelled easy is re-
+        # authored harder; those stages + S7, reservations tagged calls.variant).  Independent of the hardening
+        # rounds' cap, so an item whose item_harden_usd_cap is spent still gets its variant rounds
+        "item_variant_usd_cap": 15.0,
         "run_calls_per_model": {},
         "max_calls_per_item": 24,           # all stages, all attempts, one item
         "breaker_consecutive_errors": 4,    # N consecutive failed calls -> breaker opens for that model
@@ -494,7 +498,9 @@ DEFAULTS: dict[str, Any] = {
         # difficulty; review.frontier_*).  False: the old parked:teacher_failed.
         "frontier": True,
         "infra_retries": 2,                 # API quota / sandbox errors do not count as attempts
-        "variant_depth": 0,                 # S9b harder variants; 待定 (e.g. <=2); 0 = off in MVP
+        "variant_depth": 0,                 # S9b: per-item S9b variant rounds (a task the student labels easy is
+                                            # re-authored harder, then re-calibrated); 0 = off
+        "variant_max_attempts": 4,          # all S9b variant starts of one item incl. infra-reverted ones (no loop)
     },
     # ---------------------------------------------------------------- task review (S9R, after S9, before S10)
     # difficulty targeting of code-grounded tasks (difficulty.py): S5G targets the calibration student's weak points

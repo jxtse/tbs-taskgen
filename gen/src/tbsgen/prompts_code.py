@@ -188,3 +188,29 @@ per-parameter criterion on the scientifically hard object, a setting that must b
   "why_previous_solution_fails_now": "<why the student's method (as summarised) would now fail, with the measured
   evidence from your own baselines>"}}`.
 """
+
+S5G_VARIANT = """
+## S9b variant round {round} of at most {max_rounds}: the previous version was still too easy
+The calibration labelled the previous version of this task `easy`: the student passed **every decisive run** of it
+(two out of two), not only a first attempt.  This is a chance to keep the task at a real difficulty instead of
+discarding it.  You get the same inputs as a hardening round:
+- `/work/previous_version/` — the previous task (`task/`: statement, generator, reference, metric script,
+  baselines), its `spec.json`, `difficulty_design.json` (if any), `thresholds.json`, `S6A_measure.json` and the
+  previous `report.md`.  If earlier rounds exist they are visible there too (each round's diff and record).
+- `/work/student_feedback.json` — the student's own final summary of the method that solved it (the decisive run),
+  its elapsed minutes and, per scored metric, its value, the threshold and the relative margin.
+  (`/work/earlier_rounds.json`: the margins of earlier rounds, if any.)
+{preferred}The student solved it twice: read the margins as a map of what its generic method already handles and change the
+task so that the decisive part needs what the paper really does (a regime where the generic method breaks, residual
+structure that matters for the score, a disclosed hidden shift, a per-object / per-parameter criterion on the
+scientifically hard object, a setting that must be estimated, ...).  Rules:
+- Keep it the same paper and the same core scientific problem; keep the statement complete and fair.
+- **Not allowed**: only tightening thresholds or moving them towards the reference (thresholds are derived by the
+  pipeline from your measured reference / mid / naive values, with the usual separation rules), making the wording
+  vaguer, hiding requirements, format traps, shortening the time limit, inflating data sizes without a scientific
+  reason.
+- Rebuild and re-measure everything (reference, mid, naive, on seeds 0 and 1) as in a normal authoring job.
+- In `difficulty_design.json` add `"hardening": {{"changes": "<what you changed>",
+  "why_previous_solution_fails_now": "<why the student's method (as summarised) would now fail, with the measured
+  evidence from your own baselines>"}}`.
+"""

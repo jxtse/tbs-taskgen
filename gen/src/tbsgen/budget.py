@@ -54,6 +54,26 @@ def _harden_stages(b: dict) -> list[str]:
     return st + [s for s in ("S7",) if s not in st]
 
 
+# S9b variant round of the item being stepped (calib.variant_depth; 0 = not a variant round).  Tagged apart from
+# hardening rounds (calls.variant instead of calls.harden) so budget.item_variant_usd_cap is a separate per-item
+# allowance: an item whose hardening budget is spent can still get variant rounds.
+VARIANT_ROUND: contextvars.ContextVar = contextvars.ContextVar("tbsgen_variant_round", default=0)
+
+
+def variant_round_now() -> int:
+    v = VARIANT_ROUND.get()
+    return int((v() if callable(v) else v) or 0)
+
+
+@contextlib.contextmanager
+def variant_scope(k):
+    tok = VARIANT_ROUND.set(k if callable(k) else int(k or 0))
+    try:
+        yield
+    finally:
+        VARIANT_ROUND.reset(tok)
+
+
 class BudgetStop(RuntimeError):
     """Raised instead of making a call; carries a machine-readable reason."""
 
@@ -71,7 +91,7 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS calls(
   id INTEGER PRIMARY KEY, day TEXT, started REAL, ended REAL, model TEXT, real INTEGER, stage TEXT, item TEXT,
   status TEXT, est_usd REAL, usd REAL, in_tok INTEGER, out_tok INTEGER, cache_read INTEGER, cache_write INTEGER,
-  error_class TEXT, error TEXT, latency REAL, resp_model TEXT, prompt_sha TEXT);
+  error_class TEXT, error TEXT, latency REAL, resp_model TEXT, prompt_sha TEXT, harden INTEGER, variant INTEGER);
 CREATE INDEX IF NOT EXISTS calls_day ON calls(day, model);
 CREATE TABLE IF NOT EXISTS breaker(model TEXT PRIMARY KEY, open INTEGER, reason TEXT, ts REAL, consecutive INTEGER);
 CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY, ts REAL, kind TEXT, data TEXT);
@@ -102,6 +122,8 @@ class Ledger:
                 db.execute("ALTER TABLE calls ADD COLUMN cost_kind TEXT")
             if "harden" not in cols:        # hardening round of the call (older ledgers: NULL = first version)
                 db.execute("ALTER TABLE calls ADD COLUMN harden INTEGER")
+            if "variant" not in cols:       # S9b variant round of the call (older ledgers: NULL = not a variant)
+                db.execute("ALTER TABLE calls ADD COLUMN variant INTEGER")
 
     def _db(self):
         db = sqlite3.connect(self.path, timeout=60, isolation_level=None)
@@ -114,6 +136,7 @@ class Ledger:
         b = self.cfg["budget"]
         est = (float(b.get("est_usd_per_call", 0.0)) if est_usd is None else float(est_usd)) if real else 0.0
         hk = harden_round_now()
+        vk = variant_round_now()
         day = today()
         db = self._db()
         try:
@@ -153,6 +176,7 @@ class Ledger:
                 if n >= int(cap_c):
                     raise BudgetStop("daily_calls", f"{model} {cap_c} calls")
             cap_u, cap_h = b.get("item_usd_cap"), b.get("item_harden_usd_cap")
+            cap_v = b.get("item_variant_usd_cap")
             if item and hk and cap_h is not None:
                 # a hardening round with its own allowance: all its authoring spend, never the first version's
                 st = _harden_stages(b)
@@ -160,10 +184,22 @@ class Ledger:
                     used = _item_used(db, item, st, "AND COALESCE(harden,0)>0")
                     if used + est > float(cap_h) + 1e-9:
                         raise BudgetStop("item_harden_usd", f"{item} {used:.2f}+{est:.2f} > {cap_h} USD (hardening)")
+            elif item and vk and cap_v is not None:
+                # an S9b variant round with its own allowance: separate from the hardening rounds' spend and from
+                # the first version's, so an item that used up item_harden_usd_cap still gets variant rounds
+                st = _harden_stages(b)
+                if stage in st:
+                    used = _item_used(db, item, st, "AND COALESCE(variant,0)>0")
+                    if used + est > float(cap_v) + 1e-9:
+                        raise BudgetStop("item_variant_usd",
+                                         f"{item} {used:.2f}+{est:.2f} > {cap_v} USD (S9b variant)")
             elif cap_u is not None and item and stage in (b.get("item_usd_cap_stages") or []):
                 st = list(b.get("item_usd_cap_stages") or [])
-                # without item_harden_usd_cap the hardening rounds share item_usd_cap (the original rule)
-                used = _item_used(db, item, st, "" if cap_h is None else "AND COALESCE(harden,0)=0")
+                # without item_harden_usd_cap / item_variant_usd_cap the rounds share item_usd_cap (the original
+                # rule); a set cap keeps that round's spend out of the first version's bucket
+                extra = ("AND COALESCE(harden,0)=0" if cap_h is not None else "") + \
+                        (" AND COALESCE(variant,0)=0" if cap_v is not None else "")
+                used = _item_used(db, item, st, extra)
                 if used + est > float(cap_u) + 1e-9:
                     raise BudgetStop("item_usd", f"{item} {used:.2f}+{est:.2f} > {cap_u} USD")
             cap_i = b.get("max_calls_per_item")
@@ -176,9 +212,10 @@ class Ledger:
                 if n >= int(cap_i):
                     raise BudgetStop("item_calls", f"{item} {cap_i} calls")
             cur = db.execute(
-                "INSERT INTO calls(day,started,model,real,stage,item,status,est_usd,prompt_sha,harden) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?)",
-                (day, time.time(), model, int(real), stage, item, "reserved", est, prompt_sha, hk or None))
+                "INSERT INTO calls(day,started,model,real,stage,item,status,est_usd,prompt_sha,harden,variant) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (day, time.time(), model, int(real), stage, item, "reserved", est, prompt_sha, hk or None,
+                 vk or None))
             db.execute("COMMIT")
             return cur.lastrowid
         except BaseException:
@@ -290,15 +327,21 @@ def _item_used(db, item: str, stages: list[str], extra: str = "") -> float:
 def item_usd_left(ledger, cfg: dict, item: str, harden: int | None = None) -> float | None:
     """What is left of the item's authoring allowance (settled + reserved spend; None = no cap).  harden: the
     hardening round (None = the round being stepped, budget.HARDEN_ROUND).  In a hardening round with
-    budget.item_harden_usd_cap set: that cap minus the spend of all hardening rounds; otherwise budget.item_usd_cap
-    minus the first version's spend (minus everything when item_harden_usd_cap is unset: the original rule)."""
+    budget.item_harden_usd_cap set: that cap minus the spend of all hardening rounds; in an S9b variant round with
+    budget.item_variant_usd_cap set: that cap minus the spend of all variant rounds; otherwise budget.item_usd_cap
+    minus the first version's spend (minus everything when the round caps are unset: the original rule)."""
     b = cfg["budget"]
     h = harden_round_now() if harden is None else int(harden)
+    v = variant_round_now() if harden is None else 0
     cap_u, cap_h = b.get("item_usd_cap"), b.get("item_harden_usd_cap")
+    cap_v = b.get("item_variant_usd_cap")
     with ledger._db() as db:
         if h and cap_h is not None:
             return float(cap_h) - _item_used(db, item, _harden_stages(b), "AND COALESCE(harden,0)>0")
+        if v and cap_v is not None:
+            return float(cap_v) - _item_used(db, item, _harden_stages(b), "AND COALESCE(variant,0)>0")
         if cap_u is None:
             return None
-        return float(cap_u) - _item_used(db, item, list(b.get("item_usd_cap_stages") or []),
-                                         "" if cap_h is None else "AND COALESCE(harden,0)=0")
+        extra = ("AND COALESCE(harden,0)=0" if cap_h is not None else "") + \
+                (" AND COALESCE(variant,0)=0" if cap_v is not None else "")
+        return float(cap_u) - _item_used(db, item, list(b.get("item_usd_cap_stages") or []), extra)

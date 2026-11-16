@@ -296,6 +296,19 @@ up a round; `harden_max_attempts` (default 4) bounds all hardening starts of an 
 matter: S5G is asked to use them first, and a hardening round must use and show at least one of them (S5G design
 check and S7). `tbsgen harden --item ID` starts a round by hand. Details: [`gen/README.md`](gen/README.md) §0b (Chinese).
 
+**S9b harder variants** (`calib.variant_depth`, default 0 = off). A version the calibration labels `easy` (the student
+passed *both* decisive runs) is not discarded: with `variant_depth > 0` the pipeline starts a variant round — the same
+hardening machinery, `kind="variant"`, with the profile and the evidence of the decisive pass (its final message and
+per-metric margins) — rebuilds it from S5G, re-gates it and recalibrates it under the same label rules. Variant rounds
+have their own counters (`state.variant_round`, `calib.variant_depth` / `variant_max_attempts`, independent of
+`harden_max_rounds`) and their own per-item allowance (`budget.item_variant_usd_cap`, default 15; ledger column
+`calls.variant`, separate from `calls.harden` and from `item_usd_cap`), so an item whose hardening budget is spent still
+gets variant rounds. Infra reverts do not use up a round. Still easy after the depth -> `label:easy (S9b exhausted)`.
+Reviewed items are supported: every version is reviewed under its own round number (`review.next_round`), so review job
+names never collide and an earlier verdict can never release a new package. `tbsgen variant --item ID` (or without
+`--item`: every item that ended `label:easy`) re-opens versions finished before S9b existed; it is idempotent. Details:
+[`gen/README.md`](gen/README.md) §0d (Chinese).
+
 ### S2 abstract screen
 
 S2 decides from the bibliographic record (title, abstract, venue, year, code/data links) whether a paper is worth
@@ -715,8 +728,8 @@ Research code under active development.
   declared dependencies. A package or repository with an unrelated name, or code fetched through an allowed host,
   is not detected.
 - The teacher-agent branch of calibration has not been run on real tasks.
-- The L4b inversion attack, the cheap-model roles other than the S2 screen, harder-variant generation (S9b) and the
-  file-format and interactive task forms are not implemented.
+- The L4b inversion attack, the cheap-model roles other than the S2 screen and the file-format and interactive task
+  forms are not implemented.
 - The expert-time estimate in `task.toml` is the teacher model's own estimate.
 - The S3 publisher channels (TDM APIs, institution IP, browser) are off by default and need your own licences;
   their offline tests use recorded or scripted responses only. The browser agent's exploration actions,

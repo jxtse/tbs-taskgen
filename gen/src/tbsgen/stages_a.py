@@ -745,7 +745,7 @@ def _s5g(P, it):
     it gets the previous version and the student's passing-run summary and makes the task harder."""
     from . import codeagent, difficulty
     from .prompts_code import (CODE_PROMPT_VERSION, S5G_AUTHOR, S5G_DIFFICULTY, S5G_HARDEN, S5G_HARDEN_PREFERRED,
-                               S5G_PREFERRED)
+                               S5G_PREFERRED, S5G_VARIANT)
     c = codegate.ccfg(P.cfg)
     d = difficulty.dcfg(P.cfg)
     tmo = float(c.get("authoring_timeout_s", 7200))
@@ -755,6 +755,7 @@ def _s5g(P, it):
     except (OSError, ValueError) as e:
         return it.finish("paused", f"code:config:difficulty_profile:{type(e).__name__}", paused_stage="S5G")
     hround = int(it.state.get("harden_round", 0)) if it.state.get("harden_active") else 0
+    hkind = difficulty.round_kind(it) if hround else None
     instruction = S5G_AUTHOR.format(item=it.item_id, minutes=int(tmo // 60), forms=P.cfg["spec"]["allowed_forms"],
                                     hours_lo=lo, hours_hi=hi)
     need = list(S5G_FILES)
@@ -765,10 +766,15 @@ def _s5g(P, it):
         need.append("_spec/" + difficulty.DESIGN_FILE)
     if hround:
         pref = ", ".join((prof or {}).get("preferred") or [])
-        # the round as counted against harden_max_rounds (an infra-reverted attempt does not count)
-        instruction += S5G_HARDEN.format(round=max(1, difficulty.rounds_used(it)),
-                                         max_rounds=int(d.get("harden_max_rounds", 2)),
-                                         preferred=S5G_HARDEN_PREFERRED.format(ids=pref) if pref else "")
+        # the round as counted against its own depth (an infra-reverted attempt does not count)
+        if hkind == difficulty.KIND_VARIANT:
+            instruction += S5G_VARIANT.format(round=max(1, difficulty.rounds_used_kind(it, hkind)),
+                                              max_rounds=difficulty.max_rounds(P.cfg, it, hkind),
+                                              preferred=S5G_HARDEN_PREFERRED.format(ids=pref) if pref else "")
+        else:
+            instruction += S5G_HARDEN.format(round=max(1, difficulty.rounds_used(it)),
+                                             max_rounds=int(d.get("harden_max_rounds", 2)),
+                                             preferred=S5G_HARDEN_PREFERRED.format(ids=pref) if pref else "")
     rnd = None
     if hround:
         ht, hu = d.get("harden_authoring_timeout_s"), d.get("harden_authoring_max_usd")
@@ -787,7 +793,8 @@ def _s5g(P, it):
                                              exception=rec.get("exception"), cost_usd=rec.get("cost_usd"),
                                              cost_kind=rec.get("cost_kind"), minutes=rec.get("minutes"),
                                              missing=miss, prompt_version=CODE_PROMPT_VERSION,
-                                             difficulty_profile=difficulty.provenance(prof), harden_round=hround))
+                                             difficulty_profile=difficulty.provenance(prof), harden_round=hround,
+                                             harden_kind=hkind))
     if miss:
         if rec.get("outcome") in ("launcher_failed", "no_result") and it.bump("S5G:infra") < 2:
             rec["retry"] = True
