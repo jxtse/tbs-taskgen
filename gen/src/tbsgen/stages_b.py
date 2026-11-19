@@ -496,7 +496,10 @@ def _mark_refused(P, it, rec: dict, stage: str) -> None:
     tag it so it is no attempt and uses up no infra retry (calib.next_action / S9R count), and the stage waits
     calib.preflight_retry_s before the next launch."""
     if calib.relay_preflight_refused(rec):
-        rec.update(preflight_refused=True, refused_ts=time.time())
+        rec.update(preflight_refused=True, refused_ts=time.time(), cost_kind="relay_refused")
+        if rec.get("ledger_call"):
+            P.ledger.settle(rec["ledger_call"], 0.0, status="error", kind="relay_refused",
+                            note="relay preflight refused: no Harbor job, no model call")
         P.store.event("relay_preflight_refused", item=it.item_id, stage=stage, job=rec.get("job_name"))
 
 

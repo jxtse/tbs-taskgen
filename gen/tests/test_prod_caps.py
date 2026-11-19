@@ -361,16 +361,29 @@ def test_tmux_failure_then_refusal_gives_the_daily_slot_back(tmp_path, monkeypat
 
 
 def test_refused_reservations_do_not_use_up_call_caps(tmp_path):
-    """Codex r1: refused (not_launched) reservations are no calls: run_calls_per_model / daily_calls_per_model /
-    max_calls_per_item do not count them."""
+    """Codex r1/r2: relay-refused reservations (cost_kind relay_refused: no Harbor job) are no calls for
+    run_calls_per_model / daily_calls_per_model / max_calls_per_item; other not_launched settlements still count."""
     from tbsgen.budget import BudgetStop, Ledger
     from tbsgen.config import load_config
     cfg = load_config(None, {"budget": {"run_calls_per_model": {"m": 1}, "daily_calls_per_model": {"m": 1},
                                         "max_calls_per_item": 1, "daily_usd_total": 100.0}})
     L = Ledger(tmp_path / "l.sqlite", cfg)
     c = L.reserve("m", "S9R", "i", True, est_usd=1.0)
-    L.settle(c, 0.0, status="error", kind="not_launched", note="relay preflight refused")
+    L.settle(c, 0.0, status="error", kind="relay_refused", note="relay preflight refused")
     c2 = L.reserve("m", "S9R", "i", True, est_usd=1.0)          # not blocked by the refused one
-    L.settle(c2, 1.0)
-    with pytest.raises(BudgetStop):
-        L.reserve("m", "S9R", "i", True, est_usd=1.0)            # a real call does count
+    L.settle(c2, 0.0, status="error", kind="not_launched", note="launcher exit 4")
+    with pytest.raises(BudgetStop):                              # any other not_launched still counts (Codex r2:
+        L.reserve("m", "S9R", "i", True, est_usd=1.0)            # Harbor may have created and run that job)
+
+
+def test_crash_between_numbering_and_launch_keeps_the_admission(tmp_path, monkeypatch):
+    """Codex r2: a job number with no never-started evidence (crash after it.bump, before the intent) counts as a
+    started job, so a later refusal does not hand the paper's daily slot back (conservative side of the cap)."""
+    P, it, fl = _agent_item(tmp_path, monkeypatch, _S4C_OK, stage="S4c")
+    P.cfg["code"]["daily_new_runnability"] = 1
+    P.cfg["calib"]["preflight_retry_s"] = 3600
+    it.bump("S4c:job")                              # number 1 handed out, then the process died
+    _refuse_once(P, it, monkeypatch, fl, "S4c")     # number 2 refused by the relay
+    st = P.store.item(it.item_id).state
+    assert st["reason"].startswith("relay_down") and st["attempts"]["S4c:job"] == 2, st
+    assert it.item_id in (P.store.root / "s4c-admissions.jsonl").read_text()

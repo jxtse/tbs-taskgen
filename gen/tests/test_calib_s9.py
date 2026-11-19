@@ -848,3 +848,15 @@ def test_relay_waiting_items_take_no_scheduling_step(tmp_path):
     watch_tick(P)
     it = P.store.item(iid)
     assert it.state["reason"].startswith("relay_down") and not reschedulable(P.cfg, it)
+
+
+def test_refused_s9_reservation_is_settled_relay_refused(tmp_path):
+    P, [iid], counter, jobs = _env(tmp_path, preflight_retry_s=3600)
+    _refusing_launcher(P)
+    P.run()
+    watch_tick(P)
+    r = _runs(P, iid)[0]
+    assert r["cost_kind"] == "relay_refused"
+    with P.ledger._db() as db:
+        assert db.execute("SELECT cost_kind, usd FROM calls WHERE id=?", (r["ledger_call"],)).fetchone() == \
+            ("relay_refused", 0.0)

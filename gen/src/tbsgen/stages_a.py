@@ -625,6 +625,8 @@ def _agent_stage(P, it, kind: str, instruction: str, need: list[str], timeout_s:
             if rec.get("state") == "launched":
                 _agent_admit(P, it, kind)       # counted only once a job of this paper really started
         if rec.get("state") == "launch_failed":
+            if rec.get("not_started"):
+                _record_nostart(it, kind, rec.get("job_name"))   # tmux never started it (also in a hardening round)
             return _launch_failed(it, kind)
         it.finish("waiting", f"{kind}:agent_running", job=rec["job_name"])
         return None
@@ -644,6 +646,8 @@ def _agent_stage(P, it, kind: str, instruction: str, need: list[str], timeout_s:
             if rec.get("state") == "launched":
                 _agent_admit(P, it, kind)
         if rec.get("state") == "launch_failed":
+            if rec.get("not_started"):
+                _record_nostart(it, kind, rec.get("job_name"))   # tmux never started it (also in a hardening round)
             return _launch_failed(it, kind)
         it.finish("waiting", f"{kind}:agent_running", job=rec.get("job_name"))
         return None
@@ -674,14 +678,24 @@ def relay_waiting(cfg: dict, it) -> bool:
 
 
 def _nostart(it, kind: str) -> list[str]:
-    """Jobs of this stage that are known never to have started (relay preflight refused / tmux failed)."""
+    """Jobs of this stage that are known never to have started (relay preflight refused / tmux failed), by name."""
     return list(((it.state.get("agent_nostart") or {}).get(kind)) or [])
 
 
-def _record_nostart(it, kind: str, job: str | None) -> None:
+def _record_nostart(it, kind: str, job: str | None, save: bool = True) -> None:
     if job and job not in _nostart(it, kind):
         it.state.setdefault("agent_nostart", {}).setdefault(kind, []).append(job)
+    if save:
         it.save()
+
+
+def _none_started(it, kind: str) -> bool:
+    """Every job number this paper was given for `kind` is a job known never to have started.  A number without
+    such evidence (a job that ran, a record from before this rule, a crash between numbering and launch) counts as
+    started: the paper keeps its daily admission (the conservative side of the cap)."""
+    n = int((it.state.get("attempts") or {}).get(f"{kind}:job", 0))
+    ns = set(_nostart(it, kind))
+    return all(f"tbsgen-{it.item_id}-{kind.lower()}{k}" in ns for k in range(1, n + 1))
 
 
 def _account_refusal(P, it, kind: str, rec: dict) -> bool:
@@ -698,11 +712,14 @@ def _account_refusal(P, it, kind: str, rec: dict) -> bool:
         if not rec.get("preflight_refused"):
             rec.update(preflight_refused=True, refused_ts=time.time(), retry=True, not_started=True)
             write_json(it.p(kind, "run.json"), rec)
-        jobs = int((it.state.get("attempts") or {}).get(f"{kind}:job", 0))
-        if jobs - len(set(_nostart(it, kind)) | {job}) <= 0:
-            _withdraw_admission(P, it, kind)        # no job of this paper started: give the daily slot back
+        if rec.get("ledger_call"):              # idempotent: the refused reservation is no call (budget call caps)
+            P.ledger.settle(rec["ledger_call"], 0.0, status="error", kind="relay_refused",
+                            note="relay preflight refused: no Harbor job, no model call")
         first = job not in _nostart(it, kind)
-        _record_nostart(it, kind, job)               # last: a crash before it redoes the (idempotent) steps above
+        _record_nostart(it, kind, job, save=False)
+        if _none_started(it, kind):
+            _withdraw_admission(P, it, kind)        # no job of this paper started: give the daily slot back
+        it.save()                               # last: a crash before it redoes the (idempotent) steps above
     if first:
         P.store.event("relay_preflight_refused", item=it.item_id, stage=kind, job=job)
     return True

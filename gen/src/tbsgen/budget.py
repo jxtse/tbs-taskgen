@@ -166,9 +166,9 @@ class Ledger:
                 if cap_s is not None and spent("AND stage=?", stage) + est > float(cap_s) + 1e-12:
                     raise BudgetStop("daily_stage", f"{stage} {cap_s} USD")
             cap_r = (b.get("run_calls_per_model") or {}).get(model)
-            # call-count caps count calls that were made: a reservation settled as not_launched (the job never
-            # started, e.g. the model relay refused its preflight) is no call
-            made = "AND COALESCE(cost_kind,'') != 'not_launched'"
+            # call-count caps count calls that were made: a reservation the model relay refused at its preflight
+            # (cost_kind relay_refused, calib.relay_preflight_refused: no Harbor job, no model call) is no call
+            made = "AND COALESCE(cost_kind,'') != 'relay_refused'"
             if cap_r is not None:
                 n = db.execute(f"SELECT count(*) FROM calls WHERE model=? AND real=1 {made}", (model,)).fetchone()[0]
                 if n >= int(cap_r):
