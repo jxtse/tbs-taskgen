@@ -177,6 +177,7 @@ def test_reserved_without_launch_rechecks_admission_and_admit_uses_launch_day(tm
 def _fail_launch(P, it, monkeypatch, fl, log_text, exit_code="3"):
     import subprocess as sp
     from tbsgen import codeagent
+    P.cfg["calib"]["preflight_retry_s"] = 0         # a relay refusal waits 0 s here: the next run relaunches
     monkeypatch.setattr(codeagent.subprocess, "run", lambda args, **kw: sp.CompletedProcess(args, 0, "", ""))
     P.run(max_steps=1, until="S5G")                 # tmux started; the launcher then ends without a Harbor job
     rec = read_json(it.p("S5G", "run.json"))
@@ -184,9 +185,9 @@ def _fail_launch(P, it, monkeypatch, fl, log_text, exit_code="3"):
     Path(rec["log"]).write_text(log_text)
     Path(rec["log"] + ".exit").write_text(exit_code)
     monkeypatch.setattr(codeagent.subprocess, "run", fl)
-    P.run(max_steps=1, until="S5G")                 # poll -> launcher_failed -> infra retry
+    P.run(max_steps=1, until="S5G")                 # poll -> launcher_failed -> infra retry / relay wait
     st = P.store.item(it.item_id).state
-    assert st["status"] == "active" and st["stage"] == "S5G", st
+    assert st["stage"] == "S5G" and (st["status"] == "active" or st["reason"].startswith("relay_down")), st
     P.run(max_steps=1, until="S5G")                 # next job: the failed one is charged first
     return rec, read_json(it.p("S5G", "spent.json"))
 
@@ -212,3 +213,94 @@ def test_launcher_failed_without_preflight_evidence_stays_conservative(tmp_path,
     assert spent[rec["job_name"]]["usd"] == float(rec["budget"]["max_usd"]) > 0, spent
     # the whole allowance is used up: the paper is not re-authored on an unknown spend
     assert P.store.item(it.item_id).state["reason"] == "s5g_budget_exhausted"
+
+
+# ------------------------------------------------------------------ relay preflight refusals are no attempts
+_S4C_OK = {"runnability.json": json.dumps({"runnable": True, "reason": "ok", "language": "Python", "seconds": 3,
+                                          "entry": "python -m x"}),
+           "HOWTO.md": "pip install .", "runs/0.json": json.dumps({"cmd": "python -m x", "rc": 0, "seconds": 3,
+                                                                   "log": "runs/0.log"}), "runs/0.log": "ok"}
+REFUSED = "x: started on h\nrelay preflight try 6 http=400; retry in 30 s\nrelay preflight http=400\n2026 J: harbor exit 3\n"
+
+
+def _refuse_once(P, it, monkeypatch, fl, kind="S5G"):
+    """One job of `kind` that the model relay refused at its preflight (launcher log + exit 3, no Harbor job)."""
+    import subprocess as sp
+    from tbsgen import codeagent
+    monkeypatch.setattr(codeagent.subprocess, "run", lambda args, **kw: sp.CompletedProcess(args, 0, "", ""))
+    P.run(max_steps=1, until=kind)                  # launched (tmux ok); the launcher then exits 3 at the preflight
+    rec = read_json(it.p(kind, "run.json"))
+    assert rec["state"] == "launched", rec
+    Path(rec["log"]).write_text(REFUSED)
+    Path(rec["log"] + ".exit").write_text("3")
+    monkeypatch.setattr(codeagent.subprocess, "run", fl)
+    P.run(max_steps=1, until=kind)                  # poll: refused -> waits, nothing counted
+    return rec
+
+
+@pytest.mark.parametrize("kind", ["S4c", "S5G"])
+def test_relay_refusals_never_drop_a_paper_or_use_its_quota(tmp_path, monkeypatch, kind):
+    """2026-11-19: the relay answered 400 for 75 minutes; every S4c / S5G job was refused at the preflight, the
+    two infra retries ran out and 14 papers were dropped (code_runnability_agent_failed / s5g_missing_files) and
+    used up the day's S4c admissions.  A refused job ran nothing: the paper waits and retries, without an infra
+    retry, an authoring_max_jobs job, a daily admission or spent time."""
+    files = _S4C_OK if kind == "S4c" else _files(design=None)
+    P, it, fl = _agent_item(tmp_path, monkeypatch, files, stage=kind)
+    monkeypatch.setattr("tbsgen.stages_a.validate_spec", lambda s, c: [])
+    P.cfg["code"]["daily_new_runnability" if kind == "S4c" else "daily_new_authoring"] = 1
+    P.cfg["calib"]["preflight_retry_s"] = 3600
+    rec = _refuse_once(P, it, monkeypatch, fl, kind)
+    st = P.store.item(it.item_id).state
+    assert st["status"] == "waiting" and st["reason"].startswith("relay_down"), st
+    assert not (P.store.root / f"{kind.lower()}-admissions.jsonl").read_text().strip()   # admission withdrawn
+    P.run(max_steps=1, until=kind)                  # still inside preflight_retry_s: no new job
+    assert read_json(it.p(kind, "run.json"))["job_name"] == rec["job_name"] and len(fl.calls) == 0
+    P.cfg["calib"]["preflight_retry_s"] = 0
+    for _ in range(4):                              # more refusals than any retry budget
+        _refuse_once(P, it, monkeypatch, fl, kind)
+    st = P.store.item(it.item_id).state
+    assert st["status"] == "waiting" and st["reason"].startswith("relay_down"), st
+    a = st["attempts"]
+    assert a.get(f"{kind}:infra", 0) == 0 and a[f"{kind}:job"] == a[f"{kind}:refused"] == 5
+    spent = read_json(it.p(kind, "spent.json"))
+    assert all(c == dict(usd=0.0, sec=0.0) for c in spent.values()) and len(spent) == 4
+    P.run(max_steps=1, until=kind)                  # relay back: a real job is launched ...
+    P.run(max_steps=1, until=kind)                  # ... and collected: the paper moves on
+    st = P.store.item(it.item_id).state
+    assert st["stage"] != kind and st["status"] == "active", (st.get("reason"), st["history"][-1])
+    assert len(fl.calls) == 1
+    rows = (P.store.root / f"{kind.lower()}-admissions.jsonl").read_text().splitlines()
+    assert len(rows) == 1 and it.item_id in rows[0]   # admitted once, by the job that really ran
+
+
+def test_relay_refusal_keeps_its_paper_out_of_a_full_day(tmp_path, monkeypatch):
+    """A refused paper gives its daily slot back; when another paper took the slot meanwhile, it waits for the
+    next day like any other (budget:daily_*) instead of starting past the cap."""
+    P, it, fl = _agent_item(tmp_path, monkeypatch, _files(design=None), stage="S4c")
+    P.cfg["code"]["daily_new_runnability"] = 1
+    P.cfg["calib"]["preflight_retry_s"] = 0
+    _refuse_once(P, it, monkeypatch, fl, "S4c")
+    from tbsgen import stages_a
+    (P.store.root / "s4c-admissions.jsonl").write_text(json.dumps(dict(day=stages_a._cst_day(), item="other")) + "\n")
+    P.run(max_steps=1, until="S4c")
+    st = P.store.item(it.item_id).state
+    assert st["status"] == "paused" and st["reason"].startswith("budget:daily_s4c_papers"), st
+    assert not fl.calls
+
+
+def test_non_preflight_launcher_failure_still_uses_infra_retries(tmp_path, monkeypatch):
+    """Only the explicit relay refusal is exempt: a launcher that failed otherwise (no preflight line) still uses
+    the S4c infra retries and drops the paper after them, as before."""
+    P, it, fl = _agent_item(tmp_path, monkeypatch, _files(design=None), stage="S4c")
+    import subprocess as sp
+    from tbsgen import codeagent
+    for _ in range(2):
+        monkeypatch.setattr(codeagent.subprocess, "run", lambda args, **kw: sp.CompletedProcess(args, 0, "", ""))
+        P.run(max_steps=1, until="S4c")
+        rec = read_json(it.p("S4c", "run.json"))
+        Path(rec["log"]).write_text("rsync task failed\n")
+        Path(rec["log"] + ".exit").write_text("4")
+        monkeypatch.setattr(codeagent.subprocess, "run", fl)
+        P.run(max_steps=1, until="S4c")
+    st = P.store.item(it.item_id).state
+    assert st["status"] == "dropped" and st["reason"] == "code_runnability_agent_failed", st

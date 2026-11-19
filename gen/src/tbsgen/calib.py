@@ -90,7 +90,8 @@ FRONTIER_CHECKS = ("a_consistency", "b_missing_conditions", "e_shortcuts_leaks",
 
 def frontier_evidence(runs: list[dict], cfg: dict) -> dict:
     """Release record of a frontier task: decisive / infra / timeout counts of the teacher runs of this epoch."""
-    tea = [r for r in runs if r.get("who") == "teacher" and r.get("outcome") is not None]
+    tea = [r for r in runs if r.get("who") == "teacher" and r.get("outcome") is not None and
+           not r.get("preflight_refused")]
     dec = [r for r in tea if r["outcome"] != "infra"]
     return dict(teacher_runs=len(tea), teacher_decisive=len(dec), teacher_infra=len(tea) - len(dec),
                 teacher_timeouts=sum(1 for r in dec if is_timeout(r)),
@@ -109,6 +110,8 @@ def next_action(runs: list[dict], cfg: dict) -> tuple[str, str | None]:
         return "label", str(e)
     trailing_infra = 0
     for r in reversed(runs):
+        if r.get("preflight_refused"):
+            continue                    # the relay refused before Harbor: no attempt, no infra retry used up
         if r["outcome"] != "infra":
             break
         trailing_infra += 1
@@ -477,6 +480,38 @@ def launch(cfg: dict, rec: dict, ledger, save) -> dict:
     rec.update(state="launched", submitted=True, tmux=rec["job_name"][-60:])
     save(rec)
     return rec
+
+
+# the build-host runner writes "relay preflight http=<code>" and exits 3 before starting Harbor when the model relay
+# is down; the launcher copies that log tail and "<job>: harbor exit 3" into the job's own launcher log
+_PREFLIGHT_FAIL = re.compile(r"relay preflight http=(?!200\b)\d+\s*$", re.M)
+
+
+def relay_preflight_refused(rec: dict) -> bool:
+    """Explicit evidence that this job never reached Harbor because the model relay refused the preflight: the
+    job's OWN launcher log (not a shared one), its exit status 3, the non-200 preflight line and "harbor exit 3".
+    Such a job ran no model, so it is neither an attempt nor an infrastructure failure of the task: the stage waits
+    calib.preflight_retry_s and launches again, without using up a retry (an outage only delays the work)."""
+    log = Path(str(rec.get("log", "")))
+    if not rec.get("job_name") or not log.name.startswith(str(rec["job_name"])) or not log.exists():
+        return False
+    try:
+        code = Path(str(log) + ".exit").read_text().strip()
+        text = log.read_text(errors="replace")
+    except OSError:
+        return False
+    return code == "3" and bool(_PREFLIGHT_FAIL.search(text)) and "harbor exit 3" in text
+
+
+def preflight_wait(cfg: dict, rec: dict | None) -> str | None:
+    """While the last job was refused by the relay preflight less than calib.preflight_retry_s ago: the reason to
+    wait (None = launch now)."""
+    if not rec or not rec.get("preflight_refused"):
+        return None
+    left = float(rec.get("refused_ts") or 0) + float(cfg["calib"].get("preflight_retry_s", 600)) - time.time()
+    if left <= 0:
+        return None
+    return f"relay_down: preflight refused, retry after {time.strftime('%H:%M', time.localtime(time.time() + left))}"
 
 
 def launcher_failed(rec: dict, c: dict | None = None) -> str | None:

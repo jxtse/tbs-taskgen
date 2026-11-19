@@ -491,6 +491,15 @@ def slot_lock(P):
             fcntl.flock(fh, fcntl.LOCK_UN)
 
 
+def _mark_refused(P, it, rec: dict, stage: str) -> None:
+    """A run whose launcher exited because the model relay refused its preflight (calib.relay_preflight_refused):
+    tag it so it is no attempt and uses up no infra retry (calib.next_action / S9R count), and the stage waits
+    calib.preflight_retry_s before the next launch."""
+    if calib.relay_preflight_refused(rec):
+        rec.update(preflight_refused=True, refused_ts=time.time())
+        P.store.event("relay_preflight_refused", item=it.item_id, stage=stage, job=rec.get("job_name"))
+
+
 def _save_run(it, rec):
     runs = read_json(it.p("calib", "runs.json"), [])
     for i, r in enumerate(runs):
@@ -560,6 +569,7 @@ def _s9(P, it):
                     P.ledger.settle(rec["ledger_call"], 0.0, status="error", kind="not_launched", note=why[:500])
                 rec.update(state="launch_failed", outcome="infra", result_type="infra", cost_usd=0.0,
                            cost_kind="not_launched", error=why)
+                _mark_refused(P, it, rec, "S9")
                 _save_run(it, rec)
             elif calib.launcher_died(rec, c):
                 _settle_dead_job(P, it, rec)
@@ -571,6 +581,10 @@ def _s9(P, it):
         # hardening loop: the student solved this version on its first attempt -> back to S5G (difficulty.py)
         return start_hardening(P, it)
     act, what = calib.next_action(runs, P.cfg)
+    if act == "run":
+        wait = calib.preflight_wait(P.cfg, runs[-1] if runs else None)
+        if wait:                        # the relay refused the last run: wait, then launch the same role again
+            return it.finish("waiting", wait)
     if act == "label":
         it.state["calib_label"] = what
         it.save()
@@ -937,6 +951,7 @@ def _s9r(P, it):
                 if rec.get("ledger_call"):
                     P.ledger.settle(rec["ledger_call"], 0.0, status="error", kind="not_launched", note=why[:500])
                 rec.update(state="launch_failed", outcome="infra", cost_usd=0.0, cost_kind="not_launched", error=why)
+                _mark_refused(P, it, rec, "S9R")
                 save(rec)
             elif calib.launcher_died(rec, c):
                 try:
@@ -960,7 +975,8 @@ def _s9r(P, it):
     done = [r for r in runs if r.get("outcome") == "done"]
     if done:
         return _route_review(P, it, done[-1], rnd)
-    n_infra = sum(1 for r in runs if r.get("outcome") == "infra")
+    # a run the model relay refused at its preflight is no attempt and uses up no retry (calib.relay_preflight_refused)
+    n_infra = sum(1 for r in runs if r.get("outcome") == "infra" and not r.get("preflight_refused"))
     n_invalid = sum(1 for r in runs if r.get("outcome") == "invalid")
     if n_infra + n_invalid > int(rv.get("infra_retries", 2)):
         if n_invalid:
@@ -971,6 +987,9 @@ def _s9r(P, it):
                 return it.finish("parked", f"review:human ({why})")
             return it.finish("dropped", f"review:invalid {why}")
         return it.finish("parked", f"review:infra ({n_infra} infra, {n_invalid} invalid verdicts)")
+    wait = calib.preflight_wait(P.cfg, all_rnd[-1] if all_rnd else None)
+    if wait:                            # the relay refused the last review run: wait, then launch the next attempt
+        return it.finish("waiting", wait)
     full = _slots_full(P) if c.get("allow_submit") else None
     if full:
         # checked before the review task is built or anything persisted: the next step starts it from scratch
@@ -1347,8 +1366,9 @@ def _s5g_base(it, k: int) -> dict:
         usd = rec.get("cost_usd")
         charges[rec["job_name"]] = dict(usd=float(usd) if usd is not None else float(b.get("max_usd") or 0.0),
                                         sec=60.0 * float(rec["minutes"]) if rec.get("minutes") is not None else 0.0)
+    from .stages_a import _jobs_used
     return dict(round=k, usd=sum(c["usd"] for c in charges.values()), sec=sum(c["sec"] for c in charges.values()),
-                jobs=int((it.state.get("attempts") or {}).get("S5G:job", 0)))
+                jobs=_jobs_used(it, "S5G"))
 
 
 def start_hardening(P, it, operator: str | None = None, kind: str = "harden"):

@@ -540,6 +540,12 @@ def _agent_stage(P, it, kind: str, instruction: str, need: list[str], timeout_s:
         rec["retry"] = True                     # infrastructure: a resumed item launches a fresh job
         rec["state"] = "finished"
     if rec is None or (rec.get("state") == "finished" and rec.get("retry")):
+        from .calib import preflight_wait
+        wait = preflight_wait(P.cfg, rec)
+        if wait:                                # the relay refused the last job: wait before the next one
+            if it.state.get("status") != "waiting" or it.state.get("reason") != wait:
+                it.finish("waiting", wait, job=(rec or {}).get("job_name"))
+            return None
         why = codeagent.env_ok(P.cfg, agent=True)
         if why:
             it.finish("paused", f"code:config:{why}", paused_stage=kind)
@@ -553,9 +559,11 @@ def _agent_stage(P, it, kind: str, instruction: str, need: list[str], timeout_s:
                 usd, sec = 0.0, 0.0             # confirmed never started
             elif _failed_before_harbor(rec):
                 # explicit pre-start failure evidence in this job's own launcher log (the relay preflight refused,
-                # so Harbor never ran and no model was called): no model cost; wall time of the attempt only
+                # so Harbor never ran and no model was called): no model cost.  A refusal handled as such
+                # (preflight_refused) used no agent time either; an older record keeps its wall time
                 usd = 0.0
-                sec = max(0.0, float(rec.get("finished_ts") or time.time()) - float(rec["launch_attempted"]))
+                sec = 0.0 if rec.get("preflight_refused") else \
+                    max(0.0, float(rec.get("finished_ts") or time.time()) - float(rec["launch_attempted"]))
             else:
                 # a job that may have run: unknown cost counts as its whole allowance, unknown time as wall time
                 # since the launch (never as zero)
@@ -643,6 +651,21 @@ def _agent_stage(P, it, kind: str, instruction: str, need: list[str], timeout_s:
         if rec is None or rec.get("state") != "finished":
             if it.state.get("status") != "waiting":
                 it.finish("waiting", f"{kind}:agent_running", job=(rec or {}).get("job_name"))
+            return None
+        if _failed_before_harbor(rec) and not rec.get("preflight_refused"):
+            # the model relay refused the preflight: nothing ran.  Not an infra failure of the paper (no
+            # <kind>:infra retry, no authoring_max_jobs job, no daily admission): wait calib.preflight_retry_s,
+            # then launch a fresh job (the flag is persisted first, so a crash never counts it twice)
+            with _agent_slot_lock(P):
+                rec.update(preflight_refused=True, refused_ts=time.time(), retry=True, not_started=True)
+                write_json(recp, rec)
+                it.bump(f"{kind}:refused")
+                if _jobs_used(it, kind) <= 0:
+                    _withdraw_admission(P, it, kind)
+            P.store.event("relay_preflight_refused", item=it.item_id, stage=kind, job=rec.get("job_name"))
+            from .calib import preflight_wait
+            it.finish("waiting", preflight_wait(P.cfg, rec) or "relay_down: preflight refused",
+                      job=rec.get("job_name"))
             return None
     return rec
 
@@ -877,26 +900,22 @@ def _s5g(P, it):
     it.advance("S5G", "S6A_run", form=spec.get("form"), cost_usd=rec.get("cost_usd"), minutes=rec.get("minutes"))
 
 
-# the build-host runner writes "relay preflight http=<code>" and exits 3 before starting Harbor when the model relay
-# is down; the launcher copies that log tail and "<job>: harbor exit 3" into the job's own launcher log
-_PREFLIGHT_FAIL = re.compile(r"relay preflight http=(?!200\b)\d+\s*$", re.M)
+# (the relay-preflight evidence rule lives in calib.relay_preflight_refused, shared with S9 / S9R)
 
 
 def _failed_before_harbor(rec: dict) -> bool:
-    """True only with explicit evidence that the job never reached Harbor: launcher_failed (no Harbor config.json),
-    the job's OWN launcher log (not a shared one), exit status 3, and the relay-preflight refusal in that log.  A
+    """True only with explicit evidence that the job never reached Harbor: launcher_failed (no Harbor config.json)
+    and calib.relay_preflight_refused (the job's OWN launcher log, exit status 3, the relay-preflight refusal).  A
     missing config.json alone is not enough (a failed copy-back of a job that really ran looks the same)."""
-    if rec.get("outcome") != "launcher_failed":
-        return False
-    log = Path(str(rec.get("log", "")))
-    if not log.name.startswith(str(rec.get("job_name"))) or not log.exists():
-        return False
-    try:
-        code = Path(str(log) + ".exit").read_text().strip()
-        text = log.read_text(errors="replace")
-    except OSError:
-        return False
-    return code == "3" and bool(_PREFLIGHT_FAIL.search(text)) and "harbor exit 3" in text
+    from .calib import relay_preflight_refused
+    return rec.get("outcome") == "launcher_failed" and relay_preflight_refused(rec)
+
+
+def _jobs_used(it, kind: str) -> int:
+    """Jobs of this stage that count against code.authoring_max_jobs: every job number handed out except those the
+    model relay refused at its preflight (they ran nothing)."""
+    a = it.state.get("attempts") or {}
+    return int(a.get(f"{kind}:job", 0)) - int(a.get(f"{kind}:refused", 0))
 
 
 def _admissions_path(P, kind: str) -> Path:
@@ -971,6 +990,20 @@ def _backfill_admissions(P, kind: str) -> None:
                 f.write(json.dumps(dict(day=day, item=other.item_id, ts=time.time(), backfilled=True)) + "\n")
 
 
+def _withdraw_admission(P, it, kind: str) -> None:
+    """Remove this paper's admission line of `kind` (call under _agent_slot_lock): its only job was refused by the
+    relay preflight, so no job of the paper started and it must not use up a daily_new_* slot."""
+    path = _admissions_path(P, kind)
+    rows = _admissions(P, kind)
+    keep = [r for r in rows if r.get("item") != it.item_id]
+    if len(keep) == len(rows):
+        return
+    tmp = path.with_suffix(".jsonl.tmp")
+    tmp.write_text("".join(json.dumps(r) + "\n" for r in keep))
+    tmp.replace(path)
+    P.store.event(f"{kind.lower()}_admission_withdrawn", item=it.item_id, why="relay_preflight_refused")
+
+
 def _agent_admit(P, it, kind: str) -> None:
     """Record that this paper's first job of `kind` started (idempotent; call under _agent_slot_lock).  The day is
     the Asia/Shanghai day of the job's launch (launch_attempted), whenever the record is written."""
@@ -991,7 +1024,7 @@ def _agent_reauthor(P, it, why: str, force: bool = False) -> bool:
     if not force and (not it.p("_spec", "author_code.json").exists() or
                       codegate.ccfg(P.cfg).get("authoring", "agent") != "agent"):
         return False
-    n = it.state.get("attempts", {}).get("S5G:job", 0)
+    n = _jobs_used(it, "S5G")
     per = int(codegate.ccfg(P.cfg).get("authoring_max_jobs", 2))
     if it.state.get("harden_active"):               # each hardening round gets its own authoring_max_jobs
         n -= int((it.state.get("harden_base") or {}).get("jobs", 0))

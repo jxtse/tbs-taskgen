@@ -498,6 +498,10 @@ DEFAULTS: dict[str, Any] = {
         # difficulty; review.frontier_*).  False: the old parked:teacher_failed.
         "frontier": True,
         "infra_retries": 2,                 # API quota / sandbox errors do not count as attempts
+        # A job the model relay refused at its preflight (launcher log "relay preflight http=<non-200>", exit 3, no
+        # Harbor job) ran nothing: S4c / S5G / S9 / S9R wait this long and launch again, without using up
+        # infra_retries / code infra retries / review.infra_retries (calib.relay_preflight_refused).
+        "preflight_retry_s": 600,
         "variant_depth": 0,                 # S9b: per-item S9b variant rounds (a task the student labels easy is
                                             # re-authored harder, then re-calibrated); 0 = off
         "variant_max_attempts": 4,          # all S9b variant starts of one item incl. infra-reverted ones (no loop)

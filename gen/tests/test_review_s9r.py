@@ -957,3 +957,31 @@ def test_codex_r3_regate_without_rescore_recalibrates_and_exploit_limit_after_re
     stages_b.s8(P, it)
     st = P.store.item(iid).state
     assert st["status"] == "active" and st["repair_from"] == "review:r1", st
+
+
+def test_review_relay_refusals_do_not_park(tmp_path):
+    """S9R runs refused at the relay preflight are no attempts: review.infra_retries is untouched, the item is not
+    parked review:infra, and the review launches again once the relay answers."""
+    P, iid, jobs = _env(tmp_path, review_kw={"infra_retries": 1}, preflight_retry_s=0)
+    _to_label(P, iid, jobs)
+    teach = Path(P.cfg["calib"]["harbor_root"]) / "teach.sh"
+    good = teach.read_text()
+    rr = _runs(P, iid, "review")[-1]
+    # the first review job is already launched by the good launcher: turn it into a refusal
+    import shutil
+    shutil.rmtree(jobs / rr["job_name"])
+    Path(rr["log"]).write_text("relay preflight http=400\nJ: harbor exit 3\n")
+    Path(rr["log"] + ".exit").write_text("3")
+    teach.write_text("#!/bin/bash\necho 'relay preflight http=400'\necho 'J: harbor exit 3'\nexit 3\n")
+    for _ in range(4):
+        watch_tick(P, only=[iid])
+    st = P.store.item(iid).state
+    runs = _runs(P, iid, "review")
+    assert st["stage"] == "S9R" and st["status"] != "parked", st
+    assert len(runs) >= 3 and all(r["preflight_refused"] for r in runs if r.get("outcome") == "infra")
+    teach.write_text(good)
+    watch_tick(P, only=[iid])
+    P.run(only=[iid])
+    last = _runs(P, iid, "review")[-1]
+    assert last["state"] == "launched" and not last.get("preflight_refused") and \
+        (jobs / last["job_name"] / "config.json").exists(), last
