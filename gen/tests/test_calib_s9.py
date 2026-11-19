@@ -770,3 +770,93 @@ def test_slot_admission_waits_for_the_run_wide_lock(tmp_path):
     assert done.is_set() and not counter.exists()
     assert "slots full: 1/1" in P.store.item(ids[0]).state["reason"]
     assert B.running_jobs(P) == ["jo"]
+
+
+# ------------------------------------------------------------------ relay preflight refusals
+def _refusing_launcher(P):
+    for name in ("launch.sh", "teach.sh"):
+        p = Path(P.cfg["calib"]["harbor_root"]) / name
+        p.write_text("#!/bin/bash\necho 'relay preflight http=400'\necho 'J: harbor exit 3'\nexit 3\n")
+
+
+def test_relay_refused_runs_are_no_attempts_and_never_park(tmp_path):
+    """2026-11-19: S9 teacher runs refused at the relay preflight (http=400, exit 3, no Harbor job) were counted as
+    infra and parked their items parked:infra after calib.infra_retries.  A refused run is no attempt: the item
+    waits calib.preflight_retry_s, launches the same role again, and its retries stay untouched."""
+    P, [iid], counter, jobs = _env(tmp_path, preflight_retry_s=0)
+    good = (Path(P.cfg["calib"]["harbor_root"]) / "launch.sh").read_text()
+    _refusing_launcher(P)
+    P.run()
+    for _ in range(P.cfg["calib"]["infra_retries"] + 3):
+        watch_tick(P)
+    r = _runs(P, iid)
+    st = P.store.item(iid).state
+    assert st["stage"] == "S9" and st["status"] != "parked", st
+    assert len(r) >= 4 and all(x["preflight_refused"] and x["who"] == "glm" for x in r if x.get("outcome"))
+    assert calib.next_action(r[:-1] if r[-1].get("outcome") is None else r, P.cfg) == ("run", "glm")
+    for name in ("launch.sh", "teach.sh"):                    # relay back
+        (Path(P.cfg["calib"]["harbor_root"]) / name).write_text(good)
+    watch_tick(P)
+    P.run(only=[iid])
+    last = _runs(P, iid)[-1]
+    assert last["state"] == "launched" and not last.get("preflight_refused"), last
+    assert (jobs / last["job_name"] / "config.json").exists()
+
+
+def test_relay_refused_run_waits_before_the_next_launch(tmp_path):
+    P, [iid], counter, jobs = _env(tmp_path, preflight_retry_s=3600)
+    _refusing_launcher(P)
+    P.run()
+    watch_tick(P)
+    st = P.store.item(iid).state
+    assert st["status"] == "waiting" and st["reason"].startswith("relay_down"), st
+    n = len(_runs(P, iid))
+    P.run(only=[iid])
+    watch_tick(P)
+    assert len(_runs(P, iid)) == n == 1                         # no new launch inside the wait
+
+
+def test_other_launcher_failures_still_park_infra(tmp_path):
+    P, [iid], counter, jobs = _env(tmp_path, preflight_retry_s=0)
+    (Path(P.cfg["calib"]["harbor_root"]) / "launch.sh").write_text("#!/bin/bash\nexit 2\n")
+    P.run()
+    for _ in range(P.cfg["calib"]["infra_retries"] + 2):
+        watch_tick(P)
+    st = P.store.item(iid).state
+    assert st["status"] == "parked" and st["reason"] == "parked:infra", st
+
+
+def test_job_with_harbor_config_is_never_a_relay_refusal(tmp_path):
+    """Codex r1: a job whose Harbor config.json exists may have run; a refusal-looking launcher log does not make
+    it a free retry."""
+    P, [iid], counter, jobs = _env(tmp_path)
+    P.run()
+    r = _runs(P, iid)[0]
+    (jobs / r["job_name"]).mkdir(parents=True, exist_ok=True)
+    (jobs / r["job_name"] / "config.json").write_text("{}")
+    Path(r["log"]).write_text("relay preflight http=400\nJ: harbor exit 3\n")
+    Path(r["log"] + ".exit").write_text("3")
+    assert not calib.relay_preflight_refused(_runs(P, iid)[0])
+
+
+def test_relay_waiting_items_take_no_scheduling_step(tmp_path):
+    """Codex r1: an S9 item waiting out a relay refusal is not rewoken by run/watch (it would use up max_steps)."""
+    from tbsgen.stages_b import reschedulable
+    P, [iid], counter, jobs = _env(tmp_path, preflight_retry_s=3600)
+    _refusing_launcher(P)
+    P.run()
+    watch_tick(P)
+    it = P.store.item(iid)
+    assert it.state["reason"].startswith("relay_down") and not reschedulable(P.cfg, it)
+
+
+def test_refused_s9_reservation_is_settled_relay_refused(tmp_path):
+    P, [iid], counter, jobs = _env(tmp_path, preflight_retry_s=3600)
+    _refusing_launcher(P)
+    P.run()
+    watch_tick(P)
+    r = _runs(P, iid)[0]
+    assert r["cost_kind"] == "relay_refused"
+    with P.ledger._db() as db:
+        assert db.execute("SELECT cost_kind, usd FROM calls WHERE id=?", (r["ledger_call"],)).fetchone() == \
+            ("relay_refused", 0.0)
