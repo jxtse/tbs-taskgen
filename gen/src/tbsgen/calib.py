@@ -495,6 +495,8 @@ def relay_preflight_refused(rec: dict) -> bool:
     log = Path(str(rec.get("log", "")))
     if not rec.get("job_name") or not log.name.startswith(str(rec["job_name"])) or not log.exists():
         return False
+    if rec.get("job_dir") and (Path(rec["job_dir"]) / "config.json").exists():
+        return False                    # Harbor created the job: it may have run, whatever the launcher log says
     try:
         code = Path(str(log) + ".exit").read_text().strip()
         text = log.read_text(errors="replace")

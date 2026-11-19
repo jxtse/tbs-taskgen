@@ -817,6 +817,8 @@ def reschedulable(cfg: dict, it) -> bool:
             not cfg["calib"].get("allow_submit"):
         return False
     runs = read_json(it.p("calib", "runs.json") if it.state["stage"] == "S9" else it.p("review", "runs.json"), [])
+    if runs and calib.preflight_wait(cfg, runs[-1]):
+        return False        # the relay refused its last run: nothing to do until calib.preflight_retry_s has passed
     return not any(r.get("outcome") is None and r.get("state", "launched") == "launched" for r in runs)
 
 

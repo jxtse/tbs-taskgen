@@ -824,3 +824,27 @@ def test_other_launcher_failures_still_park_infra(tmp_path):
         watch_tick(P)
     st = P.store.item(iid).state
     assert st["status"] == "parked" and st["reason"] == "parked:infra", st
+
+
+def test_job_with_harbor_config_is_never_a_relay_refusal(tmp_path):
+    """Codex r1: a job whose Harbor config.json exists may have run; a refusal-looking launcher log does not make
+    it a free retry."""
+    P, [iid], counter, jobs = _env(tmp_path)
+    P.run()
+    r = _runs(P, iid)[0]
+    (jobs / r["job_name"]).mkdir(parents=True, exist_ok=True)
+    (jobs / r["job_name"] / "config.json").write_text("{}")
+    Path(r["log"]).write_text("relay preflight http=400\nJ: harbor exit 3\n")
+    Path(r["log"] + ".exit").write_text("3")
+    assert not calib.relay_preflight_refused(_runs(P, iid)[0])
+
+
+def test_relay_waiting_items_take_no_scheduling_step(tmp_path):
+    """Codex r1: an S9 item waiting out a relay refusal is not rewoken by run/watch (it would use up max_steps)."""
+    from tbsgen.stages_b import reschedulable
+    P, [iid], counter, jobs = _env(tmp_path, preflight_retry_s=3600)
+    _refusing_launcher(P)
+    P.run()
+    watch_tick(P)
+    it = P.store.item(iid)
+    assert it.state["reason"].startswith("relay_down") and not reschedulable(P.cfg, it)

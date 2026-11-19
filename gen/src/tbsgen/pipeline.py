@@ -269,9 +269,10 @@ class Pipeline:
                 return True
             if B.harden_needs_step(it):         # an interrupted hardening transaction (any status)
                 return it.item_id not in polled
-            # code-grounded agent job (S4c / S5G) running on the build host: poll it once per run
+            # code-grounded agent job (S4c / S5G) running on the build host: poll it once per run (not while it
+            # waits out a relay refusal: calib.preflight_retry_s)
             if it.state["status"] == "waiting" and it.state["stage"] in AGENT_STAGES:
-                return it.item_id not in polled
+                return it.item_id not in polled and not A.relay_waiting(self.cfg, it)
             # S9 waiting with nothing running (prepared while allow_submit was off, or blocked): once per run
             return it.item_id not in rewoken and B.reschedulable(self.cfg, it)
 

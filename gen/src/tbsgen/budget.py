@@ -166,13 +166,16 @@ class Ledger:
                 if cap_s is not None and spent("AND stage=?", stage) + est > float(cap_s) + 1e-12:
                     raise BudgetStop("daily_stage", f"{stage} {cap_s} USD")
             cap_r = (b.get("run_calls_per_model") or {}).get(model)
+            # call-count caps count calls that were made: a reservation settled as not_launched (the job never
+            # started, e.g. the model relay refused its preflight) is no call
+            made = "AND COALESCE(cost_kind,'') != 'not_launched'"
             if cap_r is not None:
-                n = db.execute("SELECT count(*) FROM calls WHERE model=? AND real=1", (model,)).fetchone()[0]
+                n = db.execute(f"SELECT count(*) FROM calls WHERE model=? AND real=1 {made}", (model,)).fetchone()[0]
                 if n >= int(cap_r):
                     raise BudgetStop("run_calls", f"{model} {cap_r} calls")
             cap_c = (b.get("daily_calls_per_model") or {}).get(model)
             if cap_c is not None:
-                n = db.execute("SELECT count(*) FROM calls WHERE day=? AND model=?", (day, model)).fetchone()[0]
+                n = db.execute(f"SELECT count(*) FROM calls WHERE day=? AND model=? {made}", (day, model)).fetchone()[0]
                 if n >= int(cap_c):
                     raise BudgetStop("daily_calls", f"{model} {cap_c} calls")
             cap_u, cap_h = b.get("item_usd_cap"), b.get("item_harden_usd_cap")
@@ -207,7 +210,7 @@ class Ledger:
             # use up an item's authoring budget
             if cap_i is not None and item and stage not in ("S9", "S2", "S4", "S3b", "S4c", "S5G"):
                 n = db.execute("SELECT count(*) FROM calls WHERE item=? AND stage NOT IN "
-                               "('S9','S2','S4','S3b','S4c','S5G')",
+                               f"('S9','S2','S4','S3b','S4c','S5G') {made}",
                                (item,)).fetchone()[0]
                 if n >= int(cap_i):
                     raise BudgetStop("item_calls", f"{item} {cap_i} calls")

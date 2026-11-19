@@ -539,6 +539,10 @@ def _agent_stage(P, it, kind: str, instruction: str, need: list[str], timeout_s:
     if rec is not None and rec.get("state") == "launch_failed":
         rec["retry"] = True                     # infrastructure: a resumed item launches a fresh job
         rec["state"] = "finished"
+        if rec.get("not_started"):
+            _record_nostart(it, kind, rec.get("job_name"))     # tmux never started it: no job of the paper ran
+    if rec is not None and rec.get("state") == "finished" and rec.get("retry"):
+        _account_refusal(P, it, kind, rec)      # idempotent: completes a refusal's accounting cut short by a crash
     if rec is None or (rec.get("state") == "finished" and rec.get("retry")):
         from .calib import preflight_wait
         wait = preflight_wait(P.cfg, rec)
@@ -652,25 +656,70 @@ def _agent_stage(P, it, kind: str, instruction: str, need: list[str], timeout_s:
             if it.state.get("status") != "waiting":
                 it.finish("waiting", f"{kind}:agent_running", job=(rec or {}).get("job_name"))
             return None
-        if _failed_before_harbor(rec) and not rec.get("preflight_refused"):
-            # the model relay refused the preflight: nothing ran.  Not an infra failure of the paper (no
-            # <kind>:infra retry, no authoring_max_jobs job, no daily admission): wait calib.preflight_retry_s,
-            # then launch a fresh job (the flag is persisted first, so a crash never counts it twice)
-            with _agent_slot_lock(P):
-                rec.update(preflight_refused=True, refused_ts=time.time(), retry=True, not_started=True)
-                write_json(recp, rec)
-                it.bump(f"{kind}:refused")
-                if _jobs_used(it, kind) <= 0:
-                    _withdraw_admission(P, it, kind)
-            P.store.event("relay_preflight_refused", item=it.item_id, stage=kind, job=rec.get("job_name"))
-            from .calib import preflight_wait
-            it.finish("waiting", preflight_wait(P.cfg, rec) or "relay_down: preflight refused",
-                      job=rec.get("job_name"))
-            return None
+    if rec is not None and _account_refusal(P, it, kind, rec):
+        from .calib import preflight_wait
+        it.finish("waiting", preflight_wait(P.cfg, rec) or "relay_down: preflight refused", job=rec.get("job_name"))
+        return None
     return rec
 
 
+def relay_waiting(cfg: dict, it) -> bool:
+    """A waiting S4c / S5G item whose last job the relay refused less than calib.preflight_retry_s ago: there is
+    nothing to poll (pipeline.run skips it so it never takes a scheduling step)."""
+    from .calib import preflight_wait
+    st = it.state.get("stage")
+    if st not in ("S4c", "S5G") or not str(it.state.get("reason") or "").startswith("relay_down"):
+        return False
+    return bool(preflight_wait(cfg, read_json(it.p(st, "run.json"), None)))
+
+
+def _nostart(it, kind: str) -> list[str]:
+    """Jobs of this stage that are known never to have started (relay preflight refused / tmux failed)."""
+    return list(((it.state.get("agent_nostart") or {}).get(kind)) or [])
+
+
+def _record_nostart(it, kind: str, job: str | None) -> None:
+    if job and job not in _nostart(it, kind):
+        it.state.setdefault("agent_nostart", {}).setdefault(kind, []).append(job)
+        it.save()
+
+
+def _account_refusal(P, it, kind: str, rec: dict) -> bool:
+    """A finished job of `kind` that the model relay refused at its preflight (explicit evidence in its own
+    launcher log, no Harbor job): nothing ran, so it is not an infra failure of the paper -- no <kind>:infra retry,
+    no authoring_max_jobs job, no daily admission while none of the paper's jobs started, 0 USD / 0 s.  Every step
+    is idempotent and the whole accounting is re-checked on each call, so a crash (or another process) between any
+    two steps is completed by the next step instead of being counted as an infra failure.  True = refused (the
+    caller waits calib.preflight_retry_s; the next launch is a fresh job)."""
+    if rec.get("state") != "finished" or not _failed_before_harbor(rec):
+        return False
+    job = rec.get("job_name")
+    with _agent_slot_lock(P):
+        if not rec.get("preflight_refused"):
+            rec.update(preflight_refused=True, refused_ts=time.time(), retry=True, not_started=True)
+            write_json(it.p(kind, "run.json"), rec)
+        jobs = int((it.state.get("attempts") or {}).get(f"{kind}:job", 0))
+        if jobs - len(set(_nostart(it, kind)) | {job}) <= 0:
+            _withdraw_admission(P, it, kind)        # no job of this paper started: give the daily slot back
+        first = job not in _nostart(it, kind)
+        _record_nostart(it, kind, job)               # last: a crash before it redoes the (idempotent) steps above
+    if first:
+        P.store.event("relay_preflight_refused", item=it.item_id, stage=kind, job=job)
+    return True
+
+
 def s4c(P, it):
+    """Serialised per item like s5g: two processes stepping the same paper (run + a second run / watch) never poll,
+    account and relaunch its job at the same time."""
+    from .stages_b import item_lock
+    with item_lock(it):
+        it.load()
+        if it.state.get("stage") != "S4c" or it.state.get("status") not in ("active", "waiting"):
+            return None
+        return _s4c(P, it)
+
+
+def _s4c(P, it):
     """Runnability gate: a Claude Code agent installs and runs the authors' code once on the build host."""
     from . import codeagent
     from .prompts_code import S4C_RUNNABILITY
@@ -912,10 +961,9 @@ def _failed_before_harbor(rec: dict) -> bool:
 
 
 def _jobs_used(it, kind: str) -> int:
-    """Jobs of this stage that count against code.authoring_max_jobs: every job number handed out except those the
-    model relay refused at its preflight (they ran nothing)."""
-    a = it.state.get("attempts") or {}
-    return int(a.get(f"{kind}:job", 0)) - int(a.get(f"{kind}:refused", 0))
+    """Jobs of this stage that count against code.authoring_max_jobs: every job number handed out except those
+    known never to have started (relay preflight refused, tmux failed)."""
+    return int((it.state.get("attempts") or {}).get(f"{kind}:job", 0)) - len(set(_nostart(it, kind)))
 
 
 def _admissions_path(P, kind: str) -> Path:

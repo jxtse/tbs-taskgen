@@ -261,7 +261,7 @@ def test_relay_refusals_never_drop_a_paper_or_use_its_quota(tmp_path, monkeypatc
     st = P.store.item(it.item_id).state
     assert st["status"] == "waiting" and st["reason"].startswith("relay_down"), st
     a = st["attempts"]
-    assert a.get(f"{kind}:infra", 0) == 0 and a[f"{kind}:job"] == a[f"{kind}:refused"] == 5
+    assert a.get(f"{kind}:infra", 0) == 0 and a[f"{kind}:job"] == len(st["agent_nostart"][kind]) == 5
     spent = read_json(it.p(kind, "spent.json"))
     assert all(c == dict(usd=0.0, sec=0.0) for c in spent.values()) and len(spent) == 4
     P.run(max_steps=1, until=kind)                  # relay back: a real job is launched ...
@@ -289,8 +289,9 @@ def test_relay_refusal_keeps_its_paper_out_of_a_full_day(tmp_path, monkeypatch):
 
 
 def test_non_preflight_launcher_failure_still_uses_infra_retries(tmp_path, monkeypatch):
-    """Only the explicit relay refusal is exempt: a launcher that failed otherwise (no preflight line) still uses
-    the S4c infra retries and drops the paper after them, as before."""
+    """Only the explicit relay refusal is exempt: a launcher that failed otherwise (no preflight line) is still an
+    infra failure, charged conservatively (PR #37), and the paper is dropped as before (by the infra retries or the
+    exhausted allowance, whichever comes first) -- never parked in relay_down."""
     P, it, fl = _agent_item(tmp_path, monkeypatch, _files(design=None), stage="S4c")
     import subprocess as sp
     from tbsgen import codeagent
@@ -303,4 +304,73 @@ def test_non_preflight_launcher_failure_still_uses_infra_retries(tmp_path, monke
         monkeypatch.setattr(codeagent.subprocess, "run", fl)
         P.run(max_steps=1, until="S4c")
     st = P.store.item(it.item_id).state
-    assert st["status"] == "dropped" and st["reason"] == "code_runnability_agent_failed", st
+    assert st["status"] == "dropped" and st["reason"] in ("code_runnability_agent_failed", "s4c_budget_exhausted"), st
+    assert not st.get("agent_nostart")
+
+
+def test_relay_refusal_accounting_survives_a_crash_mid_way(tmp_path, monkeypatch):
+    """Codex r1: a crash after poll_agent wrote finished/launcher_failed, or after preflight_refused was persisted
+    but before the admission was withdrawn, must be completed on resume -- never counted as an infra failure."""
+    import subprocess as sp
+    from tbsgen import codeagent, stages_a
+    P, it, fl = _agent_item(tmp_path, monkeypatch, _S4C_OK, stage="S4c")
+    P.cfg["code"]["daily_new_runnability"] = 1
+    P.cfg["calib"]["preflight_retry_s"] = 3600
+    monkeypatch.setattr(codeagent.subprocess, "run", lambda args, **kw: sp.CompletedProcess(args, 0, "", ""))
+    P.run(max_steps=1, until="S4c")
+    rec = read_json(it.p("S4c", "run.json"))
+    Path(rec["log"]).write_text(REFUSED)
+    Path(rec["log"] + ".exit").write_text("3")
+    # crash right after poll_agent persisted the finished record (before any refusal accounting)
+    real = stages_a._account_refusal
+    monkeypatch.setattr(stages_a, "_account_refusal", lambda *a, **k: (_ for _ in ()).throw(SystemExit("crash")))
+    with pytest.raises(SystemExit):
+        P.run(max_steps=1, until="S4c")
+    assert read_json(it.p("S4c", "run.json"))["state"] == "finished"
+    monkeypatch.setattr(stages_a, "_account_refusal", real)
+    it2 = P.store.item(it.item_id)
+    it2.state["status"] = "active"                  # what the driver sees after the crash: the item is stepped again
+    it2.save()
+    monkeypatch.setattr(codeagent.subprocess, "run", fl)
+    P.run(max_steps=1, until="S4c")
+    st = P.store.item(it.item_id).state
+    assert st["status"] == "waiting" and st["reason"].startswith("relay_down"), st
+    assert st["attempts"].get("S4c:infra", 0) == 0 and not fl.calls
+    assert not (P.store.root / "s4c-admissions.jsonl").read_text().strip()
+
+
+def test_tmux_failure_then_refusal_gives_the_daily_slot_back(tmp_path, monkeypatch):
+    """Codex r1: a first job tmux never started (not_started) and a second one the relay refused: no job of the
+    paper ran, so it holds no daily admission."""
+    import subprocess as sp
+    from tbsgen import codeagent
+    P, it, fl = _agent_item(tmp_path, monkeypatch, _S4C_OK, stage="S4c")
+    P.cfg["code"]["daily_new_runnability"] = 1
+    P.cfg["calib"]["preflight_retry_s"] = 3600
+    monkeypatch.setattr(codeagent.subprocess, "run", lambda args, **kw: sp.CompletedProcess(args, 1, "", "no server"))
+    P.run(max_steps=1, until="S4c")
+    assert read_json(it.p("S4c", "run.json"))["state"] == "launch_failed"
+    from tbsgen.cli import main
+    it2 = P.store.item(it.item_id)
+    it2.state.update(status="active")
+    it2.save()
+    _refuse_once(P, it, monkeypatch, fl, "S4c")
+    st = P.store.item(it.item_id).state
+    assert st["reason"].startswith("relay_down") and len(st["agent_nostart"]["S4c"]) == 2, st
+    assert not (P.store.root / "s4c-admissions.jsonl").read_text().strip()
+
+
+def test_refused_reservations_do_not_use_up_call_caps(tmp_path):
+    """Codex r1: refused (not_launched) reservations are no calls: run_calls_per_model / daily_calls_per_model /
+    max_calls_per_item do not count them."""
+    from tbsgen.budget import BudgetStop, Ledger
+    from tbsgen.config import load_config
+    cfg = load_config(None, {"budget": {"run_calls_per_model": {"m": 1}, "daily_calls_per_model": {"m": 1},
+                                        "max_calls_per_item": 1, "daily_usd_total": 100.0}})
+    L = Ledger(tmp_path / "l.sqlite", cfg)
+    c = L.reserve("m", "S9R", "i", True, est_usd=1.0)
+    L.settle(c, 0.0, status="error", kind="not_launched", note="relay preflight refused")
+    c2 = L.reserve("m", "S9R", "i", True, est_usd=1.0)          # not blocked by the refused one
+    L.settle(c2, 1.0)
+    with pytest.raises(BudgetStop):
+        L.reserve("m", "S9R", "i", True, est_usd=1.0)            # a real call does count
