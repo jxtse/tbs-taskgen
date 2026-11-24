@@ -426,3 +426,20 @@ def test_pi_incomplete_fragment_group_keeps_previous_end():
     records, _, notes = pi(events, {"profile": toy_profile()}, {})
     assert render(records[0], {})["messages"][-1]["content"] == "Blue."
     assert notes["last_complete_event"] == 2
+
+
+@pytest.mark.parametrize("stop", ["length", "aborted", "error", "interrupted"])
+@pytest.mark.parametrize("interleaved_user", [False, True])
+def test_pi_truncated_final_fragment(stop, interleaved_user):
+    events = pi_events()
+    events.append(dict(type="message", message=dict(role="assistant", content=[block("First fragment.")],
+                                                    responseId="partial", stopReason="stop")))
+    if interleaved_user:
+        events.append(dict(type="message", message=dict(role="user", content="More tile data.")))
+    events.append(dict(type="message", message=dict(role="assistant", content=[block("Unfinished")],
+                                                    responseId="partial", stopReason=stop)))
+    records, _, notes = pi(events, {}, {})
+    row = render(records[0], {})
+    assert [m["content"] for m, loss in zip(row["messages"], row["loss_mask"]) if loss] == [
+        "The synthetic slope is one."]
+    assert notes["last_complete_event"] == 4

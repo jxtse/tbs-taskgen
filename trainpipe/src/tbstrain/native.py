@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 import re
 
-from .claude_wire import Session, is_boundary
+from .claude_wire import IMAGE_TYPES, Session, has_image, is_boundary
 from .profile import ProfileError, required_profile, system_text
 from .core import lines, loads, read
 from .vendor.roller import compaction
@@ -14,9 +14,6 @@ from .vendor.roller.actf import append_user_content
 from .vendor.roller.blobs import load_blobs
 from .vendor.roller.codex_actf import codex_events_to_actf, native_response_id, session_tools
 from .vendor.roller.sft import actf_to_sft, validate_sft_record
-
-
-IMAGE_TYPES = {"image", "image_url", "input_image"}
 
 
 def string_content(value):
@@ -35,15 +32,6 @@ def string_content(value):
         else:
             raise ValueError("unsupported_content_block")
     return "\n".join(parts)
-
-
-def has_image(content):
-    return isinstance(content, list) and any(
-        isinstance(b, dict) and (
-            b.get("type") in IMAGE_TYPES or (b.get("type") == "tool_result" and has_image(b.get("content")))
-        )
-        for b in content
-    )
 
 
 def omit_image_bytes(content):
@@ -175,12 +163,12 @@ def claude(events, cfg, trial):
                 raise ValueError("incomplete_assistant_response")
         messages = [message("system", system_text(profile["system"]))]
         skip_results = set()
-        state = session.state(end, historical)
-        validate_pairs(state)
+        turns = session.turns(end, historical)
+        validate_pairs(turns.messages)
         saw_image = False
-        for m in state:
+        for m in turns.messages:
             content = m["content"]
-            saw_image |= has_image(content)
+            saw_image |= has_image(content) or bool(m.get("image_context"))
             # The managed trainer supervises every assistant. Remove replay and its paired
             # results only for this target. Mask-aware targets keep the entire wire state.
             if cfg.get("train_on_what") == "all_assistant_messages":
@@ -223,7 +211,9 @@ def claude(events, cfg, trial):
                 models.append(model)
                 row.update(compaction=True, summary_model=model, summary_model_source=source)
                 answer = message("assistant", target)
-                if saw_image:
+                if rid := summary.get("requestId") or summary["message"].get("request_id"):
+                    answer["response_id"] = rid
+                if saw_image or turns.saw_image or has_image(summary["message"]["content"]):
                     answer["image_context"] = True
                 messages.extend([message("user", instruction), answer])
         rows.append(row)
@@ -300,7 +290,7 @@ def pi(events, cfg, trial):
     previous_id = None
     active_response = None
     active_message = None
-    preceding_end = None
+    end_before_response = {}
     pending = set()
     hinted = False
     for index, e in enumerate(events):
@@ -350,23 +340,26 @@ def pi(events, cfg, trial):
         elif pending and not continuation:
             raise ValueError("unanswered_tool_call")
         if role == "assistant":
-            pending.update(b["id"] for b in blocks if b["type"] == "toolCall")
+            if response_id:
+                # A later fragment can revoke completion of the entire response.
+                end = end_before_response.setdefault(response_id, end)
             models.append(m.get("model") or request_model)
-            if m.get("stopReason") in {"aborted", "error", "length"}:
+            if m.get("stopReason") not in (None, "stop", "toolUse"):
                 if any(
                     (r.get("message") or r.get("event", {}).get("message") or {}).get("role") == "assistant"
                     for r in events[index + 1 :]
                 ):
                     raise ValueError("pi_interior_incomplete_turn")
+                # Any outstanding calls belong to the discarded final response.
+                pending.clear()
                 break
+            pending.update(b["id"] for b in blocks if b["type"] == "toolCall")
         elif role not in {"toolResult", "user"}:
             raise ValueError("pi_unsupported_role")
         if continuation:
-            end = preceding_end
             active_message["content"].extend(blocks)
         else:
             if role == "assistant":
-                preceding_end = end
                 active_response = response_id
                 active_message = m = {**m, "content": list(blocks), "response_id": response_id}
             elif role == "user":

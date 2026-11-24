@@ -272,13 +272,18 @@ def source_check(source, row, images="drop_row"):
     # that agree on the same split would otherwise pass the replay check.
     owners = {}
     response_ids = set()
+    missing_id = False
     for m in segment["messages"]:
+        if m["role"] != "assistant":
+            continue
         rid = m.get("response_id")
-        if m["role"] == "assistant" and rid:
-            if rid in response_ids:
-                return ["split_native_response"]
-            response_ids.add(rid)
-            owners.update((b["id"], rid) for b in m["content"] if b["type"] == "tool_use")
+        if not isinstance(rid, str) or not rid.strip():
+            missing_id = True
+            continue
+        if rid in response_ids:
+            return ["split_native_response"]
+        response_ids.add(rid)
+        owners.update((b["id"], rid) for b in m["content"] if b["type"] == "tool_use")
     seen = set()
     for m in row["messages"]:
         ids = {owners[c["id"]] for c in m.get("tool_calls", []) if c["id"] in owners}
@@ -305,7 +310,7 @@ def source_check(source, row, images="drop_row"):
                 for v in row["messages"]
             ):
                 return ["provenance"]
-    return []
+    return ["unverifiable_response_boundaries"] if missing_id else []
 
 
 def reference_shape(row, reference):

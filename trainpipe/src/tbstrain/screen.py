@@ -82,7 +82,8 @@ def _subcommands(command):
             tokens.extend(list(lexer))
         except ValueError:          # unbalanced quote in this line: plain split
             tokens.extend(line.split())
-        tokens.append(";")
+        if not tokens or tokens[-1] not in ("&&", "||", "|", "|&"):
+            tokens.append(";")
     for tok in tokens:
         if tok == "\n" or (tok and set(tok) <= set(";&|()\n")):
             for op in re.findall(r"&&|\|\||\|&|[;&|()]", tok):
@@ -136,7 +137,8 @@ def _commands_with_cwd(command, base):
         elif op == "&&":
             states, skipped_failure = success, failure
         else:
-            states = success
+            # A sequence resumes after either exit status, including short circuits.
+            states = success | failure
         if op == "(":
             scopes.append(states)
         elif op == ")" and scopes:
@@ -180,9 +182,10 @@ def shell_probe(command, task_dirs, cwd=None):
         # Absolute and inline paths have the same meaning under every candidate cwd.
         if any(HIDDEN.search(arg) for arg in argv) or _probe_at(argv, None, task_dirs):
             return True
-        if any(_probe_at(argv, base, task_dirs) for base in bases):
-            if not conditional and len(bases) == 1:
-                return True
+        readings = {_probe_at(argv, base, task_dirs) for base in bases}
+        if readings == {True}:
+            return True
+        if True in readings:
             result = None
     return result
 

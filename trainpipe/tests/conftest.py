@@ -58,7 +58,7 @@ def claude_events():
             "subtype": "compact_boundary",
             "compactMetadata": {"preservedMessages": {"allUuids": ["old"]}},
         },
-        cc_message("user", "Summary:\nTwo samples are available.", isCompactSummary=True),
+        cc_message("user", "Summary:\nTwo samples are available.", isCompactSummary=True, requestId="summary"),
         cc_message("assistant", [block("Replay should disappear.")], uuid="old", isSidechain=True),
         cc_message(
             "assistant",
@@ -75,6 +75,8 @@ def claude_events():
     boundary.update(logicalParentUuid=events[4]["uuid"], parentUuid=None)
     boundary["compactMetadata"] = {"preservedMessages": {"anchorUuid": events[6]["uuid"]}}
     events[8]["parentUuid"] = events[6]["uuid"]
+    events[8]["message"]["id"] = "query-response"
+    events[10]["message"]["id"] = "answer-response"
     return events
 
 
@@ -86,12 +88,13 @@ def codex_events():
         {"type": "session_meta", "payload": {"base_instructions": {"text": "Use the synthetic samples."}}},
         {"type": "turn_context", "payload": {"model": "student-model", "tools": [toy_tool()]}},
         item("message", role="user", content=[{"type": "input_text", "text": "Estimate a synthetic slope."}]),
-        item("function_call", name="sample", call_id="a", arguments='{"n":2}'),
+        item("function_call", name="sample", call_id="a", arguments='{"n":2}', response_id="measure"),
         {"type": "event_msg", "payload": {"type": "token_count"}},
         item("function_call_output", call_id="a", output="2"),
         item(
             "message",
             role="assistant",
+            response_id="answer",
             content=[{"type": "output_text", "text": "The synthetic slope is one."}],
         ),
         {"type": "event_msg", "payload": {"type": "token_count"}},
@@ -118,7 +121,8 @@ def pi_events():
                 "messages": [{"role": "system", "content": "Use the samples."}],
             },
         },
-        event("assistant", [block("The synthetic slope is one.")], stopReason="stop", model="student-model"),
+        event("assistant", [block("The synthetic slope is one.")], stopReason="stop", model="student-model",
+              responseId="answer"),
         {"type": "turn_end", "turn": 1},
         {"type": "turn_start", "turn": 2},
         event("user", "An unfinished follow-up."),

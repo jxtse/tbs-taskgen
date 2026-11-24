@@ -72,7 +72,7 @@ def export(ctx):
     return ctx.stage("export", [ctx.dependency("select"), file_hash(path), cfg, digest(profiles)], build)
 
 
-def validate(ctx, file, allow_masked=False, reference=None):
+def validate(ctx, file, allow_masked=False, reference=None, *, allow_legacy_provenance=False):
     cfg = ctx.cfg["export"]
     target, images = export_modes(cfg)
     tokenizer = ctx.path(cfg["tokenizer"])
@@ -84,7 +84,7 @@ def validate(ctx, file, allow_masked=False, reference=None):
 
     def build():
         token_counter = Counter(tokenizer)
-        failed = count = masked_assistants = max_tokens = 0
+        failed = warned = count = masked_assistants = max_tokens = 0
         required_fields = {"messages", "role", "content"}
         with (
             file.open("rb") as stream,
@@ -94,6 +94,7 @@ def validate(ctx, file, allow_masked=False, reference=None):
             try:
                 for count, (raw, src) in enumerate(zip_longest(stream, source_stream or ()), 1):
                     errors = []
+                    warnings = []
                     n = None
                     try:
                         row = loads(raw.decode("utf-8")) if raw is not None else None
@@ -121,18 +122,19 @@ def validate(ctx, file, allow_masked=False, reference=None):
                         if src is None:
                             errors.append("source_missing")
                         elif not errors:
-                            errors.extend(source_check(loads(src.decode("utf-8")), row, images))
+                            issues = source_check(loads(src.decode("utf-8")), row, images)
+                            if allow_legacy_provenance and issues == ["unverifiable_response_boundaries"]:
+                                warnings = issues
+                            else:
+                                errors.extend(issues)
                     except UnicodeDecodeError:
                         errors.append("utf8")
                     except (ValueError, TypeError, KeyError, AttributeError, IndexError) as exc:
                         errors.append("invalid_record: " + str(exc))
                     failed += bool(errors)
-                    ledger.write(
-                        dumps(
-                            dict(row=count, tokens=n, errors=errors, reason="rejected" if errors else "valid")
-                        )
-                        + "\n"
-                    )
+                    warned += bool(warnings)
+                    reason = "rejected" if errors else "warning" if warnings else "valid"
+                    ledger.write(dumps(dict(row=count, tokens=n, errors=errors, warnings=warnings, reason=reason)) + "\n")
                 if not count:
                     failed = 1
                     ledger.write(dumps(dict(row=0, errors=["empty_dataset"], reason="rejected")) + "\n")
@@ -143,7 +145,7 @@ def validate(ctx, file, allow_masked=False, reference=None):
             required_fields.add("loss_mask")
         return {
             "required_fields": sorted(required_fields),
-            "count": count, "failed": failed, "valid": not failed,
+            "count": count, "failed": failed, "warned": warned, "valid": not failed,
             "max_tokens": max_tokens, "masked_assistants": masked_assistants,
         }
 
@@ -156,6 +158,7 @@ def validate(ctx, file, allow_masked=False, reference=None):
             file_hash(tokenizer),
             cfg,
             allow_masked,
+            allow_legacy_provenance,
             file_hash(reference) if reference else None,
         ],
         build,

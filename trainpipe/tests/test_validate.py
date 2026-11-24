@@ -109,6 +109,8 @@ def test_max_length_source_and_cli_override(workspace):
         ]
     )
     src["messages"][1]["loss"] = 0
+    src["messages"][1]["response_id"] = "history"
+    src["messages"][3]["response_id"] = "answer"
     path = workspace.parent / "custom.jsonl"
     source = path.with_suffix(".sources.jsonl")
     source.write_text(dumps({"meta": {}, "segment": src}) + "\n")
@@ -135,6 +137,30 @@ def test_validate_missing_provenance(workspace, sample):
     path.write_text(dumps(sample) + "\n")
     assert main(["validate", str(path), "--config", str(workspace)]) == 1
     assert "source_missing" in next(lines(workspace.parent / "out/validate.ledger.jsonl"))["errors"]
+
+
+@pytest.mark.parametrize("partial", [False, True])
+def test_validate_legacy_response_boundaries(workspace, partial):
+    src = segment([message("system", "Instructions"), message("assistant", "First answer"),
+                   message("user", "Next tile"), message("assistant", "Second answer")])
+    if partial:
+        src["messages"][1]["response_id"] = "first"
+    row = render(src, {})
+    path = workspace.parent / "legacy.jsonl"
+    path.write_text(dumps(row) + "\n")
+    path.with_suffix(".sources.jsonl").write_text(dumps(dict(meta={}, segment=src)) + "\n")
+    args = ["validate", str(path), "--config", str(workspace)]
+    ledger = workspace.parent / "out/validate.ledger.jsonl"
+    assert main(args) == 1
+    assert next(lines(ledger))["errors"] == ["unverifiable_response_boundaries"]
+    args.append("--allow-legacy-provenance")
+    assert main(args) == 0
+    entry = next(lines(ledger))
+    assert entry["reason"] == "warning" and entry["warnings"] == ["unverifiable_response_boundaries"]
+    row["messages"][-1]["content"] = "Different answer"
+    path.write_text(dumps(row) + "\n")
+    assert main(args) == 1
+    assert next(lines(ledger))["errors"] == ["provenance"]
 
 
 def test_validate_split_native_response(workspace):

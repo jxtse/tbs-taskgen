@@ -181,7 +181,8 @@ def test_default_selection_uses_easy_cap(workspace, judge_stub):
 
 
 @pytest.mark.parametrize("mode", ["drop_row", "drop_trajectory", "mask_after"])
-def test_export_image_policy(workspace, judge_stub, mode):
+@pytest.mark.parametrize("origin", ["tool", "attachment", "nested_attachment"])
+def test_export_image_policy(workspace, judge_stub, mode, origin):
     from conftest import block, cc_message, claude_events
 
     # Keep the other tiers selectable even if this trajectory is entirely dropped.
@@ -191,11 +192,18 @@ def test_export_image_policy(workspace, judge_stub, mode):
     workspace.write_text(config)
     path = next((workspace.parent / "run/calib-jobs/hard-0").rglob("tiny.jsonl"))
     events = claude_events()
-    events[3]["message"]["content"][0]["content"] = [block("tile"), {"type": "image", "data": "toy-bytes"}]
+    image = {"type": "image", "data": "toy-bytes"}
+    if origin == "tool":
+        events[3]["message"]["content"][0]["content"] = [block("tile"), image]
+    elif origin == "attachment":
+        events[4]["rendered"] = [dict(content=[block("tile"), image])]
+    else:
+        del events[4]["rendered"]
+        events[4]["attachment"] = dict(rendered=[dict(content=[dict(type="tool_result", content=[image])])])
     follow = cc_message("assistant", [block("Describe the tile.")], uuid="after-image",
-                        parentUuid=events[3]["uuid"], version="1")
-    events[4]["parentUuid"] = follow["uuid"]
-    events.insert(4, follow)
+                        parentUuid=events[4]["uuid"], version="1", requestId="describe")
+    events[5]["logicalParentUuid"] = follow["uuid"]
+    events.insert(5, follow)
     write_lines(path, events)
 
     assert main(["run", "--config", str(workspace)], transport=judge_stub) == 0

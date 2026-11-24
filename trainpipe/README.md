@@ -56,6 +56,8 @@ Codex 从 session_meta 和 turn_context 读取 instructions、base_instructions 
 
 `validate --reference` 接受一个 JSON 行对象，检查顶层字段及类型，并按角色比较允许的消息字段与类型。参考行应覆盖待检查的角色和可选字段。普通验证和来源核验仍会执行。
 
+来源中有 assistant 回合缺少原生响应 ID 时，`validate` 默认以 `unverifiable_response_boundaries` 拒绝该行。`--allow-legacy-provenance` 将此项降为逐行警告，其余验证仍须通过。
+
 ## 平台格式
 
 - 一行包含 `messages`、OpenAI function 形式的 `tools`、`loss_mask` 和 `meta`。裁尾前按调用顺序核对每个工具结果的 ID。并行结果须与发起调用的顺序一致。行首为系统提示。末尾截到最后一个有内容、推理或工具调用的 assistant，裁去的平台消息条数写入 `meta.render_notes.dropped_tail`。

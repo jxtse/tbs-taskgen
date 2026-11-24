@@ -4,6 +4,16 @@ from collections import defaultdict
 from copy import deepcopy
 
 
+IMAGE_TYPES = {"image", "image_url", "input_image"}
+
+
+def has_image(content):
+    return isinstance(content, list) and any(
+        isinstance(b, dict) and (b.get("type") in IMAGE_TYPES or has_image(b.get("content")))
+        for b in content
+    )
+
+
 def is_boundary(event):
     return event["type"] == "system" and event.get("subtype") == "compact_boundary"
 
@@ -12,8 +22,8 @@ def text_block(text):
     return {"type": "text", "text": text}
 
 
-def attachment_parts(record):
-    for item in record.get("rendered") or []:
+def attachment_parts(rendered):
+    for item in rendered:
         value = item.get("content")
         if isinstance(value, str) and value.strip():
             yield value
@@ -63,6 +73,7 @@ class Turns:
         self.compacted = compacted
         self.from_string = None
         self.early_attributions = []
+        self.saw_image = False
 
     def flush(self):
         if self.pending:
@@ -106,8 +117,13 @@ class Turns:
     def feed(self, record, preserved=False, historical=False):
         role = record["type"]
         if role == "attachment":
-            kind = record.get("attachment", {}).get("type")
-            parts = list(attachment_parts(record))
+            # Attachment reconstruction flattens rendered blocks to text. Keep the
+            # media dependency in event order, even when text is attributed earlier.
+            attachment = record.get("attachment", {})
+            rendered = record.get("rendered") or attachment.get("rendered") or []
+            self.saw_image |= any(has_image(item.get("content")) for item in rendered)
+            kind = attachment.get("type")
+            parts = list(attachment_parts(rendered))
             if parts and kind == "remote_session_change":
                 self.attribute("\n".join(parts))
             elif parts and kind not in {"atis_latch", "prompt_snapshot"}:
@@ -115,6 +131,7 @@ class Turns:
             return
         if role not in {"assistant", "user"}:
             return
+        self.saw_image |= has_image(record["message"]["content"])
         content = native_content(record, preserved)
         mid = record["message"].get("id")
         if role == "assistant" and not mid and (rid := record.get("requestId")):
@@ -144,6 +161,8 @@ class Turns:
         self.messages.append(msg)
         if role == "assistant":
             msg["loss"] = int(not (preserved or historical))
+            if self.saw_image:
+                msg["image_context"] = True
             if mid and isinstance(content, list):
                 msg["response_id"] = mid
                 self.assistants[mid] = msg
@@ -229,7 +248,7 @@ class Session:
             leaf = boundary.get("logicalParentUuid") if boundary else None
         return ends[::-1]
 
-    def state(self, leaf, historical=()):
+    def turns(self, leaf, historical=()):
         path = self.chain(leaf)
         start = next((i for i in reversed(range(len(path))) if is_boundary(path[i])), None)
         turns = Turns(start is not None, self.request_messages)
@@ -260,7 +279,10 @@ class Session:
         turns.flush()
         self.repair_results(turns.messages)
         self.order_results(turns.messages)
-        return turns.messages
+        return turns
+
+    def state(self, leaf, historical=()):
+        return self.turns(leaf, historical).messages
 
     @staticmethod
     def order_results(messages):

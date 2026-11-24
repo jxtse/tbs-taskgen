@@ -50,6 +50,8 @@ def parser():
             p.add_argument("file", type=Path)
             p.add_argument("--reference", type=Path)
             p.add_argument("--allow-masked-assistant", action="store_true")
+            p.add_argument("--allow-legacy-provenance", action="store_true",
+                           help="warn when native response IDs are missing")
         elif name == "export":
             p.add_argument("--target", choices=["mint-sft"], default="mint-sft")
         elif name == "submit":
@@ -93,6 +95,7 @@ def execute(args, transport=None):
             getattr(args, "file", ctx.out / "train.jsonl"),
             getattr(args, "allow_masked_assistant", False),
             getattr(args, "reference", None),
+            allow_legacy_provenance=getattr(args, "allow_legacy_provenance", False),
         ),
         "submit": lambda: submit(ctx, args.confirm, args.allow_warn),
         "rollout": lambda: rollout(ctx),
