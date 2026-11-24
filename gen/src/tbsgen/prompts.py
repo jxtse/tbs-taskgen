@@ -7,7 +7,8 @@ PROMPT_VERSION = "v2.9-2026-11-24"
 
 METRICS_API = """Verifier helper module `_metrics` (provided, importable from tests/; exact signatures):
   check(name: str, value: float, threshold: float, direction: "<=" | ">=") -> None   # records + asserts
-  hidden_value(input_dir, name, value) -> value  # record a measured contribution to a hidden metric
+  hidden_value(input_dir, name, value) -> value  # tag a numeric value with its input set and metric name
+  hidden_aggregate(operation, values) -> value  # min, max, sum, mean or median of tagged values
   hidden_sets() -> list[str]          # absolute dirs: subdirectories of /tests/hidden, or [/tests/hidden]
   run_solution(timeout_sec: float, input_dir: str = "/tests/hidden") -> tuple[str, float, int]
       # runs `python /app/output/solution_cli.py <input_dir> <out_dir>` as user nobody with /tests/truth locked;
@@ -33,7 +34,8 @@ List generator_assumptions in the spec: each object has assumption (text), state
 
 GRADING_RULES = """For PROG, check every public quantity on every hidden set. Pair precision-type metrics
 with coverage, recall or a count. In measure.compute(), pass each measured per-set value through
-_metrics.hidden_value(input_dir, exact_hidden_metric_name, value) before aggregating it. Partial or empty hidden outputs must fail."""
+_metrics.hidden_value(input_dir, exact_hidden_metric_name, value) and combine tagged values with hidden_aggregate(operation, values).
+Pass the returned value directly to check. Partial or empty hidden outputs must fail."""
 
 S5_SPEC = """Paper (excerpt, DOI {doi}):
 <<<
@@ -115,7 +117,8 @@ Write the generator and the reference solution.  Files:
   `from _metrics import run_solution, hidden_sets`; `for d in hidden_sets(): out_dir, sec, rc = run_solution(t, d)`
   runs `python /app/output/solution_cli.py <d> <out_dir>` as an unprivileged user with /tests/truth locked
   (hidden_sets() = subdirectories of /tests/hidden, or /tests/hidden itself).
-  Pass each per-set result through hidden_value(d, exact_hidden_metric_name, value) before aggregating it.
+  Pass each per-set result through hidden_value(d, exact_hidden_metric_name, value). Combine tagged values
+  using hidden_aggregate(operation, values) and return the tagged result from compute().
   Never subprocess/exec agent code
   yourself (the verifier runs as root, so that would expose the truth).
 {metrics_api}

@@ -370,10 +370,11 @@ def hidden_set_names(gen):
     return sets or [hidden.name]
 
 
-def _prepare_public_probe(cfg, out, script, work, tag, arm):
+def _prepare_public_probe(cfg, out, script, work, tag, arm, identity=False):
     # shlex.quote: repr(arm) has single quotes, which must not end a single-quoted shell word
     command = "cd / && python -c " + shlex.quote(
-        f"from pathlib import Path; from probe_outputs import mutate; print(mutate(Path('/app/output'), {arm!r}))")
+        f"from pathlib import Path; from probe_outputs import mutate; "
+        f"print(mutate(Path('/app/output'), {arm!r}, identity={identity!r}))")
     # the delivered program is not output data: keep it out of the transformation
     keep = [p for p in (out / "solution_cli.py",) if p.exists()]
     stash = work / f"stash-{tag}"
@@ -392,7 +393,7 @@ def _prepare_public_probe(cfg, out, script, work, tag, arm):
     return int(lines[-1])
 
 
-def _probe_run(cfg, task, gen, ref_out, work, tag, arm, prog, kind, name):
+def _probe_run(cfg, task, gen, ref_out, work, tag, arm, prog, kind, name, *, identity=False):
     from .codeagent import safe_copytree
 
     script = Path(__file__).with_name("probe_outputs.py")
@@ -404,12 +405,12 @@ def _probe_run(cfg, task, gen, ref_out, work, tag, arm, prog, kind, name):
     if refused:
         return dict(error=f"invalid reference outputs: {refused[:3]}")
     count = 0
-    if kind == "public" and arm != "identity":
+    if kind == "public" or (identity and arm == "one_confident"):
         try:
-            count = _prepare_public_probe(cfg, out, script, work, tag, arm)
+            count = _prepare_public_probe(cfg, out, script, work, tag, arm, identity)
         except ValueError as exc:
             return dict(error=str(exc))
-        if not count:
+        if not count and not identity:
             return dict(count=0)   # no verifier was launched
     if prog:
         cli, original = out / "solution_cli.py", out / "_probe_reference.py"
@@ -417,7 +418,7 @@ def _probe_run(cfg, task, gen, ref_out, work, tag, arm, prog, kind, name):
             return dict(error="cannot wrap reference CLI")
         cli.rename(original)
         target = name if kind == "hidden" else None
-        cli.write_text(script.read_text() + f"\nhidden_main({arm!r}, {target!r})\n")
+        cli.write_text(script.read_text() + f"\nhidden_main({arm!r}, {target!r}, identity={identity!r})\n")
     t = test(cfg, task, gen, out, work, tag)
     if t["rc"] != 0 or t.get("reward") not in ("0", "1"):
         return dict(error="verifier gave no reward", rc=t["rc"], reward=t.get("reward"))
@@ -434,10 +435,14 @@ def _probe_run(cfg, task, gen, ref_out, work, tag, arm, prog, kind, name):
                 raise ValueError("invalid probe counts")
         except (TypeError, ValueError):
             return dict(error="invalid probe CLI record", stderr=lines[-1:])
-        seen.add(called)
+        if not identity or targeted:
+            seen.add(called)
         if kind == "hidden" and called == name and targeted:
             count += changes
-    if kind == "hidden" and name not in seen:
+    required = {name} if kind == "hidden" else set()
+    if identity:
+        required = set(hidden_set_names(gen))
+    if required - seen:
         return dict(error="hidden set not run by the verifier", ran=sorted(seen))
     return dict(count=count, rc=t["rc"], reward=t["reward"], failed=t["failed"],
                 passed_checks=[m["name"] for m in t["metrics"] if m.get("passed") and not m.get("aux")])
@@ -445,11 +450,12 @@ def _probe_run(cfg, task, gen, ref_out, work, tag, arm, prog, kind, name):
 
 def output_probe(cfg, task, gen, ref_out, work, arm, prog):
     """Only interpret a rejection after the same wrapped reference passes an identity control.
-    A failed control is inconclusive and blocks the gate. At most two verifier runs per arm and scope."""
+    One all-set identity run per PROG arm. ANS already has a passing unwrapped reference."""
     scopes = [] if arm == "hidden_garbage" else [("public", None)]
     if prog:
         scopes.extend(("hidden", name) for name in hidden_set_names(gen))
     per, accepted = {}, []
+    control = None
     for index, (kind, name) in enumerate(scopes):
         scope = "public" if kind == "public" else f"hidden:{name}"
         tag = f"exploit__{arm}__{kind}{index}"
@@ -460,11 +466,13 @@ def output_probe(cfg, task, gen, ref_out, work, arm, prog):
         if not trial["count"]:
             per[scope] = "na"
             continue
-        control = _probe_run(cfg, task, gen, ref_out, work, tag + "__control", "identity", prog, kind, name)
-        if control.get("reward") != "1" or "error" in control:
-            return dict(ok=False, inconclusive=True, error="identity control failed", scope=scope,
-                        control=control, trial=trial, scopes=per)
-        per[scope] = dict(trial, control_reward=control["reward"])
+        if prog and control is None:
+            control = _probe_run(cfg, task, gen, ref_out, work, tag + "__control", arm, prog, kind, name,
+                                 identity=True)
+            if control.get("reward") != "1" or "error" in control:
+                return dict(ok=False, inconclusive=True, error=control.get("error", "identity control failed"),
+                            scope=scope, control=control, trial=trial, scopes=per)
+        per[scope] = dict(trial, control_reward=control["reward"]) if prog else trial
         if trial["reward"] == "1":
             accepted.append(scope)
     return dict(ok=not accepted, na=all(v == "na" for v in per.values()), accepted_scopes=accepted, scopes=per)

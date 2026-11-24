@@ -145,6 +145,24 @@ class Ledger:
         row = db.execute("SELECT id FROM calls WHERE reservation_key=? AND status='reserved'", (key,)).fetchone()
         return row[0] if row else None
 
+    def adopt_legacy_agent_call(self, key, item, stage, model, intent_ts):
+        """Attach a job's stable key to its outstanding pre-key reservation, if present."""
+        with self._db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            held = self._reserved_call(db, key)
+            if held:
+                return held  # upgrade interrupted before run.json was saved
+            rows = db.execute("SELECT id FROM calls WHERE item=? AND stage=? AND model=? AND started>=? "
+                              "AND status='reserved' AND real=1 AND prompt_sha='' AND reservation_key IS NULL",
+                              (item, stage, model, intent_ts)).fetchall()
+            if len(rows) > 1:
+                raise BudgetStop("ambiguous_reservation", f"{item} {stage}: multiple outstanding legacy calls")
+            if rows:
+                call = rows[0][0]
+                db.execute("UPDATE calls SET reservation_key=? WHERE id=?", (key, call))
+                return call
+            return None
+
     def reserve(self, model: str, stage: str, item: str, real: bool, prompt_sha: str = "",
                 est_usd: float | None = None, reservation_key: str | None = None) -> int:
         b = self.cfg["budget"]

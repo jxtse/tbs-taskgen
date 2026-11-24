@@ -773,31 +773,32 @@ def _release_reviewed(P, it, previous):
         return it.goto("S9R", f"S10 review gate: {why}")
     sha = calib.pkg_sha(it.p("pkg"))
     epoch = it.state.get("calib_epoch", 0)
-    if previous and previous.get("pkg_sha") == sha and previous.get("calib_epoch") == epoch:
+    runs = read_json(it.p("calib", "runs.json"), [])
+    summ = [x for x in calib.run_summary(runs) if x["outcome"] is not None]
+    rv = read_json(it.p("review", "verdict.json"), None)
+    nv = (rv or {}).get("_normalized") or {}
+    rev = None if rv is None else dict(
+        verdict=nv.get("verdict"), round=it.state.get("review_round"), revisions=it.state.get("review_revisions", 0),
+        minor=[dict(id=i.get("id"), category=i.get("category"), title=i.get("title"))
+               for i in nv.get("issues") or [] if i.get("severity") == "minor"],
+        label_trustworthy=(nv.get("label_assessment") or {}).get("trustworthy"))
+    label = it.state.get("calib_label")
+    extra = {}
+    if label == "frontier":
+        # a separate release channel: no model solved it (no passing trajectory); consumers keep it apart
+        extra = dict(frontier=calib.frontier_evidence(runs, P.cfg),
+                     reference_check=nv.get("reference_check") or {})
+    record = dict(item_id=it.item_id, pkg=str(it.p("pkg")), label=label,
+                  channel="frontier" if label == "frontier" else "main", **extra,
+                  calib_runs=summ, result_types=[x["result_type"] for x in summ],
+                  pkg_sha=sha, calib_epoch=epoch, review=rev, difficulty=_difficulty_summary(it))
+    # The manifest is append-only, latest live row wins. b88e514 wrote all identity fields except pkg_sha.
+    if previous and all(previous.get(k) == v for k, v in record.items() if k != "pkg_sha" or k in previous):
         return it.advance("S10", None, status="done")
     rel = P.store.root / "release"
     rel.mkdir(exist_ok=True)
     with (rel / "manifest.jsonl").open("a") as f:
-        runs = read_json(it.p("calib", "runs.json"), [])
-        summ = [x for x in calib.run_summary(runs) if x["outcome"] is not None]
-        rv = read_json(it.p("review", "verdict.json"), None)
-        nv = (rv or {}).get("_normalized") or {}
-        rev = None if rv is None else dict(
-            verdict=nv.get("verdict"), round=it.state.get("review_round"), revisions=it.state.get("review_revisions", 0),
-            minor=[dict(id=i.get("id"), category=i.get("category"), title=i.get("title"))
-                   for i in nv.get("issues") or [] if i.get("severity") == "minor"],
-            label_trustworthy=(nv.get("label_assessment") or {}).get("trustworthy"))
-        label = it.state.get("calib_label")
-        extra = {}
-        if label == "frontier":
-            # a separate release channel: no model solved it (no passing trajectory); consumers keep it apart
-            extra = dict(frontier=calib.frontier_evidence(runs, P.cfg),
-                         reference_check=nv.get("reference_check") or {})
-        f.write(json.dumps(dict(item_id=it.item_id, pkg=str(it.p("pkg")), label=label,
-                                channel="frontier" if label == "frontier" else "main", **extra,
-                                calib_runs=summ, result_types=[x["result_type"] for x in summ],
-                                pkg_sha=sha, calib_epoch=epoch, review=rev,
-                                difficulty=_difficulty_summary(it), ts=time.time())) + "\n")
+        f.write(json.dumps(dict(record, ts=time.time())) + "\n")
     it.advance("S10", None, status="done")
 
 

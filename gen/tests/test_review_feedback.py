@@ -3,6 +3,7 @@ import csv
 import json
 from pathlib import Path
 import os
+import sqlite3
 import subprocess
 import sys
 from types import SimpleNamespace
@@ -191,7 +192,7 @@ def test_array_json_and_small_csv(tmp_path):
     with np.load(tmp_path / "b.npz") as data:
         assert not data["score"].any() and data["labels"].tolist() == ["a"] * 3
     assert json.loads((tmp_path / "c.json").read_text()) == [{"x": 0, "color": "red"}] * 3
-    assert (tmp_path / "d.txt").read_text() == "x value\n0 4\n3 1.2\n"
+    assert (tmp_path / "d.txt").read_text() == "x value\n3 4\n0 1.2\n"
 
 
 @pytest.fixture
@@ -400,7 +401,7 @@ def _probe_fixture(tmp_path, monkeypatch, sets=("A", "B")):
         (d / "data").write_text(table)
     def prepare(cfg, mounts, cmd, timeout, name):
         arm = "one_confident" if "one_confident" in cmd else "hidden_garbage"
-        return dict(rc=0, out=str(probe_outputs.mutate(mounts[0][0], arm)), err="")
+        return dict(rc=0, out=str(probe_outputs.mutate(mounts[0][0], arm, identity="identity=True" in cmd)), err="")
     monkeypatch.setattr(runner.sandbox, "run", prepare)
     return cfg, ref, gen, table
 
@@ -491,7 +492,7 @@ def test_probe_requires_every_hidden_set_to_be_run(tmp_path, monkeypatch):
 def test_probe_ids_stay_valid_while_answers_move():
     # finding 10: an id-only verifier must not reject the garbage table; ids keep their values, answers rotate
     rows = [[str(i), f"lab{i}", str(i / 10)] for i in range(6)]
-    out = probe_outputs._rotate_rows(rows)
+    out = probe_outputs._rotate_rows(rows, ["id", "label", "score"])
     assert [r[0] for r in out] == [r[0] for r in rows]
     assert sorted(r[1] for r in out) == sorted(r[1] for r in rows)
     assert all(o[1] != r[1] and o[2] != r[2] for o, r in zip(out, rows))
@@ -643,8 +644,12 @@ def test_wrapper_requires_dropped_privileges(tmp_path, monkeypatch):
         probe_outputs.hidden_main("hidden_garbage", "A")
 
 
-@pytest.mark.parametrize("version,blocked", [(PROMPT_VERSION, True), ("v2.7", False)])
-def test_runtime_parity_by_hidden_set(tmp_path, monkeypatch, wired_gates, version, blocked):
+@pytest.mark.parametrize("version,enforced,per_set", [
+    ("v2.7", False, False), ("v2.8", True, False), (PROMPT_VERSION, True, True),
+    ("cg-v3", False, False), ("cg-v4", True, False), (CODE_PROMPT_VERSION, True, True),
+])
+@pytest.mark.parametrize("has_bias", [True, False])
+def test_runtime_parity_by_hidden_set(tmp_path, monkeypatch, wired_gates, version, enforced, per_set, has_bias):
     cfg, spec, _, _ = wired_gates
     cfg["gen"]["seeds"] = [0]
     spec.update(prompt_version=version, metrics=[{"name": n} for n in
@@ -660,11 +665,14 @@ def test_runtime_parity_by_hidden_set(tmp_path, monkeypatch, wired_gates, versio
         if tag.startswith("ref"):
             log = work / "metrics.jsonl"
             monkeypatch.setattr(templates_metrics, "_PATH", str(log))
-            monkeypatch.setattr(templates_metrics, "_MEASURED_SETS", {})
             for name, scope in [("public_error", None), ("public_bias", None),
                                 ("hidden_error", "A"), ("hidden_bias", "B")]:
+                if not has_bias and name == "hidden_bias":
+                    continue
                 value = 0.8
-                if scope:
+                if scope and per_set:
+                    other = "A" if scope == "B" else "B"
+                    templates_metrics.hidden_value(gen / "tests/hidden" / other, name, value)
                     value = templates_metrics.hidden_value(gen / "tests/hidden" / scope, name, value)
                 templates_metrics.check(name, value, 1., "<=")
             result["metrics"] = [json.loads(line) for line in log.read_text().splitlines()]
@@ -673,9 +681,13 @@ def test_runtime_parity_by_hidden_set(tmp_path, monkeypatch, wired_gates, versio
     monkeypatch.setattr(runner, "test", scores)
     rep = gates.run_gates(cfg, tmp_path, spec, {}, 1)
     parity = rep["details"]["hidden_parity"][0]
-    assert parity["missing_hidden"] == {"A": ["bias"], "B": ["error"]}
-    assert parity["evaluated_hidden"] == {"A": ["error"], "B": ["bias"]}
-    assert ("hidden_parity" in rep["blocking"]) == blocked
+    if per_set:
+        assert parity["missing_hidden"] == {"A": ["bias"], "B": ["error"] if has_bias else ["bias", "error"]}
+        assert parity["evaluated_hidden"] == {"A": ["error"], "B": ["bias"] if has_bias else []}
+    else:
+        assert parity["missing_hidden"] == ([] if has_bias else ["bias"])
+    assert parity["enforced"] == enforced
+    assert ("hidden_parity" in rep["blocking"]) == (enforced and (per_set or not has_bias))
 
 
 @pytest.mark.parametrize("rows,expected_count", [(["1,7", "2,7", "3,7"], 0), (["1,7", "2,9"], 1)])
@@ -814,10 +826,9 @@ def test_class_body_uses_definition_time_timeout():
 def test_hidden_measurements_reach_check_record(tmp_path, monkeypatch):
     log = tmp_path / "metrics.jsonl"
     monkeypatch.setattr(templates_metrics, "_PATH", str(log))
-    monkeypatch.setattr(templates_metrics, "_MEASURED_SETS", {})
     values = [templates_metrics.hidden_value(d, "hidden_error", v) for d, v in
               [("/tests/hidden/A", 0.5), ("/tests/hidden/B", 0.8)]]
-    templates_metrics.check("hidden_error", max(values), 1., "<=")
+    templates_metrics.check("hidden_error", templates_metrics.hidden_aggregate("max", values), 1., "<=")
     row = json.loads(log.read_text())
     assert row["hidden_sets"] == ["A", "B"] and row["value"] == 0.8
 
@@ -828,3 +839,236 @@ def test_constant_answer_scope_is_na(tmp_path, monkeypatch):
     monkeypatch.setattr(runner, "test", _verifier(tmp_path, gen, table, score_sets=("A",), public_count=False))
     result = runner.output_probe(cfg, tmp_path, gen, ref, tmp_path, "hidden_garbage", True)
     assert result["na"] and result["scopes"] == {"hidden:A": "na"}
+
+
+def test_check_credits_only_its_argument(tmp_path, monkeypatch):
+    log = tmp_path / "metrics.jsonl"
+    monkeypatch.setattr(templates_metrics, "_PATH", str(log))
+    a = templates_metrics.hidden_value("hidden/A", "hidden_error", 0.5)
+    templates_metrics.hidden_value("hidden/B", "hidden_error", 0.5)
+    for value in (a, 0.5):
+        templates_metrics.check("hidden_error", value, 1., "<=")
+    rows = [json.loads(line) for line in log.read_text().splitlines()]
+    assert [r.get("hidden_sets", []) for r in rows] == [["A"], []]
+
+
+def test_single_set_requires_provenance(tmp_path, wired_gates):
+    cfg, spec, _, _ = wired_gates
+    cfg["gen"]["seeds"] = [0]
+    write_json(tmp_path / "_spec/provenance.json", {"prompt_version": CODE_PROMPT_VERSION})
+    rep = gates.run_gates(cfg, tmp_path, spec, {}, 1)
+    assert rep["details"]["hidden_parity"][0]["missing_hidden"] == {"d": ["mae", "score"]}
+    assert "hidden_parity" in rep["blocking"]
+
+
+@pytest.mark.parametrize("values", [["0.0"], ["1", "1.0"], ["NaN", "nan"]])
+@pytest.mark.parametrize("ext", ["csv", "txt"])
+def test_rotation_compares_numeric_values(tmp_path, values, ext):
+    path = tmp_path / ("out." + ext)
+    original = "value\n" + "\n".join(values) + "\n"
+    path.write_text(original)
+    assert probe_outputs.mutate(tmp_path, "hidden_garbage") == 0
+    assert path.read_text() == original
+
+
+@pytest.mark.parametrize("answer,values", [
+    ("predicted_class_id", ["7", "8", "7"]), ("predicted_class_id", ["7", "8"]),
+    ("site_id", ["7", "8", "7"]),
+])
+def test_id_like_answer_is_rotated(tmp_path, answer, values):
+    path = tmp_path / "out.csv"
+    path.write_text(f"id,{answer}\n" + "".join(f"{i},{v}\n" for i, v in enumerate(values)))
+    assert probe_outputs.mutate(tmp_path, "hidden_garbage") == 1
+    rows = list(csv.reader(path.read_text().splitlines()))[1:]
+    assert [r[0] for r in rows] == [str(i) for i in range(len(values))]
+    assert [r[1] for r in rows] != values
+
+
+@pytest.mark.parametrize("arm", ["hidden_garbage", "one_confident"])
+def test_control_rewrites_and_covers_all_sets(tmp_path, monkeypatch, arm):
+    cfg, ref, gen, table = _probe_fixture(tmp_path, monkeypatch)
+    verify = _verifier(tmp_path, gen, table)
+    controls = []
+
+    def timed_verifier(cfg, task, gen, out, work, tag):
+        result = verify(cfg, task, gen, out, work, tag)
+        if tag.endswith("__control"):
+            controls.append(tag)
+            for name in ("A", "B"):
+                data = (tmp_path / f"res-{tag}-{name}" / f"{name}.csv").read_bytes()
+                # csv.writer emits CRLF after actually parsing and rewriting the LF reference.
+                assert b"\r\n" in data and data.decode().splitlines() == table.splitlines()
+        else:
+            # The all-set control also needs the same timed I/O as a trial on non-target sets.
+            for name in ("A", "B"):
+                assert b"\r\n" in (tmp_path / f"res-{tag}-{name}" / f"{name}.csv").read_bytes()
+        return result
+
+    monkeypatch.setattr(runner, "test", timed_verifier)
+    assert runner.output_probe(cfg, tmp_path, gen, ref, tmp_path, arm, True)["ok"]
+    assert len(controls) == 1
+
+
+def test_ans_uses_scored_reference_as_control(tmp_path, monkeypatch):
+    cfg, ref, gen, _ = _probe_fixture(tmp_path, monkeypatch)
+    calls = []
+
+    def verify(cfg, task, gen, out, work, tag):
+        calls.append(tag)
+        return dict(rc=0, reward="0", failed=["count"], metrics=[])
+
+    monkeypatch.setattr(runner, "test", verify)
+    result = runner.output_probe(cfg, tmp_path, gen, ref, tmp_path, "one_confident", False)
+    assert len(calls) == 1 and result["ok"]
+
+
+@pytest.mark.parametrize("version", ["cg-v3", "v2.7"])
+def test_legacy_explicit_assumption_passes_both_stages(tmp_path, wired_gates, version):
+    cfg, spec, _, task = wired_gates
+    entry = dict(assumption="noise distribution", stated=True, where="Gaussian")
+    assert not validate_spec(dict(SPEC, generator_assumptions=[entry]), cfg, version)
+    spec.update(generator_assumptions=[entry])
+    write_json(tmp_path / "_spec/provenance.json", {"prompt_version": version})
+    with (task / "instruction.md").open("a") as f:
+        f.write("Gaussian noise.\n")
+    assert gates.run_gates(cfg, tmp_path, spec, {}, 1)["gates"]["assumptions_stated"]
+    (task / "instruction.md").write_text("The noise distribution is unknown.")
+    assert not gates.run_gates(cfg, tmp_path, spec, {}, 2)["gates"]["assumptions_stated"]
+
+
+def test_resume_b88e514_reservation(tmp_path, monkeypatch):
+    cfg = load_config()
+    cfg["budget"].update(daily_usd_total=10, run_calls_per_model={"model": 1})
+    it = Store(tmp_path).item("x")
+    job = "tbsgen-x-s5g1"
+    conf = dict(job_name=job, agents=[{"model_name": "model"}], jobs_dir=str(tmp_path))
+    config = it.p("S5G", "job.json")
+    write_json(config, conf)
+    rec = dict(job_name=job, state="intent", ts=100., kind="S5G", job_dir=str(tmp_path / job),
+               config=str(config), budget=dict(timeout_s=30, max_usd=1.), est_usd=1., prompt_version="cg-v4-2026-11-24")
+    write_json(it.p("S5G", "run.json"), rec)
+    # Unmigrated b88e514 calls table and the exact columns its reserve() inserted.
+    path = tmp_path / "ledger.sqlite"
+    with sqlite3.connect(path) as db:
+        db.executescript(budget.SCHEMA)
+        db.execute("ALTER TABLE calls ADD COLUMN cost_kind TEXT")
+        assert "reservation_key" not in {c[1] for c in db.execute("PRAGMA table_info(calls)")}
+        old = db.execute("INSERT INTO calls(day,started,model,real,stage,item,status,est_usd,prompt_sha,harden,variant) "
+                         "VALUES('2026-11-24',101,'model',1,'S5G','x','reserved',1,'',NULL,NULL)").lastrowid
+    ledger = budget.Ledger(path, cfg)
+    cfg["code"].update(agent_harbor_root=str(tmp_path), agent_launcher="launch")
+    launches = []
+
+    def launch(cmd, **kwargs):
+        launches.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(codeagent.subprocess, "run", launch)
+    P = SimpleNamespace(ledger=ledger, cfg=cfg, store=Store(tmp_path))
+
+    def step():
+        stages_a._agent_stage(P, it, "S5G", "", [], 30, 1, 1, True)
+
+    # Kill the upgrade after it committed the key, before that key made it to disk in run.json.
+    def crash(path, data):
+        if data.get("state") == "reserved":
+            raise InterruptedError
+        write_json(path, data)
+
+    with monkeypatch.context() as m:
+        m.setattr(codeagent, "write_json", crash)
+        with pytest.raises(InterruptedError):
+            step()
+    step()
+    assert len(launches) == 1 and job in launches[0]
+    resumed = json.loads(it.p("S5G", "run.json").read_text())
+    assert resumed["state"] == "launched" and resumed["ledger_call"] == old
+    with ledger._db() as db:
+        assert db.execute("SELECT id,reservation_key FROM calls").fetchall() == [(old, resumed["reservation_key"])]
+
+
+def test_resume_b88e514_manifest(tmp_path):
+    store = Store(tmp_path)
+    it = store.item("x")
+    it.state.update(stage="S10", calib_epoch=2, calib_label="hard")
+    cfg = load_config()
+    cfg["review"]["enabled"] = False
+    manifest = tmp_path / "release/manifest.jsonl"
+    manifest.parent.mkdir()
+    previous = dict(item_id="x", pkg=str(it.p("pkg")), label="hard", channel="main", calib_runs=[], result_types=[],
+                    calib_epoch=2, review=None, difficulty=None, ts=42.)
+    manifest.write_text(json.dumps(previous) + "\n")
+    stages_b.s10(SimpleNamespace(cfg=cfg, store=store), it)
+    assert it.state["status"] == "done"
+    assert manifest.read_text().splitlines() == [json.dumps(previous)]
+
+
+def test_release_records_changed_review_and_label(tmp_path):
+    store = Store(tmp_path)
+    it = store.item("x")
+    it.state.update(stage="S10", calib_epoch=2, calib_label="hard")
+    P = SimpleNamespace(cfg=load_config(), store=store)
+    P.cfg["review"]["enabled"] = False
+    stages_b.s10(P, it)
+    P.cfg["review"]["enabled"] = True
+    it.state["review_round"] = 1
+    write_json(it.p("review/verdict.json"), dict(_normalized=dict(verdict="pass"), round=1,
+               calib_epoch=2, pkg_sha=stages_b.calib.pkg_sha(it.p("pkg"))))
+    stages_b.s10(P, it)
+    stages_b.s10(P, it)
+    it.state["calib_label"] = "medium"
+    stages_b.s10(P, it)
+    records = [json.loads(line) for line in (tmp_path / "release/manifest.jsonl").read_text().splitlines()]
+    assert [(r["label"], (r["review"] or {}).get("verdict")) for r in records] == [
+        ("hard", None), ("hard", "pass"), ("medium", "pass")]
+
+
+def test_nested_class_uses_enclosing_function_or_module():
+    src = ("T=60\nclass Outer:\n    T=1200\n    class Inner:\n        run_solution(T)\n"
+           "def build():\n    T=900\n    class Outer:\n        T=60\n        class Inner:\n"
+           "            run_solution(T)\nT=700\n")
+    assert package.run_solution_timeouts(src, 780) == ["line 11: run_solution timeout 900s >= verifier budget 780s"]
+
+
+@pytest.mark.parametrize("ext", ["json", "npy", "npz"])
+def test_numeric_zero_format_is_unchanged(tmp_path, ext):
+    path = tmp_path / ("scores." + ext)
+    if ext == "json":
+        path.write_text('["0.0", "-0"]')
+    elif ext == "npy":
+        np.save(path, np.array([-0.0]))
+    else:
+        np.savez(path, score=np.array(["0.0", "-0"]))
+    original = path.read_bytes()
+    assert probe_outputs.mutate(tmp_path, "hidden_garbage") == 0
+    assert path.read_bytes() == original
+
+
+@pytest.mark.parametrize("ext", ["json", "npy", "npz"])
+def test_key_uniqueness_across_formats(tmp_path, ext):
+    path = tmp_path / ("scores." + ext)
+    fields = dict(id=[1, 2, 3], site_id=[7, 8, 7], predicted_class_id=[7, 8, 9])
+    if ext == "json":
+        path.write_text(json.dumps([dict(zip(fields, row)) for row in zip(*fields.values())]))
+    elif ext == "npy":
+        np.save(path, np.array(list(zip(*fields.values())), dtype=[(k, int) for k in fields]))
+    else:
+        np.savez(path, **fields)
+    assert probe_outputs.mutate(tmp_path, "hidden_garbage") == 1
+    if ext == "json":
+        rows = json.loads(path.read_text())
+        result = {k: [r[k] for r in rows] for k in fields}
+    elif ext == "npy":
+        a = np.load(path)
+        result = {k: a[k].tolist() for k in fields}
+    else:
+        with np.load(path) as z:
+            result = {k: z[k].tolist() for k in fields}
+    assert result == dict(id=[1, 2, 3], site_id=[0, 0, 0], predicted_class_id=[0, 0, 0])
+
+
+def test_headerless_first_column_is_not_an_identifier(tmp_path):
+    path = tmp_path / "answers.txt"
+    path.write_text("1 7\n2 7\n")
+    assert probe_outputs.mutate(tmp_path, "hidden_garbage") == 1
+    assert path.read_text() == "2 7\n1 7\n"

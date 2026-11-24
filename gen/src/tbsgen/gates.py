@@ -34,7 +34,7 @@ from pathlib import Path
 
 from . import runner
 from .leakcheck import leak_report
-from .spec import is_resource_metric, metric_family
+from .spec import _requires_assumptions, is_resource_metric, metric_family, requires_hidden_provenance
 from .state import read_json
 from .statement import assumptions_stated, statement_clean, threshold_format
 
@@ -228,12 +228,12 @@ def hidden_duplicates(pub: Path, hid: Path, shared_inputs=(), copied_share_max: 
                 identical_sets=same_sets, identical_public=same_public, mostly_public=mostly)
 
 
-def hidden_parity(metrics: list, spec: dict, hidden_sets=()) -> dict:
+def hidden_parity(metrics: list, spec: dict, hidden_sets=None) -> dict:
     declared = {m["name"]: m for m in spec.get("metrics", [])}
     families = {"public": set(), "hidden": set()}
-    # Direct report consumers can also supply just the measured rows. The gate always passes the full
-    # generated layout so a set without any measurements still appears in the report.
-    if not hidden_sets:
+    # The gate supplies the full layout for per-set checks and an empty tuple for historical aggregate checks.
+    # Standalone reports with no layout can infer the measured scopes from the rows.
+    if hidden_sets is None:
         hidden_sets = sorted({scope for row in metrics for scope in row.get("hidden_sets", [])})
     by_set = {name: set() for name in hidden_sets}
     exempt = set()
@@ -249,11 +249,7 @@ def hidden_parity(metrics: list, spec: dict, hidden_sets=()) -> dict:
             on = "hidden" if name.startswith("hidden_") or name.endswith("_hidden") else "public"
         family = metric_family(name)
         if on == "hidden" and by_set:
-            scopes = row.get("hidden_sets")
-            if scopes is None:
-                # Older scorers have no provenance for pooled metrics. A single set is unambiguous.
-                scopes = list(by_set) if len(by_set) == 1 else []
-            for scope in scopes:
+            for scope in row.get("hidden_sets") or ():
                 if scope in by_set:
                     by_set[scope].add(family)
         families[on].add(family)
@@ -313,6 +309,9 @@ def run_gates(cfg: dict, item_dir: Path, spec: dict, thresholds: dict, attempt: 
     task = item_dir / "task"
     work = item_dir / "runs" / f"s7-{attempt}"
     seeds = cfg["gen"]["seeds"]
+    versions = (spec.get("prompt_version"), read_json(item_dir / "_spec/provenance.json", {}).get("prompt_version"))
+    review_rules = any(_requires_assumptions(v) for v in versions)
+    per_set = any(requires_hidden_provenance(v) for v in versions)
     g, det = {}, {}
     # determinism
     a = runner.generate(cfg, task, seeds[0], work / "detA")
@@ -387,17 +386,14 @@ def run_gates(cfg: dict, item_dir: Path, spec: dict, thresholds: dict, attempt: 
                            (m["name"].startswith("hidden_") or m["name"] in hidden_names))
             ok["hidden_shift"] &= dup["ok"] and n_hidden >= 2
             det["hidden_shift"][s] = dict(dup, n_hidden=n_hidden)
-            parity = hidden_parity(ref["metrics"], spec, runner.hidden_set_names(gen))
+            parity = hidden_parity(ref["metrics"], spec, runner.hidden_set_names(gen) if per_set else ())
             det["hidden_parity"][s] = parity
             # only public checks missing on the hidden sets block (the reviewer's finding); a hidden-only metric
             # measures the shift itself and is normal (14 of 18 prod-code tasks have one).  Specs written before
             # the prompts asked for it (no public_only declarations: 6 of 25 released prod-code tasks have a
             # public-only metric) are recorded for S9R, not blocked.
-            from .spec import _requires_assumptions
-            new_rules = _requires_assumptions(spec.get("prompt_version")) or \
-                _requires_assumptions(read_json(item_dir / "_spec" / "provenance.json", {}).get("prompt_version"))
-            parity["enforced"] = new_rules
-            if new_rules:
+            parity["enforced"] = review_rules
+            if review_rules:
                 ok["hidden_parity"] &= not parity["missing_hidden"]
         det["seeds"][s] = sd
     # Probe seed zero even for a custom seed schedule. Reuse its scored reference whenever available.
@@ -437,8 +433,9 @@ def run_gates(cfg: dict, item_dir: Path, spec: dict, thresholds: dict, attempt: 
     # the verifier-time note PKG generates is not the task author's text: never evidence for a stated threshold
     from .package import strip_time_note
     ins = strip_time_note(ins)
+    missing_quotes = assumptions_stated(ins, spec.get("generator_assumptions", []), require_long_quote=review_rules)
     for name, issues in (("threshold_format", threshold_format(ins, thresholds)), ("statement_clean", statement_clean(ins)),
-                         ("assumptions_stated", assumptions_stated(ins, spec.get("generator_assumptions", [])))):
+                         ("assumptions_stated", missing_quotes)):
         g[name], det[name] = not issues, issues
     measured = read_json(item_dir / "S6A_measure.json", {}).get("runs", {})
     for name, (passed, detail) in realism(spec, work / "detA/environment/data", measured).items():

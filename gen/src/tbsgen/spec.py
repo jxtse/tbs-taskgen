@@ -22,11 +22,19 @@ FORMS_ALL = {"ANS", "PROG", "DOMF", "CODE", "MULTI", "DESIGN", "INTERACT", "TRAJ
 
 
 # The two prompt families have independent version sequences.
-def _requires_assumptions(version) -> bool:
+def _prompt_at_least(version, standard, code) -> bool:
     match = re.match(r"^(cg-)?v(\d+)(?:\.(\d+))?(?:-|$)", str(version))
     if not match:
         return False
-    return (int(match[2]), int(match[3] or 0)) >= ((4, 0) if match[1] else (2, 8))
+    return (int(match[2]), int(match[3] or 0)) >= (code if match[1] else standard)
+
+
+def _requires_assumptions(version) -> bool:
+    return _prompt_at_least(version, (2, 8), (4, 0))
+
+
+def requires_hidden_provenance(version) -> bool:
+    return _prompt_at_least(version, (2, 9), (5, 0))
 
 
 PIN = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?==[0-9][A-Za-z0-9.!+_-]*")
@@ -36,10 +44,10 @@ def valid_pins(pins) -> bool:
     return isinstance(pins, list) and len(pins) <= 8 and all(isinstance(p, str) and PIN.fullmatch(p) for p in pins)
 
 
-def assumption_quote(where: str) -> str:
+def assumption_quote(where: str, require_long_quote: bool = True) -> str:
     """The statement quote after whitespace normalization, or empty if too short."""
     quote = " ".join(where.split())
-    return quote if len(quote) >= 12 else ""
+    return quote if not require_long_quote or len(quote) >= 12 else ""
 
 
 def validate_spec(spec, cfg: dict, prompt_version=None) -> list[str]:

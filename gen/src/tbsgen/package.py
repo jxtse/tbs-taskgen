@@ -248,24 +248,42 @@ def run_solution_timeouts(src: str, budget: float) -> list[str]:
     for node in tree.body:
         bind(node, final)
 
-    def visit(node, visible, deferred):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)):
+    scopes = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)
+
+    def local_names(node):
+        if isinstance(node, scopes):
+            if hasattr(node, "name"):
+                yield node.name
+            return
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+            yield node.id
+        for child in ast.iter_child_nodes(node):
+            yield from local_names(child)
+
+    def visit(node, visible, deferred, class_parent):
+        if isinstance(node, scopes):
             body = node.body if isinstance(node.body, list) else [node.body]
             # Bases, decorators and default arguments execute in the defining scope.
             for child in ast.iter_child_nodes(node):
                 if child not in body:
-                    visit(child, visible, deferred)
+                    visit(child, visible, deferred, class_parent)
             if isinstance(node, ast.ClassDef):
-                class_scope = dict(visible)
+                # A class body's namespace is private to that body. Its nested classes start from
+                # the same enclosing function/module bindings, at this definition point.
+                class_scope = dict(class_parent)
                 for stmt in body:
-                    visit(stmt, class_scope, deferred)
+                    visit(stmt, class_scope, deferred, class_parent)
                     bind(stmt, class_scope)
             else:
                 local = {n.arg for n in ast.walk(node.args) if isinstance(n, ast.arg)}
-                local.update(n.id for n in ast.walk(node) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store))
-                enclosing = {k: v for k, v in deferred.items() if k not in local}
+                local.update(name for stmt in body for name in local_names(stmt))
+                current = {k: v for k, v in deferred.items() if k not in local}
+                later = dict(current)
                 for stmt in body:
-                    visit(stmt, enclosing, enclosing)
+                    bind(stmt, later)
+                for stmt in body:
+                    visit(stmt, current, later, current)
+                    bind(stmt, current)
             return
         if isinstance(node, ast.Call):
             name = getattr(node.func, "id", None)
@@ -277,11 +295,11 @@ def run_solution_timeouts(src: str, budget: float) -> list[str]:
                 if type(value) in (int, float) and value >= budget:
                     errors.append(f"line {node.lineno}: run_solution timeout {value:g}s >= verifier budget {budget:g}s")
         for child in ast.iter_child_nodes(node):
-            visit(child, visible, deferred)
+            visit(child, visible, deferred, class_parent)
 
     sofar = {}
     for node in tree.body:
-        visit(node, sofar, final)
+        visit(node, sofar, final, sofar)
         bind(node, sofar)
     return errors
 

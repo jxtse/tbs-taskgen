@@ -652,6 +652,10 @@ def _agent_stage(P, it, kind: str, instruction: str, need: list[str], timeout_s:
                         # record goes back to intent first (a resume re-reserves through ledger.reserve), then the
                         # old row is settled; a crash in between leaves the row in orphan_calls, settled below
                         # on the next pass -- never a "reserved" record whose ledger row is already closed.
+                        if rec["state"] == "intent" and not rec.get("reservation_key") and rec.get("config"):
+                            conf = read_json(Path(rec["config"]), {})
+                            if conf:
+                                codeagent.recover_legacy_agent_call(it, kind, rec, conf, P.ledger)
                         orphan = rec.get("ledger_call")
                         key = rec.pop("reservation_key", None)
                         if key and not orphan:  # DB commit survived, reserved run.json did not

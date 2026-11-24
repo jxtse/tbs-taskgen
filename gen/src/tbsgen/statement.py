@@ -59,11 +59,11 @@ def threshold_format(text: str, thresholds: dict | None = None) -> list[str]:
     return list(dict.fromkeys(bad))
 
 
-def assumptions_stated(text: str, assumptions: list) -> list[str]:
+def assumptions_stated(text: str, assumptions: list, require_long_quote: bool = True) -> list[str]:
     normalized = " ".join(strip_time_note(text).split())
     missing = []
     for a in assumptions:
-        quote = assumption_quote(a["where"])
+        quote = assumption_quote(a["where"], require_long_quote)
         if a["stated"] and (not quote or quote not in normalized):
             missing.append(a["where"])
     return missing

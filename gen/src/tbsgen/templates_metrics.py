@@ -102,18 +102,31 @@ def speed_bench(repeats: int = 5):
     return med
 
 
-_MEASURED_SETS = {}
+class _HiddenValue(float):
+    """A JSON-serializable measurement that retains its sources until check() records it."""
+    def __new__(cls, value, name, scopes):
+        result = super().__new__(cls, value)
+        result.name = name
+        result.scopes = scopes
+        return result
 
 
 def hidden_value(input_dir, name, value):
-    """Record which hidden input contributed a value to a named metric, before aggregation."""
-    _MEASURED_SETS.setdefault(name, set()).add(os.path.basename(os.path.normpath(input_dir)))
-    return value
+    scope = os.path.basename(os.path.normpath(input_dir))
+    return _HiddenValue(value, name, (scope,))
+
+
+def hidden_aggregate(operation, values):
+    """Reduce tagged per-set measurements of one metric, carrying exactly those inputs' scopes."""
+    values = list(values)
+    if not values or not all(isinstance(v, _HiddenValue) and v.name == values[0].name for v in values):
+        raise ValueError("expected tagged measurements of a single hidden metric")
+    reducers = {"min": min, "max": max, "sum": sum, "mean": lambda xs: sum(xs) / len(xs), "median": _median}
+    scopes = {scope for v in values for scope in v.scopes}
+    return _HiddenValue(reducers[operation](values), values[0].name, scopes)
 
 
 def _record(rec):
-    if "threshold" in rec and rec["name"] in _MEASURED_SETS:
-        rec["hidden_sets"] = sorted(_MEASURED_SETS[rec["name"]])
     os.makedirs(os.path.dirname(_PATH), exist_ok=True)
     with open(_PATH, "a") as f:
         f.write(json.dumps(rec) + "\n")
@@ -127,6 +140,7 @@ def check(name, value, threshold, direction):
     [SPEED_MIN, SPEED_MAX]); memory-like ones do not.  The recorded "threshold" stays the locked literal — the
     pipeline's lock checks compare it (runner / review.runtime_thresholds); the effective one is recorded next to
     it.  Non-resource metrics are asserted at the literal threshold as before."""
+    source = {"hidden_sets": sorted(value.scopes)} if isinstance(value, _HiddenValue) and value.name == name else {}
     value = float(value)
     kind = resource_kind(name)
     if kind:
@@ -139,7 +153,7 @@ def check(name, value, threshold, direction):
                     ratio = 1.0                      # same host: noise never moves a threshold
                 ratio = min(SPEED_MAX, max(SPEED_MIN, ratio))
         eff = float(threshold) * ratio if direction == "<=" else float(threshold) / ratio
-        rec = {"name": name, "value": value, "threshold": float(threshold), "direction": direction,
+        rec = {**source, "name": name, "value": value, "threshold": float(threshold), "direction": direction,
                "threshold_effective": eff, "speed_ratio": round(ratio, 4)}
         if not RESOURCE_GATING:
             rec["gated"] = False
@@ -156,7 +170,7 @@ def check(name, value, threshold, direction):
     passed = (value >= threshold) if direction == ">=" else (value <= threshold)
     if math.isnan(value):
         passed = False
-    _record({"name": name, "value": value, "threshold": float(threshold), "direction": direction,
+    _record({**source, "name": name, "value": value, "threshold": float(threshold), "direction": direction,
              "passed": bool(passed)})
     assert passed, f"{name}={value:.6g} fails {direction} {threshold}"
 

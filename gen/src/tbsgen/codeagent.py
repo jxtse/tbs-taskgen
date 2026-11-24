@@ -392,6 +392,20 @@ def agent_job_config(cfg: dict, task: Path, job_name: str, jobs_dir: Path, max_u
             "verifier": {"disable": False}, "agents": [agent], "tasks": [{"path": str(task.resolve())}]}
 
 
+def recover_legacy_agent_call(it, kind, rec, conf, ledger):
+    # b88e514 recorded the job name in the intent and job config, but only item/stage/model/start in SQLite.
+    if (ledger is None or rec.get("reservation_key") or rec.get("state") != "intent"
+            or rec.get("kind") != kind or rec.get("ts") is None or rec.get("job_name") != conf["job_name"]
+            or rec.get("job_dir") != str(Path(conf["jobs_dir"]) / conf["job_name"])):
+        return
+    key = f"legacy:{it.item_id}:{kind}:{conf['job_name']}:{rec['ts']}"
+    model = conf["agents"][0]["model_name"]
+    call = ledger.adopt_legacy_agent_call(key, it.item_id, kind, model, rec["ts"])
+    if call is not None:
+        rec.update(state="reserved", model=model, reservation_key=key, ledger_call=call)
+        write_json(it.p(kind, "run.json"), rec)
+
+
 def launch_agent(cfg: dict, it, kind: str, conf: dict, ledger, est_usd: float, extra: dict | None = None) -> dict:
     """intent -> reserved -> launched, persisted in <item>/<kind>/run.json (one job per stage attempt).  extra:
     fields stored with the intent (e.g. budget, harden_round) so a resumed job keeps them."""
@@ -404,7 +418,11 @@ def launch_agent(cfg: dict, it, kind: str, conf: dict, ledger, est_usd: float, e
                    job_dir=str(Path(conf["jobs_dir"]) / conf["job_name"]), config=str((d / "job.json").resolve()),
                    **(extra or {}))
         (d / "job.json").write_text(json.dumps(conf, indent=1))
+        if ledger is not None:
+            rec["reservation_key"] = uuid.uuid4().hex
         write_json(recp, rec)
+    else:
+        recover_legacy_agent_call(it, kind, rec, conf, ledger)
     if rec["state"] == "intent":
         model = conf["agents"][0]["model_name"]
         if ledger is not None:
