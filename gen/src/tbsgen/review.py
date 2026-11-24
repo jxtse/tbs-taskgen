@@ -554,7 +554,10 @@ when you judge timing, measure the reference here and reason about the margin, n
 a. **Consistency.**  Do `instruction.md`, the data format notes in `environment/data/`, `tests/measure.py` /
    `test_outputs.py` and the reference agree on file names, output paths, column names, array shapes, units, formats
    and the CLI contract?  An agent that follows the statement literally must be scored correctly.
-b. **Missing conditions.**  Does the statement give every convention needed to hit the thresholds (integration
+b. **Missing conditions.** Read /review/extra/generator/generate.py and list every score-relevant formula or
+   assumption the statement neither discloses nor makes uniquely recoverable from data. Verify any recovery
+   in the reference. Report each omission as blocking, with problem and fix_kind `statement`.
+   Does the statement give every convention needed to hit the thresholds (integration
    ranges, boundary / tail handling, truncation, normalisation, random seeds, tie-breaking, …)?  Is a convention the
    reference relies on, and that changes a metric by more than its threshold allows, left unstated?  Do the tests
    check anything the statement does not ask for?
@@ -577,7 +580,9 @@ i. **Authors' code (code-grounded tasks; `records/author_code.json` exists, else
    leak the authors' implementation (repository / package / function / file names, vendored code, an installable
    package)?  A leak of the authors' implementation is blocking (`statement` if only the wording names it,
    `core_invalid` if the task is only a re-run).
-j. **Genuine difficulty.**  Does the difficulty come from the science itself (a real structure in the data, a
+j. **Genuine difficulty.** Read the S7 effort_floor and data_realism observations when present. Compare low
+   reference times with the derivation required, and small datasets with the scientific formats and variation.
+   Does the difficulty come from the science itself (a real structure in the data, a
    real limitation of the obvious method, a real numerical / boundary issue of the paper's method, a scientifically
    motivated and disclosed shift of the hidden cases)?  If `records/difficulty_design.json` exists, check each
    lever it claims against the statement, the generator, the reference and the measurements (and
@@ -720,6 +725,8 @@ def normalize(raw: dict | None, reward: float | None = None, allow_human: bool =
         if it["severity"] == "blocking":
             pc = it.get("problem")
             fk = it.get("fix_kind")
+            if fk == "statement" and pc in (None, "statement"):
+                it["problem"], pc, fk = "statement", "statement", "local"
             if not isinstance(pc, (str, type(None))) or not isinstance(fk, (str, type(None))):
                 problems.append(f"{it['id']}: problem / fix_kind must be strings")
                 hard.append(it["id"])

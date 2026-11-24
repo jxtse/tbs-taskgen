@@ -498,3 +498,14 @@ S9 打出标签后，**hard / unstable**（`calib.keep_labels`）必须先过审
   - 其余拉不开 → S6M 一次；之后默认直接丢弃（`gen.back_to_spec_max` 默认 0）；若打开，只有“差一点”（失败 1 到 max_mid_fail+1 项）才回 S5；
   - `ref_worse_than_naive` 且某指标参考比 naive 差 ≥ `gen.ref_gross_ratio` 倍（默认 10）→ 判为参考实现错误，带倍数回 S6A 重写全部代码一次（规则 `ref_gross`，`gen.ref_rewrite_max`=1），仍然如此 → `dropped: ref_grossly_wrong`；倍数较小的仍走 S8。
   - 依据：e2e-prod-20261109 的离线回放（9 篇丢弃题的真实 S6A/S6M/S8 产物重新在沙箱实测）：3 篇入库题首轮 S6B 均为 mid 失败 3/4 判据、S6M 后变成 1 项，规则不误伤；回 S5 的 5 篇无一救回。
+
+### 6c. 题面、隐藏集与题库分布（2026-11-24）
+
+- S6B 的阈值舍入最多增加 3 位有效数字。仍无法排除基线时记录 `threshold_unreadable`，进入原有修复流程。naive 基线连精确值都能通过时（该指标本来就拒不掉 naive），不再为它加位数，而是保留 2 位有效数字（prod-code doi-7f1e4ce020185a83 的 `≥ 0.8665767420502813` 就是这样来的，现为 0.86）。S7 的 `threshold_format` 要求阈值处的数最多 6 位有效数字，题面任何数最多 12 位有效数字（GM、J2 等物理常数不受影响）。隐藏指标的参考余量单独由 `thresholds.min_ref_margin_hidden` 控制，默认 0.05 与旧规则相同；设为 0.10 时 prod-code 已发布的 25 题中有 4 题不过，提高前需重新校准。
+- `statement_clean` 拦截内部编辑文字（audit、revision、TODO、tbsgen、mid/naive baseline 等）和 HTML 注释；patch、internal standard、baseline-free 这类科学用法不拦。新 S5/S5G spec 列出 `generator_assumptions`。`assumptions_stated` 逐条核对题面原文，未明说的条件须填写 `recovered from data: <恢复方法>`。S9R 对照生成器和参考解复核。
+- PROG 的 `hidden_parity` 对照参考验证实际记录的公开、隐藏指标族：公开查了、隐藏没查的指标阻塞（仅公开的指标需 `public_only: true` 和 `public_only_reason`）；只在隐藏集上查的指标只记录，因为它通常就是在测分布偏移。`hidden_shift` 在两个隐藏集完全相同、隐藏集与公开数据完全相同、或某个隐藏集一半以上字节是公开文件的拷贝时阻塞；单个共用文件（训练表、时间网格）只记录在 `copied_files`。共用校准表等可按文件名列入 `shared_inputs`。
+- 种子 0 的 `hidden_garbage` 保留公开答案，在每个隐藏集上将参考输出的数值归零、标签替换为众数。`coverage` 将超过 5 行数据的 CSV 缩为最高置信度的一行（无分数列时取首行），同时测试公开和隐藏交付物。验证器须拒绝这些输出。没有适用 CSV 时 coverage 记为 `na`；隐藏 CLI 未执行、崩溃或缺少 reward 时探针失败；输出格式探针不会改写（如 FITS、HDF5）时记为 `na`，留给 S9R。
+- S7 报告中，`effort_floor` 提示参考解各次公开求解均少于 30 秒且专家估时至少 2 小时的题目。`data_realism` 提示所有公开文件均为 CSV/NPY/JSON/TXT 且总量小于 2 MB 的题目。两项供 S9R 参考，可分别在 spec 用 `effort_note`、`data_realism_note` 说明理由，`data_formats` 可列出实际格式。
+- PKG 静态检查两个评分脚本，要求显式的单次 `run_solution` 时限小于 verifier 超时减去 `package.verifier_overhead_sec`。题包必须声明 agent 和 verifier 的网络策略，verifier 始终离线，显式 public 对照组记录警告。`extra_pip` 最多 8 个 `name==version`，加入自包含 Dockerfile；PKG 在配置的沙箱镜像内离线核对安装版本，缺包或不匹配报 `extra_pip_unsupported`。
+- `tbsgen diversity --run DIR [--runs-root ROOT] [--json]` 按 14 个领域统计已发布和在途题目，列出空缺领域和相近方法簇。S5G 按候选主题和标题预估，S10 按完整 spec 复核。已发布题至少 `diversity.min_released`（20）道且领域占比超过 `diversity.max_area_share`（0.25），或同簇已有 `max_per_template`（2）题时，默认只写 state 和 event。`diversity.enforce=true` 时暂存为 parked。
+- 只读审计分享包可运行 `python scripts/audit_share.py <share>/1-hard --runs-root <runs>`，标准输出为逐题表和 JSON 汇总。

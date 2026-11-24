@@ -78,11 +78,14 @@ def _pipeline(a, overrides=None) -> Pipeline:
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="tbsgen")
     sub = ap.add_subparsers(dest="cmd", required=True)
-    for name in ("ingest", "run", "resume", "status", "report", "ledger", "breaker", "calib-ingest", "ping", "reset",
+    for name in ("ingest", "run", "resume", "status", "report", "ledger", "diversity", "breaker", "calib-ingest", "ping", "reset",
                  "harbor-local", "fetch", "remote", "fulltext", "calib", "review", "regate", "harden", "variant"):
         s = sub.add_parser(name)
         s.add_argument("--run", required=True)
         s.add_argument("--config", default=None)
+        if name == "diversity":
+            s.add_argument("--runs-root", type=Path)
+            s.add_argument("--json", action="store_true")
         if name == "ingest":
             s.add_argument("--candidates", required=True)
             s.add_argument("--top", type=int, default=0)
@@ -165,6 +168,11 @@ def main(argv=None):
     a = ap.parse_args(argv)
     if a.cmd == "ping":
         return _ping(a)
+    if a.cmd == "diversity":
+        from . import diversity
+        result = diversity.report(Path(a.run), a.runs_root)
+        print(json.dumps(result, indent=2) if a.json else diversity.format_report(result))
+        return 0
     P = _pipeline(a)
     if a.cmd == "fetch":
         return _fetch(P, a)

@@ -202,7 +202,7 @@ def test_network_modes_are_configurable(tmp_path):
     t = _pkg_toml(tmp_path, mode="agent-allowlist", agent_hosts=["api.example.com"])
     assert t["agent"]["allowed_hosts"] == ["api.example.com"]
     t = _pkg_toml(tmp_path, mode="no-network")
-    assert t["environment"]["network_mode"] == "no-network" and "network_mode" not in t["agent"]
+    assert t["environment"]["network_mode"] == "no-network" and t["agent"]["network_mode"] == "no-network"
     with pytest.raises(ValueError):
         _pkg_toml(tmp_path, mode="open")
 

@@ -361,3 +361,64 @@ def truth_probe(cfg: dict, task: Path, gen: Path, ref_out: Path, work: Path, tag
     bad = [m.get("stderr_tail", "") for m in runs if want not in m.get("stderr_tail", "")]
     return dict(ok=bool(runs) and bool(truth_rel) and not bad, n_runs=len(runs), via_run_solution=bool(runs),
                 n_targets=len(targets), readable=[x[-400:] for x in bad][:3], passed=t["passed"])
+
+def output_probe(cfg, task, gen, ref_out, work, arm, prog):
+    """Keep the reference public deliverables. In each verifier invocation the replacement CLI runs
+    the original CLI once in a private temp dir, then transforms its actual output. This uses the
+    same hidden layout, permissions and time limit as the scored reference, including on SSH.
+    A missing run, wrapper crash or missing reward cannot establish rejection of a probe."""
+    from .codeagent import safe_copytree
+
+    tag = f"exploit__{arm}"
+    out = work / f"out-{tag}"
+    if out.exists():
+        shutil.rmtree(out)
+    out.mkdir(parents=True)
+    refused = safe_copytree(ref_out, out)
+    if refused:
+        return dict(ok=False, error=f"invalid reference outputs: {refused[:3]}")
+    public = 0
+    script = Path(__file__).with_name("probe_outputs.py")
+    if arm == "one_confident" and any(p.suffix.lower() == ".csv" for p in out.rglob("*")):
+        command = """cd / && python -c 'from pathlib import Path; from probe_outputs import mutate; print(mutate(Path("/app/output"), "one_confident"))'"""
+        prep = sandbox.run(cfg, [(out, "/app/output", "rw"), (script, "/probe_outputs.py", "ro")],
+                           command, cfg["gen"]["baseline_timeout"], f"tbsgen-prepare-{tag}")
+        if prep["rc"] != 0 or not prep["out"].strip().isdigit():
+            return dict(ok=False, error="public coverage probe failed", stderr=prep["err"][-500:])
+        public = int(prep["out"].strip())
+    if prog:
+        cli = out / "solution_cli.py"
+        original = out / "_probe_reference.py"
+        if not cli.is_file() or original.exists():
+            return dict(ok=False, error="cannot wrap reference CLI")
+        cli.rename(original)
+        cli.write_text(script.read_text() + f"\nhidden_main({arm!r})\n")
+    elif not public:
+        return dict(ok=True, na=True)
+    t = test(cfg, task, gen, out, work, tag)
+    runs = [m for m in t["metrics"] if m.get("name") == "_solution_cli_run"]
+    counts = {}
+    for run in runs:
+        lines = run.get("stderr_tail", "").splitlines()
+        if run.get("rc") == 0 and lines and lines[-1].startswith("TBSGEN_PROBE_NA "):
+            # an output format the probe cannot transform: no evidence either way, recorded for S9R
+            return dict(ok=True, na=True, unsupported=lines[-1].removeprefix("TBSGEN_PROBE_NA ")[:300])
+        if run.get("rc") != 0 or not lines or not lines[-1].startswith("TBSGEN_PROBE "):
+            return dict(ok=False, error="probe CLI failed", stderr=lines[-2:])
+        try:
+            name, count = json.loads(lines[-1].removeprefix("TBSGEN_PROBE "))
+            if not isinstance(name, str) or type(count) is not int or count < 0:
+                raise ValueError("invalid probe counts")
+        except (TypeError, ValueError):
+            return dict(ok=False, error="invalid probe CLI record", stderr=lines[-1:])
+        counts[name] = count
+    if prog:
+        hidden = gen / "tests" / "hidden"
+        expected = {d.name for d in hidden.iterdir() if d.is_dir()} or {hidden.name}
+        if set(counts) != expected or (arm == "hidden_garbage" and not all(counts.values())):
+            return dict(ok=False, error="incomplete hidden outputs", expected=sorted(expected), counts=counts)
+    valid = t["rc"] == 0 and t["reward"] in ("0", "1")
+    na = arm == "one_confident" and not public and not any(counts.values())
+    return dict(ok=valid and (na or not t["passed"]), na=na and valid, public_files=public, hidden_files=counts,
+                reward=t["reward"], passed_checks=[m["name"] for m in t["metrics"] if m.get("passed")
+                                                   and not m.get("aux")], failed=t["failed"])

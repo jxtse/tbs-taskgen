@@ -11,11 +11,15 @@ Standard Harbor task layout, plus:
 """
 from __future__ import annotations
 
+import ast
 import json
+import shlex
 import shutil
 import tomllib
 from pathlib import Path
 
+from . import sandbox
+from .spec import valid_pins
 from .runner import TEST_SH, metrics_helper_text, timing_budget
 
 TASK_TOML = """schema_version = "1.0"
@@ -59,7 +63,7 @@ ENV PIP_NO_INDEX=1 PIP_INDEX_URL=http://127.0.0.1:9/no-index PIP_EXTRA_INDEX_URL
 
 DOCKERFILE_SELF = """FROM python:3.11-slim
 RUN python -m pip install --no-cache-dir numpy==2.1.3 scipy==1.14.1 pandas==2.2.3 scikit-learn==1.5.2 \\
-        statsmodels==0.14.4 pytest==8.3.3
+        statsmodels==0.14.4 pytest==8.3.3{extra}
 ENV OMP_NUM_THREADS=2 OPENBLAS_NUM_THREADS=2 MKL_NUM_THREADS=2 NUMEXPR_NUM_THREADS=2
 {offline}WORKDIR /app
 COPY data /app/data
@@ -90,13 +94,16 @@ def network_policy(cfg: dict) -> dict:
                                    "# launcher adds per run (harbor run --allow-agent-host HOST / agents[].extra_allowed_hosts)\n"
                                    f'network_mode = "allowlist"\nallowed_hosts = {hosts}\n'),
                     verifier_network='network_mode = "no-network"\n')
-    return dict(env_network=f'network_mode = "{mode}"', agent_network="", verifier_network="")
+    return dict(env_network=f'network_mode = "{mode}"', agent_network=f'network_mode = "{mode}"\n',
+                verifier_network='network_mode = "no-network"\n')
 
 
-def dockerfile(cfg: dict, mode: str | None = None) -> str:
+def dockerfile(cfg: dict, mode: str | None = None, extra_pip=()) -> str:
+    if not valid_pins(list(extra_pip)):
+        raise ValueError("invalid extra_pip")
     off = OFFLINE_INDEX if (cfg["package"].get("network") or {}).get("disable_index") else ""
     if (mode or cfg["package"]["dockerfile_mode"]) == "selfcontained":
-        return DOCKERFILE_SELF.format(offline=off)
+        return DOCKERFILE_SELF.format(offline=off, extra="".join(" " + pin for pin in extra_pip))
     return DOCKERFILE_LOCAL.format(image=cfg["sandbox"]["image"], offline=off)
 
 
@@ -135,14 +142,14 @@ def package(cfg: dict, item_dir: Path, gen0: Path, spec: dict, provenance: dict)
     (out / "solution" / "solve.sh").write_text(SOLVE_SH)
     (out / "instruction.md").write_text(instruction_text(cfg, spec, (task / "instruction.md").read_text()))
     pk = cfg["package"]
-    (out / "environment" / "Dockerfile").write_text(dockerfile(cfg))
+    (out / "environment" / "Dockerfile").write_text(dockerfile(cfg, extra_pip=spec.get("extra_pip", [])))
     (out / "task.toml").write_text(TASK_TOML.format(
         task_id=item_dir.name, desc=_q(spec.get("title", item_dir.name)),
         keywords=json.dumps(spec.get("competencies", [])[:8], ensure_ascii=False),
         domain=_q(spec.get("domain", "")), field=_q(spec.get("field", "")), form=_q(spec.get("form", "")),
         expert_h=float(spec.get("expert_time_hours", 2.0)), verifier_sec=float(pk["verifier_timeout"]) + timing_budget(cfg, spec),
         agent_sec=float(pk["agent_hours"] * 3600), cpus=TASK_CPUS, **network_policy(cfg)))
-    (out / "provenance.json").write_text(json.dumps(provenance, indent=1, ensure_ascii=False, default=str))
+    (out / "provenance.json").write_text(json.dumps(dict(provenance, extra_pip=spec.get("extra_pip", [])), indent=1, ensure_ascii=False, default=str))
     for p in (out / "tests" / "test.sh", out / "solution" / "solve.sh"):
         p.chmod(0o755)
     return out
@@ -218,9 +225,81 @@ def instruction_text(cfg: dict, spec: dict, text: str) -> str:
             + "\n")
 
 
+def run_solution_timeouts(src: str, budget: float) -> list[str]:
+    """Statically resolve numeric literals and simple module constants without executing task code."""
+    try:
+        tree = ast.parse(src)
+    except SyntaxError as e:
+        return [f"cannot check run_solution timeouts: {e.msg} at line {e.lineno}"]
+    names = {"run_solution"}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            names.update(a.asname for a in node.names if a.name == "run_solution" and a.asname)
+    constants = {}
+    for node in tree.body:
+        if isinstance(node, (ast.Assign, ast.AnnAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for target in targets:
+                if isinstance(target, ast.Name):
+                    constants[target.id] = node.value.value if isinstance(node.value, ast.Constant) else None
+    errors = []
+
+    def visit(node, visible):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            # A same-named parameter or local binding makes the module constant inapplicable here.
+            local = {n.arg for n in ast.walk(node.args) if isinstance(n, ast.arg)}
+            local.update(n.id for n in ast.walk(node) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store))
+            visible = {k: v for k, v in visible.items() if k not in local}
+        if isinstance(node, ast.Call):
+            name = getattr(node.func, "id", None)
+            if name in names or getattr(node.func, "attr", None) == "run_solution":
+                arg = next((k.value for k in node.keywords if k.arg == "timeout_sec"), None)
+                if arg is None and node.args:
+                    arg = node.args[0]
+                value = visible.get(arg.id) if isinstance(arg, ast.Name) else getattr(arg, "value", None)
+                if type(value) in (int, float) and value >= budget:
+                    errors.append(f"line {node.lineno}: run_solution timeout {value:g}s >= verifier budget {budget:g}s")
+        for child in ast.iter_child_nodes(node):
+            visit(child, visible)
+
+    visit(tree, constants)
+    return errors
+
+
+def network_errors(t: dict, mode: str) -> tuple[list, list]:
+    errors, warnings = [], []
+    if t.get("verifier", {}).get("network_mode") != "no-network":
+        errors.append("[verifier].network_mode must explicitly be no-network")
+    agent = t.get("agent", {}).get("network_mode")
+    if agent == "public" and mode == "public":
+        warnings.append("agent network is public for a comparison run")
+    elif agent not in ("allowlist", "no-network"):
+        errors.append("[agent].network_mode must explicitly be allowlist or no-network")
+    return errors, warnings
+
+
+def sandbox_pin_errors(cfg: dict, pins: list) -> list[str]:
+    if not pins:
+        return []
+    if not valid_pins(pins):
+        return ["extra_pip_unsupported: invalid package pins"]
+    # Both local and SSH runners use the configured image, offline. Query installed metadata only.
+    code = ("from importlib.metadata import version\n"
+            f"for pin in {pins!r}:\n"
+            "    name, wanted = pin.split('==')\n"
+            "    if version(name) != wanted: raise SystemExit(pin)\n")
+    try:
+        result = sandbox.run(cfg, [], "python -c " + shlex.quote(code), 30, "tbsgen-check-pins")
+    except (OSError, ValueError) as e:
+        return [f"extra_pip_unsupported: cannot verify {pins} in the configured sandbox: {e}"]
+    if result["rc"]:
+        return [f"extra_pip_unsupported: {pins} in {cfg['sandbox']['image']}: {result['err'][-300:]}"]
+    return []
+
+
 def validate_pkg(pkg: Path, cfg: dict | None = None) -> dict:
     missing = [r for r in REQUIRED if not (pkg / r).exists()]
-    errs = []
+    errs, warnings = [], []
     try:
         t = tomllib.loads((pkg / "task.toml").read_text())
         for sec in ("task", "verifier", "agent", "environment"):
@@ -228,9 +307,21 @@ def validate_pkg(pkg: Path, cfg: dict | None = None) -> dict:
                 errs.append(f"task.toml missing [{sec}]")
         if (t.get("environment") or {}).get("network_mode") not in NETWORK_MODES:
             errs.append("task.toml [environment] needs network_mode")
+        policy = ((cfg or {}).get("package", {}).get("network") or {}).get("mode", "agent-allowlist")
+        network, warnings = network_errors(t, policy)
+        errs.extend(network)
+        overhead = float((cfg or {}).get("package", {}).get("verifier_overhead_sec", 120))
+        budget = float(t["verifier"]["timeout_sec"]) - overhead
+        for name in ("measure.py", "test_outputs.py"):
+            path = pkg / "tests" / name
+            if path.is_file():
+                errs.extend(f"{name}: {e}" for e in run_solution_timeouts(path.read_text(), budget))
     except Exception as e:  # noqa: BLE001
         errs.append(f"task.toml: {e}")
     if cfg is not None and not missing:
+        from .state import read_json
+        pins = read_json(pkg / "provenance.json", {}).get("extra_pip", [])
+        errs.extend(sandbox_pin_errors(cfg, pins))
         errs += verifier_time_errors(pkg, float((cfg.get("package") or {}).get("verifier_overhead_sec", 120)))
     leaked = [str(p.relative_to(pkg)) for p in (pkg / "environment").rglob("*")
               if p.is_file() and any(s in p.parts for s in ("tests", "truth", "generator", "solution"))]
@@ -239,4 +330,4 @@ def validate_pkg(pkg: Path, cfg: dict | None = None) -> dict:
     for gen_only in ("generator", "baselines", "_spec"):
         if (pkg / gen_only).exists():
             errs.append(f"{gen_only}/ must not be packaged")
-    return dict(ok=not missing and not errs, missing=missing, errors=errs)
+    return dict(ok=not missing and not errs, missing=missing, errors=errs, warnings=warnings)

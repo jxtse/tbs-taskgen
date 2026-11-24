@@ -27,6 +27,7 @@ gates/attempt-<n>.json = {"gates": {name: bool}, "blocking": [names], "details":
 """
 from __future__ import annotations
 
+import hashlib
 import math
 import re
 from pathlib import Path
@@ -34,6 +35,8 @@ from pathlib import Path
 from . import runner
 from .leakcheck import leak_report
 from .spec import metric_family
+from .state import read_json
+from .statement import assumptions_stated, statement_clean, threshold_format
 
 
 CLI_RE = re.compile(r"solution_cli\.py\s+<input_dir>\s+<output_dir>")
@@ -188,6 +191,81 @@ def exploit_patch_problems(task: Path, patch: dict) -> list[str]:
     return bad
 
 
+def hidden_duplicates(pub: Path, hid: Path, shared_inputs=(), copied_share_max: float = 0.5) -> dict:
+    """Compare file bytes across splits and relative-path/digest trees across hidden regimes."""
+    def index(root):
+        result = {}
+        for p in sorted(root.rglob("*")):
+            if p.is_file():
+                with p.open("rb") as f:
+                    result[p.relative_to(root)] = (p.stat().st_size, hashlib.file_digest(f, "sha256").hexdigest())
+        return result
+
+    public = index(pub)
+    by_digest = {}
+    for path, (size, digest) in public.items():
+        if size > 1024:
+            by_digest.setdefault(digest, []).append(str(path))
+    hidden = index(hid)
+    copies = {str(path): by_digest[digest] for path, (size, digest) in hidden.items()
+              if size > 1024 and digest in by_digest and path.name not in shared_inputs}
+    sets = sorted(d.name for d in hid.iterdir() if d.is_dir()) if hid.is_dir() else []
+    trees = {name: {p.relative_to(name): v for p, v in hidden.items() if p.parts[0] == name} for name in sets}
+    same_sets = [[a, b] for i, a in enumerate(sets) for b in sets[i+1:] if trees[a] == trees[b]]
+    same_public = [name for name, tree in {".": hidden, **trees}.items() if tree and tree == public]
+    # A copied file is fine on its own (a shared training table, a common time grid: 7 of the 21 tbsgen tasks in the
+    # 2026-11-23 share do this).  What tests nothing is a hidden set made mostly of public bytes.
+    mostly = {}
+    for name, tree in ({".": hidden} if not sets else trees).items():
+        total = sum(size for size, _ in tree.values())
+        copied = sum(size for p, (size, digest) in tree.items()
+                     if digest in by_digest and size > 1024 and Path(p).name not in shared_inputs)
+        if total and copied >= copied_share_max * total:
+            mostly[name] = round(copied / total, 3)
+    return dict(ok=bool(hidden) and not (same_sets or same_public or mostly), copied_files=copies,
+                identical_sets=same_sets, identical_public=same_public, mostly_public=mostly)
+
+
+def hidden_parity(metrics: list, spec: dict) -> dict:
+    declared = {m["name"]: m for m in spec.get("metrics", [])}
+    families = {"public": set(), "hidden": set()}
+    exempt = set()
+    for row in metrics:
+        name = row.get("name")
+        if not name or row.get("aux") or name.startswith("_"):
+            continue
+        m = declared.get(name, {})
+        on = m.get("on")
+        if on not in families:
+            on = "hidden" if name.startswith("hidden_") or name.endswith("_hidden") else "public"
+        family = metric_family(name)
+        families[on].add(family)
+        reason = m.get("public_only_reason")
+        if on == "public" and m.get("public_only") is True and isinstance(reason, str) and reason.strip():
+            exempt.add(family)
+    return dict(missing_hidden=sorted(families["public"] - families["hidden"] - exempt),
+                missing_public=sorted(families["hidden"] - families["public"]))
+
+
+def realism(spec, public, runs):
+    times = [v["solve_sec"] for k, v in runs.items() if re.fullmatch(r"ref\d+", k) and
+             v.get("solve_rc") == 0 and isinstance(v.get("solve_sec"), (int, float))]
+    hours = next((spec[k] for k in ("expert_time_estimate_hours", "expert_hours", "expert_time_hours")
+                  if k in spec), 0)
+    files = [p for p in public.rglob("*") if p.is_file()]
+    size = sum(p.stat().st_size for p in files)
+    formats = sorted({p.suffix.lower() for p in files})
+    try:
+        long_task = float(hours) >= 2
+    except (TypeError, ValueError):
+        long_task = False
+    effort = bool(str(spec.get("effort_note") or "").strip()) or not times or max(times) >= 30 or not long_task
+    data = bool(str(spec.get("data_realism_note") or "").strip()) or size >= 2_000_000 or bool(
+        set(formats) - {".csv", ".npy", ".json", ".txt"})
+    return {"effort_floor": (effort, dict(solve_sec=times, expert_hours=hours)),
+            "data_realism": (data, dict(bytes=size, extensions=formats))}
+
+
 def run_gates(cfg: dict, item_dir: Path, spec: dict, thresholds: dict, attempt: int) -> dict:
     task = item_dir / "task"
     work = item_dir / "runs" / f"s7-{attempt}"
@@ -203,6 +281,11 @@ def run_gates(cfg: dict, item_dir: Path, spec: dict, thresholds: dict, attempt: 
     ok = dict(oracle=True, nop=True, naive=True, mid=True, exploit=True, exploit_valid=True, hidden_shift=True,
               oracle_margin=True)
     exploits = sorted(str(p.relative_to(task)) for p in (task / "baselines").glob("exploit_*.py"))
+    hidden_names = {m["name"] for m in spec.get("metrics", []) if m.get("on") == "hidden"}
+    if spec.get("form") == "PROG":
+        ok["hidden_parity"] = True
+        det["hidden_parity"], det["hidden_shift"] = {}, {}
+    det["oracle_margin"] = {}
     det["seeds"] = {}
     for s in seeds:
         gen = work / "detA" if s == seeds[0] else work / f"gen{s}"
@@ -244,28 +327,69 @@ def run_gates(cfg: dict, item_dir: Path, spec: dict, thresholds: dict, attempt: 
                 continue        # recorded-only resource metric: never decides a run, no margin to demand
             th = m.get("threshold_effective", m["threshold"])          # machine-speed scaled time threshold
             room = (th - m["value"]) if m["direction"] == "<=" else (m["value"] - th)
-            if room < 0.5 * cfg["thresholds"]["min_ref_margin"] * max(abs(th), 1e-12):
+            hidden_metric = m["name"].startswith("hidden_") or m["name"] in hidden_names
+            fraction = (cfg["thresholds"]["min_ref_margin_hidden"] if hidden_metric
+                        else 0.5 * cfg["thresholds"]["min_ref_margin"])
+            required = fraction * max(abs(th), 1e-12)
+            if room < required and not math.isclose(room, required, rel_tol=1e-12):
+                det["oracle_margin"].setdefault(s, []).append(m["name"])
                 ok["oracle_margin"] = False
         if spec.get("form") == "PROG":
             hid = gen / "tests" / "hidden"
             pub = gen / "environment" / "data"
-            hfiles = [p for p in hid.rglob("*") if p.is_file()]
-            differs = bool(hfiles) and runner.tree_hash(hid) != runner.tree_hash(pub)
-            hid_names = {m["name"] for m in spec.get("metrics", []) if m.get("on") == "hidden"}
+            dup = hidden_duplicates(pub, hid, spec.get("shared_inputs", []))
             n_hidden = sum(1 for m in ref["metrics"] if not m.get("aux") and
-                           (m["name"].startswith("hidden_") or m["name"] in hid_names))
-            ok["hidden_shift"] &= differs and n_hidden >= 2
+                           (m["name"].startswith("hidden_") or m["name"] in hidden_names))
+            ok["hidden_shift"] &= dup["ok"] and n_hidden >= 2
+            det["hidden_shift"][s] = dict(dup, n_hidden=n_hidden)
+            parity = hidden_parity(ref["metrics"], spec)
+            det["hidden_parity"][s] = parity
+            # only public checks missing on the hidden sets block (the reviewer's finding); a hidden-only metric
+            # measures the shift itself and is normal (14 of 18 prod-code tasks have one)
+            ok["hidden_parity"] &= not parity["missing_hidden"]
             if s == seeds[0]:
                 tp = runner.truth_probe(cfg, task, gen, work / f"out-ref{s}", work, f"truthprobe{s}")
                 g["truth_isolation"] = tp["ok"]
                 det["truth_isolation"] = tp
         det["seeds"][s] = sd
+    # Probe seed zero even for a custom seed schedule. Reuse its scored reference whenever available.
+    seed0 = next((s for s in seeds if str(s) == "0"), None)
+    if seed0 is None:
+        gen = work / "probe-gen0"
+        reference_ok = runner.generate(cfg, task, 0, gen)["rc"] == 0
+        ref_out = work / "out-probe-ref0"
+        if reference_ok:
+            sv = runner.solve(cfg, task, gen, "solution/solve.py", work, "probe-ref0")
+            reference_ok = sv["rc"] == 0 and runner.test(cfg, task, gen, ref_out, work, "probe-ref0")["passed"]
+    else:
+        gen = work / ("detA" if seed0 == seeds[0] else "gen0")
+        ref_out = work / "out-ref0"
+        reference = det["seeds"][seed0].get("ref", {})
+        reference_ok = reference.get("solve_rc") == 0 and reference.get("passed")
+    prog = spec.get("form") == "PROG"
+    arms = [("coverage", "one_confident")]
+    if prog:
+        arms.append(("hidden_garbage", "hidden_garbage"))
+    for gate, arm in arms:
+        result = (runner.output_probe(cfg, task, gen, ref_out, work, arm, prog) if reference_ok
+                  else dict(ok=False, error="seed 0 reference failed"))
+        det["seeds"].setdefault(0 if seed0 is None else seed0, {})[f"exploit__{arm}"] = result
+        g[gate] = result["ok"]
+        det[gate] = "na" if result.get("na") else result
+        if gate == "hidden_garbage":
+            ok["exploit"] &= result["ok"]
     g.update(ok)
     # thresholds stated
     ins = (task / "instruction.md").read_text() if (task / "instruction.md").exists() else ""
     # the verifier-time note PKG generates is not the task author's text: never evidence for a stated threshold
     from .package import strip_time_note
     ins = strip_time_note(ins)
+    for name, issues in (("threshold_format", threshold_format(ins, thresholds)), ("statement_clean", statement_clean(ins)),
+                         ("assumptions_stated", assumptions_stated(ins, spec.get("generator_assumptions", [])))):
+        g[name], det[name] = not issues, issues
+    measured = read_json(item_dir / "S6A_measure.json", {}).get("runs", {})
+    for name, (passed, detail) in realism(spec, work / "detA/environment/data", measured).items():
+        g[name], det[name] = passed, detail
     nums = numbers_in(ins)
     unstated = [k for k, t in thresholds.items()
                 if not any(math.isclose(v, abs(t["threshold"]), rel_tol=1e-6, abs_tol=1e-12) for v in nums)]
@@ -300,7 +424,6 @@ def run_gates(cfg: dict, item_dir: Path, spec: dict, thresholds: dict, attempt: 
         g["tdm_verbatim"] = tv["ok"]
     # ready-made implementation of the paper in the image, the reference or a baseline (prerelease.py)
     from . import prerelease
-    from .state import read_json
     spec_a = prerelease.with_author_code(item_dir, spec)
     rm = prerelease.readymade_check(task, read_json(item_dir / "S1_candidate.json", {}), spec_a,
                                     public_env=gen0 / "environment")
@@ -323,7 +446,7 @@ def run_gates(cfg: dict, item_dir: Path, spec: dict, thresholds: dict, attempt: 
         det["targeting_leak"] = tl
     blocking = [k for k, v in g.items() if not v and k in _blocking(cfg)]
     nonblocking = [k for k, v in g.items() if not v and k not in _blocking(cfg)]
-    return dict(attempt=attempt, gates=g, blocking=blocking, nonblocking=nonblocking, ok=all(g.values()),
+    return dict(attempt=attempt, gates=g, blocking=blocking, nonblocking=nonblocking, ok=not blocking and not set(nonblocking) - {"effort_floor", "data_realism"},
                 details=det)
 
 

@@ -247,7 +247,9 @@ def _slim(g):
     out = {k: g[k] for k in ("gates", "blocking", "nonblocking", "why") if k in g}
     det = g.get("details") or g.get("info") or {}
     if isinstance(det, dict):
-        out["details"] = {k: det[k] for k in ("determinism", "unstated", "isolation", "runs", "truth_isolation")
+        out["details"] = {k: det[k] for k in ("determinism", "unstated", "isolation", "runs", "truth_isolation",
+                                              "statement_clean", "threshold_format", "hidden_parity", "hidden_shift",
+                                              "assumptions_stated", "hidden_garbage", "coverage", "oracle_margin")
                           if k in det}
         if "exploit_valid" in out.get("blocking", []):
             out["fix_hint"] = ("an exploit baseline did not really run (details.seeds.<seed>.exploit_*.valid.why): fix "
@@ -744,6 +746,18 @@ def review_gate(P, it) -> str | None:
 
 
 def s10(P, it):
+    from . import diversity
+    from .stages_a import _agent_slot_lock
+    # Serialize the inventory read and manifest append with other S10 and S5G admissions in this run.
+    with _agent_slot_lock(P):
+        why = diversity.admission(P, it, "S10")
+        if why:
+            withdraw(P, it.item_id, why)
+            return it.finish("parked", why)
+        return _release_reviewed(P, it)
+
+
+def _release_reviewed(P, it):
     why = review_gate(P, it)
     if why and it.state.get("calib_label") == "frontier" and not (P.cfg.get("review") or {}).get("enabled"):
         withdraw(P, it.item_id, why)

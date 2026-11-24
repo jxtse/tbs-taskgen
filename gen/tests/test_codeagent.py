@@ -151,7 +151,7 @@ def test_s4c_not_runnable_gpu(tmp_path, monkeypatch):
     assert st["status"] == "dropped" and st["reason"] == "code_needs_gpu"
 
 
-SPEC = {"title": "t", "domain": "d", "field": "f", "form": "ANS", "expert_time_hours": 3, "competencies": ["x"],
+SPEC = {"generator_assumptions": [], "title": "t", "domain": "d", "field": "f", "form": "ANS", "expert_time_hours": 3, "competencies": ["x"],
         "grounding_vs_extension": "g", "metrics": [{"name": "rmse", "direction": "<=", "on": "public", "desc": "d"},
                                                    {"name": "bias", "direction": "<=", "on": "public", "desc": "d"},
                                                    {"name": "cov", "direction": ">=", "on": "public", "desc": "d"}],

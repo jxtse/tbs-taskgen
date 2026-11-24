@@ -198,6 +198,8 @@ def s5(P, it):
         except ValueError as e:
             errs = [f"unparseable: {e}"]
             continue
+        if isinstance(spec, dict):
+            spec["prompt_version"] = PROMPT_VERSION
         errs = validate_spec(spec, P.cfg)
         if not errs:
             break
@@ -473,7 +475,7 @@ def s6m(P, it):
             # the naive baseline already drops a superset of key derive nodes; keep naive_drop ⊇ mid_drop by
             # adding the node (naive.py is regenerated below only if the node really is new to it) (review #8)
             cand["depgraph"]["naive_drop"] = list(cand["depgraph"].get("naive_drop", [])) + [new]
-        errs = validate_spec(cand, P.cfg)
+        errs = validate_spec(cand, P.cfg, read_json(it.p("_spec", "provenance.json"), {}).get("prompt_version"))
         if errs:
             write_json(it.p("S6M_error.json"), dict(mid_drop=new, errors=errs))
             return it.finish("dropped", "s6m_invalid_spec:" + ";".join(errs)[:200])
@@ -607,7 +609,7 @@ def _agent_stage(P, it, kind: str, instruction: str, need: list[str], timeout_s:
             # stepping different papers cannot both take the last slot / daily admission
             why = _agent_admission(P, it, kind)
             if why:
-                it.finish("paused" if why.startswith("budget:") else "waiting", why, paused_stage=kind)
+                it.finish(_admission_status(why), why, paused_stage=kind)
                 return None
             n = it.bump(f"{kind}:job")
             work = it.p(kind, "work")
@@ -617,6 +619,9 @@ def _agent_stage(P, it, kind: str, instruction: str, need: list[str], timeout_s:
             jobs = Path(codeagent._c(P.cfg).get("agent_jobs_dir") or it.p(kind, "jobs"))
             conf = codeagent.agent_job_config(P.cfg, task, f"tbsgen-{it.item_id}-{kind.lower()}{n}", jobs, max_usd)
             extra = dict(budget=dict(timeout_s=timeout_s, max_usd=max_usd), est_usd=est_usd)
+            if kind == "S5G":
+                from .prompts_code import CODE_PROMPT_VERSION
+                extra["prompt_version"] = CODE_PROMPT_VERSION
             if rnd is not None:
                 extra["harden_round"] = rnd["round"]
             rec = codeagent.launch_agent(P.cfg, it, kind, conf, P.ledger, est_usd, extra=extra)
@@ -634,12 +639,20 @@ def _agent_stage(P, it, kind: str, instruction: str, need: list[str], timeout_s:
         # resumed: reuse the persisted reservation amount (clamped to the paper cap when the job was set up); the
         # record already holds its slot (intent / reserved count as running) and its admission is per paper
         with _agent_slot_lock(P):
-            if rec.get("state") == "intent" or (rec.get("state") == "reserved" and not rec.get("launch_attempted")):
+            started = rec.get("launch_attempted") or (rec.get("job_dir") and
+                                                      (Path(rec["job_dir"]) / "config.json").exists())
+            if rec["state"] == "intent" or not started:
                 # never started (budget stop before the reservation, or a crash before the launch): no admission
                 # yet -> the same checks as a new job (a held reservation keeps its slot meanwhile)
                 why = _agent_admission(P, it, kind)
                 if why:
-                    it.finish("paused" if why.startswith("budget:") else "waiting", why, paused_stage=kind)
+                    if why.startswith("diversity:") and rec["state"] == "reserved":
+                        # A parked paper releases its unused money and its concurrent authoring slot.
+                        if rec.get("ledger_call"):
+                            P.ledger.settle(rec["ledger_call"], 0., status="error", kind="not_launched", note=why)
+                        rec.update(state="intent", ledger_call=None)
+                        write_json(recp, rec)
+                    it.finish(_admission_status(why), why, paused_stage=kind)
                     return None
             rec = codeagent.launch_agent(P.cfg, it, kind, json.loads(Path(rec["config"]).read_text()), P.ledger,
                                          float(rec.get("est_usd", est_usd)))
@@ -833,7 +846,7 @@ def _s5g(P, it):
     paper really supports and records them in _spec/difficulty_design.json; in a hardening round (difficulty.py)
     it gets the previous version and the student's passing-run summary and makes the task harder."""
     from . import codeagent, difficulty
-    from .prompts_code import (CODE_PROMPT_VERSION, S5G_AUTHOR, S5G_DIFFICULTY, S5G_HARDEN, S5G_HARDEN_PREFERRED,
+    from .prompts_code import (S5G_AUTHOR, S5G_DIFFICULTY, S5G_HARDEN, S5G_HARDEN_PREFERRED,
                                S5G_PREFERRED, S5G_VARIANT)
     c = codegate.ccfg(P.cfg)
     d = difficulty.dcfg(P.cfg)
@@ -876,12 +889,13 @@ def _s5g(P, it):
                        float(c.get("authoring_est_usd", 15.0)), with_contract=True, rnd=rnd)
     if rec is None:
         return
+    version = rec.get("prompt_version", "cg-v3-2026-11-12")  # jobs already launched before the change
     out = codeagent.deliverable(rec)
     miss = [f for f in need if not (out and codeagent.safe_read(out / f, root=Path(rec["trial"])) is not None)]
     write_json(it.p("S5G_result.json"), dict(job=rec.get("job_name"), outcome=rec.get("outcome"),
                                              exception=rec.get("exception"), cost_usd=rec.get("cost_usd"),
                                              cost_kind=rec.get("cost_kind"), minutes=rec.get("minutes"),
-                                             missing=miss, prompt_version=CODE_PROMPT_VERSION,
+                                             missing=miss, prompt_version=version,
                                              difficulty_profile=difficulty.provenance(prof), harden_round=hround,
                                              harden_kind=hkind))
     if miss:
@@ -894,6 +908,8 @@ def _s5g(P, it):
         spec = json.loads(codeagent.safe_read(out / "_spec" / "spec.json", root=Path(rec["trial"])) or "")
     except (OSError, ValueError) as e:
         return it.finish("dropped", f"s5g_spec_unparseable:{type(e).__name__}")
+    if isinstance(spec, dict):
+        spec["prompt_version"] = version
     errs = validate_spec(spec, P.cfg)
     write_json(it.p("_spec", "spec_errors.json"), errs)
     if errs:
@@ -950,7 +966,7 @@ def _s5g(P, it):
                                                     field=spec.get("field"), competencies=spec.get("competencies")))
     c1 = read_json(it.p("S1_candidate.json"), {}) or {}
     write_json(it.p("_spec", "provenance.json"), dict(
-        doi=c1.get("doi"), title=c1.get("title"), target=c1.get("_target"), prompt_version=CODE_PROMPT_VERSION,
+        doi=c1.get("doi"), title=c1.get("title"), target=c1.get("_target"), prompt_version=version,
         authoring="agent", agent_job=rec.get("job_name"), fulltext=read_json(it.p("S3_fulltext.json")),
         fulltext_sha=hashlib.sha256(it.p("fulltext.txt").read_bytes()).hexdigest()[:16],
         author_code=dict(repo=s3c.get("primary_url"), pin=s3c.get("pin"), license=s3c.get("license")),
@@ -1007,6 +1023,12 @@ def _cst_day() -> str:
     return time.strftime("%Y-%m-%d", time.gmtime(time.time() + 8 * 3600))
 
 
+def _admission_status(why):
+    if why.startswith("diversity:"):
+        return "parked"
+    return "paused" if why.startswith("budget:") else "waiting"
+
+
 def _agent_admission(P, it, kind: str) -> str | None:
     """Production throttles before a new S4c / S5G job (call under _agent_slot_lock): code.max_concurrent_agent_jobs
     (S4c + S5G records of this run in intent / reserved / launched; "queued:" -> the item waits and is polled
@@ -1014,6 +1036,11 @@ def _agent_admission(P, it, kind: str) -> str | None:
     this Asia/Shanghai day; "budget:daily_*" -> paused until the next day's `resume --reason budget:daily`).  A
     paper is recorded when its job starts (_agent_admit); later jobs of the same paper (re-authoring, hardening
     rounds) are not counted again."""
+    if kind == "S5G":
+        from . import diversity
+        why = diversity.admission(P, it, kind)
+        if why:
+            return why
     c = codegate.ccfg(P.cfg)
     cap = c.get("max_concurrent_agent_jobs")
     if cap is not None:

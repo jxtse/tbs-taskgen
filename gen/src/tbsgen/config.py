@@ -396,6 +396,10 @@ DEFAULTS: dict[str, Any] = {
     },
     "thresholds": {
         "frac": 0.5,                        # 待定: threshold position between ref and mid (log-midpoint)
+        # hidden-set metrics: the share of the reference's margin S7 demands.  0.05 = the old rule (half of
+        # min_ref_margin).  A full 0.10 would block 4 of the 25 tasks released by prod-code on 2026-11-24
+        # (hidden margins 6.8-9.7 %); raise it only together with a recalibration.
+        "min_ref_margin_hidden": 0.05,
         "min_ref_margin": 0.10,             # reference must clear each threshold by >=10% (relative)
         "loose_margin": 0.50,               # non-separating metrics: threshold = ref worsened by 50%
         "noise_floor_abs": 1e-9,            # two values both below this are floating-point noise: never "separating"
@@ -423,7 +427,8 @@ DEFAULTS: dict[str, Any] = {
         "max_exploit_repair_rounds": 2,     # S8 rounds when exploit_valid is the only blocking gate: only the broken
                                             # baselines/exploit_*.py are rewritten (allowed with locked thresholds)
         "blocking": ["oracle", "hidden_shift", "leak", "isolation", "infeasible", "determinism", "truth_isolation",
-                     "cli_contract", "output_contract", "tdm_verbatim", "readymade", "author_leak"],
+                     "threshold_format", "statement_clean", "hidden_parity", "hidden_garbage", "coverage",
+                     "assumptions_stated", "cli_contract", "output_contract", "tdm_verbatim", "readymade", "author_leak"],
         # readymade (prerelease.readymade_check): the task image installs, or the reference / a baseline imports,
         # the paper's own implementation (code_links repo names, method_names of the S5 spec).  Rules only.
         # TDM terms (Elsevier: quotes <= 200 chars; Wiley: no redistribution): longest verbatim overlap between
@@ -432,6 +437,7 @@ DEFAULTS: dict[str, Any] = {
         "tdm_verbatim_channels": ["elsevier", "wiley"],
         "tdm_verbatim_unknown": False,      # True: a full text of unknown channel is checked too
     },
+    "diversity": {"max_area_share": 0.25, "max_per_template": 2, "min_released": 20, "enforce": False},
     "sandbox": {
         "backend": "docker",                # "docker" (local) | "ssh" (docker on `host`; code-grounded runs: the
                                             # authors' code runs on the build host only)

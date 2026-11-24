@@ -3,7 +3,7 @@ S8 local repair).  Outputs are machine-parsed: S5 -> one JSON object; S6A/S6C/S8
 "=== FILE: <rel path> ===" ... "=== END ===".  Kept short on purpose: the contract (file layout + rules)
 matters more than prose.  Version strings go into provenance so prompt changes are traceable.
 """
-PROMPT_VERSION = "v2.7-2026-11-11"
+PROMPT_VERSION = "v2.8-2026-11-24"
 
 METRICS_API = """Verifier helper module `_metrics` (provided, importable from tests/; exact signatures):
   check(name: str, value: float, threshold: float, direction: "<=" | ">=") -> None   # records + asserts
@@ -22,6 +22,16 @@ SYSTEM = (
     "numeric criteria. Ground truth never appears in public files or objects; no rule-only protection "
     "(the agent is root: 'do not read X' protects nothing). No black-box query budgets with an in-container "
     "oracle. Output exactly the requested format.")
+
+ASSUMPTION_RULES = """## Everything the grader depends on is in the statement
+Disclose every score-relevant forward model, physical formula, noise model, parameterisation, convention,
+unit and coordinate frame used by the generator. An omitted assumption must be uniquely recoverable from
+the data, and the reference must recover it there. Describe what changes on the hidden sets.
+List generator_assumptions in the spec: each object has assumption (text), stated (boolean), and where
+(an exact statement quote of at least 12 characters or "recovered from data: <how the reference does it>")."""
+
+GRADING_RULES = """For PROG, check every public quantity on every hidden set. Pair precision-type metrics
+with coverage, recall or a count. Partial or empty hidden outputs must fail."""
 
 S5_SPEC = """Paper (excerpt, DOI {doi}):
 <<<
@@ -80,7 +90,7 @@ Baselines (they decide whether the task survives; most rejected specs failed her
   than the naive approach (e.g. a selection score that an all-or-nothing answer maximises) is not a valid metric.
 - Choose metrics so that the expected separation holds by construction: ref passes all; mid fails 1-2 criteria
   (the ones its missing step affects); naive fails >= 2.  State it in "expected_separation".
-Keep the JSON compact (short descs): code is written in a later step."""
+Keep the JSON compact (short descs): code is written in a later step.\n""" + ASSUMPTION_RULES + "\n" + GRADING_RULES
 
 S6A_GEN = """Specification:
 {spec}
@@ -144,6 +154,8 @@ Write (generator, solution and mid/naive baselines already exist and are fixed):
   {hours} h.
 Format: === FILE: <path> === blocks, then === END ==="""
 
+S6C_TESTS += "\n" + ASSUMPTION_RULES + "\n" + GRADING_RULES
+
 S8_REPAIR = """The task failed blocking gates.  Gate log:
 {gates}
 {metrics_api}
@@ -153,6 +165,8 @@ Current files:
 Return ONLY the files you change (same paths; no new files, no deleted criteria, thresholds unchanged unless the
 gate log says they were re-derived).  Format: === FILE: <path> === blocks, then === END ==="""
 
+
+S8_REPAIR += "\n" + GRADING_RULES
 
 S8_EXPLOIT = """S7 found exploit baselines that did not really run, so they tested nothing (details per seed: solve_rc,
 solve_err, valid.why):

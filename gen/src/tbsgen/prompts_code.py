@@ -1,6 +1,8 @@
 """Instructions for the code-grounded agent jobs (S4c runnability, S5G task authoring).  Versioned like prompts.py."""
 
-CODE_PROMPT_VERSION = "cg-v3-2026-11-12"   # v2: difficulty targeting + hardening rounds; v3: process-kill guard
+from .prompts import ASSUMPTION_RULES, GRADING_RULES
+
+CODE_PROMPT_VERSION = "cg-v4-2026-11-24"
 
 S4C_RUNNABILITY = """# Runnability check of a paper's published code ({item})
 
@@ -88,7 +90,7 @@ separates a correct expert solution from simpler approaches.
 - The **reference solution** should call or port the authors' implementation of the paper's method (port = copy the
   needed functions into `solution/solve.py`, self-contained; credit the source file in a comment).  It must run in
   the task image: python 3.11 with exactly numpy 2.1.3, scipy 1.14.1, pandas 2.2.3, scikit-learn 1.5.2,
-  statsmodels 0.14.4 (no other packages, no network) -- **never** the authors' repository or package (the solver
+  statsmodels 0.14.4 (offline; additional format readers require matching pins in the sandbox image) -- **never** the authors' repository or package (the solver
   must not get it).  Test that in a fresh venv with only those pins.  If the authors' code is not Python or needs
   other packages, use it at **build time only**: run it here to produce ground truth / reference outputs for fixed
   inputs, store them under `generator/assets/` (small, < 20 MB, with `generator/assets/PROVENANCE.md`: exact
@@ -98,6 +100,11 @@ separates a correct expert solution from simpler approaches.
   seeds / parameters for the hidden (PROG) inputs.  Synthetic data from your own generator is the fallback.
 - `generator/generate.py <seed>` must be deterministic in the seed and run with the same pinned stack (it runs in a
   network-less container with only that stack; it cannot call the authors' code).
+
+Prefer original scientific formats (FITS, HDF5/NetCDF, FASTA/FASTQ/BAM-like text, mzML, CIF/PDB,
+DICOM, VTK, raw instrument logs). Preserve missing values, mixed units/formats, outliers and instrument
+artefacts when the paper handles them. List data_formats and any extra_pip reader pins (name==version,
+at most eight, available as wheels or pure Python and already installed in the configured sandbox image).
 
 ## No leaks of the authors' implementation
 - `instruction.md` must not name the repository, the package, the authors' function / class names, or their file
@@ -120,6 +127,8 @@ Process hygiene: this agent itself runs as a process in the container.  Never ki
 kill only those PIDs.  A pattern kill once matched the agent and ended the job without its results.
 """
 
+
+S5G_AUTHOR += "\n" + ASSUMPTION_RULES + "\n" + GRADING_RULES
 
 # appended to S5G_AUTHOR when difficulty.profile_path is set (difficulty.py)
 S5G_DIFFICULTY = """
