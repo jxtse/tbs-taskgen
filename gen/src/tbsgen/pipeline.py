@@ -156,9 +156,23 @@ class Pipeline:
         else:
             it.finish(status, reason, **info)
 
+    def _migrate_probe_report(self, it):
+        try:
+            return "ok" if B.migrate_probe_report(self, it) else None
+        except Exception as exc:
+            with B.item_lock(it):
+                it.load()
+                stage = it.state["stage"]
+                self.store.event("stage_crash", item=it.item_id, stage=stage, err=f"{type(exc).__name__}: {exc}",
+                                 tb=traceback.format_exc()[-1500:])
+                if B.legacy_report_id(it):
+                    it.finish("paused", f"probe migration: {exc}", paused_stage=stage)
+            return "paused"
+
     def _step(self, it) -> str:
-        if B.migrate_probe_report(self, it):
-            return "ok"
+        migrated = self._migrate_probe_report(it)
+        if migrated:
+            return migrated
         st = it.state["stage"]
         role = MODEL_STAGES.get(st)
         alias = resolve_role(self.cfg, role) if role else None
@@ -324,8 +338,10 @@ class Pipeline:
             hist = it.state.get("history") or [{}]
             if stages and hist[-1].get("paused_stage", it.state["stage"]) not in stages:
                 continue
-            if B.migrate_probe_report(self, it):
-                out.append(it.item_id)
+            migrated = self._migrate_probe_report(it)
+            if migrated:
+                if migrated == "ok":
+                    out.append(it.item_id)
                 continue
             probe_park = (it.state["status"] == "parked" and it.state.get("reason") == "parked:probe_unreviewed"
                           and (self.cfg.get("review") or {}).get("enabled"))

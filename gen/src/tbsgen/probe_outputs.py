@@ -324,3 +324,40 @@ def hidden_main(arm, target, identity=False):
         files, uncertain = mutation_report(Path(tmp), arm, identity=identity or name != target)
         shutil.copytree(tmp, dest, dirs_exist_ok=True)
     print("\nTBSGEN_PROBE " + json.dumps([name, files, identity or name == target, uncertain]), file=sys.stderr)
+
+
+def reproduce_scope(scope):
+    """Apply one bundled scope to fresh reference output, then score it with the packaged grader."""
+    records = Path(__file__).parent
+    arm, target = scope.split("/", 1)
+    probes = json.loads((records / "output_probes.json").read_text())["probes"]
+    if (target != "public" and not target.startswith("hidden:")) or target not in probes[arm]["scopes"]:
+        raise ValueError(f"unknown probe scope: {scope}")
+
+    out = Path("/app/output")
+    if out.exists():
+        shutil.rmtree(out)
+    out.mkdir()
+    subprocess.run(["bash", "/solution/solve.sh"], check=True, cwd="/app")
+    hidden = target.removeprefix("hidden:") if target.startswith("hidden:") else None
+    cli = out / "solution_cli.py"
+    if hidden is not None or cli.is_file():
+        original = out / "_probe_reference.py"
+        if original.exists():
+            raise ValueError("cannot wrap reference CLI")
+        cli.rename(original)
+        wrapper = (records / "probe_outputs.py").read_text()
+        cli.write_text(wrapper + f"\nhidden_main({arm!r}, {hidden!r})\n")
+    if target == "public" and not mutation_report(out, arm)[0]:
+        raise ValueError(f"no outputs transformed for {scope}")
+    subprocess.run(["bash", "/review/pkg/tests/test.sh"], check=True, env=dict(os.environ, TBSGEN_PROBE_REPORT="1"))
+    if hidden is not None:
+        metrics = Path("/logs/verifier/metrics.jsonl").read_text().splitlines()
+        for line in metrics:
+            metric = json.loads(line)
+            tail = metric.get("stderr_tail", "")
+            if metric.get("name") == "_solution_cli_run" and metric.get("rc") == 0 and tail.startswith("TBSGEN_PROBE "):
+                name, files, targeted, _ = json.loads(tail.removeprefix("TBSGEN_PROBE "))
+                if name == hidden and targeted and files:
+                    return
+        raise ValueError(f"no outputs transformed for {scope}")

@@ -146,6 +146,26 @@ class Ledger:
         row = db.execute("SELECT id FROM calls WHERE reservation_key=? AND status='reserved'", (key,)).fetchone()
         return row[0] if row else None
 
+    def adopt_started_job(self, model, stage, item, job_name, launch_key, estimate, cost):
+        """Track a job that already started. Admission limits apply only before launch."""
+        key = f"harbor-adopt:{job_name}"
+        with contextlib.closing(self._db()) as db, db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT id FROM calls WHERE item=? AND stage=? AND "
+                             "(reservation_key=? OR (reservation_key=? AND status IN ('reserved','sent','ok'))) "
+                             "ORDER BY id DESC LIMIT 1", (item, stage, key, launch_key)).fetchone()
+            if row:
+                call = row[0]
+            else:
+                call = db.execute(
+                    "INSERT INTO calls(day,started,model,real,stage,item,status,est_usd,reservation_key) "
+                    "VALUES(?,?,?,1,?,?,'reserved',?,?)",
+                    (today(), time.time(), model, stage, item, estimate, key)).lastrowid
+            if cost is not None:
+                usd, kind, usage = cost
+                self._settle(db, call, usd, "ok", "adopted completed Harbor job", kind, usage)
+            return call
+
     def adopt_legacy_agent_call(self, key, item, stage, model, intent_ts):
         """Attach a job's stable key to its outstanding pre-key reservation, if present."""
         with self._db() as db:
@@ -305,18 +325,18 @@ class Ledger:
         reserved estimate as the cost (unknown actual cost is never booked as 0) and marks the row
         cost_kind="reservation".  kind: "reported" (default for a given usd) or "tokens" (estimated from token
         usage); usage (if known) is stored in the token columns."""
+        with contextlib.closing(self._db()) as db, db:
+            self._settle(db, call_id, usd, status, note, kind, usage)
+
+    @staticmethod
+    def _settle(db, call_id, usd, status, note, kind, usage):
         kind = "reservation" if usd is None else (kind or "reported")
         u = usage or {}
-        db = self._db()
-        try:
-            db.execute("UPDATE calls SET ended=?, status=?, usd=COALESCE(?, est_usd), error=?, cost_kind=?, "
-                       "in_tok=COALESCE(?, in_tok), out_tok=COALESCE(?, out_tok), cache_read=COALESCE(?, cache_read), "
-                       "cache_write=COALESCE(?, cache_write) WHERE id=?",
-                       (time.time(), status, usd, note[:500], kind, u.get("input_tokens"), u.get("output_tokens"),
-                        u.get("cache_read_input_tokens"), u.get("cache_creation_input_tokens"), call_id))
-            db.commit()
-        finally:
-            db.close()
+        db.execute("UPDATE calls SET ended=?, status=?, usd=COALESCE(?, est_usd), error=?, cost_kind=?, "
+                   "in_tok=COALESCE(?, in_tok), out_tok=COALESCE(?, out_tok), cache_read=COALESCE(?, cache_read), "
+                   "cache_write=COALESCE(?, cache_write) WHERE id=?",
+                   (time.time(), status, usd, note[:500], kind, u.get("input_tokens"), u.get("output_tokens"),
+                    u.get("cache_read_input_tokens"), u.get("cache_creation_input_tokens"), call_id))
 
     # ------------------------------------------------------------------ breaker / reports
     def breaker(self, model: str) -> dict | None:

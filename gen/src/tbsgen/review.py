@@ -10,7 +10,7 @@ teacher).  Its network is that of the teacher: the model endpoint during the age
 The agent writes /app/review_out/verdict.json:
     {"verdict": "pass" | "revise" | "drop",
      "checklist": {"a_consistency": {"status": "ok"|"issue"|"na", "note": ...}, ... "g_calibration": {...}},
-     "probe_findings": {"<arm>/<scope>": {"classification", "repro_id", "command", "observed_reward", "observation", "reason", ...}},
+     "probe_findings": {"<arm>/<scope>": {"classification", "repro_id", "observed_reward", "observation", "reason", ...}},
      "issues": [{"id", "category", "severity": "blocking"|"minor", "fix_kind": "local"|"fundamental", "title",
                  "evidence": [...], "fix"}],
      "label_assessment": {"label": ..., "trustworthy": true|false|null, "reason": ...},
@@ -42,7 +42,7 @@ from pathlib import Path
 
 from . import calib
 from .gates import current_probe_report
-from .probe_findings import CURRENT_CONTRACT, finding_errors, has_evidence, read_repros
+from .probe_findings import CURRENT_CONTRACT, JOURNAL_CONTRACTS, finding_errors, has_evidence, read_repros, repro_command
 from .state import passed_gate_attempt, passed_gate_report, read_json, write_json
 
 VERDICTS = ("pass", "revise", "drop")
@@ -329,9 +329,12 @@ def write_bundle(item_dir: Path, dest: Path, state: dict, digest_kb: int = 150) 
         details = report.get("details", {})
         probes = {arm: details[gate] for gate, arm in PROBE_ARMS.items() if gate in details}
         suspected = suspected_scopes(report)
-    (rec / "output_probes.json").write_text(json.dumps(dict(probes=probes, suspected_scopes=suspected), indent=2))
+    commands = {scope: repro_command(scope) for scope in suspected}
+    write_json(rec / "output_probes.json", dict(probes=probes, suspected_scopes=suspected, repro_commands=commands))
     if probes:
         shutil.copy2(Path(__file__).with_name("probe_outputs.py"), rec / "probe_outputs.py")
+        (rec / "reproduce_scope.py").write_text("import sys\nfrom probe_outputs import reproduce_scope\n"
+                                              "reproduce_scope(sys.argv[1])\n")
     reps = sorted((item_dir / "repair").glob("round-*/review.json")) if (item_dir / "repair").exists() else []
     if reps:
         (rec / "s8_repairs").mkdir()
@@ -381,7 +384,7 @@ def write_bundle(item_dir: Path, dest: Path, state: dict, digest_kb: int = 150) 
             (d / f"{pre}verifier_metrics.jsonl").write_text(_tail(tr / "verifier" / "metrics.jsonl", 20000))
             (d / f"{pre}trace_digest.md").write_text(trace_digest(tr, digest_kb * 1000))
     (cal / "runs.json").write_text(json.dumps(summary, indent=1, default=str))
-    return dict(calib_runs=len(runs), suspected_scopes=suspected,
+    return dict(calib_runs=len(runs), suspected_scopes=suspected, repro_commands=commands,
                 digests=sorted(p.name for p in cal.iterdir() if p.is_dir()))
 
 
@@ -440,7 +443,7 @@ def build_task(cfg: dict, item_dir: Path, state: dict, rnd: int, out: Path | Non
     (out / "tests" / "test.sh").write_text(TEST_SH)
     (out / "tests" / "test.sh").chmod(0o755)
     (out / "solution").mkdir()
-    (out / "solution" / "solve.sh").write_text(ORACLE_SH.replace("{scopes}", repr(info["suspected_scopes"])))
+    (out / "solution" / "solve.sh").write_text(ORACLE_SH.replace("{commands}", repr(info["repro_commands"])))
     (out / "solution" / "solve.sh").chmod(0o755)
     return out
 
@@ -471,12 +474,12 @@ python3 - <<'PYTHON'
 import json, subprocess
 from pathlib import Path
 findings = {}
-for scope in {scopes}:
-    run = subprocess.run(["tbs-repro", scope, "--", "bash", "/review/pkg/tests/test.sh"],
+for scope, command in {commands}.items():
+    run = subprocess.run(["tbs-repro", scope, "--", *command],
                          stdout=subprocess.PIPE, text=True)
     row = json.loads(run.stdout)
     findings[scope] = dict(classification="probe_artefact", reason="Synthetic review harness smoke test.",
-                           command="bash /review/pkg/tests/test.sh", repro_id=row["repro_id"],
+                           repro_id=row["repro_id"],
                            observed_reward=row["reward"], observation="Packaged grader completed the smoke test.")
 Path("/app/review_out/verdict.json").write_text(json.dumps(dict(verdict="pass", probe_findings=findings,
     issues=[], checklist={}, label_assessment={}, summary="Synthetic review harness smoke test.")))
@@ -624,10 +627,11 @@ e. **Shortcuts and leaks.**  Can the task be passed without doing the work (hard
    `/logs/verifier/reward.txt` or `metrics.jsonl`)?
    Open `/review/records/output_probes.json` for the per-scope trials, transformed paths, deliverable flags,
    verifier output and identity controls. Required shortcut_suspected scope IDs for this package: {suspected}.
-   For EACH ID, reproduce the scoped run with the packaged grader. The exact transformations and CLI wrapper are in
-   `records/probe_outputs.py` when probes are present. Change only the named public or hidden scope and check
+   For EACH ID, reproduce the scoped run with the packaged grader. Use the exact argv listed for that ID in
+   `/review/records/output_probes.json` under `repro_commands`. The command prepares fresh reference outputs,
+   applies the named transformation and runs the grader. Check
    which changed values the statement requires and the grader scores. In `probe_findings`, record the exact ID,
-   the `repro_id` printed by `tbs-repro <scope_id> -- <command...>`, the wrapped command line in `command`,
+   the `repro_id` printed by `tbs-repro <scope_id> -- <command...>`,
    its `observed_reward` ("0", "1", or a number), and an `observation` of at least
    20 characters describing the grader output. An optional `reproduction` note may add context.
    Classify a real grader gap as `grader_gap` and link an evidenced blocking issue by `issue_id`. This applies
@@ -715,7 +719,7 @@ Write `{verdict_path}` (JSON, exactly these keys) and optionally `/app/review_ou
     "h_timing_gate": {{"status": "...", "note": "..."}}
   }},
   "probe_findings": {{"<required scope ID>": {{"classification": "grader_gap | probe_artefact",
-    "repro_id": "ID printed by tbs-repro", "command": "exact command run", "observed_reward": 1, "observation": "describe the actual grader output",
+    "repro_id": "ID printed by tbs-repro", "observed_reward": 1, "observation": "describe the actual grader output",
     "reason": "why", "issue_id": "required for grader_gap"}}}},
   "issues": [
     {{"id": "I1", "category": "a|b|c|d|e|f|g|h|i|j", "severity": "blocking | minor",
@@ -815,7 +819,7 @@ def normalize(raw: dict | None, reward: float | None = None, allow_human: bool =
     if rv not in allowed_verdicts:
         problems.append(f"verdict {rv!r} not one of {allowed_verdicts}")
         v = None
-    elif contract == CURRENT_CONTRACT and errors:
+    elif contract in JOURNAL_CONTRACTS and errors:
         v = None
     elif rv == "drop" and blocking:
         v = "drop"
@@ -880,7 +884,7 @@ def classify(job_dir: Path, model: str | None, prices: dict, allow_human: bool =
         rw = ((json.loads((trial / "result.json").read_text()).get("verifier_result") or {}).get("rewards") or {})
         reward = rw.get("reward")
         reward = float(reward) if isinstance(reward, (int, float)) else 0.0
-    repros = read_repros(trial / "verifier/repro.jsonl") if trial and contract == CURRENT_CONTRACT else {}
+    repros = read_repros(trial / "verifier/repro.jsonl") if trial and contract in JOURNAL_CONTRACTS else {}
     return dict(outcome="done" if raw is not None else "infra", verdict_raw=raw, verifier_reward=reward, repros=repros,
                 verdict=normalize(raw, reward, allow_human, suspected_scopes, contract, allowed_verdicts, repros)
                 if raw is not None else None,

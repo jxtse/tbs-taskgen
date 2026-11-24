@@ -28,6 +28,8 @@ import re
 import time
 from pathlib import Path
 
+from .state import read_json
+
 INFRA_EXC = {"NetworkConnectionError", "EnvironmentStartTimeoutError", "AgentSetupTimeoutError", "CancelledError",
              "UnknownApiError", "RateLimitError", "AgentInstallError"}
 AGENT_ENV = {
@@ -352,6 +354,47 @@ def job_started(rec: dict) -> bool:
     return (jd / "config.json").exists() or (jd / "result.json").exists() or Path(rec.get("log", "/x")).exists()
 
 
+def check_job_identity(jd, rec, *, review=False):
+    conf = read_json(jd / "config.json", {})
+    agents = conf.get("agents") or [{}]
+    tasks = conf.get("tasks") or [{}]
+    ident = dict(job_name=conf.get("job_name"), model=agents[0].get("model_name"), task=tasks[0].get("path"))
+    want = dict(job_name=rec["job_name"],
+                model=rec.get("model", None if review else ident["model"]),
+                task=rec.get("task", None if review else ident["task"]))
+    if task_matches(jd, ident["task"], want["task"]):
+        ident["task"] = want["task"]                  # a remote launcher's synced copy of the run's own task
+    if ident != want:
+        raise ValueError(f"job identity mismatch: job {ident} vs pending run {want}")
+
+
+def reservation_key(rec, item, stage):
+    # The launch key written by the stacked concurrency change (#44).
+    attempt = rec.get("attempt", rec.get("n", 1))
+    return rec.get("reservation_key") or json.dumps([item, stage, rec["job_name"], attempt])
+
+
+def adopt_started(cfg, rec, ledger, save):
+    """Recover an existing Harbor job with its original identity and without a new submission."""
+    if ledger is not None:
+        stage = rec.get("ledger_stage", "S9")
+        jd = Path(rec["job_dir"])
+        cost = None
+        if read_json(jd / "result.json", {}).get("finished_at"):
+            check_job_identity(jd, rec, review=stage == "S9R")
+            cost = job_cost(collect(jd, rec["model"], cfg["models"].get("prices", {})))
+        if not rec.get("ledger_call"):
+            rec["ledger_call"] = ledger.adopt_started_job(
+                rec["model"], stage, rec["item"], rec["job_name"], reservation_key(rec, rec["item"], stage),
+                float(cfg["calib"]["est_usd_per_run"]), cost)
+        elif cost is not None:
+            usd, kind, usage = cost
+            ledger.settle(rec["ledger_call"], usd, kind=kind, usage=usage)
+    rec.update(state="launched", submitted=True, recovered=True)
+    save(rec)
+    return rec
+
+
 def launch(cfg: dict, rec: dict, ledger, save) -> dict:
     """intent -> reserved -> launched.  `save(rec)` persists the run record; it is called after every step so a
     crash at any point is recoverable: a reserved-but-not-started job is launched once on resume, a started job
@@ -360,14 +403,7 @@ def launch(cfg: dict, rec: dict, ledger, save) -> dict:
     import subprocess
     c = cfg["calib"]
     if rec["state"] == "intent" and job_started(rec):
-        # its printed command was already run (by hand): take the job over as it is (task, config, identity
-        # unchanged); no preparation, path rewrite or pre-submit check applies to a job that exists
-        rec["ledger_call"] = ledger.reserve(rec["model"], rec.get("ledger_stage", "S9"), rec["item"], True,
-                                            est_usd=float(c["est_usd_per_run"]),
-                                            reservation_key=f"harbor-adopt:{rec['job_name']}") if ledger is not None else None
-        rec.update(state="launched", submitted=True, recovered=True)
-        save(rec)
-        return rec
+        return adopt_started(cfg, rec, ledger, save)
     if rec["state"] == "intent":
         # an intent has no side effect outside item_dir.  It may have been written while submit was off, before
         # calib.agent_allowed_hosts was set: update only that field of its job config (model, job dir and task stay

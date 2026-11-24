@@ -3,6 +3,7 @@
 from GLM), the second-review rule, manifest notes and withdrawal.  No Docker, no network, no real jobs."""
 import hashlib
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -84,7 +85,7 @@ def _runs(P, iid, sub="calib"):
 
 
 def _receipt(scope, key, reward=1):
-    return dict(repro_id=key, scope_id=scope, reward=reward, exit_code=0, output_sha256="a" * 64)
+    return dict(repro_id=key, scope_id=scope, reward=reward, exit_code=0, command=review.repro_command(scope), output_sha256="a" * 64)
 
 
 def _finish(jobs, job_name, reward=None, cost=5.0, verdict=None, name="trial__a", repros=()):
@@ -998,7 +999,7 @@ def test_review_relay_refusals_do_not_park(tmp_path):
         (jobs / last["job_name"] / "config.json").exists(), last
 
 
-def test_suspected_scopes_bind_bundle_validator_and_ingest(tmp_path):
+def test_suspected_scopes_bind_bundle_validator_and_ingest(tmp_path, caplog):
     P, iid, jobs = _env(tmp_path)
     it = P.store.item(iid)
     trial = dict(status="shortcut_suspected", transformed_files=[dict(path="side.csv", declared_deliverable=False)],
@@ -1018,7 +1019,7 @@ def test_suspected_scopes_bind_bundle_validator_and_ingest(tmp_path):
     assert bundle["probes"]["one_confident"] == report
     prompt = (task / "instruction.md").read_text()
     assert all(s in prompt for s in (first, second, review.REVIEW_PROMPT_VERSION, "reproduce"))
-    artifact = dict(classification="probe_artefact", command="python check.py", observed_reward="1",
+    artifact = dict(classification="probe_artefact", observed_reward="1",
                     observation="The optional plotting branch was never executed.",
                     reason="Only the diagnostic file changed.", repro_id="first-run")
     other = dict(artifact, repro_id="second-run")
@@ -1036,7 +1037,15 @@ def test_suspected_scopes_bind_bundle_validator_and_ingest(tmp_path):
         assert review.normalize(verdict, suspected_scopes=[first, second],
                                 repros=review.read_repros(journal))["verdict"] == expected
 
+    assert "command" not in artifact
+    assert bundle["repro_commands"] == {scope: review.repro_command(scope) for scope in (first, second)}
+    for argv in (["bash", "/review/pkg/tests/test.sh"], rows[1]["command"], [*rows[0]["command"], "extra"]):
+        journal.write_text("\n".join(json.dumps(row) for row in [dict(rows[0], command=argv), *rows[1:]]))
+        check(None)
+    journal.write_bytes(json.dumps(rows[0]).encode() + b'\n{"truncated"\n' +
+                        json.dumps(rows[1]).encode() + b"\n\xff\n" + json.dumps(rows[2]).encode())
     check("pass")
+    assert "Skipped 2 unparseable reproduction journal lines" in caplog.text
     del verdict["probe_findings"][second]
     check(None)
     verdict["probe_findings"][second] = other
@@ -1468,6 +1477,85 @@ def test_migration_cancels_unstarted_job_at_zero(tmp_path, stage, launched):
     assert P.ledger.reserve("model", stage, iid, True, est_usd=5) != call
 
 
+@pytest.mark.parametrize("stage", ["S9", "S9R"])
+def test_cancel_recovers_committed_launch_key(tmp_path, stage):
+    from tbsgen import stages_b
+    P, iid, _ = _env(tmp_path, allow_submit=False)
+    it = P.store.item(iid)
+    it.state.update(stage=stage, review_round=1, calib_label="hard")
+    it.save()
+    P.run(only=[iid])
+    sub = "calib" if stage == "S9" else "review"
+    rec, = _runs(P, iid, sub)
+    assert rec["state"] == "intent" and not rec.get("ledger_call")
+    model = rec["model"]
+    key = json.dumps([iid, stage, rec["job_name"], rec.get("attempt", rec["n"])])
+    # #44 has committed the reservation, but the item still has its earlier intent.
+    call = P.ledger.reserve(model, stage, iid, True, est_usd=30, reservation_key=key)
+    other = P.ledger.reserve(model, stage, iid, True, est_usd=4,
+                             reservation_key=json.dumps([iid, stage, "other-job", 1]))
+    P.cfg["budget"]["run_calls_per_model"] = {model: 2}
+    if stage == "S9":
+        write_json(it.p("gates/attempt-1.json"), {})
+        P.resume(only=[iid])
+    else:
+        P.cfg["review"]["enabled"] = False
+        P.run(only=[iid])
+    cancelled, = _runs(P, iid, sub)
+    assert cancelled["state"] == "cancelled_unstarted" and cancelled["ledger_call"] == call
+    with P.ledger._db() as db:
+        assert db.execute("SELECT usd FROM calls WHERE id=?", (call,)).fetchone() == (0,)
+        assert db.execute("SELECT status FROM calls WHERE id=?", (other,)).fetchone() == ("reserved",)
+    assert P.ledger.reserve(model, stage, "next", True, est_usd=1)
+    assert not stages_b.running_jobs(P)
+
+
+@pytest.mark.parametrize("state", ["fresh", "intent", "reserved"])
+def test_disabled_review_without_scopes_releases_without_launch(tmp_path, state):
+    from tbsgen import stages_b
+    P, iid, jobs = _env(tmp_path, allow_submit=False)
+    it = P.store.item(iid)
+    it.state.update(stage="S9R", review_round=1, calib_label="hard")
+    it.save()
+    if state != "fresh":
+        P.run(only=[iid])
+        rec, = _runs(P, iid, "review")
+        if state == "reserved":
+            call = P.ledger.reserve(rec["model"], "S9R", iid, True, est_usd=30)
+            write_json(it.p("review/runs.json"), [dict(rec, state=state, ledger_call=call)])
+    P.cfg["calib"]["allow_submit"] = True
+    P.cfg["review"]["enabled"] = False
+    P.run(only=[iid])
+    assert it.load().state["status"] == "done" and stages_b._released(P, iid)
+    assert not list(jobs.iterdir()) and not stages_b.running_jobs(P)
+    assert [r["state"] for r in _runs(P, iid, "review")] == ([] if state == "fresh" else ["cancelled_unstarted"])
+    assert P.item_cost(iid) == dict(calls=0, usd=0, in_tok=0, out_tok=0)
+
+
+@pytest.mark.parametrize("stage", ["S9R", "S10", "S9R_after_ingest"])
+def test_review_off_accepts_received_v5_pass(tmp_path, stage):
+    from tbsgen import stages_b
+    P, iid, jobs = _env(tmp_path)
+    it = P.store.item(iid)
+    scope = _current_probe(it)
+    _to_label(P, iid, jobs)
+    rec, = _runs(P, iid, "review")
+    write_json(it.p("review/runs.json"), [dict(rec, review_contract_version="s9r-v5")])
+    finding = dict(classification="probe_artefact", command="bash /tests/test.sh", observed_reward=1,
+                   observation="Only the diagnostic output changed.", reason="The declared output matched.")
+    P.cfg["review"]["enabled"] = stage == "S9R_after_ingest"
+    _finish(jobs, rec["job_name"], verdict=dict(V("pass"), probe_findings={scope: finding}))
+    assert ingest(P, it)["outcome"] == ("infra" if stage == "S9R_after_ingest" else "done")
+    P.cfg["review"]["enabled"] = False
+    if stage == "S10":
+        v = read_json(it.p("review/r1/verdict.json"))
+        write_json(it.p("review/verdict.json"), dict(v, round=1))
+        it.goto("S10", "received pass")
+    P.run(only=[iid])
+    assert it.load().state["status"] == "done" and stages_b._released(P, iid)
+    assert len(_runs(P, iid, "review")) == 1
+
+
 def test_obsolete_calibration_excluded_from_manifest(tmp_path):
     from tbsgen import calib, stages_b
     P, iid, _ = _env(tmp_path, review_kw={"enabled": False})
@@ -1556,7 +1644,8 @@ def test_s7_autofix_once_per_statement(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("stage", ["S9", "S9R"])
-def test_migration_adopts_manual_intent_once(tmp_path, monkeypatch, stage):
+@pytest.mark.parametrize("entry", ["resume", "step"])
+def test_migration_adopts_manual_intent_once(tmp_path, monkeypatch, stage, entry):
     from tbsgen import stages_b
     P, iid, jobs = _env(tmp_path, allow_submit=False, review_kw={"est_usd_per_run": 12})
     it = P.store.item(iid)
@@ -1569,19 +1658,29 @@ def test_migration_adopts_manual_intent_once(tmp_path, monkeypatch, stage):
     write_json(jobs / rec["job_name"] / "config.json", read_json(Path(rec["config"])))
     _finish(jobs, rec["job_name"], cost=7, verdict=V("pass") if stage == "S9R" else None)
     write_json(it.p("gates/attempt-1.json"), {})
-    # Lose the run-record write immediately after committing the ledger reservation.
+    model = rec["model"]
+    prior = P.ledger.reserve(model, stage, "earlier", True, est_usd=190)
+    P.ledger.settle(prior, 190)
+    P.cfg["budget"]["daily_usd_per_model"] = {model: 200}
+
+    def recover():
+        return P.resume(only=[iid]) if entry == "resume" else P.step(it.load())
+
+    # Lose the first save after accounting for the manual job. Neither scheduler entry may raise.
     def interrupted(*args):
-        raise InterruptedError
+        raise InterruptedError("interrupted adoption")
 
     with monkeypatch.context() as m:
         m.setattr(stages_b, "_save_run" if stage == "S9" else "_save_review", interrupted)
-        with pytest.raises(InterruptedError):
-            stages_b.migrate_probe_report(P, it.load())
-    assert stages_b.migrate_probe_report(P, it.load())
+        assert recover() == ([] if entry == "resume" else "paused")
+    assert it.load().state["status"] == "paused"
+    assert P.ledger.summary()["usd_total"] == 197  # settled even before the interrupted state save
+    assert recover() == ([iid] if entry == "resume" else "ok")
     adopted, = _runs(P, iid, sub)
-    with P.ledger._db() as db:
-        assert db.execute("SELECT stage, est_usd, reservation_key FROM calls").fetchall() == [
-            (stage, 30 if stage == "S9" else 12, "harbor-adopt:" + rec["job_name"])]
+    assert P.ledger.summary()["usd_total"] == 197
+    from tbsgen.budget import BudgetStop
+    with pytest.raises(BudgetStop, match="daily_model"):
+        P.ledger.reserve(model, stage, "next", True, est_usd=12)
     assert adopted["recovered"] and adopted["state"] == "launched"
     watch_tick(P, only=[iid], max_steps=0)
     assert it.load().state["stage"] == "S6A_run" and it.state["status"] == "active"
@@ -1612,12 +1711,12 @@ def test_unstarted_review_releases_budget_and_slot(tmp_path, upgrade):
     assert P.item_cost(iid)["calls"] == 0 and stages_b._slots_full(P) is None
     assert P.ledger.reserve(rec["model"], "S9R", "another-item", True, est_usd=30) != call
     if upgrade:
-        assert _runs(P, iid, "review")[1]["review_contract_version"] == "s9r-v6"
+        assert _runs(P, iid, "review")[1]["review_contract_version"] == review.CURRENT_CONTRACT
     else:
         assert it.state["reason"] == "parked:probe_unreviewed"
 
 
-def test_packaged_repro_records_fresh_reward_and_verifier_exports_it(tmp_path):
+def test_packaged_repro_records_fresh_reward_and_verifier_exports_it(tmp_path, monkeypatch):
     P, iid, _ = _env(tmp_path)
     it = P.store.item(iid)
     scope = _current_probe(it)
@@ -1630,28 +1729,57 @@ def test_packaged_repro_records_fresh_reward_and_verifier_exports_it(tmp_path):
     # Map the generated image's absolute paths to an isolated directory.
     helper = task / "environment/tbs-repro"
     helper.write_text(helper.read_text().replace('Path("/logs")', f"Path({str(logs)!r})"))
-    def run(code):
-        result = subprocess.run([helper, scope, "--", sys.executable, "-c", code], capture_output=True, check=False)
+    def run(*argv):
+        result = subprocess.run([helper, scope, "--", *argv], capture_output=True, check=False)
         row = json.loads(result.stdout)
         assert row["exit_code"] == result.returncode and row["scope_id"] == scope
         assert row["output_sha256"] == hashlib.sha256(result.stderr).hexdigest()
         return row
 
-    first = run("import sys; sys.exit(4)")
+    first = run(sys.executable, "-c", "import sys; sys.exit(4)")
     assert first["reward"] is None and first["exit_code"] == 4
-    second = run(f"import sys; print('out', flush=True); print('err', file=sys.stderr); open({str(reward)!r}, 'w').write('0.5')")
+    second = run(sys.executable, "-c", f"import sys; print('out', flush=True); print('err', file=sys.stderr); open({str(reward)!r}, 'w').write('0.5')")
     assert second["reward"] == 0.5 and second["repro_id"] != first["repro_id"]
     assert [json.loads(line) for line in (logs / "review/repro.jsonl").read_text().splitlines()] == [first, second]
 
     output = tmp_path / "review_out"
     finding = dict(repro_id=second["repro_id"], classification="probe_artefact", reason="Synthetic smoke test.",
-                   command="python", observed_reward=0.5, observation="The optional branch was never executed.")
+                   observed_reward=0.5, observation="The optional branch was never executed.")
     write_json(output / "verdict.json", dict(V("pass"), probe_findings={scope: finding}))
     script = (task / "tests/test.sh").read_text().replace("/tests/", str(task / "tests") + "/")
     script = script.replace("/logs/", str(logs) + "/").replace("/app/review_out/", str(output) + "/")
     subprocess.run(["bash", "-c", script], check=True)
-    assert reward.read_text().strip() == "1"
+    assert reward.read_text().strip() == "0"  # the helper executed a different command
     assert (verifier / "repro.jsonl").read_bytes() == (logs / "review/repro.jsonl").read_bytes()
+    assert review.normalize(review.read_verdict(logs), suspected_scopes=[scope],
+                            repros=review.read_repros(verifier / "repro.jsonl"))["verdict"] is None
+
+    # Execute the bundle's public-scope command. Translate container paths only at process entry.
+    bundle = task / "environment/review"
+    records = bundle / "records"
+    app = tmp_path / "app"
+    app.mkdir()
+    (bundle / "pkg/solution/solve.sh").write_text(
+        'for i in {1..6}; do echo "$i,$i"; done | (echo id,confidence; cat) > output/results.csv\n')
+    (bundle / "pkg/tests/test.sh").write_text(
+        f'test "$(wc -l < "{app}/output/results.csv")" -eq 2 && echo 1 > "{reward}"\n')
+    probe = records / "probe_outputs.py"
+    probe.write_text(probe.read_text().replace('"/app', f'"{app}').replace('"/solution/', f'"{bundle}/pkg/solution/')
+                     .replace('"/review/', f'"{bundle}/'))
+    python = tmp_path / "python3"
+    python.write_text(f'#!/bin/sh\nif [ "$1" = "/review/records/reproduce_scope.py" ]; then\n'
+                      f'  shift\n  exec "{sys.executable}" "{records}/reproduce_scope.py" "$@"\nfi\n'
+                      f'exec "{sys.executable}" "$@"\n')
+    python.chmod(0o755)
+    monkeypatch.setenv("PATH", str(tmp_path) + os.pathsep + os.environ["PATH"])
+    argv = read_json(records / "output_probes.json")["repro_commands"][scope]
+    scoped = run(*argv)
+    assert scoped["command"] == argv and scoped["exit_code"] == 0 and scoped["reward"] == 1
+    assert (app / "output/results.csv").read_text().splitlines() == ["id,confidence", "6,6"]
+    finding.update(repro_id=scoped["repro_id"], observed_reward=1)
+    write_json(output / "verdict.json", dict(V("pass"), probe_findings={scope: finding}))
+    subprocess.run(["bash", "-c", script], check=True)
+    assert reward.read_text().strip() == "1"
     assert review.normalize(review.read_verdict(logs), suspected_scopes=[scope],
                             repros=review.read_repros(verifier / "repro.jsonl"))["verdict"] == "pass"
 
