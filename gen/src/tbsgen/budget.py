@@ -26,7 +26,7 @@ import time
 from pathlib import Path
 
 CN = dt.timezone(dt.timedelta(hours=8))
-EXCLUDE_UNSTARTED_JOBS = "COALESCE(cost_kind,'') NOT IN ('probe_migration_cancelled','cancelled_unstarted')"
+EXCLUDE_UNSTARTED_JOBS = "COALESCE(cost_kind,'') NOT IN ('probe_migration_cancelled','cancelled_unstarted','expired_unsent')"
 # hardening round of the item being stepped (Pipeline.step sets it while state.harden_active; 0 = not a hardening
 # round).  Every reservation is tagged with it (calls.harden), so budget.item_harden_usd_cap can keep a hardening
 # round's authoring spend (S5G, S6A, S6M, S6C, S7, S8 ...) apart from the first version's budget.item_usd_cap.
@@ -128,8 +128,10 @@ class Ledger:
                 db.execute("ALTER TABLE calls ADD COLUMN variant INTEGER")
             if "reservation_key" not in cols:
                 db.execute("ALTER TABLE calls ADD COLUMN reservation_key TEXT")
-            db.execute("CREATE UNIQUE INDEX IF NOT EXISTS calls_reservation ON calls(reservation_key) "
-                       "WHERE reservation_key IS NOT NULL")
+            # A cross-day replacement shares the key of the expired reservation.
+            db.execute("DROP INDEX IF EXISTS calls_reservation")
+            db.execute("CREATE UNIQUE INDEX IF NOT EXISTS calls_open_reservation ON calls(reservation_key) "
+                       "WHERE reservation_key IS NOT NULL AND status='reserved'")
 
     def _db(self):
         db = sqlite3.connect(self.path, timeout=60, isolation_level=None)
@@ -145,6 +147,16 @@ class Ledger:
     def _reserved_call(db, key):
         row = db.execute("SELECT id FROM calls WHERE reservation_key=? AND status='reserved'", (key,)).fetchone()
         return row[0] if row else None
+
+    def cancel_unstarted_job(self, item, stage, key, saved_id, kind):
+        """Cancel all open calls for this launch, including a replacement missing from the job record."""
+        with contextlib.closing(self._db()) as db, db:
+            db.execute("BEGIN IMMEDIATE")
+            rows = db.execute("SELECT id FROM calls WHERE item=? AND stage=? AND status IN ('reserved','sent') "
+                              "AND (reservation_key=? OR id=?) ORDER BY id", (item, stage, key, saved_id)).fetchall()
+            for (call,) in rows:
+                self._settle(db, call, 0.0, "error", "", kind, None)
+            return rows[-1][0] if rows else saved_id
 
     def adopt_started_job(self, model, stage, item, job_name, launch_key, estimate, cost):
         """Track a job that already started. Admission limits apply only before launch."""

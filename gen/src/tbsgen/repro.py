@@ -15,7 +15,7 @@ def record(scope, command, logs):
     path.parent.mkdir(parents=True, exist_ok=True)
     reward_file = logs / "verifier/reward.txt"
     digest = hashlib.sha256()
-    with path.open("a") as journal:
+    with path.open("a+b") as journal:
         # Graders share a single reward file. Only a fresh reward belongs to this run.
         fcntl.flock(journal, fcntl.LOCK_EX)
         reward_file.unlink(missing_ok=True)
@@ -31,7 +31,13 @@ def record(scope, command, logs):
         row = dict(repro_id=uuid.uuid4().hex, scope_id=scope, command=command, exit_code=code,
                    reward=reward if reward is not None and math.isfinite(reward) else None,
                    output_sha256=digest.hexdigest())
-        journal.write(json.dumps(row) + "\n")
+        journal.seek(0, 2)
+        prefix = b""
+        if journal.tell():
+            journal.seek(-1, 2)
+            if journal.read(1) != b"\n":
+                prefix = b"\n"
+        journal.write(prefix + json.dumps(row).encode() + b"\n")
     return row
 
 

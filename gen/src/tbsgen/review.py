@@ -634,9 +634,11 @@ e. **Shortcuts and leaks.**  Can the task be passed without doing the work (hard
    the `repro_id` printed by `tbs-repro <scope_id> -- <command...>`,
    its `observed_reward` ("0", "1", or a number), and an `observation` of at least
    20 characters describing the grader output. An optional `reproduction` note may add context.
-   Classify a real grader gap as `grader_gap` and link an evidenced blocking issue by `issue_id`. This applies
-   to additional grader gaps you find too. For a `probe_artefact`, explain why the changed files or values do
-   not demonstrate a grader defect.
+   Classify a real grader gap as `grader_gap` and link an evidenced blocking issue by `issue_id`.
+   For a `probe_artefact`, explain why the changed files or values do not demonstrate a grader defect.
+   Report any additional grader gap in `issues` as a blocking issue with concrete evidence. You may run your
+   own command with `tbs-repro` and include its `repro_id` in the issue. If you also list the gap in
+   `probe_findings`, link it by `issue_id`. The packaged argv requirement applies only to the required IDs above.
 f. **Network / ready-made code.**  Does solving it need the internet or the paper's published implementation?
 g. **Calibration evidence.**  Using the traces: did failures come from the task's difficulty, from a task defect
    (ambiguity, contradiction), or from the harness / infrastructure (timeouts from a slow model, crashes, API

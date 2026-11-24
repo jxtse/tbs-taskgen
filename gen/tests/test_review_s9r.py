@@ -1061,15 +1061,61 @@ def test_suspected_scopes_bind_bundle_validator_and_ingest(tmp_path, caplog):
         for problem, routed in (("test_gap", "revise"), ("core_invalid", "drop")):
             verdict["issues"] = [dict(BLOCK, problem=problem)]
             check(routed)
-        for change in ({"repro_id": "absent"}, {"repro_id": "second-run"}, {"observed_reward": True},
-                       {"observed_reward": 0.5}, {"observation": "short"}, {"issue_id": "absent"},
-                       {"repro_id": "", "observation": "I have not attempted to execute the grader on this scope."}):
+        invalid = [{"repro_id": "absent"}, {"issue_id": "absent"}, {"repro_id": ""}]
+        if scope == first:
+            invalid.extend([{"repro_id": "second-run"}, {"observed_reward": True},
+                            {"observed_reward": 0.5}, {"observation": "short"}])
+        for change in invalid:
             verdict["probe_findings"][scope] = dict(gap, **change)
             check(None)
         verdict.update(issues=[], probe_findings={first: artifact, second: other})
     _finish(jobs, retry["job_name"], verdict=verdict, repros=rows)
     watch_tick(P, only=[iid])
     assert P.store.item(iid).state["status"] == "done"
+
+
+def test_reviewer_duplicate_sample_routes_to_revision(tmp_path):
+    from tbsgen import repro
+    P, iid, jobs = _env(tmp_path)
+    it = P.store.item(iid)
+    it.state.update(stage="S9R", review_round=4, calib_label="hard")
+    it.save()
+    P.run(only=[iid])
+    rec, = _runs(P, iid, "review")
+    assert rec["review_contract_version"] == "s9r-v8" and rec["suspected_scopes"] == []
+    scope = "duplicate_sample/public"
+    table = tmp_path / "samples.csv"
+    table.write_text("sample\nA\nB\nC\nD\nE\nA\n")
+    logs = tmp_path / "logs"
+    (logs / "verifier").mkdir(parents=True)
+    # A grader that checks only the set of sample IDs accepts the duplicate row.
+    command = [sys.executable, "-c", "import pathlib, sys; "
+               "rows = pathlib.Path(sys.argv[1]).read_text().splitlines()[1:]; "
+               "pathlib.Path(sys.argv[2]).write_text(str(int(set(rows) == set('ABCDE'))))",
+               str(table), str(logs / "verifier/reward.txt")]
+    row = repro.record(scope, command, logs)
+    assert row["reward"] == 1
+    issue = dict(BLOCK, problem="test_gap", title="Duplicate sample accepted",
+                 evidence=["The grader accepted six rows for five samples after duplicating A."])
+    gap = dict(classification="grader_gap", issue_id=issue["id"])
+    recorded_gap = dict(gap, repro_id=row["repro_id"], observed_reward=1, reason="Row counts are unchecked.",
+                        observation="The grader returned reward 1 for a repeated sample ID.")
+    raw = dict(V("revise", [issue]), probe_findings={scope: recorded_gap})
+    validator = Path(rec["task"]) / "tests/s9r_validate.py"
+    journal = logs / "review/repro.jsonl"
+    records = review.read_repros(journal)
+    for verdict in (raw, dict(raw, probe_findings={scope: gap}), V("revise", [dict(issue, repro_id=row["repro_id"])])):
+        src = tmp_path / "verdict.json"
+        write_json(src, verdict)
+        subprocess.run([sys.executable, validator, src, tmp_path / "parsed.json", journal], check=True)
+        assert review.normalize(verdict, repros=records)["verdict"] == "revise"
+    assert review.normalize(raw, contract="s9r-v7", repros=records)["verdict"] is None
+    assert review.normalize(V("revise", [dict(issue, repro_id="missing")]))["verdict"] is None
+    assert review.normalize(dict(raw, issues=[dict(issue, evidence=[])]), repros=records)["verdict"] is None
+    _finish(jobs, rec["job_name"], verdict=raw, repros=[row])
+    assert ingest(P, it)["verdict"] == "revise"
+    P.step(it)
+    assert it.load().state["stage"] == "S8" and it.state["repair_from"] == "review:r4"
 
 
 def test_short_probe_threshold_log(tmp_path):
@@ -1532,6 +1578,63 @@ def test_disabled_review_without_scopes_releases_without_launch(tmp_path, state)
     assert P.item_cost(iid) == dict(calls=0, usd=0, in_tok=0, out_tok=0)
 
 
+@pytest.mark.parametrize("expired", [True, False])
+def test_disabled_review_cancels_cross_day_replacement(tmp_path, expired):
+    from tbsgen import calib, stages_b
+    from tbsgen.budget import today
+    P, iid, jobs = _env(tmp_path, allow_submit=False)
+    it = P.store.item(iid)
+    it.state.update(stage="S9R", review_round=1, calib_label="hard")
+    it.save()
+    P.run(only=[iid])
+    rec, = _runs(P, iid, "review")
+    model = rec["model"]
+    key = calib.reservation_key(rec, iid, "S9R")
+    old = P.ledger.reserve(model, "S9R", iid, True, est_usd=12, reservation_key=key)
+    write_json(it.p("review/runs.json"), [dict(rec, state="reserved", reservation_key=key, ledger_call=old)])
+    other = P.ledger.reserve(model, "S9R", "other", True, est_usd=188, reservation_key="other-job")
+    with P.ledger._db() as db:
+        db.execute("UPDATE calls SET day='2000-01-01' WHERE id=?", (old,))
+        if expired:
+            db.execute("UPDATE calls SET status='cancelled', usd=0, cost_kind='expired_unsent' WHERE id=?", (old,))
+        # The launch transaction committed today's sent row, then crashed before saving its ID.
+        replacement = db.execute(
+            "INSERT INTO calls(day,model,stage,item,real,est_usd,status,reservation_key) "
+            "VALUES(?,?,'S9R',?,1,12,'sent',?)", (today(), model, iid, key)).lastrowid
+    P.cfg["budget"]["daily_usd_per_model"] = {model: 200}
+    P.cfg["review"]["enabled"] = False
+    P.run(only=[iid])
+    assert it.load().state["status"] == "done" and not list(jobs.iterdir()) and not stages_b.running_jobs(P)
+    cancelled, = _runs(P, iid, "review")
+    assert cancelled["ledger_call"] == replacement and cancelled["state"] == "cancelled_unstarted"
+    with P.ledger._db() as db:
+        assert db.execute("SELECT usd,cost_kind FROM calls WHERE reservation_key=? ORDER BY id", (key,)).fetchall() == [
+            (0, "expired_unsent" if expired else "cancelled_unstarted"), (0, "cancelled_unstarted")]
+        assert db.execute("SELECT status FROM calls WHERE id=?", (other,)).fetchone() == ("reserved",)
+    assert P.item_cost(iid)["calls"] == 0
+    assert P.ledger.reserve(model, "S9R", "next", True, est_usd=12)
+
+
+@pytest.mark.parametrize("stale", ["package", "round", "epoch", "all", "missing"])
+def test_disabled_review_manifest_requires_current_verdict(tmp_path, stale):
+    from tbsgen import calib, stages_b
+    P, iid, _ = _env(tmp_path, review_kw={"enabled": False})
+    it = P.store.item(iid)
+    it.state.update(stage="S9R", review_round=4, calib_epoch=5, calib_label="hard")
+    it.save()
+    sha = calib.pkg_sha(it.p("pkg"))
+    if stale != "missing":
+        raw = V("revise", [BLOCK, MINOR], trust=False)
+        write_json(it.p("review/verdict.json"), dict(raw, _normalized=review.normalize(raw),
+                   round=2 if stale in ("round", "all") else 4, calib_epoch=2 if stale in ("epoch", "all") else 5,
+                   pkg_sha="old" if stale in ("package", "all") else sha))
+    P.run(only=[iid])
+    assert it.load().state["status"] == "done"
+    manifest = stages_b._live_release(P, iid)
+    assert manifest["pkg_sha"] == sha and manifest["calib_epoch"] == 5
+    assert manifest["review"] == {"status": "not_reviewed", "reason": "review_disabled"}
+
+
 @pytest.mark.parametrize("stage", ["S9R", "S10", "S9R_after_ingest"])
 def test_review_off_accepts_received_v5_pass(tmp_path, stage):
     from tbsgen import stages_b
@@ -1782,6 +1885,18 @@ def test_packaged_repro_records_fresh_reward_and_verifier_exports_it(tmp_path, m
     assert reward.read_text().strip() == "1"
     assert review.normalize(review.read_verdict(logs), suspected_scopes=[scope],
                             repros=review.read_repros(verifier / "repro.jsonl"))["verdict"] == "pass"
+
+
+def test_repro_append_after_truncated_tail(tmp_path, caplog):
+    from tbsgen import repro
+    command = [sys.executable, "-c", "pass"]
+    first = repro.record("before", command, tmp_path)
+    journal = tmp_path / "review/repro.jsonl"
+    with journal.open("ab") as out:
+        out.write(b'{"partial":"\xff')
+    second = repro.record("after", command, tmp_path)
+    assert review.read_repros(journal) == {row["repro_id"]: row for row in (first, second)}
+    assert "Skipped 1 unparseable reproduction journal lines" in caplog.text
 
 
 def test_received_drop_without_bound_gate_report(tmp_path):

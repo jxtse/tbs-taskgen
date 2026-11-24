@@ -1031,8 +1031,14 @@ def test_resume_b88e514_manifest(tmp_path, monkeypatch):
     monkeypatch.setattr(stages_b.calib, "pkg_sha", track_hash)
     stages_b.s10(SimpleNamespace(cfg=cfg, store=store), it)
     assert it.state["status"] == "done"
-    assert manifest.read_text().splitlines() == [json.dumps(previous)]
     assert hashed == [it.p("pkg"), Path(previous["pkg"])]
+    # Refresh the legacy null review once, preserving the original release row.
+    before = manifest.read_bytes()
+    old, current = map(json.loads, before.splitlines())
+    assert old == previous and current["pkg_sha"] == hash_directory(it.p("pkg"))
+    assert current["review"] == {"status": "not_reviewed", "reason": "review_disabled"}
+    stages_b.s10(SimpleNamespace(cfg=cfg, store=store), it)
+    assert manifest.read_bytes() == before
 
 
 def test_release_records_changed_review_and_label(tmp_path):

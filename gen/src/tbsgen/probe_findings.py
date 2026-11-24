@@ -7,8 +7,8 @@ from pathlib import Path
 import re
 
 
-CURRENT_CONTRACT = "s9r-v7"
-JOURNAL_CONTRACTS = ("s9r-v6", CURRENT_CONTRACT)
+CURRENT_CONTRACT = "s9r-v8"
+JOURNAL_CONTRACTS = ("s9r-v6", "s9r-v7", CURRENT_CONTRACT)
 
 
 def repro_command(scope):
@@ -63,6 +63,14 @@ def _matches_run(finding, scope, records, contract):
             and row["reward"] == reward)
 
 
+def _optional_repro_errors(entry, records, location):
+    if "repro_id" in entry:
+        key = entry["repro_id"]
+        if not isinstance(key, str) or not key or not isinstance(records.get(key), dict):
+            return [f"{location}: unknown or ambiguous repro_id"]
+    return []
+
+
 def finding_errors(verdict, suspected_scopes, contract=CURRENT_CONTRACT, repros=None):
     if contract == "s9r-v1":
         return []
@@ -73,16 +81,31 @@ def finding_errors(verdict, suspected_scopes, contract=CURRENT_CONTRACT, repros=
         return ["probe_findings must be an object keyed by scope ID"]
     issues = verdict.get("issues")
     blocking_ids = set()
-    for issue in issues if isinstance(issues, list) else ():
+    errors = []
+    records = repros or {}
+    for i, issue in enumerate(issues if isinstance(issues, list) else ()):
         if (isinstance(issue, dict) and issue.get("severity") == "blocking"
                 and isinstance(issue.get("id"), str) and has_evidence(issue.get("evidence"))):
             blocking_ids.add(issue["id"])
-    errors = []
+        if contract == "s9r-v8" and isinstance(issue, dict):
+            errors.extend(_optional_repro_errors(issue, records, f"issues[{i}]"))
     scopes = suspected_scopes if contract == "s9r-v2" else [*suspected_scopes, *findings]
     for scope in dict.fromkeys(scopes):
         finding = findings.get(scope)
         if not isinstance(finding, dict):
             errors.append(f"missing probe finding: {scope}")
+            continue
+        extra = contract == "s9r-v8" and scope not in suspected_scopes
+        if finding.get("classification") == "grader_gap":
+            issue = finding.get("issue_id")
+            if not isinstance(issue, str) or issue not in blocking_ids:
+                errors.append(f"{scope}: grader_gap requires an evidenced blocking issue")
+        elif extra:
+            errors.append(f"{scope}: additional findings must link an evidenced blocking issue as grader_gap")
+        elif finding.get("classification") != "probe_artefact":
+            errors.append(f"{scope}: expected grader_gap or probe_artefact")
+        if extra:
+            errors.extend(_optional_repro_errors(finding, records, scope))
             continue
         if contract == "s9r-v2":
             if not isinstance(finding.get("reproduction"), str) or not finding["reproduction"].strip():
@@ -91,7 +114,7 @@ def finding_errors(verdict, suspected_scopes, contract=CURRENT_CONTRACT, repros=
             reward = finding.get("observed_reward")
             if not (reward in ("0", "1") or type(reward) is int or type(reward) is float and math.isfinite(reward)):
                 errors.append(f"{scope}: invalid or missing observed_reward")
-            elif contract in JOURNAL_CONTRACTS and not _matches_run(finding, scope, repros or {}, contract):
+            elif contract in JOURNAL_CONTRACTS and not _matches_run(finding, scope, records, contract):
                 errors.append(f"{scope}: no matching reproduction record for scope, command and reward")
             if contract in JOURNAL_CONTRACTS:
                 fields = [("observation", 20)]
@@ -106,10 +129,4 @@ def finding_errors(verdict, suspected_scopes, contract=CURRENT_CONTRACT, repros=
                 errors.extend(legacy_execution_errors(scope, finding, contract))
         if not isinstance(finding.get("reason"), str) or not finding["reason"].strip():
             errors.append(f"{scope}: missing reason")
-        if finding.get("classification") == "grader_gap":
-            issue = finding.get("issue_id")
-            if not isinstance(issue, str) or issue not in blocking_ids:
-                errors.append(f"{scope}: grader_gap requires an evidenced blocking issue")
-        elif finding.get("classification") != "probe_artefact":
-            errors.append(f"{scope}: expected grader_gap or probe_artefact")
     return errors

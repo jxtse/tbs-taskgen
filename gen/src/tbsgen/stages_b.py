@@ -219,12 +219,10 @@ def migrate_probe_report(P, it):
 
 
 def _cancel_probe_job(P, it, rec, save, kind="probe_migration_cancelled"):
-    call = rec.get("ledger_call")
-    if not call:
-        stage = rec.get("ledger_stage") or ("S9R" if save is _save_review else "S9")
-        call = P.ledger.reserved_call(calib.reservation_key(rec, it.item_id, stage))
-    if call:
-        P.ledger.settle(call, 0.0, status="error", kind=kind)
+    stage = rec.get("ledger_stage") or ("S9R" if save is _save_review else "S9")
+    key = calib.reservation_key(rec, it.item_id, stage)
+    call = P.ledger.cancel_unstarted_job(it.item_id, stage, key, rec.get("ledger_call"), kind)
+    if call is not None:
         rec["ledger_call"] = call
     rec.update(state="cancelled_unstarted", outcome="infra", result_type="infra", obsolete_probe_job=True,
                cost_usd=0.0, cost_kind=kind)
@@ -243,11 +241,10 @@ def finish_job_stage(P, it, status, reason, **info):
         path = it.p(stage, "run.json")
         agent = read_json(path, {})
         if _unstarted(agent):
-            call = agent.get("ledger_call")
-            if call is None and agent.get("reservation_key"):
-                call = P.ledger.reserved_call(agent["reservation_key"])
+            key = agent.get("reservation_key") or json.dumps([it.item_id, stage, agent["job_name"]])
+            call = P.ledger.cancel_unstarted_job(it.item_id, stage, key, agent.get("ledger_call"), "cancelled_unstarted")
             if call is not None:
-                P.ledger.settle(call, 0.0, status="error", kind="cancelled_unstarted")
+                agent["ledger_call"] = call
             agent.update(state="cancelled_unstarted", not_started=True, cost_usd=0.0, cost_kind="cancelled_unstarted")
             write_json(path, agent)
     for directory, save in (("review", _save_review), ("calib", _save_run)):
@@ -883,16 +880,28 @@ def _park_unreviewed(P, it, scopes):
     return finish_job_stage(P, it, "parked", why, detail={"suspected_scopes": scopes})
 
 
-def review_gate(P, it, scopes=None) -> str | None:
+def _current_review(it, sha):
+    v = read_json(it.p("review", "verdict.json"), None)
+    if not v:
+        return None, "no review verdict"
+    if (v.get("round") is None or v["round"] != it.state.get("review_round")
+            or v.get("calib_epoch", 0) != it.state.get("calib_epoch", 0)):
+        return None, "review verdict of another round / calibration epoch"
+    if v.get("pkg_sha") != sha:
+        return None, "package changed after the review"
+    return v, None
+
+
+def review_gate(P, it, scopes=None, current=None) -> str | None:
     """Why S10 must not release this item yet (None = may release): with review on and a reviewable label, the
     current package, calibration epoch and review round need a recorded pass.  Frontier tasks also need a confirmed reference."""
     scopes = _probe_scopes(it) if scopes is None else scopes
     frontier = it.state.get("calib_label") == "frontier"
     if not frontier and not scopes and not review.reviewable(P.cfg, it.state.get("calib_label")):
         return None
-    v = read_json(it.p("review", "verdict.json"), None)
-    if not v:
-        return "no review verdict"
+    v, why = current or _current_review(it, calib.pkg_sha(it.p("pkg")))
+    if why:
+        return why
     norm = v.get("_normalized") or {}
     if norm.get("verdict") != "pass":
         return f"review verdict {norm.get('verdict')}"
@@ -910,10 +919,6 @@ def review_gate(P, it, scopes=None) -> str | None:
         fp = review.frontier_problems(norm, _oracle_gate_ok(it))
         if fp:
             return "frontier not confirmed: " + "; ".join(fp)[:200]
-    if v.get("round") != it.state.get("review_round") or v.get("calib_epoch", 0) != it.state.get("calib_epoch", 0):
-        return "review verdict of another round / calibration epoch"
-    if v.get("pkg_sha") != calib.pkg_sha(it.p("pkg")):
-        return "package changed after the review"
     return None
 
 
@@ -934,7 +939,9 @@ def s10(P, it):
 
 
 def _release_reviewed(P, it, previous, scopes):
-    why = review_gate(P, it, scopes)
+    sha = calib.pkg_sha(it.p("pkg"))
+    current = _current_review(it, sha)
+    why = review_gate(P, it, scopes, current)
     if why and not P.cfg["review"]["enabled"]:
         if scopes:
             return _park_unreviewed(P, it, scopes)
@@ -945,17 +952,18 @@ def _release_reviewed(P, it, previous, scopes):
         withdraw(P, it.item_id, f"S10 review gate: {why}")
         it.state["review_round"] = review.next_round(it.dir, it.state)
         return it.goto("S9R", f"S10 review gate: {why}")
-    sha = calib.pkg_sha(it.p("pkg"))
     epoch = it.state.get("calib_epoch", 0)
     runs = read_json(it.p("calib", "runs.json"), [])
     summ = [x for x in calib.run_summary(runs) if x["outcome"] is not None]
-    rv = read_json(it.p("review", "verdict.json"), None)
+    rv, _ = current
     nv = (rv or {}).get("_normalized") or {}
     rev = None if rv is None else dict(
-        verdict=nv.get("verdict"), round=it.state.get("review_round"), revisions=it.state.get("review_revisions", 0),
+        verdict=nv.get("verdict"), round=rv["round"], revisions=it.state.get("review_revisions", 0),
         minor=[dict(id=i.get("id"), category=i.get("category"), title=i.get("title"))
                for i in nv.get("issues") or [] if i.get("severity") == "minor"],
         label_trustworthy=(nv.get("label_assessment") or {}).get("trustworthy"))
+    if rv is None and not P.cfg["review"]["enabled"]:
+        rev = dict(status="not_reviewed", reason="review_disabled")
     label = it.state.get("calib_label")
     extra = {}
     if label == "frontier":
