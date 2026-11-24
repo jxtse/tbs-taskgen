@@ -338,7 +338,8 @@ def reproduce_scope(scope):
     if out.exists():
         shutil.rmtree(out)
     out.mkdir()
-    subprocess.run(["bash", "/solution/solve.sh"], check=True, cwd="/app")
+    # Harbor overlays /solution/solve.sh with the review oracle, which already holds the reproduction lock.
+    subprocess.run(["bash", "/review/pkg/solution/solve.sh"], check=True, cwd="/app")
     hidden = target.removeprefix("hidden:") if target.startswith("hidden:") else None
     cli = out / "solution_cli.py"
     if hidden is not None or cli.is_file():

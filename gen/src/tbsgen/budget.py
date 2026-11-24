@@ -156,16 +156,21 @@ class Ledger:
                               "AND (reservation_key=? OR id=?) ORDER BY id", (item, stage, key, saved_id)).fetchall()
             for (call,) in rows:
                 self._settle(db, call, 0.0, "error", "", kind, None)
-            return rows[-1][0] if rows else saved_id
+            if rows:
+                return rows[-1][0]
+            # A previous cancellation may have committed before the replacement id reached runs.json.
+            row = db.execute("SELECT MAX(id) FROM calls WHERE item=? AND stage=? AND day=? "
+                             "AND (reservation_key=? OR id=?)", (item, stage, today(), key, saved_id)).fetchone()
+            return row[0] or saved_id
 
-    def adopt_started_job(self, model, stage, item, job_name, launch_key, estimate, cost):
+    def adopt_started_job(self, model, stage, item, job_name, launch_key, estimate, cost, saved_id=None):
         """Track a job that already started. Admission limits apply only before launch."""
         key = f"harbor-adopt:{job_name}"
         with contextlib.closing(self._db()) as db, db:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute("SELECT id FROM calls WHERE item=? AND stage=? AND "
-                             "(reservation_key=? OR (reservation_key=? AND status IN ('reserved','sent','ok'))) "
-                             "ORDER BY id DESC LIMIT 1", (item, stage, key, launch_key)).fetchone()
+                             "(reservation_key=? OR ((id=? OR reservation_key=?) AND status IN ('reserved','sent','ok'))) "
+                             "ORDER BY id DESC LIMIT 1", (item, stage, key, saved_id, launch_key)).fetchone()
             if row:
                 call = row[0]
             else:

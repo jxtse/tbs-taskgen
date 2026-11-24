@@ -4,6 +4,8 @@ from GLM), the second-review rule, manifest notes and withdrawal.  No Docker, no
 import hashlib
 import json
 import os
+import shutil
+import signal
 import subprocess
 import sys
 from pathlib import Path
@@ -1617,7 +1619,8 @@ def test_disabled_review_cancels_cross_day_replacement(tmp_path, expired):
     assert P.ledger.reserve(model, "S9R", "next", True, est_usd=12)
 
 
-def test_disabled_review_attempted_launch_releases_cross_day_replacement(tmp_path, monkeypatch):
+@pytest.mark.parametrize("cancel_committed", [False, True])
+def test_disabled_review_attempted_launch_releases_cross_day_replacement(tmp_path, monkeypatch, cancel_committed):
     """#44 saves launch_attempted, commits today's sent row, and may crash before writing back its id."""
     from tbsgen import calib, stages_b
     from tbsgen.budget import today
@@ -1643,6 +1646,10 @@ def test_disabled_review_attempted_launch_releases_cross_day_replacement(tmp_pat
     P.cfg["review"]["enabled"] = False
     monkeypatch.setattr(calib, "session_alive", lambda c, r: False)
     P.run(only=[iid])      # launch_attempted -> drained as launched
+    if cancel_committed:
+        # Simulate loss of the run-record write after the cancellation transaction commits.
+        assert P.ledger.cancel_unstarted_job(iid, "S9R", key, old, "not_launched") == replacement
+        assert _runs(P, iid, "review")[0]["ledger_call"] == old
     stages_b.watch_tick(P, only=[iid])   # watcher: no session, no job -> launch_failed
     failed, = _runs(P, iid, "review")
     assert failed["state"] == "launch_failed" and failed["ledger_call"] == replacement
@@ -1858,7 +1865,7 @@ def test_unstarted_review_releases_budget_and_slot(tmp_path, upgrade):
         assert it.state["reason"] == "parked:probe_unreviewed"
 
 
-def test_packaged_repro_records_fresh_reward_and_verifier_exports_it(tmp_path, monkeypatch):
+def test_packaged_repro_and_oracle_in_harbor_upload_order(tmp_path, monkeypatch):
     P, iid, _ = _env(tmp_path)
     it = P.store.item(iid)
     scope = _current_probe(it)
@@ -1905,8 +1912,10 @@ def test_packaged_repro_records_fresh_reward_and_verifier_exports_it(tmp_path, m
         'for i in {1..6}; do echo "$i,$i"; done | (echo id,confidence; cat) > output/results.csv\n')
     (bundle / "pkg/tests/test.sh").write_text(
         f'test "$(wc -l < "{app}/output/results.csv")" -eq 2 && echo 1 > "{reward}"\n')
+    solution = tmp_path / "solution"
+    shutil.copytree(bundle / "pkg/solution", solution)  # image build
     probe = records / "probe_outputs.py"
-    probe.write_text(probe.read_text().replace('"/app', f'"{app}').replace('"/solution/', f'"{bundle}/pkg/solution/')
+    probe.write_text(probe.read_text().replace('"/app', f'"{app}').replace('"/solution/', f'"{solution}/')
                      .replace('"/review/', f'"{bundle}/'))
     python = tmp_path / "python3"
     python.write_text(f'#!/bin/sh\nif [ "$1" = "/review/records/reproduce_scope.py" ]; then\n'
@@ -1924,6 +1933,191 @@ def test_packaged_repro_records_fresh_reward_and_verifier_exports_it(tmp_path, m
     assert reward.read_text().strip() == "1"
     assert review.normalize(review.read_verdict(logs), suspected_scopes=[scope],
                             repros=review.read_repros(verifier / "repro.jsonl"))["verdict"] == "pass"
+
+    # Harbor uploads the review oracle over the image's solve.sh, then runs the verifier after the oracle.
+    oracle = solution / "solve.sh"
+    oracle.write_text((task / "solution/solve.sh").read_text().replace("/app/review_out", str(output)))
+    (tmp_path / "tbs-repro").symlink_to(helper)
+    (output / "verdict.json").unlink()
+    with subprocess.Popen(["bash", oracle], start_new_session=True) as process:
+        try:
+            assert process.wait(timeout=10) == 0
+        finally:
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGKILL)
+    oracle_finding = read_json(output / "verdict.json")["probe_findings"][scope]
+    receipts = review.read_repros(logs / "review/repro.jsonl")
+    assert len(receipts) == 4
+    receipt = receipts[oracle_finding["repro_id"]]
+    assert (receipt["scope_id"], receipt["exit_code"], receipt["reward"]) == (scope, 0, 1)
+    subprocess.run(["bash", "-c", script], check=True)
+    assert reward.read_text().strip() == "1"
+
+
+@pytest.mark.parametrize("stage", ["S9", "S9R"])
+@pytest.mark.parametrize("entry", ["watch", "reconcile", "migration", "finish"])
+def test_remote_marker_reattaches_and_settles_trial(tmp_path, stage, entry):
+    from tbsgen import calib, stages_b
+    from tbsgen.budget import BudgetStop
+
+    P, iid, jobs = _env(tmp_path, allow_submit=False, est_usd_per_run=12, max_concurrent_jobs=1)
+    it = P.store.item(iid)
+    it.state.update(stage=stage, review_round=1, calib_label="hard")
+    it.save()
+    P.run(only=[iid])
+    directory = "review" if stage == "S9R" else "calib"
+    rec, = _runs(P, iid, directory)
+    name, model = rec["job_name"], rec["model"]
+    earlier = P.ledger.reserve(model, stage, "earlier", True, est_usd=188)
+    P.ledger.settle(earlier, 188)
+    P.cfg["budget"]["daily_usd_total"] = 200
+    key = calib.reservation_key(rec, iid, stage)
+    call = P.ledger.reserve(model, stage, iid, True, est_usd=12, reservation_key=key)
+    rec.update(state="launched", tmux=name[-60:], launch_attempted=True, ledger_call=call,
+               log=str(it.p(directory, name + ".log")))
+    if entry in ("reconcile", "finish"):
+        rec.update(state="reserved", launch_attempted=False)
+    write_json(it.p(directory, "runs.json"), [rec])
+    write_json(jobs / name / "tbsgen-remote.json", {})
+    assert calib.job_started(rec) and calib.launcher_failed(rec, P.cfg["calib"]) is None
+
+    # A fake tmux records exactly what would run, then reports the attach session as alive.
+    requested = tmp_path / "requested"
+    alive = tmp_path / "session"
+    tmux = Path(P.cfg["calib"]["tmux_bin"])
+    tmux.write_text(f"""#!/bin/sh
+if [ "$1" = has-session ]; then
+    test -f "{alive}" && exit 0
+    echo "no server running" >&2
+    exit 1
+fi
+echo "$@" >> "{requested}"
+touch "{alive}"
+""")
+    P.cfg["calib"]["allow_submit"] = True
+    if entry == "migration":
+        alive.touch()
+        write_json(it.p("gates/attempt-1.json"), {})
+        assert stages_b.migrate_probe_report(P, it)
+        assert it.state["probe_migration_job_stage"] == stage
+        alive.unlink()
+    if entry == "reconcile":
+        P.cfg["budget"]["run_usd_total"] = 188
+        P.cfg["review"]["enabled"] = False
+        it.goto(stage, "recover")
+        (stages_b.s9r if stage == "S9R" else stages_b.s9)(P, it)
+    if entry == "finish":
+        stages_b.finish_job_stage(P, it.load(), "parked", "synthetic finish")
+    watch_tick(P, only=[iid])
+    watch_tick(P, only=[iid])
+    attached, = _runs(P, iid, directory)
+    assert attached["state"] == "remote_unknown" and attached["outcome"] is None
+    assert attached["job_name"] == name and attached["ledger_call"] == call
+    assert stages_b.running_jobs(P) == [name] and stages_b._slots_full(P)
+    command, = requested.read_text().splitlines()
+    assert f"new-session -d -s {name[-60:]}" in command and rec["config"] in command
+    with P.ledger._db() as db:
+        assert db.execute("SELECT status,usd FROM calls WHERE id=?", (call,)).fetchone() == ("reserved", None)
+    with pytest.raises(BudgetStop, match="daily_total"):
+        P.ledger.reserve(model, stage, "next", True, est_usd=12)
+
+    write_json(jobs / name / "config.json", read_json(Path(rec["config"])))
+    _finish(jobs, name, cost=7, verdict=V("pass") if stage == "S9R" else None)
+    watch_tick(P, only=[iid], max_steps=0)
+    settled, = _runs(P, iid, directory)
+    assert settled["cost_usd"] == 7 and settled["ledger_call"] == call
+    assert P.item_cost(iid)["usd"] == 7 and not stages_b.running_jobs(P)
+    with pytest.raises(BudgetStop, match="daily_total"):
+        P.ledger.reserve(model, stage, "next", True, est_usd=12)
+    if entry == "migration":
+        assert it.load().state["stage"] == "S6A_run" and it.state["status"] == "active"
+    elif entry == "finish":
+        assert it.load().state["status"] == "parked" and it.state["reason"] == "synthetic finish"
+
+
+def test_remote_sync_before_recovery_settles_current_reservation(tmp_path):
+    from tbsgen import calib
+
+    P, iid, jobs = _env(tmp_path, allow_submit=False)
+    it = P.store.item(iid)
+    it.state.update(stage="S9R", review_round=1)
+    it.save()
+    P.run(only=[iid])
+    rec, = _runs(P, iid, "review")
+    key = calib.reservation_key(rec, iid, "S9R")
+    old = P.ledger.reserve(rec["model"], "S9R", iid, True, est_usd=12, reservation_key=key)
+    with P.ledger._db() as db:
+        db.execute("UPDATE calls SET day='2000-01-01',status='cancelled',usd=0,cost_kind='expired_unsent' WHERE id=?",
+                   (old,))
+    current = P.ledger.reserve(rec["model"], "S9R", iid, True, est_usd=12, reservation_key=key)
+    write_json(it.p("review/runs.json"), [dict(rec, state="reserved", ledger_call=old)])
+    jd = jobs / rec["job_name"]
+    write_json(jd / "tbsgen-remote.json", {})
+    write_json(jd / "config.json", read_json(Path(rec["config"])))
+    _finish(jobs, rec["job_name"], cost=7, verdict=V("pass"))
+    watch_tick(P, only=[iid], max_steps=0)
+    settled, = _runs(P, iid, "review")
+    assert settled["ledger_call"] == current and settled["cost_usd"] == 7
+    with P.ledger._db() as db:
+        assert db.execute("SELECT usd FROM calls WHERE reservation_key=? ORDER BY id", (key,)).fetchall() == [(0,), (7,)]
+
+
+@pytest.mark.parametrize("trial_synced", [False, True])
+def test_remote_attach_gone_settles_from_evidence(tmp_path, trial_synced):
+    P, iid, jobs = _env(tmp_path, review_kw={"launcher": "remote.sh"})
+    it = P.store.item(iid)
+    it.state.update(stage="S9R", review_round=1, calib_label="hard")
+    it.save()
+    # Both the original and the attach report GONE. Only the second can release this reservation.
+    script = Path(P.cfg["calib"]["harbor_root"]) / "remote.sh"
+    script.write_text(f"""#!/bin/sh
+name=$(basename "$2" .json)
+mkdir -p "{jobs}/$name"
+touch "{jobs}/$name/tbsgen-remote.json"
+exit 5
+""")
+    script.chmod(0o755)
+    P.run(only=[iid])
+    rec, = _runs(P, iid, "review")
+    watch_tick(P, only=[iid], max_steps=0)
+    attached, = _runs(P, iid, "review")
+    assert attached["state"] == "remote_unknown" and attached["ledger_call"] == rec["ledger_call"]
+    assert Path(attached["log"] + ".exit").read_text().strip() == "5"
+    if trial_synced:
+        _finish(jobs, rec["job_name"], cost=7)
+        (jobs / rec["job_name"] / "result.json").unlink()  # only a trial synced
+    watch_tick(P, only=[iid], max_steps=0)
+    failed, = _runs(P, iid, "review")
+    assert (failed["state"], failed["cost_kind"]) == (("died", "reported") if trial_synced else
+                                                      ("launch_failed", "not_launched"))
+    with P.ledger._db() as db:
+        usd, = db.execute("SELECT usd FROM calls WHERE id=?", (rec["ledger_call"],)).fetchone()
+        assert usd == (7 if trial_synced else 0)
+
+
+@pytest.mark.parametrize("entry", ["S9", "intent", "pass"])
+def test_disabled_review_rechecks_keep_labels(tmp_path, entry):
+    from tbsgen import stages_b
+    P, iid, jobs = _env(tmp_path)
+    it = P.store.item(iid)
+    if entry != "S9":
+        P.cfg["calib"]["allow_submit"] = entry == "pass"
+        it.state.update(stage="S9R", review_round=1, calib_label="hard")
+        it.save()
+        P.run(only=[iid])  # the label was kept when this round was created
+        if entry == "pass":
+            rec, = _runs(P, iid, "review")
+            _finish(jobs, rec["job_name"], verdict=V("pass"))
+            ingest(P, it)
+    P.cfg["calib"]["keep_labels"] = ["unstable"]
+    P.cfg["review"]["enabled"] = False
+    if entry != "S9":
+        P.run(only=[iid])
+    else:
+        _to_label(P, iid, jobs)
+    assert it.load().state["status"] == "dropped"
+    assert it.state["reason"] == "label:hard (not kept; S9b variants off)"
+    assert not stages_b._released(P, iid)
 
 
 def test_repro_append_after_truncated_tail(tmp_path, caplog):
