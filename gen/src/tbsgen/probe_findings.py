@@ -63,11 +63,23 @@ def _matches_run(finding, scope, records, contract):
             and row["reward"] == reward)
 
 
-def _optional_repro_errors(entry, records, location):
+def _optional_repro_errors(entry, records, location, scope=None):
     if "repro_id" in entry:
         key = entry["repro_id"]
-        if not isinstance(key, str) or not key or not isinstance(records.get(key), dict):
+        row = records.get(key) if isinstance(key, str) and key else None
+        if not isinstance(row, dict):
             return [f"{location}: unknown or ambiguous repro_id"]
+        errors = []
+        if scope is not None and row.get("scope_id") not in (scope, None, ""):
+            errors.append(f"{location}: cited repro record belongs to scope {row.get('scope_id')!r}")
+        reward = entry.get("observed_reward")
+        if reward is not None:
+            try:
+                if float(reward) != row.get("reward"):
+                    errors.append(f"{location}: observed_reward does not match the cited repro record")
+            except (TypeError, ValueError):
+                errors.append(f"{location}: invalid observed_reward")
+        return errors
     return []
 
 
@@ -105,7 +117,7 @@ def finding_errors(verdict, suspected_scopes, contract=CURRENT_CONTRACT, repros=
         elif finding.get("classification") != "probe_artefact":
             errors.append(f"{scope}: expected grader_gap or probe_artefact")
         if extra:
-            errors.extend(_optional_repro_errors(finding, records, scope))
+            errors.extend(_optional_repro_errors(finding, records, scope, scope))
             continue
         if contract == "s9r-v2":
             if not isinstance(finding.get("reproduction"), str) or not finding["reproduction"].strip():

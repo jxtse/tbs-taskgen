@@ -718,8 +718,10 @@ def _s9(P, it):
         elif rec.get("outcome") is None and rec.get("state") == "launched":
             why = calib.launcher_failed(rec, c)
             if why:
-                if rec.get("ledger_call"):
-                    P.ledger.settle(rec["ledger_call"], 0.0, status="error", kind="not_launched", note=why[:500])
+                # release every open reservation of this launch (incl. a cross-day replacement not yet written back)
+                rec["ledger_call"] = P.ledger.cancel_unstarted_job(
+                    it.item_id, rec.get("ledger_stage") or "S9", calib.reservation_key(rec, it.item_id, rec.get("ledger_stage") or "S9"),
+                    rec.get("ledger_call"), "not_launched")
                 rec.update(state="launch_failed", outcome="infra", result_type="infra", cost_usd=0.0,
                            cost_kind="not_launched", error=why)
                 _mark_refused(P, it, rec, "S9")
@@ -1198,8 +1200,9 @@ def _s9r(P, it):
         elif rec.get("outcome") is None and rec.get("state") == "launched":
             why = calib.launcher_failed(rec, c)
             if why:
-                if rec.get("ledger_call"):
-                    P.ledger.settle(rec["ledger_call"], 0.0, status="error", kind="not_launched", note=why[:500])
+                rec["ledger_call"] = P.ledger.cancel_unstarted_job(
+                    it.item_id, rec.get("ledger_stage") or "S9R", calib.reservation_key(rec, it.item_id, rec.get("ledger_stage") or "S9R"),
+                    rec.get("ledger_call"), "not_launched")
                 rec.update(state="launch_failed", outcome="infra", cost_usd=0.0, cost_kind="not_launched", error=why)
                 _mark_refused(P, it, rec, "S9R")
                 save(rec)

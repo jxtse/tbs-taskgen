@@ -1062,6 +1062,8 @@ def test_suspected_scopes_bind_bundle_validator_and_ingest(tmp_path, caplog):
             verdict["issues"] = [dict(BLOCK, problem=problem)]
             check(routed)
         invalid = [{"repro_id": "absent"}, {"issue_id": "absent"}, {"repro_id": ""}]
+        if scope != first:   # an additional finding may not cite a record of another scope or another reward
+            invalid.extend([{"repro_id": "second-run"}, {"observed_reward": 0}])
         if scope == first:
             invalid.extend([{"repro_id": "second-run"}, {"observed_reward": True},
                             {"observed_reward": 0.5}, {"observation": "short"}])
@@ -1612,6 +1614,43 @@ def test_disabled_review_cancels_cross_day_replacement(tmp_path, expired):
             (0, "expired_unsent" if expired else "cancelled_unstarted"), (0, "cancelled_unstarted")]
         assert db.execute("SELECT status FROM calls WHERE id=?", (other,)).fetchone() == ("reserved",)
     assert P.item_cost(iid)["calls"] == 0
+    assert P.ledger.reserve(model, "S9R", "next", True, est_usd=12)
+
+
+def test_disabled_review_attempted_launch_releases_cross_day_replacement(tmp_path, monkeypatch):
+    """#44 saves launch_attempted, commits today's sent row, and may crash before writing back its id."""
+    from tbsgen import calib, stages_b
+    from tbsgen.budget import today
+    P, iid, jobs = _env(tmp_path, allow_submit=False)
+    it = P.store.item(iid)
+    it.state.update(stage="S9R", review_round=1, calib_label="hard")
+    it.save()
+    P.run(only=[iid])
+    rec, = _runs(P, iid, "review")
+    model = rec["model"]
+    key = calib.reservation_key(rec, iid, "S9R")
+    old = P.ledger.reserve(model, "S9R", iid, True, est_usd=12, reservation_key=key)
+    write_json(it.p("review/runs.json"),
+               [dict(rec, state="reserved", reservation_key=key, ledger_call=old, launch_attempted=True,
+                     tmux=rec["job_name"], log=str(tmp_path / "review1.log"))])
+    other = P.ledger.reserve(model, "S9R", "other", True, est_usd=188, reservation_key="other-job")
+    with P.ledger._db() as db:
+        db.execute("UPDATE calls SET day='2000-01-01' WHERE id=?", (old,))
+        replacement = db.execute(
+            "INSERT INTO calls(day,model,stage,item,real,est_usd,status,reservation_key) "
+            "VALUES(?,?,'S9R',?,1,12,'sent',?)", (today(), model, iid, key)).lastrowid
+    P.cfg["budget"]["daily_usd_per_model"] = {model: 200}
+    P.cfg["review"]["enabled"] = False
+    monkeypatch.setattr(calib, "session_alive", lambda c, r: False)
+    P.run(only=[iid])      # launch_attempted -> drained as launched
+    stages_b.watch_tick(P, only=[iid])   # watcher: no session, no job -> launch_failed
+    failed, = _runs(P, iid, "review")
+    assert failed["state"] == "launch_failed" and failed["ledger_call"] == replacement
+    with P.ledger._db() as db:
+        rows = db.execute("SELECT id,status,usd FROM calls WHERE reservation_key=? ORDER BY id", (key,)).fetchall()
+        assert [r[0] for r in rows] == [old, replacement]
+        assert all(r[1] not in ("reserved", "sent") and (r[2] or 0) == 0 for r in rows)
+        assert db.execute("SELECT status FROM calls WHERE id=?", (other,)).fetchone() == ("reserved",)
     assert P.ledger.reserve(model, "S9R", "next", True, est_usd=12)
 
 
