@@ -1,4 +1,5 @@
 import asyncio
+import re
 from pathlib import Path
 
 from .core import dumps, read
@@ -28,16 +29,29 @@ def quoted(quote, prompt):
     return any(_norm(c) and _norm(c) in p for c in candidates) or _norm(quote.replace("\n", "\\n")) in p
 
 
+def _plain(text):
+    """Markdown-insensitive form for evidence matching (judges drop or add emphasis, code ticks and table pipes)."""
+    return re.sub(r"\s+([.,;:!?)])", r"\1", _norm(re.sub(r"[*_`|>#]+", " ", text)))
+
+
 def assess_task(answer, prompt):
-    if (
-        answer.get("verdict") not in {"keep", "flag", "drop"}
-        or answer.get("difficulty") not in {"easy", "medium", "hard"}
-        or not answer.get("rationale")
-        or not isinstance(answer.get("evidence"), list)
-        or not answer["evidence"]
-        or not all(quoted(q, prompt) for q in answer["evidence"])
-    ):
-        raise ValueError("invalid task judge response or evidence")
+    problems = []
+    if answer.get("verdict") not in {"keep", "flag", "drop"}:
+        problems.append("verdict must be keep, flag or drop")
+    if answer.get("difficulty") not in {"easy", "medium", "hard"}:
+        problems.append("difficulty must be easy, medium or hard")
+    if not answer.get("rationale"):
+        problems.append("missing rationale")
+    evidence = answer.get("evidence")
+    if not isinstance(evidence, list) or not evidence:
+        problems.append("evidence must be a non-empty list of excerpts")
+    else:
+        plain = _plain(prompt)
+        for i, q in enumerate(evidence):
+            if not (quoted(q, prompt) or (isinstance(q, str) and _plain(q) and _plain(q) in plain)):
+                problems.append(f"evidence {i} is not an excerpt of the material: {str(q)[:120]!r}")
+    if problems:
+        raise ValueError("invalid task judge response or evidence: " + "; ".join(problems))
     return answer
 
 

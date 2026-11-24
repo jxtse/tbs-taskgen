@@ -875,3 +875,14 @@ def test_summary_preserves_nonmatching_lines():
 
     body = "Keep the samples.\r\n  Keep the samples.\r\nFinal line.\n"
     assert strip_instruction_lines(body, "Keep the samples.") == "  Keep the samples.\r\nFinal line.\n"
+
+
+def test_task_judge_evidence_ignores_markdown_emphasis():
+    from tbstrain.judge import assess_task
+
+    prompt = "instruction\nThe functional form of `N` is **not disclosed**. | `hidden_err` | max |"
+    ok = {"verdict": "keep", "difficulty": "hard", "rationale": "r",
+          "evidence": ["The functional form of N is not disclosed.", "hidden_err"]}
+    assert assess_task(ok, prompt)["verdict"] == "keep"
+    with pytest.raises(ValueError, match="evidence 0"):
+        assess_task({**ok, "evidence": ["something else entirely"]}, prompt)
