@@ -36,17 +36,27 @@ def _imports(path, root):
 def grader_files(pkg):
     root = Path(pkg) / "tests"
     resolved_root = root.resolve()
-    paths = [root / name for name in ("test_outputs.py", "measure.py", "test.sh") if (root / name).is_file()]
+
+    def grader_source(path):
+        resolved = path.resolve()
+        if not resolved.is_relative_to(resolved_root):
+            return False
+        for relative in (path.relative_to(root), resolved.relative_to(resolved_root)):
+            if any("truth" in part.lower() or "hidden" in part.lower() for part in relative.parts):
+                return False
+        return path.is_file()
+
+    paths = [root / name for name in ("test_outputs.py", "measure.py", "test.sh") if grader_source(root / name)]
     if not paths:
         return []
     metrics = root / "_metrics.py"
-    if metrics.is_file() and metrics.resolve().is_relative_to(resolved_root):
+    if grader_source(metrics):
         paths.append(metrics)
     seen = set(paths)
     for path in paths:
         if path.suffix == ".py":
             for helper in _imports(path, root):
-                if helper not in seen and helper.is_file() and helper.resolve().is_relative_to(resolved_root):
+                if helper not in seen and grader_source(helper):
                     seen.add(helper)
                     paths.append(helper)
     return paths

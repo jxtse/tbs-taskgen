@@ -55,7 +55,8 @@ def native_content(record, preserved):
 
 
 class Turns:
-    def __init__(self, compacted):
+    def __init__(self, compacted, request_messages):
+        self.request_messages = request_messages
         self.messages = []
         self.pending = []
         self.assistants = {}
@@ -116,8 +117,13 @@ class Turns:
             return
         content = native_content(record, preserved)
         mid = record["message"].get("id")
-        if role == "user" and isinstance(content, list) and any(b["type"] == "tool_result" for b in content):
-            self.assistants.clear()
+        if role == "assistant" and not mid and (rid := record.get("requestId")):
+            ids = self.request_messages.get(rid, ())
+            if len(ids) > 1:
+                raise ValueError("ambiguous_request_id")
+            mid = next(iter(ids), rid)
+        if role == "assistant" and mid and isinstance(content, str):
+            content = [text_block(content)]
         if role == "assistant" and mid in self.assistants:
             self.assistants[mid]["content"].extend(content)
             return
@@ -139,6 +145,7 @@ class Turns:
         if role == "assistant":
             msg["loss"] = int(not (preserved or historical))
             if mid and isinstance(content, list):
+                msg["response_id"] = mid
                 self.assistants[mid] = msg
         elif self.early_attributions:
             for raw in self.early_attributions:
@@ -151,13 +158,17 @@ class Session:
         self.index = {}
         self.children = defaultdict(list)
         self.results = {}
+        self.request_messages = defaultdict(set)
         for r in records:
             uid = r.get("uuid")
             if not uid or uid in self.index or r.get("isSidechain"):
                 continue
             self.index[uid] = r
             self.children[r.get("parentUuid")].append(uid)
-            c = r.get("message", {}).get("content")
+            msg = r.get("message", {})
+            if r["type"] == "assistant" and msg.get("id") and r.get("requestId"):
+                self.request_messages[r["requestId"]].add(msg["id"])
+            c = msg.get("content")
             if r["type"] == "user" and isinstance(c, list):
                 for b in c:
                     if b["type"] == "tool_result":
@@ -221,7 +232,7 @@ class Session:
     def state(self, leaf, historical=()):
         path = self.chain(leaf)
         start = next((i for i in reversed(range(len(path))) if is_boundary(path[i])), None)
-        turns = Turns(start is not None)
+        turns = Turns(start is not None, self.request_messages)
         if start is not None:
             boundary = path[start]
             path = path[start + 1:]
@@ -248,7 +259,25 @@ class Session:
             turns.feed(r, historical=r["uuid"] in historical)
         turns.flush()
         self.repair_results(turns.messages)
+        self.order_results(turns.messages)
         return turns.messages
+
+    @staticmethod
+    def order_results(messages):
+        positions = {}
+        slots = []
+        for m in [*messages, {"role": "assistant", "content": []}]:
+            if m["role"] == "assistant":
+                results = sorted((blocks[i] for blocks, i in slots),
+                                 key=lambda b: positions[b["tool_use_id"]])
+                for (blocks, i), result in zip(slots, results):
+                    blocks[i] = result
+                slots.clear()
+                positions = {b["id"]: i for i, b in enumerate(m["content"])
+                             if isinstance(b, dict) and b["type"] == "tool_use"}
+            elif isinstance(m["content"], list):
+                slots.extend((m["content"], i) for i, b in enumerate(m["content"])
+                             if b.get("tool_use_id") in positions)
 
     def repair_results(self, messages):
         present = {b["tool_use_id"] for m in messages if isinstance(m["content"], list)

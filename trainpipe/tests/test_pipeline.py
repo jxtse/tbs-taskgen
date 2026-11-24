@@ -178,3 +178,78 @@ def test_default_selection_uses_easy_cap(workspace, judge_stub):
     workspace.write_text(workspace.read_text().replace('mode = "shares"\n', ''))
     assert main(["run", "--config", str(workspace)], transport=judge_stub) == 0
     assert sorted(r["tier"] for r in lines(workspace.parent / "out/selection.jsonl")) == ["hard", "medium"]
+
+
+@pytest.mark.parametrize("mode", ["drop_row", "drop_trajectory", "mask_after"])
+def test_export_image_policy(workspace, judge_stub, mode):
+    from conftest import block, cc_message, claude_events
+
+    # Keep the other tiers selectable even if this trajectory is entirely dropped.
+    config = workspace.read_text().replace('mode = "shares"', 'mode = "easy_cap"')
+    if mode != "drop_row":
+        config = config.replace("[export]", f'[export]\nimages="{mode}"')
+    workspace.write_text(config)
+    path = next((workspace.parent / "run/calib-jobs/hard-0").rglob("tiny.jsonl"))
+    events = claude_events()
+    events[3]["message"]["content"][0]["content"] = [block("tile"), {"type": "image", "data": "toy-bytes"}]
+    follow = cc_message("assistant", [block("Describe the tile.")], uuid="after-image",
+                        parentUuid=events[3]["uuid"], version="1")
+    events[4]["parentUuid"] = follow["uuid"]
+    events.insert(4, follow)
+    write_lines(path, events)
+
+    assert main(["run", "--config", str(workspace)], transport=judge_stub) == 0
+    out = workspace.parent / "out"
+    rows = {r["meta"]["segment"]: r for r in lines(out / "train.jsonl") if r["meta"]["harness"] == "claude-code"}
+    dropped = {r["segment"] for r in lines(out / "export.ledger.jsonl") if r["reason"] == "image_content"}
+    if mode == "drop_row":
+        assert set(rows) == {1} and dropped == {0}
+    elif mode == "drop_trajectory":
+        assert not rows and dropped == {0, 1}
+    else:
+        assert set(rows) == {0, 1} and not dropped
+        assert [v for m, v in zip(rows[0]["messages"], rows[0]["loss_mask"]) if m["role"] == "assistant"] == [1, 0, 0]
+        assert rows[1]["loss_mask"][-1] == 1
+    counts = dict(rows=1, dropped_rows=len(dropped), dropped_trajectories=int(mode == "drop_trajectory"),
+                  masked_turns=2 if mode == "mask_after" else 0)
+    assert read(out / "reports/export.json")["image_content"] == read(out / "reports/select.json")["image_content"] == counts
+    assert "toy-bytes" not in (out / "train.sources.jsonl").read_text()
+
+
+@pytest.mark.parametrize("harness", ["claude", "codex", "pi"])
+@pytest.mark.parametrize("role", ["user", "tool"])
+def test_native_image_context(harness, role, tmp_path):
+    from conftest import block, cc_message, link_events, toy_profile
+    from tbstrain.native import claude
+    from tbstrain.wire import image_dependents
+
+    image = dict(type="image", mimeType="image/png", data="dG95")
+    if harness == "claude":
+        events = link_events([
+            cc_message("user", [image] if role == "user" else "Question"),
+            cc_message("assistant", [dict(type="tool_use", id="a", name="sample", input={})]),
+            cc_message("user", [dict(type="tool_result", tool_use_id="a", content=[image] if role == "tool" else "ok")]),
+            cc_message("assistant", [block("Done.")]),
+        ])
+        records, _, _ = claude(events, {"profile": toy_profile()}, dict(trial=str(tmp_path), agent_version="1"))
+    elif harness == "codex":
+        events = codex_events()
+        content = [dict(type="input_image", image_url="data:image/png;base64,dG95")]
+        if role == "user":
+            events[2]["payload"]["content"] = content
+        else:
+            events[5]["payload"]["output"] = content
+        records, _, _ = codex(events, {}, {})
+    else:
+        events = [
+            dict(type="message", message=dict(role="user", content=[image] if role == "user" else "Question")),
+            dict(type="message", message=dict(role="assistant", stopReason="toolUse",
+                 content=[dict(type="toolCall", id="a", name="sample", arguments={})])),
+            dict(type="message", message=dict(role="toolResult", toolCallId="a", content=[image] if role == "tool" else "ok")),
+            dict(type="message", message=dict(role="assistant", content=[block("Done.")], stopReason="stop")),
+        ]
+        records, _, _ = pi(events, {"profile": toy_profile()}, {})
+    messages = records[0]["messages"]
+    assistants = [m for m in messages if m["role"] == "assistant"]
+    assert list(image_dependents(messages)) == assistants[(0 if role == "user" else 1):]
+    assert "dG95" not in str(records)

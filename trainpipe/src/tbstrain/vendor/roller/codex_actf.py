@@ -111,7 +111,7 @@ def _arguments(payload: Mapping[str, Any]) -> tuple[dict[str, Any], Any]:
 
 
 _OUTPUT_TEXT_BLOCK_TYPES = frozenset({"text", "input_text", "output_text"})
-_OUTPUT_IMAGE_BLOCK_TYPES = frozenset({"image", "input_image"})
+_OUTPUT_IMAGE_BLOCK_TYPES = frozenset({"image", "input_image", "image_url"})
 _OUTPUT_UNSUPPORTED_BLOCK_TYPES = frozenset({"input_file", "input_audio"})
 
 
@@ -168,7 +168,7 @@ def _normalize_output_block(value: Any) -> dict[str, Any]:
         image["type"] = "image"
         image_url = image.pop("image_url", None)
         if "data" not in image and image_url is not None:
-            image["data"] = image_url
+            image["data"] = image_url.get("url") if isinstance(image_url, Mapping) else image_url
         return image
     if block_kind == "unsupported":
         # Multimodal SFT cannot represent these typed Responses blocks. Keep
@@ -329,6 +329,12 @@ def session_tools(events: Iterable[Mapping[str, Any]]) -> tuple[list[Any], str]:
     return tools, "inferred"
 
 
+def native_response_id(event):
+    payload = event.get("payload") or {}
+    return (payload.get("response_id") or event.get("response_id")
+            or payload.get("responseId") or event.get("responseId"))
+
+
 def codex_events_to_actf(
     events: Iterable[dict[str, Any]],
     *,
@@ -343,9 +349,9 @@ def codex_events_to_actf(
     Codex emits reasoning, messages and tool calls as separate response items.
     A ``token_count`` event closes the corresponding model request, so all
     response items before that boundary are grouped into one ACTF assistant
-    step. Each tool output also closes the step before any subsequent assistant
-    item. Tool outputs are paired by ``call_id`` even though they arrive after
-    the model-request boundary.
+    step. An explicit response ID joins its items across intervening tool
+    outputs. Without an ID, an output closes the preceding step. Tool outputs
+    are paired by ``call_id``.
     """
 
     rows = list(events)
@@ -358,6 +364,7 @@ def codex_events_to_actf(
     system_parts: list[str] = []
     system_seen: set[str] = set()
     groups: list[dict[str, Any]] = []
+    identified_groups = {}
     current: dict[str, Any] | None = None
     calls_by_id: dict[str, dict[str, Any]] = {}
     first_time: str | None = None
@@ -369,8 +376,13 @@ def codex_events_to_actf(
             system_seen.add(text)
             system_parts.append(text)
 
-    def group(timestamp: str | None = None) -> dict[str, Any]:
+    def group(timestamp: str | None = None, response_id=None) -> dict[str, Any]:
         nonlocal current, pending_user, pending_user_time, pending_reasoning
+        if response_id:
+            if response_id in identified_groups:
+                current = identified_groups[response_id]
+            elif current and current.get("response_id") and current["response_id"] != response_id:
+                close_group({}, timestamp)
         if current is None:
             current = {
                 "user_content": pending_user,
@@ -389,6 +401,9 @@ def codex_events_to_actf(
         elif pending_reasoning:
             current["reasoning"].extend(pending_reasoning)
             pending_reasoning = []
+        if response_id:
+            current["response_id"] = response_id
+            identified_groups[response_id] = current
         if timestamp:
             current["finished_at"] = timestamp
         return current
@@ -483,12 +498,16 @@ def codex_events_to_actf(
             continue
 
         payload_type = payload.get("type")
+        response_id = native_response_id(event)
         if payload_type == "reasoning":
             reasoning, source = _reasoning_text(payload, include_summary)
             if source != "none":
                 reasoning_sources.add(source)
             if reasoning:
-                pending_reasoning.append(reasoning)
+                if response_id:
+                    group(timestamp, response_id)["reasoning"].append(reasoning)
+                else:
+                    pending_reasoning.append(reasoning)
             continue
 
         if payload_type == "message":
@@ -514,14 +533,14 @@ def codex_events_to_actf(
                         continue
                 else:
                     value = content
-                if value:
-                    image_blocks = _user_image_blocks(payload.get("content"))
+                image_blocks = _user_image_blocks(payload.get("content"))
+                if value or image_blocks:
                     if image_blocks is not None:
                         value = user_content(image_blocks, expected)
                     pending_user = append_user_content(pending_user, value)
                     pending_user_time = pending_user_time or timestamp
             elif role == "assistant":
-                target = group(timestamp)
+                target = group(timestamp, response_id)
                 if content:
                     target["content"].append(content)
             continue
@@ -546,7 +565,7 @@ def codex_events_to_actf(
                 "output_time": None,
                 "is_error": False,
             }
-            group(timestamp)["tool_calls"].append(call)
+            group(timestamp, response_id)["tool_calls"].append(call)
             calls_by_id[call_id] = call
             continue
 
@@ -620,6 +639,7 @@ def codex_events_to_actf(
         steps.append(
             {
                 "step_id": len(steps) + 1,
+                "response_id": raw_group.get("response_id"),
                 "assistant_content": {
                     "content": "\n\n".join(raw_group["content"]),
                     "reasoning_content": reasoning if keep_thinking else "",

@@ -312,15 +312,15 @@ def test_wire_check_reports_body_mismatch_without_exposing_text(tmp_path, capsys
     assert report["mismatch"] == 1 and report["first_difference"]["difference"] == "$.max_tokens value differs"
 
 
-def test_claude_result_ends_fragment_group(tmp_path):
+def test_distinct_claude_responses_stay_separate(tmp_path):
     events = link_events([
         cc_message("user", "Inspect the toy swatch."),
         cc_message("assistant", [call("sample", "swatch")]),
         cc_message("user", [result("swatch", "violet")]),
         cc_message("assistant", [block("The swatch is violet.")]),
     ])
-    for e in (events[1], events[3]):
-        e["message"]["id"] = "reused-id"
+    events[1]["message"]["id"] = "measure"
+    events[3]["message"]["id"] = "describe"
     record, = claude(events, {"profile": toy_profile()}, {"agent_version": "1", "trial": str(tmp_path)})[0]
     row = render(record, {})
     assert check(row) == []
@@ -354,3 +354,75 @@ def test_redacted_thinking_provenance(harness, tmp_path):
     assert check(row) == []
     assert row["meta"]["reasoning_source"] == "redacted"
     assert not row["messages"][-1].get("reasoning_content")
+
+
+@pytest.mark.parametrize("harness", ["claude-id", "claude-request", "claude-mixed", "codex", "pi"])
+def test_interleaved_native_response(harness, tmp_path):
+    if harness.startswith("claude"):
+        events = link_events([
+            cc_message("user", "Collect two readings."),
+            cc_message("assistant", [block("First."), call("sample", "a")]),
+            cc_message("user", [result("a", "one")]),
+            cc_message("assistant", [dict(type="thinking", thinking="Second."), call("sample", "b")]),
+            cc_message("user", [result("b", "two")]),
+            cc_message("assistant", [block("Done.")]),
+        ])
+        for i in (1, 3):
+            events[i]["requestId"] = f"req-{i}" if harness == "claude-id" else "request"
+            if harness == "claude-id" or (harness == "claude-mixed" and i == 3):
+                events[i]["message"]["id"] = "batch"
+        records, _, _ = claude(events, {"profile": toy_profile()}, {"trial": str(tmp_path), "agent_version": "1"})
+        assert [b["type"] for b in records[0]["messages"][2]["content"]] == [
+            "text", "tool_use", "thinking", "tool_use"]
+    elif harness == "codex":
+        events = codex_events()
+        first = events[3]["payload"]
+        first["response_id"] = "batch"
+        events[6:6] = [
+            dict(type="response_item", payload={**first, "call_id": "b"}),
+            dict(type="response_item", payload=dict(type="function_call_output", call_id="b", output="two")),
+        ]
+        records, _, _ = codex(events, {}, {})
+    else:
+        def entry(role, content, **fields):
+            return dict(type="message", message=dict(role=role, content=content, **fields))
+
+        events = [entry("user", "Collect two readings.")]
+        for tid in ("a", "b"):
+            events.extend([
+                entry("assistant", [dict(type="toolCall", id=tid, name="sample", arguments={})],
+                      stopReason="toolUse", responseId="batch"),
+                entry("toolResult", tid, toolCallId=tid, toolName="sample"),
+            ])
+        events.append(entry("assistant", [block("Done.")], stopReason="stop"))
+        records, _, _ = pi(events, {"profile": toy_profile()}, {})
+    row = render(records[0], {})
+    assert check(row) == []
+    assert [m["role"] for m in row["messages"]] == ["system", "user", "assistant", "tool", "tool", "assistant"]
+    assert [c["id"] for c in row["messages"][2]["tool_calls"]] == ["a", "b"]
+    assert [m["tool_call_id"] for m in row["messages"][3:5]] == ["a", "b"]
+    assert records[0]["messages"][2]["response_id"] == ("request" if harness == "claude-request" else "batch")
+
+
+def test_native_parallel_completion_order():
+    events = link_events([
+        cc_message("assistant", [call("sample", "a"), call("sample", "b")]),
+        cc_message("user", [result("b", "two"), result("a", "one")]),
+        cc_message("assistant", [block("Done.")]),
+    ])
+    session = Session(events)
+    assert session.state(session.leaf)[1]["content"] == [result("a", "one"), result("b", "two")]
+
+
+def test_pi_incomplete_fragment_group_keeps_previous_end():
+    def entry(role, content, **fields):
+        return dict(type="message", message=dict(role=role, content=content, **fields))
+
+    events = [entry("user", "First tile"), entry("assistant", [block("Blue.")], stopReason="stop"),
+              entry("user", "Next tile"), entry("assistant", [block("Inspect.")], responseId="batch"),
+              entry("assistant", [dict(type="toolCall", id="a", name="sample", arguments={})],
+                    responseId="batch", stopReason="toolUse"),
+              entry("toolResult", "green", toolCallId="a")]
+    records, _, notes = pi(events, {"profile": toy_profile()}, {})
+    assert render(records[0], {})["messages"][-1]["content"] == "Blue."
+    assert notes["last_complete_event"] == 2

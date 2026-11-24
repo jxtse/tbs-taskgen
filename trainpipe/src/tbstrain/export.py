@@ -4,7 +4,8 @@ from pathlib import Path
 
 from .profile import configured_profiles, required_profile
 from .core import digest, dumps, file_hash, loads, read
-from .wire import Counter, check, render, source_check, reference_shape
+from .select import image_counts
+from .wire import Counter, check, export_modes, image_policy_errors, render, source_check, reference_shape
 
 
 def distribution(counts):
@@ -18,12 +19,15 @@ def distribution(counts):
 def export(ctx):
     cfg = ctx.cfg["export"]
     path = ctx.path(cfg["tokenizer"])
-    target = cfg.get("train_on_what", "all_assistant_messages")
+    target, images = export_modes(cfg)
     profiles = configured_profiles(ctx)
 
     def build():
         counts = []
-        decisions = []
+        screened = list(ctx.rows("screen"))
+        decisions = [dict(trial_id=r["trial_id"], task_id=r["task_id"], segment=i,
+                          keep=False, reason="image_content")
+                     for r in screened for i in r.get("image_dropped_segments", [])]
         token_counter = Counter(path)
         with (
             (ctx.work / "train.jsonl").open("w", encoding="utf-8") as output,
@@ -33,13 +37,17 @@ def export(ctx):
                 profile = profiles.get(r["harness"])
                 if r["harness"] == "claude-code":
                     required_profile(profile, r["harness"], r.get("agent_version"))
-                if r.get("wire_context_hash") != digest([profile, target, cfg.get("codex_reasoning", "drop")]):
+                if r.get("wire_context_hash") != digest([profile, target, cfg.get("codex_reasoning", "drop"), images]):
                     raise ValueError("wire context changed: rerun screen and select")
+                dropped = set(r.get("image_dropped_segments", []))
                 for i, segment in enumerate(read(ctx.out / "segments" / r["source"])):
+                    if i in dropped:
+                        continue
                     meta = {k: r[k] for k in ("task_id", "trial_id", "harness", "tier", "domain")}
                     meta.update(segment=i, compaction=segment.get("compaction", False))
                     row = render(segment, meta)
                     errors = check(row, allow_masked=target == "loss_mask")
+                    errors.extend(image_policy_errors(segment, images))
                     if errors:
                         raise ValueError(f"invalid screened row: {errors}")
                     tokens, _ = token_counter.counts(row)
@@ -55,6 +63,7 @@ def export(ctx):
         return {
             "count": len(counts),
             "length": distribution(counts),
+            "image_content": image_counts(screened),
             "dropped": len(decisions) - len(counts),
             "train_on_what": target,
             "note": "Managed all_assistant_messages supervises every assistant message and ignores loss_mask.",
@@ -65,6 +74,7 @@ def export(ctx):
 
 def validate(ctx, file, allow_masked=False, reference=None):
     cfg = ctx.cfg["export"]
+    target, images = export_modes(cfg)
     tokenizer = ctx.path(cfg["tokenizer"])
     file = Path(file).absolute()
     exemplar = loads(reference.read_bytes()) if reference else None
@@ -90,7 +100,7 @@ def validate(ctx, file, allow_masked=False, reference=None):
                         errors = check(
                             row,
                             allow_masked=allow_masked
-                            or cfg.get("train_on_what") == "loss_mask",
+                            or target == "loss_mask",
                         )
                         if not errors and reference:
                             errors.extend(reference_shape(row, exemplar))
@@ -111,7 +121,7 @@ def validate(ctx, file, allow_masked=False, reference=None):
                         if src is None:
                             errors.append("source_missing")
                         elif not errors:
-                            errors.extend(source_check(loads(src.decode("utf-8")), row))
+                            errors.extend(source_check(loads(src.decode("utf-8")), row, images))
                     except UnicodeDecodeError:
                         errors.append("utf8")
                     except (ValueError, TypeError, KeyError, AttributeError, IndexError) as exc:

@@ -5,7 +5,34 @@ import json
 from tokenizers import Tokenizer
 
 from .core import dumps, loads
-from .native import function_schemas, string_content, validate_pairs
+from .native import function_schemas, has_image, string_content, validate_pairs
+
+
+def image_dependents(messages):
+    """Assistant targets conditioned on omitted media, including removed replay."""
+    seen = False
+    for m in messages:
+        seen |= bool(m.get("image_context"))
+        if seen and m["role"] == "assistant":
+            yield m
+        seen |= has_image(m["content"])
+
+
+def image_policy_errors(segment, mode):
+    for m in image_dependents(segment["messages"]):
+        if mode != "mask_after" or m["loss"]:
+            return ["image_content"]
+    return []
+
+
+def export_modes(cfg):
+    images = cfg.get("images", "drop_row")
+    if images not in {"drop_row", "drop_trajectory", "mask_after"}:
+        raise ValueError("invalid export.images")
+    target = cfg.get("train_on_what", "loss_mask" if images == "mask_after" else "all_assistant_messages")
+    if images == "mask_after" and target != "loss_mask":
+        raise ValueError("export.images mask_after requires loss_mask supervision")
+    return target, images
 
 
 def render(source, meta):
@@ -235,9 +262,30 @@ def check(row, *, allow_masked=False):
     return sorted(set(errors))
 
 
-def source_check(source, row):
+def source_check(source, row, images="drop_row"):
     """Verify source blocks against their corresponding role, call ID and output field."""
-    expected = render(source["segment"], source["meta"])
+    segment = source["segment"]
+    if errors := image_policy_errors(segment, images):
+        return errors
+
+    # Native response IDs live only in the sidecar. A converter and renderer
+    # that agree on the same split would otherwise pass the replay check.
+    owners = {}
+    response_ids = set()
+    for m in segment["messages"]:
+        rid = m.get("response_id")
+        if m["role"] == "assistant" and rid:
+            if rid in response_ids:
+                return ["split_native_response"]
+            response_ids.add(rid)
+            owners.update((b["id"], rid) for b in m["content"] if b["type"] == "tool_use")
+    seen = set()
+    for m in row["messages"]:
+        ids = {owners[c["id"]] for c in m.get("tool_calls", []) if c["id"] in owners}
+        if seen & ids:
+            return ["split_native_response"]
+        seen.update(ids)
+    expected = render(segment, source["meta"])
     if expected != row:
         return ["provenance"]
     # Independently walk the input blocks. Renderer regressions must not silently erase text.

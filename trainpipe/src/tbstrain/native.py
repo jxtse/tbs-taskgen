@@ -10,9 +10,13 @@ from .claude_wire import Session, is_boundary
 from .profile import ProfileError, required_profile, system_text
 from .core import lines, loads, read
 from .vendor.roller import compaction
+from .vendor.roller.actf import append_user_content
 from .vendor.roller.blobs import load_blobs
-from .vendor.roller.codex_actf import codex_events_to_actf, session_tools
+from .vendor.roller.codex_actf import codex_events_to_actf, native_response_id, session_tools
 from .vendor.roller.sft import actf_to_sft, validate_sft_record
+
+
+IMAGE_TYPES = {"image", "image_url", "input_image"}
 
 
 def string_content(value):
@@ -24,13 +28,36 @@ def string_content(value):
     for b in value:
         if b["type"] == "text" and isinstance(b.get("text"), str):
             parts.append(b["text"])
-        elif b["type"] in {"image", "image_url"}:
+        elif b["type"] in IMAGE_TYPES:
             parts.append("[image omitted in export]")
         elif b["type"] == "tool_reference" and isinstance(b.get("tool_name"), str):
             parts.append(json.dumps(b, ensure_ascii=False))
         else:
             raise ValueError("unsupported_content_block")
     return "\n".join(parts)
+
+
+def has_image(content):
+    return isinstance(content, list) and any(
+        isinstance(b, dict) and (
+            b.get("type") in IMAGE_TYPES or (b.get("type") == "tool_result" and has_image(b.get("content")))
+        )
+        for b in content
+    )
+
+
+def omit_image_bytes(content):
+    if not isinstance(content, list):
+        return content
+    blocks = []
+    for b in content:
+        if b["type"] in IMAGE_TYPES:
+            blocks.append({"type": "image"})
+        elif b["type"] == "tool_result":
+            blocks.append({**b, "content": omit_image_bytes(b["content"])})
+        else:
+            blocks.append(b)
+    return blocks
 
 
 def text_block(value):
@@ -150,8 +177,10 @@ def claude(events, cfg, trial):
         skip_results = set()
         state = session.state(end, historical)
         validate_pairs(state)
+        saw_image = False
         for m in state:
             content = m["content"]
+            saw_image |= has_image(content)
             # The managed trainer supervises every assistant. Remove replay and its paired
             # results only for this target. Mask-aware targets keep the entire wire state.
             if cfg.get("train_on_what") == "all_assistant_messages":
@@ -167,7 +196,11 @@ def claude(events, cfg, trial):
                 # The platform supplies the separator when joining text blocks.
                 for block in content[:m["prepended"]]:
                     block["text"] = block["text"].rstrip("\n")
-            entry = message(m["role"], content)
+            entry = message(m["role"], omit_image_bytes(content))
+            if saw_image and m["role"] == "assistant":
+                entry["image_context"] = True
+            if m.get("response_id"):
+                entry["response_id"] = m["response_id"]
             entry["loss"] = m.get("loss", 0)
             messages.append(entry)
         row = segment(messages, profile["tools"])
@@ -189,7 +222,10 @@ def claude(events, cfg, trial):
                 model, source = summary_identity(summary, requests, chain, following[following.index(summary) + 1:])
                 models.append(model)
                 row.update(compaction=True, summary_model=model, summary_model_source=source)
-                messages.extend([message("user", instruction), message("assistant", target)])
+                answer = message("assistant", target)
+                if saw_image:
+                    answer["image_context"] = True
+                messages.extend([message("user", instruction), answer])
         rows.append(row)
     return rows, models, {"resume_prefix_events": len(historical), "hint_run": hinted}
 
@@ -197,14 +233,15 @@ def claude(events, cfg, trial):
 def pi_segment(messages, system, tools):
     """Bind Pi's completed message events to Roller steps, then use its validated SFT path."""
     steps = []
-    users = []
+    users = ""
     errors = set()
     reasoning_sources = set()
     schemas = list(function_schemas(tools or []))
     for m in messages:
         role = m["role"]
         if role == "user":
-            users.append(string_content(m["content"]))
+            content = m["content"] if has_image(m["content"]) else string_content(m["content"])
+            users = append_user_content(users, content)
         elif role == "toolResult":
             if not steps:
                 raise ValueError("orphan_tool_result")
@@ -212,7 +249,7 @@ def pi_segment(messages, system, tools):
                 dict(
                     toolCallId=m["toolCallId"],
                     toolName=m.get("toolName"),
-                    content=string_content(m["content"]),
+                    content=m["content"] if has_image(m["content"]) else string_content(m["content"]),
                 )
             )
             if m.get("isError"):
@@ -237,9 +274,13 @@ def pi_segment(messages, system, tools):
             assistant = dict(
                 content="\n".join(text), reasoning_content="\n".join(reasoning), tool_calls=calls
             )
-            steps.append(dict(user_content="\n\n".join(users), assistant_content=assistant, observation=[]))
-            users.clear()
+            steps.append(dict(user_content=users, assistant_content=assistant, observation=[]))
+            users = ""
     converted = from_sft(actf_to_sft(dict(system_prompt=system or "", tools=schemas, steps=steps)))
+    assistants = (m for m in converted["messages"] if m["role"] == "assistant")
+    for native, target in zip((m for m in messages if m["role"] == "assistant"), assistants, strict=True):
+        if native.get("response_id"):
+            target["response_id"] = native["response_id"]
     for m in converted["messages"]:
         for b in m["content"]:
             if b.get("tool_use_id") in errors:
@@ -257,7 +298,10 @@ def pi(events, cfg, trial):
     request_model = None
     open_turn = None
     previous_id = None
-    pending = deque()
+    active_response = None
+    active_message = None
+    preceding_end = None
+    pending = set()
     hinted = False
     for index, e in enumerate(events):
         kind = e.get("type")
@@ -297,13 +341,16 @@ def pi(events, cfg, trial):
         role = m["role"]
         blocks = m["content"]
         hinted |= has_hint(blocks)
+        response_id = m.get("responseId") or m.get("response_id") or m.get("id") or event.get("id") or e.get("id")
+        continuation = role == "assistant" and response_id and response_id == active_response
         if role == "toolResult":
-            if not pending or pending.popleft() != m["toolCallId"]:
+            if m["toolCallId"] not in pending:
                 raise ValueError("tool_order")
-        elif pending:
+            pending.remove(m["toolCallId"])
+        elif pending and not continuation:
             raise ValueError("unanswered_tool_call")
         if role == "assistant":
-            pending.extend(b["id"] for b in blocks if b["type"] == "toolCall")
+            pending.update(b["id"] for b in blocks if b["type"] == "toolCall")
             models.append(m.get("model") or request_model)
             if m.get("stopReason") in {"aborted", "error", "length"}:
                 if any(
@@ -314,11 +361,21 @@ def pi(events, cfg, trial):
                 break
         elif role not in {"toolResult", "user"}:
             raise ValueError("pi_unsupported_role")
-        current.append(m)
+        if continuation:
+            end = preceding_end
+            active_message["content"].extend(blocks)
+        else:
+            if role == "assistant":
+                preceding_end = end
+                active_response = response_id
+                active_message = m = {**m, "content": list(blocks), "response_id": response_id}
+            elif role == "user":
+                active_response = None
+            current.append(m)
         if (
             role == "assistant"
             and m.get("stopReason") in (None, "stop")
-            and not any(b["type"] == "toolCall" for b in blocks)
+            and not any(b["type"] == "toolCall" for b in active_message["content"])
         ):
             end = (index, len(current))
     if pending:
@@ -393,11 +450,13 @@ def from_sft(record, *, tools=None):
     validate_sft_record(record)
     messages = []
     start = record.get("target_start_index", 0)
+    saw_image = False
     for i, m in enumerate(record["messages"]):
         role = m["role"]
+        saw_image |= has_image(m["content"])
         if i < start and role in ("assistant", "tool"):
             continue
-        content = string_content(m["content"])
+        content = omit_image_bytes(m["content"]) if has_image(m["content"]) else string_content(m["content"])
         if role == "tool":
             messages.append(
                 message(
@@ -415,7 +474,10 @@ def from_sft(record, *, tools=None):
                 name = (f["namespace"] + "." if f.get("namespace") else "") + f["name"]
                 args = {"input": f["input"]} if call["type"] == "custom" else loads(f["arguments"])
                 blocks.append({"type": "tool_use", "id": call["id"], "name": name, "input": args})
-            messages.append(message(role, blocks))
+            entry = message(role, blocks)
+            if saw_image:
+                entry["image_context"] = True
+            messages.append(entry)
         else:
             messages.append(message("system" if role == "developer" else role, content))
     return segment(messages, function_schemas(record["tools"]) if tools is None else tools)
@@ -447,7 +509,8 @@ def has_hint(blocks):
 def codex(events, cfg, trial):
     current_model = None
     models = []
-    pending = deque()
+    pending = set()
+    active_response = None
     reasoning_mode = cfg.get("codex_reasoning", "drop")
     received_result = False
     boundaries = []
@@ -469,15 +532,18 @@ def codex(events, cfg, trial):
         hinted |= bool(p.get("hint") or has_hint(p.get("content")) or has_hint(p.get("summary"))
                        or has_hint(p.get("output")))
         if kind in {"function_call", "custom_tool_call", "reasoning"} or p.get("role") == "assistant":
-            if received_result and pending:
+            response_id = native_response_id(e)
+            if received_result and pending and not (response_id and response_id == active_response):
                 raise ValueError("unanswered_tool_call")
+            active_response = response_id
             models.append(p.get("model") or current_model)
         if kind in {"function_call", "custom_tool_call"}:
             received_result = False
-            pending.append(p["call_id"])
+            pending.add(p["call_id"])
         elif kind in {"function_call_output", "custom_tool_call_output"}:
-            if not pending or pending.popleft() != p["call_id"]:
+            if p["call_id"] not in pending:
                 raise ValueError("tool_order")
+            pending.remove(p["call_id"])
             received_result = True
     if pending:
         raise ValueError("unanswered_tool_call")
@@ -506,7 +572,12 @@ def codex(events, cfg, trial):
             actf["system_prompt"] = system_text(required_profile(profile, "codex", trial.get("agent_version"))["system"])
         record = actf_to_sft(actf)
         offered = platform_schemas(record["tools"], profile, "codex", trial.get("agent_version"))
-        return [{**from_sft(record, tools=offered), **provenance}], models, {"hint_run": hinted}
+        row = from_sft(record, tools=offered)
+        assistants = (m for m in row["messages"] if m["role"] == "assistant")
+        for m, step in zip(assistants, actf["steps"], strict=True):
+            if step.get("response_id"):
+                m["response_id"] = step["response_id"]
+        return [{**row, **provenance}], models, {"hint_run": hinted}
     path = Path(trial["capture"])
     calls = compaction._root_calls(list(lines(path)), read(path.parent / "manifest.json", {}))
     calls = load_blobs(calls, path.parent.parent / "blobs")
@@ -574,9 +645,18 @@ def codex(events, cfg, trial):
                 continue
         if record["target_start_index"] < len(record["messages"]):
             windows.append((record, summary_meta))
+    response_by_call = {c["id"]: call["output"].get("id") or call["call_id"]
+                        for call, targets in verified for target in targets for c in target.get("tool_calls", [])}
     converted = [{**from_sft(r, tools=platform_schemas(r["tools"], profile, "codex", trial.get("agent_version"))),
                   **meta} for r, meta in windows]
     for row in converted:
+        for m in row["messages"]:
+            ids = {response_by_call[b["id"]] for b in m["content"]
+                   if b["type"] == "tool_use" and b["id"] in response_by_call}
+            if len(ids) > 1:
+                raise ValueError("mixed_native_responses")
+            if ids:
+                m["response_id"] = ids.pop()
         row.update(provenance)
         if row["messages"][0]["role"] != "system":
             prompt = actf["system_prompt"] or system_text(required_profile(

@@ -18,20 +18,37 @@ def _norm(text):
     return " ".join(text.split())
 
 
+def _excerpt_in(needle, text):
+    # A suffix of a power operator is not a multiplication operator.
+    if not needle:
+        return False
+    pos = text.find(needle)
+    while pos >= 0:
+        end = pos + len(needle)
+        if not ((needle.startswith("*") and pos and text[pos - 1] == "*")
+                or (needle.endswith("*") and text[end:end + 1] == "*")):
+            return True
+        pos = text.find(needle, pos + 1)
+    return False
+
+
 def quoted(quote, prompt):
-    """Exact excerpt check tolerant to whitespace and to JSON escaping of the transcript (blocks are serialized)."""
+    """Match excerpts across whitespace and JSON escaping."""
     if not isinstance(quote, str) or not quote.strip():
         return False
-    if quote in prompt:
-        return True
     p = _norm(prompt)
-    candidates = {quote, dumps(quote)[1:-1], quote.replace("\\n", "\n"), quote.replace('\\"', '"')}
-    return any(_norm(c) and _norm(c) in p for c in candidates) or _norm(quote.replace("\n", "\\n")) in p
+    candidates = {quote, dumps(quote)[1:-1], quote.replace("\\n", "\n"), quote.replace('\\"', '"'),
+                  quote.replace("\n", "\\n")}
+    return any(_excerpt_in(_norm(c), p) for c in candidates)
 
 
 def _plain(text):
-    """Markdown-insensitive form for evidence matching (judges drop or add emphasis, code ticks and table pipes)."""
-    return re.sub(r"\s+([.,;:!?)])", r"\1", _norm(re.sub(r"[*_`|>#]+", " ", text)))
+    """Remove paired inline markup and line-leading Markdown delimiters."""
+    text = re.sub(r"(?m)^[ \t]*(?:(?:>[ \t]+)+|\|(?!\|)[ \t]*)", "", text)
+    text = re.sub(r"(?<!`)(`+)(?!`)([^\n]*?(?<!`))\1(?!`)", r"\2", text)
+    text = re.sub(r"(?<![\w*_])(\*\*|\*|_)(?![\s*_])([^\n]*?)(?<![\s*_])\1(?![\w*_])",
+                  r"\2", text)
+    return re.sub(r"\s+([.,;:!?)])", r"\1", _norm(text))
 
 
 def assess_task(answer, prompt):
@@ -48,7 +65,7 @@ def assess_task(answer, prompt):
     else:
         plain = _plain(prompt)
         for i, q in enumerate(evidence):
-            if not (quoted(q, prompt) or (isinstance(q, str) and _plain(q) and _plain(q) in plain)):
+            if not (quoted(q, prompt) or (isinstance(q, str) and _excerpt_in(_plain(q), plain))):
                 problems.append(f"evidence {i} is not an excerpt of the material: {str(q)[:120]!r}")
     if problems:
         raise ValueError("invalid task judge response or evidence: " + "; ".join(problems))
@@ -149,17 +166,38 @@ def windows(records, limit):
         yield "".join(parts)
 
 
+def package_layout(pkg):
+    """Summarize the release using filesystem metadata only."""
+    hidden = pkg / "tests/hidden"
+    count = "unknown"
+    if hidden.is_dir() and hidden.resolve().is_relative_to(pkg.resolve()):
+        count = max(1, sum(p.is_dir() for p in hidden.iterdir()))
+    entries = [f"Hidden input sets (standard hidden_sets directory rule): {count}"]
+    for path in sorted(pkg.rglob("*")):
+        relative = path.relative_to(pkg).as_posix()
+        if path.is_symlink():
+            entries.append(f"{relative} [symlink]")
+        elif path.is_dir():
+            entries.append(relative + "/")
+        elif path.is_file():
+            entries.append(f"{relative} ({path.stat().st_size} bytes)")
+    return excerpt("\n".join(entries), 2400, include_marker_in_limit=True)
+
+
 def task_prompt(task, statement, limit):
     pkg = Path(task["pkg"])
     graders = grader_files(pkg)
     if not graders:
         return None
     inputs = [("instruction", statement), *((str(p.relative_to(pkg / "tests")), p.read_text("utf-8")) for p in graders),
-              ("metrics", dumps(task["metrics"]))]
+              ("metrics", dumps(task["metrics"])), ("package layout", package_layout(pkg))]
     budget = max(0, limit - sum(len(title) + 2 for title, _ in inputs) + 1)
     sizes = {title: len(value) for title, value in inputs}
     primary = [title for title in sizes if title in ("test_outputs.py", "measure.py")]
     reserved = sum(sizes[title] for title in primary)
+    if sizes["instruction"] <= budget - reserved:
+        primary.append("instruction")
+        reserved += sizes["instruction"]
     if reserved <= budget:
         budget -= reserved
         pending = [title for title in sizes if title not in primary]
@@ -189,7 +227,7 @@ def judge(ctx, kind):
     ctx.check_sources("tasks")
     name = "judge-" + kind
     cfg = ctx.cfg["judge"]
-    filename = {"task": "task-v2.md", "trajectory": "trajectory-v3.md"}[kind]
+    filename = {"task": "task-v3.md", "trajectory": "trajectory-v3.md"}[kind]
     rubric = (Path(__file__).parent / "rubrics" / filename).read_text("utf-8")
     dep = "filter-tasks" if kind == "task" else "screen"
 

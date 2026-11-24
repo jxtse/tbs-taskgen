@@ -6,10 +6,12 @@ from datetime import datetime
 from collections.abc import Mapping
 from copy import deepcopy
 from typing import Any
+from .codex_actf import _output_content, _user_image_blocks
 from .sft import (
     SFTConversionError,
     _arguments_json,
     _image_data_uri,
+    _message_content,
     _normalize_tool_call,
     validate_sft_record,
 )
@@ -204,6 +206,8 @@ def _responses_item(item: Mapping[str, Any]) -> list[dict[str, Any]]:
         role = item.get("role")
         if role not in {"system", "developer", "user", "assistant"}:
             raise SFTConversionError(f"unsupported Responses role: {role}")
+        if role == "user" and (parts := _user_image_blocks(item.get("content"))):
+            return [{"role": role, "content": _message_content(parts, "Responses user content")}]
         value = _text_blocks(item.get("content", []), kinds={"input_text", "output_text"}, separator="")
         if role == "assistant":
             return [
@@ -236,8 +240,9 @@ def _responses_item(item: Mapping[str, Any]) -> list[dict[str, Any]]:
         if not isinstance(identifier, str) or not identifier:
             raise SFTConversionError("Responses tool output lacks a call ID")
         output = item.get("output")
-        if not isinstance(output, str):
-            raise SFTConversionError("Responses tool output is not text")
+        blocks, _ = _output_content(output)
+        if not isinstance(output, str) or any(b["type"] == "image" for b in blocks):
+            output = _message_content(blocks, "Responses tool output")
         return [{"role": "tool", "tool_call_id": identifier, "content": output}]
     if kind == "reasoning":
         # An empty placeholder contributes no prompt content. Any populated

@@ -886,3 +886,61 @@ def test_task_judge_evidence_ignores_markdown_emphasis():
     assert assess_task(ok, prompt)["verdict"] == "keep"
     with pytest.raises(ValueError, match="evidence 0"):
         assess_task({**ok, "evidence": ["something else entirely"]}, prompt)
+
+
+@pytest.mark.parametrize("source,altered", [
+    ("score = err ** 2", "score = err * 2"),
+    ("** 2", "* 2"),
+    ("score = a*b", "score = a b"),
+    ("score = a | b", "score = a b"),
+    ("score = a > b", "score = a b"),
+    ("score = a_b", "score = a b"),
+])
+def test_task_evidence_preserves_operators(source, altered):
+    from tbstrain.judge import assess_task
+
+    decision = dict(verdict="flag", difficulty="hard", rationale="Check the calculation.")
+    with pytest.raises(ValueError, match="evidence 0"):
+        assess_task({**decision, "evidence": [altered]}, source)
+    assert assess_task({**decision, "evidence": [source]}, source)["evidence"] == [source]
+    assert assess_task({**decision, "evidence": ["Use the blue tile."]},
+                       "> | Use *the* _blue_ `tile` .")
+
+
+@pytest.mark.parametrize("subdirs,expected", [([], 1), (["small", "large"], 2)])
+def test_task_judge_package_layout(workspace, judge_stub, subdirs, expected):
+    pkg = workspace.parent / "run/items/easy/pkg"
+    hidden = pkg / "tests/hidden"
+    hidden.mkdir()
+    for name in subdirs:
+        (hidden / name).mkdir()
+    (hidden / "labels.py").write_text("secret = 718\n")
+    (pkg / "tests/truth.py").write_text("secret = 824\n")
+    (pkg / "tests/measure.py").write_text("from hidden import labels\nimport truth\n")
+    for command in (["ingest"], ["difficulty"], ["filter-tasks"], ["judge", "--kind", "task"]):
+        assert main([*command, "--config", str(workspace)], transport=judge_stub) == 0
+    body, = [c for c in judge_stub.calls if "tests/hidden/labels.py" in c["messages"][0]["content"]]
+    prompt = body["messages"][0]["content"]
+    assert f"hidden_sets directory rule): {expected}" in prompt
+    assert "tests/hidden/labels.py (13 bytes)" in prompt and "tests/truth.py (13 bytes)" in prompt
+    assert all(f"tests/hidden/{name}/" in prompt for name in subdirs)
+    assert "718" not in prompt and "824" not in prompt and str(pkg) not in prompt
+    assert "released file tree" in body["system"]
+
+
+@pytest.mark.parametrize("tool,key", [("Bash", "command"), ("functions.exec_command", "cmd")])
+@pytest.mark.parametrize("command,note", [
+    ("cd . || cd ..; cat tests/palette.tsv", True),
+    ("cd swatches || cd samples; cat tests/palette.tsv", False),
+    ("cd swatches || cd ..; cat tests/palette.tsv", True),
+    ("cd . || cd /oracle; cat tiles", True),
+    ("cd .. || cd ../oracle; cat tests/palette.tsv", True),
+    ("cd . || cd ..; cd /app; cat tests/palette.tsv", False),
+    ("(cd . || cd ..); cat tests/palette.tsv", False),
+])
+def test_conditional_cwd_candidates(tool, key, command, note):
+    src = _probe_segment("", "violet", name=tool)
+    src["messages"][0]["content"][0]["input"] = {key: command}
+    flags, fatal, stripped = inspect_segment(src, True)
+    assert not fatal and not stripped
+    assert flags == ({"inconclusive"} if note else set())

@@ -8,7 +8,7 @@ from .core import atomic, digest, file_hash, lines
 from .profile import ProfileError, configured_profiles
 from .native import CONVERTERS, message, segment
 from .tasks import valid
-from .wire import Counter, check, render, string_content
+from .wire import Counter, check, export_modes, image_dependents, render, string_content
 
 HIDDEN = re.compile(
     # absolute grader paths only: `/tests/...` as a path, not `d + '/test'` (a relative directory being built)
@@ -55,9 +55,12 @@ SENSITIVE_NAME = re.compile(
 )
 
 
+HEREDOC = re.compile(r"<<-?\s*['\"]?(\w+)['\"]?[^\n]*\n.*?\n\s*\1\b", re.S)
+
+
 def _subcommands(command):
     """Yield tokenized commands with their terminating shell operator."""
-    command = re.sub(r"<<-?\s*['\"]?(\w+)['\"]?[^\n]*\n.*?\n\s*\1\b", "", command, flags=re.S)
+    command = HEREDOC.sub("", command)
     argv = []
 
     def flush(argv):
@@ -98,56 +101,90 @@ def _under(path, roots):
     return any(path == r or path.startswith(r + "/") for r in roots)
 
 
+def _changed_directory(state, argv):
+    base, stack = state
+    args = [a for a in argv[1:] if a not in {"--", "-L", "-P"}]
+    if argv[0] in ("cd", "pushd") and len(args) == 1 and not args[0].startswith(("-", "+")):
+        if argv[0] == "pushd":
+            stack = (*stack, base)
+        return posixpath.normpath(posixpath.join(base, args[0])), stack
+    if argv[0] == "popd" and not args and stack:
+        return stack[-1], stack[:-1]
+    return state
+
+
 def _commands_with_cwd(command, base):
-    stack = []
+    states = {(posixpath.normpath(base), ())}
     scopes = []
+    skipped_success = set()
+    skipped_failure = set()
     previous_op = None
     for argv, op in _subcommands(command):
         piped = previous_op in ("|", "|&") or op in ("|", "|&", "&")
         previous_op = op
         if argv:
-            yield argv, base
+            yield argv, {base for base, _ in states}, bool(skipped_success)
+        changed = states
         if argv and not piped and argv[0] in ("cd", "pushd", "popd"):
-            args = [a for a in argv[1:] if a not in {"--", "-L", "-P"}]
-            if argv[0] in ("cd", "pushd") and len(args) == 1 and not args[0].startswith(("-", "+")):
-                if argv[0] == "pushd":
-                    stack.append(base)
-                base = posixpath.normpath(posixpath.join(base, args[0]))
-            elif argv[0] == "popd" and not args and stack:
-                base = stack.pop()
+            changed = {_changed_directory(state, argv) for state in states}
+        # A successful cd changes cwd. Its failure path starts at the old cwd.
+        success = changed | skipped_success
+        failure = states | skipped_failure
+        skipped_success, skipped_failure = set(), set()
+        if op == "||":
+            states, skipped_success = failure, success
+        elif op == "&&":
+            states, skipped_failure = success, failure
+        else:
+            states = success
         if op == "(":
-            scopes.append((base, stack.copy()))
+            scopes.append(states)
         elif op == ")" and scopes:
-            base, stack = scopes.pop()
+            states = scopes.pop()
+
+
+def _probe_at(argv, base, task_dirs):
+    cmd = argv[0].rsplit("/", 1)[-1]
+    paths = [posixpath.normpath(posixpath.join(base or "", a)) for a in argv[1:]
+             if not a.startswith("-") and (base is not None or posixpath.isabs(a))]
+    # reading grader directories directly, by any command
+    if any(_under(p.rstrip("/*"), GRADER_ROOTS) for p in paths) and cmd not in ("mkdir", "echo", "printf"):
+        return True
+    if cmd not in SEARCH_CMDS:
+        return False
+    recursive = cmd in ("find", "locate", "tree", "du") or any(
+        a.startswith("-") and not a.startswith("--") and "r" in a.lower() for a in argv[1:]
+    ) or cmd == "rg"
+    foreign = [
+        p for p in paths
+        if not _under(p.rstrip("/"), (*task_dirs, *SCRATCH)) and (p == "/" or _under(p, SYSTEM_ROOTS))
+    ]
+    names = " ".join(argv[1:])
+    if cmd == "locate" and SENSITIVE_NAME.search(names):
+        return True
+    if recursive and "/" in paths and (cmd == "find" or SENSITIVE_NAME.search(names)):
+        return True     # whole-disk search
+    if foreign and (recursive or cmd == "ls") and SENSITIVE_NAME.search(names):
+        return True
+    return False
 
 
 def shell_probe(command, task_dirs, cwd=None):
-    """True when a shell command looks for grader material outside the task and the agent's scratch space."""
-    if HIDDEN.search(command):       # grader paths anywhere, including inline scripts (open('/tests/...'))
+    """Return None for a possible probe whose relative path depends on a branch."""
+    if HIDDEN.search(command) and ("||" not in command or any(HIDDEN.search(m[0]) for m in HEREDOC.finditer(command))):
         return True
-    for argv, base in _commands_with_cwd(command, posixpath.join(task_dirs[0], cwd or ".")):
-        cmd = argv[0].rsplit("/", 1)[-1]
-        paths = [posixpath.normpath(posixpath.join(base, a)) for a in argv[1:] if not a.startswith("-")]
-        # reading grader directories directly, by any command
-        if any(_under(p.rstrip("/*"), GRADER_ROOTS) for p in paths) and cmd not in ("mkdir", "echo", "printf"):
-            return True
-        if cmd not in SEARCH_CMDS:
+    result = False
+    for argv, bases, conditional in _commands_with_cwd(command, posixpath.join(task_dirs[0], cwd or ".")):
+        if conditional and argv[0] in ("cd", "pushd", "popd"):
             continue
-        recursive = cmd in ("find", "locate", "tree", "du") or any(
-            a.startswith("-") and not a.startswith("--") and "r" in a.lower() for a in argv[1:]
-        ) or cmd == "rg"
-        foreign = [
-            p for p in paths
-            if not _under(p.rstrip("/"), (*task_dirs, *SCRATCH)) and (p == "/" or _under(p, SYSTEM_ROOTS))
-        ]
-        names = " ".join(argv[1:])
-        if cmd == "locate" and SENSITIVE_NAME.search(names):
+        # Absolute and inline paths have the same meaning under every candidate cwd.
+        if any(HIDDEN.search(arg) for arg in argv) or _probe_at(argv, None, task_dirs):
             return True
-        if recursive and "/" in paths and (cmd == "find" or SENSITIVE_NAME.search(names)):
-            return True     # whole-disk search
-        if foreign and (recursive or cmd == "ls") and SENSITIVE_NAME.search(names):
-            return True
-    return False
+        if any(_probe_at(argv, base, task_dirs) for base in bases):
+            if not conditional and len(bases) == 1:
+                return True
+            result = None
+    return result
 
 
 def shell_input(args, default_dir):
@@ -207,6 +244,8 @@ def inspect_segment(source, offline, task_dirs=("/app", "/work")):
             immaterial = result is not None and simple and (no_matches or bool(FAIL.fullmatch(output)))
             if shell:
                 probe = shell_probe(value, task_dirs, cwd)
+                if probe is None:
+                    flags.add("inconclusive")
                 # only when curl/wget/pip install is the command itself, not a grep pattern mentioning it
                 shell_net = any(
                     argv[0].rsplit("/", 1)[-1] in ("curl", "wget")
@@ -296,7 +335,7 @@ def screen(ctx):
     cfg = ctx.cfg.get("screen", {}).copy()
     exp = ctx.cfg["export"]
     profiles = configured_profiles(ctx)
-    cfg["train_on_what"] = exp.get("train_on_what", "all_assistant_messages")
+    cfg["train_on_what"], cfg["images"] = export_modes(exp)
     train_models = cfg.get("train_models")
     if not isinstance(train_models, list) or not train_models or not all(
         isinstance(m, str) and m.strip() for m in train_models
@@ -357,7 +396,7 @@ def screen(ctx):
                     stripped.extend(sorted(removed))
                     profile = profiles.get(trial["harness"])
                     records, models, details = CONVERTERS[trial["harness"]](native, {**cfg, "profile": profile}, trial)
-                    details["wire_context_hash"] = digest([profile, cfg["train_on_what"], cfg["codex_reasoning"]])
+                    details["wire_context_hash"] = digest([profile, cfg["train_on_what"], cfg["codex_reasoning"], cfg["images"]])
                     observed = set(models) | set(trial["response_models"])
                     if trial["reported_model"]:
                         observed.add(trial["reported_model"])
@@ -369,9 +408,15 @@ def screen(ctx):
                     )
                     if has_tagged_hint or details.get("hint_run"):
                         fatal.add("hint_run")
-                    for record in records:
+                    affected = [list(image_dependents(r["messages"])) for r in records]
+                    drop_all = cfg["images"] == "drop_trajectory" and any(affected)
+                    details.update(image_rows=sum(map(bool, affected)), image_dropped_segments=[],
+                                   image_masked_turns=0, image_dropped_trajectory=False)
+                    for index, (record, dependent) in enumerate(zip(records, affected, strict=True)):
                         # Validate before and after editing so removing a call cannot mask corruption.
                         fatal.update(check(render(record, {}), allow_masked=allow_masked))
+                        for m in dependent:
+                            m["image_context"] = True
                         f, d, s = inspect_segment(
                             record,
                             tasks[trial["task_id"]]["offline"],
@@ -380,13 +425,29 @@ def screen(ctx):
                         flags.update(f)
                         fatal.update(d)
                         stripped.extend(sorted(s))
+                        if drop_all or (dependent and cfg["images"] == "drop_row"):
+                            details["image_dropped_segments"].append(index)
+                            continue
+                        if dependent:
+                            for m in image_dependents(record["messages"]):
+                                details["image_masked_turns"] += m["loss"]
+                                m["loss"] = 0
+                            if not any(m["loss"] for m in record["messages"]):
+                                details["image_dropped_segments"].append(index)
+                                continue
                         wire = render(record, {})
                         fatal.update(check(wire, allow_masked=allow_masked))
                         length, supervised = counter.counts(wire)
                         if length <= exp.get("max_length", 194560):
                             total += supervised
                             within_limit += 1
+                    if details["image_dropped_segments"]:
+                        flags.add("image_content")
+                        if len(details["image_dropped_segments"]) == len(records):
+                            details["image_dropped_trajectory"] = True
+                            fatal.add("image_content")
                     if not fatal:
+                        # The trajectory judge still audits the full cleaned trajectory.
                         atomic(directory / path, records, sort_keys=False)
                 except ProfileError:
                     raise

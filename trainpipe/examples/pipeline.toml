@@ -42,6 +42,7 @@ easy_quality = 4
 seed = 0
 
 [export]
+images = "drop_row"
 codex_reasoning = "drop"
 tokenizer = "../state/tokenizer.json"
 train_on_what = "all_assistant_messages"

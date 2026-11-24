@@ -135,3 +135,34 @@ def test_validate_missing_provenance(workspace, sample):
     path.write_text(dumps(sample) + "\n")
     assert main(["validate", str(path), "--config", str(workspace)]) == 1
     assert "source_missing" in next(lines(workspace.parent / "out/validate.ledger.jsonl"))["errors"]
+
+
+def test_validate_split_native_response(workspace):
+    path = workspace.parent / "split.jsonl"
+    source = segment([message("system", "Instructions")], [toy_tool()])
+    for tid in ("a", "b"):
+        source["messages"].extend([
+            {**message("assistant", [dict(type="tool_use", id=tid, name="sample", input={})]),
+             "response_id": "batch"},
+            message("user", [dict(type="tool_result", tool_use_id=tid, content="ok")]),
+        ])
+    source["messages"].append(message("assistant", "Done."))
+    row = render(source, {})
+    assert not check(row)
+    path.write_text(dumps(row) + "\n")
+    path.with_suffix(".sources.jsonl").write_text(dumps(dict(meta={}, segment=source)) + "\n")
+    assert main(["validate", str(path), "--config", str(workspace)]) == 1
+    assert next(lines(workspace.parent / "out/validate.ledger.jsonl"))["errors"] == ["split_native_response"]
+
+
+@pytest.mark.parametrize("mode", ["drop_row", "mask_after"])
+def test_validate_rejects_supervision_after_image(workspace, mode):
+    source = segment([message("system", "Instructions"), message("assistant", "Ready."),
+                      message("user", [{"type": "image"}]), message("assistant", "Describe the tile.")])
+    row = render(source, {})
+    path = workspace.parent / "image.jsonl"
+    path.write_text(dumps(row) + "\n")
+    path.with_suffix(".sources.jsonl").write_text(dumps(dict(meta={}, segment=source)) + "\n")
+    workspace.write_text(workspace.read_text().replace("[export]", f'[export]\nimages="{mode}"'))
+    assert main(["validate", str(path), "--config", str(workspace)]) == 1
+    assert next(lines(workspace.parent / "out/validate.ledger.jsonl"))["errors"] == ["image_content"]

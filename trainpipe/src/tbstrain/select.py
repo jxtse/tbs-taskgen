@@ -28,6 +28,13 @@ def easy_capped(pools, easy_max):
     return core + easy[:n_easy]
 
 
+def image_counts(rows):
+    return dict(rows=sum(r.get("image_rows", 0) for r in rows),
+                dropped_rows=sum(len(r.get("image_dropped_segments", [])) for r in rows),
+                dropped_trajectories=sum(r.get("image_dropped_trajectory", False) for r in rows),
+                masked_turns=sum(r.get("image_masked_turns", 0) for r in rows))
+
+
 def select(ctx):
     cfg = ctx.cfg.get("select", {})
 
@@ -125,6 +132,7 @@ def select(ctx):
             for r in rows
         ]
         summary = {k: dict(Counter(r[k] for r in selected)) for k in ("tier", "domain", "harness")}
+        summary["image_content"] = image_counts(rows)
         summary["tasks"] = len({r["task_id"] for r in selected})
         summary["supervised_tokens"] = sum(r["supervised_tokens"] for r in selected)
         ctx.emit("selection", selected)
@@ -134,6 +142,10 @@ def select(ctx):
             "",
             f"Selected {len(chosen)} trajectories from {summary['tasks']} tasks, "
             f"{summary['supervised_tokens']} supervised tokens (mode {mode}).",
+            "",
+            "## Image policy at screening",
+            "",
+            *[f"- {k}: {v}" for k, v in summary["image_content"].items()],
             "",
             "## Exclusion counts",
             "",
