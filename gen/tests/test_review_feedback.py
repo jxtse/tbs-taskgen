@@ -10,7 +10,8 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from tbsgen import cli, diversity, gates, package, probe_outputs, review, runner, stages_a, stages_b
+from tbsgen import budget, cli, codeagent, diversity, gates, package, probe_outputs, review, runner, stages_a, stages_b
+from tbsgen import templates_metrics
 from tbsgen.config import load_config
 from tbsgen.fakes import SPEC
 from tbsgen.prompts import PROMPT_VERSION
@@ -190,10 +191,11 @@ def test_array_json_and_small_csv(tmp_path):
     with np.load(tmp_path / "b.npz") as data:
         assert not data["score"].any() and data["labels"].tolist() == ["a"] * 3
     assert json.loads((tmp_path / "c.json").read_text()) == [{"x": 0, "color": "red"}] * 3
-    assert (tmp_path / "d.txt").read_text() == "x value\n0 0\n0 0\n"
+    assert (tmp_path / "d.txt").read_text() == "x value\n0 4\n3 1.2\n"
 
 
-def test_gate_wiring(tmp_path, monkeypatch):
+@pytest.fixture
+def wired_gates(tmp_path, monkeypatch):
     cfg = load_config()
     spec = {"form": "PROG", "expert_time_hours": 2, "metrics": [
         {"name": "mae_hidden", "on": "hidden"}, {"name": "hidden_score"}, {"name": "mae_public"}, {"name": "score"}]}
@@ -231,6 +233,11 @@ def test_gate_wiring(tmp_path, monkeypatch):
     (task / "baselines/exploit_echo.py").touch()
     (task / "instruction.md").write_text("python /app/output/solution_cli.py <input_dir> <output_dir>\n")
     write_json(tmp_path / "S6A_measure.json", {"runs": {"ref0": {"solve_rc": 0, "solve_sec": 1}}})
+    return cfg, spec, arms, task
+
+
+def test_gate_wiring(tmp_path, monkeypatch, wired_gates):
+    cfg, spec, arms, task = wired_gates
     cfg["thresholds"]["min_ref_margin_hidden"] = .10   # stricter than the default 0.05: the 7 % margin fails
     rep = gates.run_gates(cfg, tmp_path, spec, {}, 1)
     assert rep["blocking"] == ["oracle_margin"]
@@ -412,7 +419,12 @@ def _verifier(tmp_path, gen, table, score_sets=("A", "B"), stop_early=False, pub
         for d in sorted((gen / "tests/hidden").iterdir()):
             res = tmp_path / f"res-{tag}-{d.name}"
             res.mkdir()
-            run = subprocess.run([sys.executable, out / "solution_cli.py", d, res], capture_output=True, text=True)
+            # Exercise the generated wrapper on this host with the sandbox account simulated in this child only.
+            harness = ("import os, pwd, runpy, sys; acct = pwd.getpwnam('nobody'); "
+                       "os.geteuid = lambda: acct.pw_uid; os.getegid = lambda: acct.pw_gid; "
+                       "sys.argv.pop(0); runpy.run_path(sys.argv[0], run_name='__main__')")
+            run = subprocess.run([sys.executable, "-c", harness, out / "solution_cli.py", d, res],
+                                 capture_output=True, text=True)
             metrics.append(dict(name="_solution_cli_run", rc=run.returncode, stderr_tail=run.stderr, aux=True))
             outs[d.name] = res
         for name in score_sets:
@@ -442,7 +454,7 @@ def test_probe_catches_an_unscored_hidden_set(tmp_path, monkeypatch):
     for arm in ("hidden_garbage", "one_confident"):
         (tmp_path / arm).mkdir()
         r = runner.output_probe(cfg, tmp_path, gen, ref, tmp_path / arm, arm, True)
-        assert not r["ok"] and r["accepted_scopes"] == ["B"], r
+        assert not r["ok"] and r["accepted_scopes"] == ["hidden:B"], r
 
 
 def test_probe_public_count_does_not_hide_missing_hidden_coverage(tmp_path, monkeypatch):
@@ -451,7 +463,7 @@ def test_probe_public_count_does_not_hide_missing_hidden_coverage(tmp_path, monk
     cfg, ref, gen, table = _probe_fixture(tmp_path, monkeypatch)
     monkeypatch.setattr(runner, "test", _verifier(tmp_path, gen, table, score_sets=()))
     r = runner.output_probe(cfg, tmp_path, gen, ref, tmp_path, "one_confident", True)
-    assert not r["ok"] and set(r["accepted_scopes"]) == {"A", "B"} and r["scopes"]["public"]["reward"] == "0"
+    assert not r["ok"] and set(r["accepted_scopes"]) == {"hidden:A", "hidden:B"} and r["scopes"]["public"]["reward"] == "0"
 
 
 def test_probe_side_files_do_not_skip_the_check(tmp_path, monkeypatch):
@@ -459,7 +471,7 @@ def test_probe_side_files_do_not_skip_the_check(tmp_path, monkeypatch):
     cfg, ref, gen, table = _probe_fixture(tmp_path, monkeypatch)
     monkeypatch.setattr(runner, "test", _verifier(tmp_path, gen, table, score_sets=("A",)))
     r = runner.output_probe(cfg, tmp_path, gen, ref, tmp_path, "hidden_garbage", True)
-    assert not r["na"] and r["scopes"]["A"]["reward"] == "0" and r["accepted_scopes"] == ["B"]
+    assert not r["na"] and r["scopes"]["hidden:A"]["reward"] == "0" and r["accepted_scopes"] == ["hidden:B"]
 
 
 def test_probe_requires_every_hidden_set_to_be_run(tmp_path, monkeypatch):
@@ -496,14 +508,23 @@ def test_unsupported_files_are_skipped_not_fatal(tmp_path):
     assert probe_outputs.mutate(tmp_path, "hidden_garbage", []) == 0
 
 
-def test_probe_not_run_when_truth_isolation_failed(tmp_path, monkeypatch):
-    # finding 8: the wrapper executes the reference; with truth readable it must not run at all
-    calls = []
-    monkeypatch.setattr(runner, "output_probe", lambda *a: calls.append(a) or {"ok": True})
-    spec = {"form": "PROG", "metrics": [{"name": "hidden_x"}]}
-    g = {"truth_isolation": False}
-    isolated = g.get("truth_isolation", True) is not False
-    assert not isolated   # the guard used in gates.run_gates
+@pytest.mark.parametrize("isolated", [True, False])
+def test_probes_use_isolated_seed_zero(tmp_path, monkeypatch, wired_gates, isolated):
+    cfg, spec, _, _ = wired_gates
+    cfg["gen"]["seeds"] = [7, 0]
+    checked, used = [], []
+    def truth(cfg, task, gen, ref, work, tag):
+        checked.append((gen.name, ref.name))
+        return {"ok": isolated}
+    def probe(cfg, task, gen, ref, work, arm, prog):
+        used.append((gen.name, ref.name))
+        return {"ok": True}
+    monkeypatch.setattr(runner, "truth_probe", truth)
+    monkeypatch.setattr(runner, "output_probe", probe)
+    rep = gates.run_gates(cfg, tmp_path, spec, {}, 1)
+    assert checked == [("gen0", "out-ref0")]
+    assert used == (checked * 2 if isolated else [])
+    assert rep["gates"]["truth_isolation"] == isolated
     assert {"threshold_format", "statement_clean", "hidden_parity", "hidden_garbage", "coverage",
             "assumptions_stated"} <= gates._blocking({"gates": {"blocking": ["oracle"]}})   # finding 5
 
@@ -558,8 +579,8 @@ def test_s10_keeps_an_existing_release(tmp_path, monkeypatch):
     (tmp_path / "release/manifest.jsonl").write_text('{"item_id":"x"}\n')
     P = SimpleNamespace(store=store, cfg=load_config())
     monkeypatch.setattr(diversity, "admission", lambda *a: pytest.fail("re-decided an existing release"))
-    monkeypatch.setattr(stages_b, "_release_reviewed", lambda P, it: "released")
-    assert stages_b.s10(P, it) == "released"
+    stages_b.s10(P, it)
+    assert it.state["status"] == "done"
 
 
 def test_orphan_reservation_settled_before_relaunch(tmp_path, monkeypatch):
@@ -612,3 +633,198 @@ def test_public_probe_command_survives_the_shell(tmp_path, monkeypatch):
         runner.output_probe(cfg, tmp_path, gen, ref, tmp_path / arm, arm, True)
     public = [s for s in seen if "probe_outputs import mutate" in s[0]]
     assert public and all(rc == 0 for _, rc, _ in public), public
+
+
+def test_wrapper_requires_dropped_privileges(tmp_path, monkeypatch):
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
+    monkeypatch.setattr(sys, "argv", ["wrapper", "A", str(tmp_path)])
+    monkeypatch.setattr(subprocess, "run", lambda *a, **kw: pytest.fail("started reference"))
+    with pytest.raises(PermissionError):
+        probe_outputs.hidden_main("hidden_garbage", "A")
+
+
+@pytest.mark.parametrize("version,blocked", [(PROMPT_VERSION, True), ("v2.7", False)])
+def test_runtime_parity_by_hidden_set(tmp_path, monkeypatch, wired_gates, version, blocked):
+    cfg, spec, _, _ = wired_gates
+    cfg["gen"]["seeds"] = [0]
+    spec.update(prompt_version=version, metrics=[{"name": n} for n in
+                ("public_error", "public_bias", "hidden_error", "hidden_bias")])
+    generate, verify = runner.generate, runner.test
+    def two_sets(cfg, task, seed, path):
+        result = generate(cfg, task, seed, path)
+        (path / "tests/hidden/d").rename(path / "tests/hidden/A")
+        (path / "tests/hidden/B").mkdir()
+        return result
+    def scores(cfg, task, gen, out, work, tag):
+        result = verify(cfg, task, gen, out, work, tag)
+        if tag.startswith("ref"):
+            log = work / "metrics.jsonl"
+            monkeypatch.setattr(templates_metrics, "_PATH", str(log))
+            monkeypatch.setattr(templates_metrics, "_MEASURED_SETS", {})
+            for name, scope in [("public_error", None), ("public_bias", None),
+                                ("hidden_error", "A"), ("hidden_bias", "B")]:
+                value = 0.8
+                if scope:
+                    value = templates_metrics.hidden_value(gen / "tests/hidden" / scope, name, value)
+                templates_metrics.check(name, value, 1., "<=")
+            result["metrics"] = [json.loads(line) for line in log.read_text().splitlines()]
+        return result
+    monkeypatch.setattr(runner, "generate", two_sets)
+    monkeypatch.setattr(runner, "test", scores)
+    rep = gates.run_gates(cfg, tmp_path, spec, {}, 1)
+    parity = rep["details"]["hidden_parity"][0]
+    assert parity["missing_hidden"] == {"A": ["bias"], "B": ["error"]}
+    assert parity["evaluated_hidden"] == {"A": ["error"], "B": ["bias"]}
+    assert ("hidden_parity" in rep["blocking"]) == blocked
+
+
+@pytest.mark.parametrize("rows,expected_count", [(["1,7", "2,7", "3,7"], 0), (["1,7", "2,9"], 1)])
+def test_garbage_preserves_keys_and_counts_changes(tmp_path, rows, expected_count):
+    path = tmp_path / "results.csv"
+    original = ("id,value\n" + "\n".join(rows) + "\n").encode()
+    path.write_bytes(original)
+    assert probe_outputs.mutate(tmp_path, "hidden_garbage") == expected_count
+    if expected_count:
+        changed = list(csv.reader(path.read_text().splitlines()))[1:]
+        assert [r[0] for r in changed] == ["1", "2"]
+        assert [r[1] for r in changed] != ["7", "9"]
+    else:
+        assert path.read_bytes() == original
+
+
+def test_failed_identity_control_is_inconclusive(tmp_path, monkeypatch):
+    cfg, ref, gen, table = _probe_fixture(tmp_path, monkeypatch, sets=("A",))
+    verify = _verifier(tmp_path, gen, table, score_sets=("A",))
+    calls = []
+    def wrapper_fails(cfg, task, gen, out, work, tag):
+        result = verify(cfg, task, gen, out, work, tag)
+        calls.append(result["reward"])
+        return dict(result, reward="0", passed=False, failed=["runtime"])
+    monkeypatch.setattr(runner, "test", wrapper_fails)
+    result = runner.output_probe(cfg, tmp_path, gen, ref, tmp_path, "hidden_garbage", True)
+    assert not result["ok"] and result["inconclusive"]
+    assert calls.count("1") == 1 and len(calls) <= 2
+
+
+@pytest.mark.parametrize("rc,reward", [(124, "1"), (0, None)])
+def test_zero_changes_still_requires_verifier_result(tmp_path, monkeypatch, rc, reward):
+    cfg, ref, gen, _ = _probe_fixture(tmp_path, monkeypatch, sets=("A",))
+    (ref / "solution_cli.py").write_text("import pathlib, sys\n(pathlib.Path(sys.argv[2])/'x.fits').touch()")
+    verify = _verifier(tmp_path, gen, "", score_sets=(), public_count=False)
+    def timeout(*args):
+        return dict(verify(*args), rc=rc, reward=reward)
+    monkeypatch.setattr(runner, "test", timeout)
+    result = runner.output_probe(cfg, tmp_path, gen, ref, tmp_path, "hidden_garbage", True)
+    assert not result["ok"] and not result.get("na")
+
+
+def test_hidden_scope_named_public(tmp_path, monkeypatch):
+    cfg, ref, gen, table = _probe_fixture(tmp_path, monkeypatch, sets=("public",))
+    monkeypatch.setattr(runner, "test", _verifier(tmp_path, gen, table, score_sets=()))
+    result = runner.output_probe(cfg, tmp_path, gen, ref, tmp_path, "one_confident", True)
+    assert result["scopes"]["public"]["reward"] == "0"
+    assert result["accepted_scopes"] == ["hidden:public"]
+
+
+@pytest.mark.parametrize("version", [PROMPT_VERSION, CODE_PROMPT_VERSION])
+def test_spec_quote_length_after_normalization(version):
+    def errors(where, v):
+        entry = dict(assumption="noise", stated=True, where=where)
+        return validate_spec(dict(SPEC, generator_assumptions=[entry]), load_config(), v)
+    assert errors("  A   Gaussian\n", version)
+    assert not errors("  A   Gaussian\n", "cg-v3")
+    assert not errors("  12345\n  678901", version)  # 12 normalized characters
+
+
+def test_diversity_resume_reuses_committed_reservation(tmp_path, monkeypatch):
+    cfg = load_config()
+    cfg["budget"].update(daily_usd_total=10, run_calls_per_model={"model": 1})
+    ledger = budget.Ledger(tmp_path / "ledger.sqlite", cfg)
+    store = Store(tmp_path)
+    it = store.item("x")
+    P = SimpleNamespace(ledger=ledger, cfg=cfg, store=store)
+    job = "tbsgen-x-s5g1"
+    conf = dict(job_name=job, agents=[{"model_name": "model"}], jobs_dir=str(tmp_path))
+    config = it.p("S5G", "job.json")
+    write_json(config, conf)
+    old = ledger.reserve("model", "S5G", it.item_id, True, est_usd=1.)
+    recp = it.p("S5G", "run.json")
+    write_json(recp, dict(state="reserved", job_name=job, job_dir=str(tmp_path / job),
+                          config=str(config), ledger_call=old))
+    def step():
+        stages_a._agent_stage(P, it, "S5G", "", [], 30, 1, 1, True)
+    monkeypatch.setattr(stages_a, "_agent_admission", lambda *a: "diversity:template_full:x")
+    step()
+    assert it.state["status"] == "parked"
+    monkeypatch.setattr(stages_a, "_agent_admission", lambda *a: None)
+    # Stand-in for Harbor's already-created config; no external launcher is needed.
+    write_json(tmp_path / job / "config.json", conf)
+    def crash(path, data):
+        if path == recp and data.get("state") == "reserved":
+            raise InterruptedError("after reserve commit")
+        write_json(path, data)
+    with monkeypatch.context() as m:
+        m.setattr(codeagent, "write_json", crash)
+        with pytest.raises(InterruptedError):
+            step()
+    with ledger._db() as db:
+        held = db.execute("SELECT id FROM calls WHERE status='reserved'").fetchall()
+    assert len(held) == 1
+    step()
+    rec = json.loads(recp.read_text())
+    assert rec["state"] == "launched" and rec["ledger_call"] == held[0][0]
+    with ledger._db() as db:
+        assert db.execute("SELECT count(*) FROM calls").fetchone() == (2,)
+
+
+def test_release_retry_after_append_is_idempotent(tmp_path, monkeypatch):
+    store = Store(tmp_path)
+    P = SimpleNamespace(cfg=load_config(), store=store)
+    it = store.item("x")
+    it.state.update(stage="S10", calib_epoch=1)
+    it.save()
+    write_json(it.p("pkg", "data.json"), 1)
+    with monkeypatch.context() as m:
+        save = it.save
+        def crash():
+            if it.state["status"] == "done":
+                raise InterruptedError("before done save")
+            save()
+        m.setattr(it, "save", crash)
+        with pytest.raises(InterruptedError):
+            stages_b.s10(P, it)
+    manifest = tmp_path / "release/manifest.jsonl"
+    assert len(manifest.read_text().splitlines()) == 1
+    it.load()
+    stages_b.s10(P, it)
+    assert it.state["status"] == "done" and len(manifest.read_text().splitlines()) == 1
+    it.state["calib_epoch"] += 1
+    stages_b.s10(P, it)
+    write_json(it.p("pkg", "data.json"), 2)
+    stages_b.s10(P, it)
+    records = [json.loads(line) for line in manifest.read_text().splitlines()]
+    assert len({(r["pkg_sha"], r["calib_epoch"]) for r in records}) == len(records) == 3
+
+
+def test_class_body_uses_definition_time_timeout():
+    src = "T=60\nclass C:\n    run_solution(T)\n    def method(self): run_solution(T)\nT=1200"
+    assert package.run_solution_timeouts(src, 780) == ["line 4: run_solution timeout 1200s >= verifier budget 780s"]
+
+
+def test_hidden_measurements_reach_check_record(tmp_path, monkeypatch):
+    log = tmp_path / "metrics.jsonl"
+    monkeypatch.setattr(templates_metrics, "_PATH", str(log))
+    monkeypatch.setattr(templates_metrics, "_MEASURED_SETS", {})
+    values = [templates_metrics.hidden_value(d, "hidden_error", v) for d, v in
+              [("/tests/hidden/A", 0.5), ("/tests/hidden/B", 0.8)]]
+    templates_metrics.check("hidden_error", max(values), 1., "<=")
+    row = json.loads(log.read_text())
+    assert row["hidden_sets"] == ["A", "B"] and row["value"] == 0.8
+
+def test_constant_answer_scope_is_na(tmp_path, monkeypatch):
+    cfg, ref, gen, _ = _probe_fixture(tmp_path, monkeypatch, sets=("A",))
+    table = "value,case_id,trial_key\n7,1,a\n7,2,b\n7,3,c\n"
+    (gen / "tests/hidden/A/data").write_text(table)
+    monkeypatch.setattr(runner, "test", _verifier(tmp_path, gen, table, score_sets=("A",), public_count=False))
+    result = runner.output_probe(cfg, tmp_path, gen, ref, tmp_path, "hidden_garbage", True)
+    assert result["na"] and result["scopes"] == {"hidden:A": "na"}

@@ -3,6 +3,7 @@ import math
 import re
 
 from .package import strip_time_note
+from .spec import assumption_quote
 
 # Scientific homonyms stay allowed: "patch" (sky patch, tissue patch), "internal standard", "baseline-free" (structural
 # health monitoring) all occur in real statements of the 2026-11-23 share; only their process senses are flagged.
@@ -62,7 +63,7 @@ def assumptions_stated(text: str, assumptions: list) -> list[str]:
     normalized = " ".join(strip_time_note(text).split())
     missing = []
     for a in assumptions:
-        quote = " ".join(a["where"].split())
-        if a["stated"] and (len(quote) < 12 or quote not in normalized):
+        quote = assumption_quote(a["where"])
+        if a["stated"] and (not quote or quote not in normalized):
             missing.append(a["where"])
     return missing

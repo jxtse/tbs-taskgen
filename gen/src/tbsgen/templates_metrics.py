@@ -102,7 +102,18 @@ def speed_bench(repeats: int = 5):
     return med
 
 
+_MEASURED_SETS = {}
+
+
+def hidden_value(input_dir, name, value):
+    """Record which hidden input contributed a value to a named metric, before aggregation."""
+    _MEASURED_SETS.setdefault(name, set()).add(os.path.basename(os.path.normpath(input_dir)))
+    return value
+
+
 def _record(rec):
+    if "threshold" in rec and rec["name"] in _MEASURED_SETS:
+        rec["hidden_sets"] = sorted(_MEASURED_SETS[rec["name"]])
     os.makedirs(os.path.dirname(_PATH), exist_ok=True)
     with open(_PATH, "a") as f:
         f.write(json.dumps(rec) + "\n")

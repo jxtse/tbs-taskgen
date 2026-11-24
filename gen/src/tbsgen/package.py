@@ -238,19 +238,35 @@ def run_solution_timeouts(src: str, budget: float) -> list[str]:
     errors = []
     # Module constants are taken in source order: a module-level call sees the value bound above it; a call inside a
     # function (run later, at pytest time) sees the final module-level value.
-    final = {}
-    for node in tree.body:
+    def bind(node, bindings):
         if isinstance(node, (ast.Assign, ast.AnnAssign)):
             for target in (node.targets if isinstance(node, ast.Assign) else [node.target]):
                 if isinstance(target, ast.Name):
-                    final[target.id] = node.value.value if isinstance(node.value, ast.Constant) else None
+                    bindings[target.id] = node.value.value if isinstance(node.value, ast.Constant) else None
 
-    def visit(node, visible):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
-            # A same-named parameter or local binding makes the module constant inapplicable here.
-            local = {n.arg for n in ast.walk(node.args) if isinstance(n, ast.arg)}
-            local.update(n.id for n in ast.walk(node) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store))
-            visible = {k: v for k, v in visible.items() if k not in local}
+    final = {}
+    for node in tree.body:
+        bind(node, final)
+
+    def visit(node, visible, deferred):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)):
+            body = node.body if isinstance(node.body, list) else [node.body]
+            # Bases, decorators and default arguments execute in the defining scope.
+            for child in ast.iter_child_nodes(node):
+                if child not in body:
+                    visit(child, visible, deferred)
+            if isinstance(node, ast.ClassDef):
+                class_scope = dict(visible)
+                for stmt in body:
+                    visit(stmt, class_scope, deferred)
+                    bind(stmt, class_scope)
+            else:
+                local = {n.arg for n in ast.walk(node.args) if isinstance(n, ast.arg)}
+                local.update(n.id for n in ast.walk(node) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store))
+                enclosing = {k: v for k, v in deferred.items() if k not in local}
+                for stmt in body:
+                    visit(stmt, enclosing, enclosing)
+            return
         if isinstance(node, ast.Call):
             name = getattr(node.func, "id", None)
             if name in names or getattr(node.func, "attr", None) == "run_solution":
@@ -261,18 +277,12 @@ def run_solution_timeouts(src: str, budget: float) -> list[str]:
                 if type(value) in (int, float) and value >= budget:
                     errors.append(f"line {node.lineno}: run_solution timeout {value:g}s >= verifier budget {budget:g}s")
         for child in ast.iter_child_nodes(node):
-            visit(child, visible)
+            visit(child, visible, deferred)
 
     sofar = {}
     for node in tree.body:
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            visit(node, final)
-        else:
-            visit(node, dict(sofar))
-            if isinstance(node, (ast.Assign, ast.AnnAssign)):
-                for target in (node.targets if isinstance(node, ast.Assign) else [node.target]):
-                    if isinstance(target, ast.Name):
-                        sofar[target.id] = node.value.value if isinstance(node.value, ast.Constant) else None
+        visit(node, sofar, final)
+        bind(node, sofar)
     return errors
 
 

@@ -36,6 +36,12 @@ def valid_pins(pins) -> bool:
     return isinstance(pins, list) and len(pins) <= 8 and all(isinstance(p, str) and PIN.fullmatch(p) for p in pins)
 
 
+def assumption_quote(where: str) -> str:
+    """The statement quote after whitespace normalization, or empty if too short."""
+    quote = " ".join(where.split())
+    return quote if len(quote) >= 12 else ""
+
+
 def validate_spec(spec, cfg: dict, prompt_version=None) -> list[str]:
     if not isinstance(spec, dict):
         return ["spec is not a JSON object"]
@@ -46,8 +52,8 @@ def validate_spec(spec, cfg: dict, prompt_version=None) -> list[str]:
             errs.append(f"{key} must be a list of nonempty names")
     if not valid_pins(spec.get("extra_pip", [])):
         errs.append("extra_pip must contain at most 8 name==version pins")
-    if "generator_assumptions" in spec or any(_requires_assumptions(v) for v in
-                                              (prompt_version, spec.get("prompt_version"))):
+    new_rules = any(_requires_assumptions(v) for v in (prompt_version, spec.get("prompt_version")))
+    if "generator_assumptions" in spec or new_rules:
         entries = spec.get("generator_assumptions")
         if not isinstance(entries, list):
             errs.append("generator_assumptions must be a list")
@@ -56,6 +62,8 @@ def validate_spec(spec, cfg: dict, prompt_version=None) -> list[str]:
                 if not isinstance(a, dict) or not all(isinstance(a.get(k), str) and a[k].strip()
                                                       for k in ("assumption", "where")) or not isinstance(a.get("stated"), bool):
                     errs.append("invalid generator_assumptions entry")
+                elif new_rules and a["stated"] and not assumption_quote(a["where"]):
+                    errs.append("stated generator_assumptions.where needs at least 12 characters after normalization")
                 elif not a["stated"] and not re.match(r"^recovered from data:\s*\S", a["where"]):
                     errs.append("unstated assumption needs recovered from data: <how>")
     form = spec.get("form")

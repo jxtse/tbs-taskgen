@@ -752,14 +752,15 @@ def s10(P, it):
     with _agent_slot_lock(P):
         # A version already released (manifest append done, crash before "done") keeps its release: the diversity
         # decision is taken once per item, before the first append, not re-taken against a later inventory.
-        why = None if _released(P, it.item_id) else diversity.admission(P, it, "S10")
+        previous = _live_release(P, it.item_id)
+        why = None if previous else diversity.admission(P, it, "S10")
         if why:
             withdraw(P, it.item_id, why)
             return it.finish("parked", why)
-        return _release_reviewed(P, it)
+        return _release_reviewed(P, it, previous)
 
 
-def _release_reviewed(P, it):
+def _release_reviewed(P, it, previous):
     why = review_gate(P, it)
     if why and it.state.get("calib_label") == "frontier" and not (P.cfg.get("review") or {}).get("enabled"):
         withdraw(P, it.item_id, why)
@@ -770,6 +771,10 @@ def _release_reviewed(P, it):
         withdraw(P, it.item_id, f"S10 review gate: {why}")
         it.state["review_round"] = review.next_round(it.dir, it.state)
         return it.goto("S9R", f"S10 review gate: {why}")
+    sha = calib.pkg_sha(it.p("pkg"))
+    epoch = it.state.get("calib_epoch", 0)
+    if previous and previous.get("pkg_sha") == sha and previous.get("calib_epoch") == epoch:
+        return it.advance("S10", None, status="done")
     rel = P.store.root / "release"
     rel.mkdir(exist_ok=True)
     with (rel / "manifest.jsonl").open("a") as f:
@@ -791,7 +796,7 @@ def _release_reviewed(P, it):
         f.write(json.dumps(dict(item_id=it.item_id, pkg=str(it.p("pkg")), label=label,
                                 channel="frontier" if label == "frontier" else "main", **extra,
                                 calib_runs=summ, result_types=[x["result_type"] for x in summ],
-                                calib_epoch=it.state.get("calib_epoch", 0), review=rev,
+                                pkg_sha=sha, calib_epoch=epoch, review=rev,
                                 difficulty=_difficulty_summary(it), ts=time.time())) + "\n")
     it.advance("S10", None, status="done")
 
@@ -1091,19 +1096,23 @@ def _ingest_review(P, it, job_dir: str | None = None) -> dict:
     return dict(outcome=res["outcome"], verdict=rec.get("verdict"), job_name=rec["job_name"])
 
 
-def _released(P, item_id: str) -> bool:
+def _live_release(P, item_id: str) -> dict | None:
     m = P.store.root / "release" / "manifest.jsonl"
     if not m.exists():
-        return False
-    live = False
+        return None
+    live = None
     for line in m.read_text().splitlines():
         try:
             o = json.loads(line)
         except ValueError:
             continue
         if o.get("item_id") == item_id:
-            live = not o.get("withdrawn")
+            live = None if o.get("withdrawn") else o
     return live
+
+
+def _released(P, item_id: str) -> bool:
+    return _live_release(P, item_id) is not None
 
 
 def withdraw(P, item_id: str, reason: str) -> bool:

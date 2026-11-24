@@ -228,9 +228,14 @@ def hidden_duplicates(pub: Path, hid: Path, shared_inputs=(), copied_share_max: 
                 identical_sets=same_sets, identical_public=same_public, mostly_public=mostly)
 
 
-def hidden_parity(metrics: list, spec: dict) -> dict:
+def hidden_parity(metrics: list, spec: dict, hidden_sets=()) -> dict:
     declared = {m["name"]: m for m in spec.get("metrics", [])}
     families = {"public": set(), "hidden": set()}
+    # Direct report consumers can also supply just the measured rows. The gate always passes the full
+    # generated layout so a set without any measurements still appears in the report.
+    if not hidden_sets:
+        hidden_sets = sorted({scope for row in metrics for scope in row.get("hidden_sets", [])})
+    by_set = {name: set() for name in hidden_sets}
     exempt = set()
     for row in metrics:
         name = row.get("name")
@@ -243,6 +248,14 @@ def hidden_parity(metrics: list, spec: dict) -> dict:
         if on not in families:
             on = "hidden" if name.startswith("hidden_") or name.endswith("_hidden") else "public"
         family = metric_family(name)
+        if on == "hidden" and by_set:
+            scopes = row.get("hidden_sets")
+            if scopes is None:
+                # Older scorers have no provenance for pooled metrics. A single set is unambiguous.
+                scopes = list(by_set) if len(by_set) == 1 else []
+            for scope in scopes:
+                if scope in by_set:
+                    by_set[scope].add(family)
         families[on].add(family)
         reason = m.get("public_only_reason")
         if on == "public" and m.get("public_only") is True and isinstance(reason, str) and reason.strip():
@@ -253,8 +266,16 @@ def hidden_parity(metrics: list, spec: dict) -> dict:
     def covered(fam, others):
         want = _core_tokens(fam)
         return any(want and want <= _core_tokens(o) | _tokens(o) for o in others)
-    return dict(missing_hidden=sorted(f for f in families["public"] - exempt if not covered(f, families["hidden"])),
-                missing_public=sorted(f for f in families["hidden"] if not covered(f, families["public"])))
+
+    def missing(measured):
+        return sorted(f for f in families["public"] - exempt if not covered(f, measured))
+
+    missing_public = sorted(f for f in families["hidden"] if not covered(f, families["public"]))
+    if by_set:
+        gaps = {name: missing(measured) for name, measured in by_set.items()}
+        return dict(missing_hidden={k: v for k, v in gaps.items() if v}, missing_public=missing_public,
+                    evaluated_hidden={k: sorted(v) for k, v in by_set.items()})
+    return dict(missing_hidden=missing(families["hidden"]), missing_public=missing_public)
 
 
 _AGG = {"mean", "median", "max", "min", "worst", "avg", "average", "best", "p95", "p90", "total", "overall", "all",
@@ -328,7 +349,7 @@ def run_gates(cfg: dict, item_dir: Path, spec: dict, thresholds: dict, attempt: 
                            out_files=sum(1 for p in od.rglob("*") if p.is_file()) if od.exists() else 0,
                            metrics=[{k: m.get(k) for k in ("name", "value", "threshold", "direction", "passed", "aux",
                                                             "rc", "wall_times", "gated", "threshold_effective",
-                                                            "speed_ratio") if k in m}
+                                                            "speed_ratio", "hidden_sets") if k in m}
                                     for m in t["metrics"]])
         ref = sd["ref"]
         ok["oracle"] &= ref["passed"] and ref["solve_rc"] == 0
@@ -366,7 +387,7 @@ def run_gates(cfg: dict, item_dir: Path, spec: dict, thresholds: dict, attempt: 
                            (m["name"].startswith("hidden_") or m["name"] in hidden_names))
             ok["hidden_shift"] &= dup["ok"] and n_hidden >= 2
             det["hidden_shift"][s] = dict(dup, n_hidden=n_hidden)
-            parity = hidden_parity(ref["metrics"], spec)
+            parity = hidden_parity(ref["metrics"], spec, runner.hidden_set_names(gen))
             det["hidden_parity"][s] = parity
             # only public checks missing on the hidden sets block (the reviewer's finding); a hidden-only metric
             # measures the shift itself and is normal (14 of 18 prod-code tasks have one).  Specs written before
@@ -378,10 +399,6 @@ def run_gates(cfg: dict, item_dir: Path, spec: dict, thresholds: dict, attempt: 
             parity["enforced"] = new_rules
             if new_rules:
                 ok["hidden_parity"] &= not parity["missing_hidden"]
-            if s == seeds[0]:
-                tp = runner.truth_probe(cfg, task, gen, work / f"out-ref{s}", work, f"truthprobe{s}")
-                g["truth_isolation"] = tp["ok"]
-                det["truth_isolation"] = tp
         det["seeds"][s] = sd
     # Probe seed zero even for a custom seed schedule. Reuse its scored reference whenever available.
     seed0 = next((s for s in seeds if str(s) == "0"), None)
@@ -400,6 +417,9 @@ def run_gates(cfg: dict, item_dir: Path, spec: dict, thresholds: dict, attempt: 
     prog = spec.get("form") == "PROG"
     arms = [("coverage", "one_confident")]
     if prog:
+        tp = (runner.truth_probe(cfg, task, gen, ref_out, work, "truthprobe0") if reference_ok
+              else dict(ok=False, error="seed 0 reference failed"))
+        g["truth_isolation"], det["truth_isolation"] = tp["ok"], tp
         arms.append(("hidden_garbage", "hidden_garbage"))
     isolated = g.get("truth_isolation", True) is not False      # never run the reference wrapper with truth readable
     for gate, arm in arms:

@@ -117,6 +117,7 @@ class Ledger:
         self.cfg = cfg
         with self._db() as db:
             db.executescript(SCHEMA)
+            db.execute("BEGIN IMMEDIATE")
             cols = {r[1] for r in db.execute("PRAGMA table_info(calls)")}
             if "cost_kind" not in cols:     # added for S9 runs: reported / tokens / reservation (older ledgers: NULL)
                 db.execute("ALTER TABLE calls ADD COLUMN cost_kind TEXT")
@@ -124,6 +125,10 @@ class Ledger:
                 db.execute("ALTER TABLE calls ADD COLUMN harden INTEGER")
             if "variant" not in cols:       # S9b variant round of the call (older ledgers: NULL = not a variant)
                 db.execute("ALTER TABLE calls ADD COLUMN variant INTEGER")
+            if "reservation_key" not in cols:
+                db.execute("ALTER TABLE calls ADD COLUMN reservation_key TEXT")
+            db.execute("CREATE UNIQUE INDEX IF NOT EXISTS calls_reservation ON calls(reservation_key) "
+                       "WHERE reservation_key IS NOT NULL")
 
     def _db(self):
         db = sqlite3.connect(self.path, timeout=60, isolation_level=None)
@@ -131,8 +136,17 @@ class Ledger:
         return db
 
     # ------------------------------------------------------------------ reserve / finish
+    def reserved_call(self, key: str) -> int | None:
+        with self._db() as db:
+            return self._reserved_call(db, key)
+
+    @staticmethod
+    def _reserved_call(db, key):
+        row = db.execute("SELECT id FROM calls WHERE reservation_key=? AND status='reserved'", (key,)).fetchone()
+        return row[0] if row else None
+
     def reserve(self, model: str, stage: str, item: str, real: bool, prompt_sha: str = "",
-                est_usd: float | None = None) -> int:
+                est_usd: float | None = None, reservation_key: str | None = None) -> int:
         b = self.cfg["budget"]
         est = (float(b.get("est_usd_per_call", 0.0)) if est_usd is None else float(est_usd)) if real else 0.0
         hk = harden_round_now()
@@ -141,6 +155,11 @@ class Ledger:
         db = self._db()
         try:
             db.execute("BEGIN IMMEDIATE")
+            if reservation_key is not None:
+                held = self._reserved_call(db, reservation_key)
+                if held:
+                    db.execute("COMMIT")
+                    return held
             row = db.execute("SELECT open, reason FROM breaker WHERE model=?", (model,)).fetchone()
             if row and row[0]:
                 raise BudgetStop("breaker_open", f"{model}: {row[1]}")
@@ -215,10 +234,10 @@ class Ledger:
                 if n >= int(cap_i):
                     raise BudgetStop("item_calls", f"{item} {cap_i} calls")
             cur = db.execute(
-                "INSERT INTO calls(day,started,model,real,stage,item,status,est_usd,prompt_sha,harden,variant) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO calls(day,started,model,real,stage,item,status,est_usd,prompt_sha,harden,variant,reservation_key) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
                 (day, time.time(), model, int(real), stage, item, "reserved", est, prompt_sha, hk or None,
-                 vk or None))
+                 vk or None, reservation_key))
             db.execute("COMMIT")
             return cur.lastrowid
         except BaseException:

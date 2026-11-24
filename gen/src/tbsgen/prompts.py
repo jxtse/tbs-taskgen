@@ -3,10 +3,11 @@ S8 local repair).  Outputs are machine-parsed: S5 -> one JSON object; S6A/S6C/S8
 "=== FILE: <rel path> ===" ... "=== END ===".  Kept short on purpose: the contract (file layout + rules)
 matters more than prose.  Version strings go into provenance so prompt changes are traceable.
 """
-PROMPT_VERSION = "v2.8-2026-11-24"
+PROMPT_VERSION = "v2.9-2026-11-24"
 
 METRICS_API = """Verifier helper module `_metrics` (provided, importable from tests/; exact signatures):
   check(name: str, value: float, threshold: float, direction: "<=" | ">=") -> None   # records + asserts
+  hidden_value(input_dir, name, value) -> value  # record a measured contribution to a hidden metric
   hidden_sets() -> list[str]          # absolute dirs: subdirectories of /tests/hidden, or [/tests/hidden]
   run_solution(timeout_sec: float, input_dir: str = "/tests/hidden") -> tuple[str, float, int]
       # runs `python /app/output/solution_cli.py <input_dir> <out_dir>` as user nobody with /tests/truth locked;
@@ -31,7 +32,8 @@ List generator_assumptions in the spec: each object has assumption (text), state
 (an exact statement quote of at least 12 characters or "recovered from data: <how the reference does it>")."""
 
 GRADING_RULES = """For PROG, check every public quantity on every hidden set. Pair precision-type metrics
-with coverage, recall or a count. Partial or empty hidden outputs must fail."""
+with coverage, recall or a count. In measure.compute(), pass each measured per-set value through
+_metrics.hidden_value(input_dir, exact_hidden_metric_name, value) before aggregating it. Partial or empty hidden outputs must fail."""
 
 S5_SPEC = """Paper (excerpt, DOI {doi}):
 <<<
@@ -112,7 +114,9 @@ Write the generator and the reference solution.  Files:
   (reads /app/output and /tests/truth).  PROG: execute the agent program ONLY through the provided helper
   `from _metrics import run_solution, hidden_sets`; `for d in hidden_sets(): out_dir, sec, rc = run_solution(t, d)`
   runs `python /app/output/solution_cli.py <d> <out_dir>` as an unprivileged user with /tests/truth locked
-  (hidden_sets() = subdirectories of /tests/hidden, or /tests/hidden itself).  Never subprocess/exec agent code
+  (hidden_sets() = subdirectories of /tests/hidden, or /tests/hidden itself).
+  Pass each per-set result through hidden_value(d, exact_hidden_metric_name, value) before aggregating it.
+  Never subprocess/exec agent code
   yourself (the verifier runs as root, so that would expose the truth).
 {metrics_api}
   Under

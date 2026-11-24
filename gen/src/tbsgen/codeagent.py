@@ -41,6 +41,7 @@ import shlex
 import shutil
 import subprocess
 import time
+import uuid
 from pathlib import Path
 
 from .state import read_json, write_json
@@ -73,7 +74,6 @@ def run_id(cfg: dict) -> str:
     root = Path(str((cfg.get("run") or {}).get("root") or "."))
     f = root / "code_run_id.txt"
     if not f.exists():
-        import uuid
         root.mkdir(parents=True, exist_ok=True)
         tmp = f.with_suffix(f".tmp{os.getpid()}")
         tmp.write_text(f"{root.name[:40]}-{uuid.uuid4().hex[:8]}\n")
@@ -407,8 +407,14 @@ def launch_agent(cfg: dict, it, kind: str, conf: dict, ledger, est_usd: float, e
         write_json(recp, rec)
     if rec["state"] == "intent":
         model = conf["agents"][0]["model_name"]
-        rec["ledger_call"] = ledger.reserve(model, kind, it.item_id, True, est_usd=float(est_usd)) \
-            if ledger is not None else None
+        if ledger is not None:
+            if not rec.get("reservation_key"):
+                rec["reservation_key"] = uuid.uuid4().hex
+                write_json(recp, rec)
+            rec["ledger_call"] = ledger.reserve(model, kind, it.item_id, True, est_usd=float(est_usd),
+                                                reservation_key=rec["reservation_key"])
+        else:
+            rec["ledger_call"] = None
         rec["model"] = model
         rec["state"] = "reserved"
         write_json(recp, rec)

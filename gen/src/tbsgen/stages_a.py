@@ -647,12 +647,15 @@ def _agent_stage(P, it, kind: str, instruction: str, need: list[str], timeout_s:
                 # yet -> the same checks as a new job (a held reservation keeps its slot meanwhile)
                 why = _agent_admission(P, it, kind)
                 if why:
-                    if why.startswith("diversity:") and rec["state"] == "reserved":
+                    if why.startswith("diversity:"):
                         # A parked paper releases its unused money and its concurrent authoring slot.  Order: the
                         # record goes back to intent first (a resume re-reserves through ledger.reserve), then the
                         # old row is settled; a crash in between leaves the row in orphan_calls, settled below
                         # on the next pass -- never a "reserved" record whose ledger row is already closed.
                         orphan = rec.get("ledger_call")
+                        key = rec.pop("reservation_key", None)
+                        if key and not orphan:  # DB commit survived, reserved run.json did not
+                            orphan = P.ledger.reserved_call(key)
                         rec.update(state="intent", ledger_call=None,
                                    orphan_calls=list(rec.get("orphan_calls") or []) + ([orphan] if orphan else []))
                         write_json(recp, rec)
