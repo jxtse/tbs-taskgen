@@ -61,14 +61,20 @@ def declared_outputs(spec, statement):
     for line in statement.splitlines():
         if line.lstrip().startswith("#"):
             in_outputs = bool(re.search(r"\b(?:outputs?|deliverables?)\b", line, re.I))
+        list_end = None
         for match in FILE_TOKEN.finditer(line):
             path = match[0]
             explicit_path = path.startswith(("/app/output/", "<output_dir>/", "output/"))
             relative = not path.startswith(("/", "data/"))
             declaration = re.search(r"\b(?:write|produce|submit|save|deliverables?:|outputs?:)\s+[`*]*$",
                                     line[:match.start()], re.I)
-            if explicit_path or (relative and (in_outputs or declaration)):
+            continuation = list_end is not None and re.fullmatch(
+                r"[`*]*\s*(?:,\s*(?:(?:and|or)\s+)?|(?:and|or)\s+)[`*]*", line[list_end:match.start()], re.I)
+            if explicit_path or (relative and (in_outputs or declaration or continuation)):
                 declared.add(output_relative_path(path))
+                list_end = match.end() if declaration or continuation or explicit_path else None
+            else:
+                list_end = None
     return declared
 
 

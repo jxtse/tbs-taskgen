@@ -206,8 +206,7 @@ def hidden_duplicates(pub: Path, hid: Path, shared_inputs=(), copied_share_max: 
     trees = {name: {p.relative_to(name): v for p, v in hidden.items() if p.parts[0] == name} for name in sets}
     same_sets = [[a, b] for i, a in enumerate(sets) for b in sets[i+1:] if trees[a] == trees[b]]
     same_public = [name for name, tree in {".": hidden, **trees}.items() if tree and tree == public]
-    # A copied file is fine on its own (a shared training table, a common time grid: 7 of the 21 tbsgen tasks in the
-    # released tasks do this).  What tests nothing is a hidden set made mostly of public bytes.
+    # Allow individual shared inputs, such as a training table or time grid.
     mostly = {}
     for name, tree in ({".": hidden} if not sets else trees).items():
         total = sum(size for size, _ in tree.values())
@@ -344,7 +343,7 @@ def run_gates(cfg: dict, item_dir: Path, spec: dict, thresholds: dict, attempt: 
                                                             "rc", "wall_times", "gated", "threshold_effective",
                                                             "speed_ratio", "hidden_sets") if k in m}
                                     for m in t["metrics"]])
-            if str(s) == "0" and tag == "ref":
+            if s == seeds[0] and tag == "ref":
                 sd[tag]["verifier"] = {k: t[k] for k in ("out", "err", "metrics") if k in t}
         ref = sd["ref"]
         ok["oracle"] &= ref["passed"] and ref["solve_rc"] == 0
@@ -384,39 +383,23 @@ def run_gates(cfg: dict, item_dir: Path, spec: dict, thresholds: dict, attempt: 
             det["hidden_shift"][s] = dict(dup, n_hidden=n_hidden)
             parity = hidden_parity(ref["metrics"], spec, runner.hidden_set_names(gen) if per_set else ())
             det["hidden_parity"][s] = parity
-            # only public checks missing on the hidden sets block (the reviewer's finding); a hidden-only metric
-            # measures the shift itself and is normal (most released tasks have one).  Specs written before
-            # the prompts asked for it (no public_only declarations: about a quarter of released tasks have a
-            # public-only metric) are recorded for S9R, not blocked.
+            # Earlier specs did not require public_only declarations. Record their gaps for review.
             parity["enforced"] = review_rules
             if review_rules:
                 ok["hidden_parity"] &= not parity["missing_hidden"]
         det["seeds"][s] = sd
-    # Probe seed zero even for a custom seed schedule. Reuse its scored reference whenever available.
-    seed0 = next((s for s in seeds if str(s) == "0"), None)
-    if seed0 is None:
-        gen = work / "probe-gen0"
-        ref_out = work / "out-probe-ref0"
-        reference = {"generate_rc": runner.generate(cfg, task, 0, gen)["rc"]}
-        if reference["generate_rc"] == 0:
-            sv = runner.solve(cfg, task, gen, "solution/solve.py", work, "probe-ref0")
-            reference["solve_rc"] = sv["rc"]
-            if sv["rc"] == 0:
-                t = runner.test(cfg, task, gen, ref_out, work, "probe-ref0")
-                reference.update(verifier_rc=t["rc"], reward=t.get("reward"),
-                                 verifier={k: t[k] for k in ("out", "err", "metrics") if k in t})
-    else:
-        gen = work / ("detA" if seed0 == seeds[0] else "gen0")
-        ref_out = work / "out-ref0"
-        scored = det["seeds"][seed0].get("ref", {})
-        reference = {k: scored.get(k) for k in ("solve_rc", "verifier_rc", "reward", "verifier")}
+    seed = seeds[0]
+    gen = work / "detA"
+    ref_out = work / f"out-ref{seed}"
+    scored = det["seeds"][seed]["ref"]
+    reference = {k: scored.get(k) for k in ("solve_rc", "verifier_rc", "reward", "verifier")}
     reference_ok = (reference.get("solve_rc") == 0 and reference.get("verifier_rc") == 0
                     and reference.get("reward") == "1")
     prog = spec.get("form") == "PROG"
     arms = [("coverage", "one_confident")]
     if prog:
-        tp = (runner.truth_probe(cfg, task, gen, ref_out, work, "truthprobe0") if reference_ok
-              else dict(ok=False, error="seed 0 reference failed"))
+        tp = (runner.truth_probe(cfg, task, gen, ref_out, work, f"truthprobe{seed}") if reference_ok
+              else dict(ok=False, error=f"seed {seed} reference failed"))
         g["truth_isolation"], det["truth_isolation"] = tp["ok"], tp
         arms.append(("hidden_garbage", "hidden_garbage"))
     isolated = g.get("truth_isolation", True) is not False      # never run the reference wrapper with truth readable
@@ -426,11 +409,11 @@ def run_gates(cfg: dict, item_dir: Path, spec: dict, thresholds: dict, attempt: 
             if not prog:
                 result["control"] = reference
         else:
-            reason = "seed 0 reference failed" if not reference_ok else "not run: truth isolation failed"
+            reason = f"seed {seed} reference failed" if not reference_ok else "not run: truth isolation failed"
             scopes = {scope: dict(status="inconclusive", error=reason, transformed_files=[])
                       for scope, _ in runner.probe_scopes(arm, prog, gen)}
             result = dict(ok=True, inconclusive=True, reference=reference, error=reason, scopes=scopes)
-        det["seeds"].setdefault(0 if seed0 is None else seed0, {})[f"exploit__{arm}"] = result
+        det["seeds"][seed][f"exploit__{arm}"] = result
         g[gate] = result["ok"]
         det[gate] = result
     g.update(ok)
@@ -460,7 +443,7 @@ def run_gates(cfg: dict, item_dir: Path, spec: dict, thresholds: dict, attempt: 
     oc = output_contract(ins, work / f"out-ref{seeds[0]}")
     g["output_contract"] = oc["ok"]
     det["output_contract"] = oc
-    # leak gates on seed 0 artefacts
+    # Inspect the generated files used by PKG.
     gen0 = work / "detA"
     lr = leak_report(gen0 / "environment" / "data", [gen0 / "tests" / "truth"], ins, cfg,
                      depgraph=spec.get("depgraph"),
@@ -500,11 +483,15 @@ def run_gates(cfg: dict, item_dir: Path, spec: dict, thresholds: dict, attempt: 
                                         read_json(item_dir / "_spec" / "difficulty_design.json", None))
         g["targeting_leak"] = not tl
         det["targeting_leak"] = tl
-    blocking = [k for k, v in g.items() if not v and k in _blocking(cfg)]
-    nonblocking = [k for k, v in g.items() if not v and k not in _blocking(cfg)]
+    return dict(attempt=attempt, gates=g, details=det, **gate_policy(cfg, g))
+
+
+def gate_policy(cfg, g):
+    required = _blocking(cfg)
+    blocking = [k for k, v in g.items() if not v and k in required]
+    nonblocking = [k for k, v in g.items() if not v and k not in required]
     advisory = OUTPUT_PROBES | {"effort_floor", "data_realism"}
-    return dict(attempt=attempt, gates=g, blocking=blocking, nonblocking=nonblocking,
-                ok=not blocking and set(nonblocking) <= advisory, details=det)
+    return dict(blocking=blocking, nonblocking=nonblocking, ok=not blocking and set(nonblocking) <= advisory)
 
 
 OUTPUT_PROBES = {"coverage", "one_confident", "hidden_garbage"}
@@ -519,3 +506,26 @@ def _blocking(cfg) -> set[str]:
     if "oracle" in b:
         b.add("oracle_margin")
     return b | {"nop", "naive", "mid", "exploit", "exploit_valid", "targeting_leak"}
+
+def legacy_probe_pass(cfg, report, reason):
+    """Recover an S8 stop caused solely by gates that are advisory today."""
+    if not reason.startswith("gates:") and reason not in OUTPUT_PROBES:
+        return False
+    reasons = set(reason.removeprefix("gates:").split(","))
+    if not reasons <= OUTPUT_PROBES | {"exploit"}:
+        return False
+    results = dict(report.get("gates", {}))
+    if not results or not any(results.get(k) is False for k in OUTPUT_PROBES):
+        return False
+    if results.get("exploit") is False and results.get("hidden_garbage") is False:
+        # Old S7 folded hidden_garbage into exploit. Recover the original baseline
+        # decision for each scored seed (old probe-only extra seeds had no ref).
+        seeds = report.get("details", {}).get("seeds", {})
+        probe_tags = {"exploit__one_confident", "exploit__hidden_garbage"}
+        scored = [sd for sd in seeds.values() if set(sd) - probe_tags]
+        for sd in scored:
+            arms = [v for k, v in sd.items() if k.startswith("exploit_") and k not in probe_tags]
+            if not arms or not all(arm.get("passed") is False for arm in arms):
+                return False
+        results["exploit"] = bool(scored)
+    return gate_policy(cfg, results)["ok"]

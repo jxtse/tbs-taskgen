@@ -12,7 +12,7 @@ from . import calib, difficulty, gates, package, repair, review
 from .models import parse_files
 from .prompts import METRICS_API, S6C_TESTS, S8_EXPLOIT, S8_REPAIR, S8_REVIEW, SYSTEM
 from .stages_a import _write_files, chat_files, save_raw
-from .state import read_json, write_json
+from .state import latest_gate_report, read_json, write_json
 
 
 def s6c(P, it):
@@ -102,6 +102,11 @@ def s7(P, it):
 def s8(P, it):
     if str(it.state.get("repair_from", "")).startswith("review:") or it.state.get("review_revision_pending"):
         return _s8_review(P, it)
+    reason = str(it.state.get("repair_from", ""))
+    gate_log = latest_gate_report(it.p("gates"))
+    if gates.legacy_probe_pass(P.cfg, gate_log, reason):
+        it.state.pop("repair_from", None)
+        return it.goto("PKG", "S7 deterministic gates passed; output probes require review")
     if it.state.get("repair_from") == "gates:exploit_valid":
         return _s8_exploits(P, it)
     if it.state.get("thresholds_locked"):
@@ -109,10 +114,7 @@ def s8(P, it):
         # and is not bound by the revision limit, so it must not run — the review revision is retried (feedback)
         # while rounds remain, else the item is dropped (review.allow_human restores the old park)
         why = f"after the review revision: {it.state.get('repair_from')}"
-        last = sorted(it.p("gates").glob("attempt-*.json"),
-                      key=lambda q: int(q.stem.split("-")[-1]) if q.stem.split("-")[-1].isdigit() else -1) \
-            if it.p("gates").exists() else []
-        oc = ((read_json(last[-1], {}) or {}).get("details") or {}).get("output_contract") if last else None
+        oc = (gate_log.get("details") or {}).get("output_contract")
         if oc and not oc.get("ok"):
             # compact per-file difference first, so the budget never cuts the columns that matter
             diff = {f: dict(missing_in_statement=sorted(set(m["reference"]) - set(m["stated"])),
@@ -125,9 +127,8 @@ def s8(P, it):
         return it.finish("dropped", f"repair_limit:{it.state.get('repair_from')}")
     task = it.p("task")
     spec = read_json(it.p("_spec", "spec.json"))
-    last = sorted(it.p("gates").glob("attempt-*.json")) if it.p("gates").exists() else []
-    gate_log = read_json(last[-1]) if last and str(it.state.get("repair_from", "")).startswith("gates:") else \
-        read_json(it.p("S6_failure.json"))
+    if not gate_log or not reason.startswith("gates:"):
+        gate_log = read_json(it.p("S6_failure.json"))
     slim = json.dumps(_slim(gate_log), default=str)[:20000]
     user = S8_REPAIR.format(gates=slim, depgraph=json.dumps(spec["depgraph"]), files=repair.files_for_repair(task, gate_log),
                             metrics_api=METRICS_API)
@@ -212,8 +213,7 @@ def _s8_exploits(P, it):
             return it.finish("parked", f"exploit_repair_limit:{n}")
         return it.finish("dropped", f"exploit_repair_limit:{n}")
     task = it.p("task")
-    last = sorted(it.p("gates").glob("attempt-*.json"))
-    gate_log = read_json(last[-1]) if last else {}
+    gate_log = latest_gate_report(it.p("gates"))
     exploits = sorted(str(p.relative_to(task)) for p in (task / "baselines").glob("exploit_*.py"))
     files = "\n".join(f"=== FILE: {rel} ===\n{(task / rel).read_text()}" for rel in exploits)
     ctx = "\n".join(f"=== FILE: {rel} ===\n{(task / rel).read_text()[:30000]}"
@@ -291,8 +291,7 @@ def _slim(g):
 
 def pkg(P, it):
     spec = read_json(it.p("_spec", "spec.json"))
-    last = sorted(it.p("gates").glob("attempt-*.json"))[-1]
-    gate = read_json(last)
+    gate = latest_gate_report(it.p("gates"))
     gen0 = it.p("runs", f"s7-{gate['attempt']}", "detA")
     from . import prerelease
     cand = read_json(it.p("S1_candidate.json"), {})
@@ -374,12 +373,16 @@ def _revision_pkg_problem(it, gate: dict) -> str | None:
     if want and review.pkg_data_hash(it.p("pkg")) != want:
         return "the revision changed packaged data / hidden inputs / truth; only README format notes may change"
     locked = review.locked_signature(read_json(it.p("thresholds.json"))["thresholds"])
+    locked_checks = set(locked)
     logs = sorted(it.p("runs", f"s7-{gate['attempt']}").glob("logs-*/metrics.jsonl"))
     if not any(m.parent.name.startswith("logs-ref") for m in logs):
         return "no reference verifier log of the S7 attempt to check the thresholds applied at run time"
     for m in logs:                        # every arm (ref, mid, naive, exploits, nop): what check() applied
         got = review.runtime_thresholds(m)
-        if got and got != locked:
+        if got is None:
+            return f"cannot read runtime thresholds ({m.parent.name})"
+        reference = m.parent.name.startswith("logs-ref")
+        if (reference and got != locked) or not set(got) <= locked_checks:
             return f"the verifier applied thresholds {got} != locked {locked} ({m.parent.name})"
     return None
 
@@ -597,6 +600,10 @@ def _s9(P, it):
             # S9b: the student passed both decisive runs -> re-author a harder variant of this task and re-calibrate
             # it instead of discarding the version (difficulty.start_hardening, kind="variant"; own depth + budget)
             return start_hardening(P, it, kind=difficulty.KIND_VARIANT)
+        if not P.cfg.get("review", {}).get("enabled"):
+            scopes = _probe_scopes(it)
+            if scopes:
+                return _park_unreviewed(P, it, scopes)
         if review.reviewable(P.cfg, what):
             # S9R: kept labels must pass the review before S10; parked:teacher_failed is reviewed as a diagnosis.
             # A fresh round number per version: review job names / verdict records never collide with an earlier
@@ -713,20 +720,30 @@ def _ingest(P, it, job_dir: str | None = None) -> dict:
 
 def _oracle_gate_ok(it) -> bool:
     """The last S7 gate report of the current version passed the oracle (reference) gate."""
-    reps = sorted(it.p("gates").glob("attempt-*.json"), key=lambda p: int(p.stem.split("-")[-1]))
-    if not reps:
-        return False
-    g = (read_json(reps[-1], {}) or {}).get("gates") or {}
+    g = latest_gate_report(it.p("gates")).get("gates", {})
     return g.get("oracle") is True
 
 
-def review_gate(P, it) -> str | None:
+def _probe_scopes(it):
+    return review.suspected_scopes(latest_gate_report(it.p("gates")))
+
+
+def _park_unreviewed(P, it, scopes):
+    why = "parked:probe_unreviewed"
+    withdraw(P, it.item_id, why)
+    return it.finish("parked", why, detail={"suspected_scopes": scopes})
+
+
+def review_gate(P, it, scopes=None) -> str | None:
     """Why S10 must not release this item yet (None = may release): with review on and a reviewable label, the
     current package, calibration epoch and review round need a recorded pass.  A frontier task always does (with
     review disabled it can never be released)."""
+    scopes = _probe_scopes(it) if scopes is None else scopes
+    if scopes and not (P.cfg.get("review") or {}).get("enabled"):
+        return "parked:probe_unreviewed"
     if it.state.get("calib_label") == "frontier" and not (P.cfg.get("review") or {}).get("enabled"):
         return "frontier needs an S9R review (review disabled)"
-    if not review.reviewable(P.cfg, it.state.get("calib_label")):
+    if not scopes and not review.reviewable(P.cfg, it.state.get("calib_label")):
         return None
     v = read_json(it.p("review", "verdict.json"), None)
     if not v:
@@ -734,6 +751,13 @@ def review_gate(P, it) -> str | None:
     norm = v.get("_normalized") or {}
     if norm.get("verdict") != "pass":
         return f"review verdict {norm.get('verdict')}"
+    if scopes:
+        runs = read_json(it.p("review", "runs.json"), [])
+        job = next((r for r in runs if r.get("job_name") == v.get("job")), {})
+        if not set(scopes) <= set(job.get("suspected_scopes", [])):
+            return "probe scopes require review: " + ", ".join(scopes)
+    if (scopes or v.get("probe_findings")) and review.normalize(v, suspected_scopes=scopes)["verdict"] != "pass":
+        return "probe findings require a new review"
     if it.state.get("calib_label") == "frontier":
         fp = review.frontier_problems(norm, _oracle_gate_ok(it))
         if fp:
@@ -752,16 +776,19 @@ def s10(P, it):
     with _agent_slot_lock(P):
         # A version already released (manifest append done, crash before "done") keeps its release: the diversity
         # decision is taken once per item, before the first append, not re-taken against a later inventory.
+        scopes = _probe_scopes(it)
+        if scopes and not (P.cfg.get("review") or {}).get("enabled"):
+            return _park_unreviewed(P, it, scopes)
         previous = _live_release(P, it.item_id)
         why = None if previous else diversity.admission(P, it, "S10")
         if why:
             withdraw(P, it.item_id, why)
             return it.finish("parked", why)
-        return _release_reviewed(P, it, previous)
+        return _release_reviewed(P, it, previous, scopes)
 
 
-def _release_reviewed(P, it, previous):
-    why = review_gate(P, it)
+def _release_reviewed(P, it, previous, scopes):
+    why = review_gate(P, it, scopes)
     if why and it.state.get("calib_label") == "frontier" and not (P.cfg.get("review") or {}).get("enabled"):
         withdraw(P, it.item_id, why)
         return it.finish("parked", f"frontier:unreviewed ({why})")
@@ -792,8 +819,11 @@ def _release_reviewed(P, it, previous):
                   channel="frontier" if label == "frontier" else "main", **extra,
                   calib_runs=summ, result_types=[x["result_type"] for x in summ],
                   pkg_sha=sha, calib_epoch=epoch, review=rev, difficulty=_difficulty_summary(it))
-    # The manifest is append-only, latest live row wins. b88e514 wrote all identity fields except pkg_sha.
-    if previous and all(previous.get(k) == v for k, v in record.items() if k != "pkg_sha" or k in previous):
+    if previous and "pkg_sha" not in previous and previous.get("pkg"):
+        previous_pkg = Path(previous["pkg"])
+        if previous_pkg.is_dir():
+            previous = dict(previous, pkg_sha=calib.pkg_sha(previous_pkg))
+    if previous and all(previous.get(k) == v for k, v in record.items()):
         return it.advance("S10", None, status="done")
     rel = P.store.root / "release"
     rel.mkdir(exist_ok=True)
@@ -946,7 +976,20 @@ def _s9r(P, it):
     rnd = int(it.state.get("review_round") or 1)
     save = lambda r: _save_review(it, r)  # noqa: E731
     runs = [r for r in read_json(it.p("review", "runs.json"), []) if r.get("n") == rnd]
+    sha, epoch = calib.pkg_sha(it.p("pkg")), int(it.state.get("calib_epoch", 0))
+    scopes = _probe_scopes(it)
+    if scopes and not rv.get("enabled"):
+        return _park_unreviewed(P, it, scopes)
     for rec in runs:                                     # reconcile interrupted submissions / dead launches
+        current_version = rec.get("pkg_sha") == sha and int(rec.get("calib_epoch") or 0) == epoch
+        if current_version and set(scopes) - set(rec.get("suspected_scopes", [])):
+            pending_intent = rec.get("outcome") is None and rec.get("state") in ("intent", "reserved")
+            if rec.get("outcome") == "done" or (pending_intent and not calib.job_started(rec)):
+                if pending_intent and rec.get("ledger_call"):
+                    P.ledger.settle(rec["ledger_call"], 0.0, status="error", kind="not_launched")
+                rec.update(outcome="infra", obsolete_probe_review=True)
+                save(rec)
+                continue
         if rec.get("outcome") is None and rec.get("state") in ("intent", "reserved"):
             if not c.get("allow_submit"):
                 return it.finish("waiting", f"review {rec['job_name']} in state {rec['state']}; submit disabled")
@@ -995,14 +1038,14 @@ def _s9r(P, it):
     pending = [r for r in all_rnd if r.get("outcome") is None]
     if pending:
         return it.finish("waiting", f"awaiting review run {pending[-1]['job_name']}")
-    sha, epoch = calib.pkg_sha(it.p("pkg")), int(it.state.get("calib_epoch", 0))
     # a verdict counts only for the package and calibration epoch it was submitted with
     runs = [r for r in all_rnd if r.get("pkg_sha") == sha and int(r.get("calib_epoch") or 0) == epoch]
     done = [r for r in runs if r.get("outcome") == "done"]
     if done:
         return _route_review(P, it, done[-1], rnd)
     # a run the model relay refused at its preflight is no attempt and uses up no retry (calib.relay_preflight_refused)
-    n_infra = sum(1 for r in runs if r.get("outcome") == "infra" and not r.get("preflight_refused"))
+    n_infra = sum(1 for r in runs if r.get("outcome") == "infra" and not r.get("preflight_refused")
+                  and not r.get("obsolete_probe_review"))
     n_invalid = sum(1 for r in runs if r.get("outcome") == "invalid")
     if n_infra + n_invalid > int(rv.get("infra_retries", 2)):
         if n_invalid:
@@ -1069,14 +1112,18 @@ def _ingest_review(P, it, job_dir: str | None = None) -> dict:
         ident["task"] = want["task"]
     if ident != want:
         raise ValueError(f"job identity mismatch: job {ident} vs pending review run {want}")
+    scopes = _probe_scopes(it)
+    assigned = rec.get("suspected_scopes", [])
     res = review.classify(jd, rec.get("model"), P.cfg["models"].get("prices", {}),
                           allow_human=bool((P.cfg.get("review") or {}).get("allow_human")),
-                          suspected_scopes=rec.get("suspected_scopes", []))
+                          suspected_scopes=set(scopes) | set(assigned))
     rec.update(outcome="invalid" if (res["outcome"] == "done" and (res["verdict"] or {}).get("verdict") is None)
                else res["outcome"],
                minutes=res["minutes"], cost_usd=res["cost_usd"], cost_kind=res["cost_kind"],
                trial=res["trial"], n_trials=res["n_trials"], usage=res["usage"])
-    if res["verdict"] is not None:
+    if set(scopes) - set(assigned):
+        rec.update(outcome="infra", obsolete_probe_review=True)
+    elif res["verdict"] is not None:
         d = it.p("review", f"r{rec['n']}")
         d.mkdir(parents=True, exist_ok=True)
         raw = res["verdict_raw"]
@@ -1090,11 +1137,12 @@ def _ingest_review(P, it, job_dir: str | None = None) -> dict:
         rec["verdict"] = res["verdict"]["verdict"]
     if rec.get("ledger_call"):
         P.ledger.settle(rec["ledger_call"], res["cost_usd"], kind=res["cost_kind"], usage=res["usage"],
-                        note=f"S9R review r{rec['n']} outcome={res['outcome']} verdict={rec.get('verdict')}")
+                        note=f"S9R review r{rec['n']} outcome={rec['outcome']} verdict={rec.get('verdict')}")
     _save_review(it, rec)
     it.state["status"] = "active"
     it.save()
-    return dict(outcome=res["outcome"], verdict=rec.get("verdict"), job_name=rec["job_name"])
+    outcome = "infra" if rec.get("obsolete_probe_review") else res["outcome"]
+    return dict(outcome=outcome, verdict=rec.get("verdict"), job_name=rec["job_name"])
 
 
 def _append_manifest(path: Path, record: dict) -> None:
@@ -1166,6 +1214,9 @@ def _route_review(P, it, rec: dict, rnd: int):
         return _review_invalid(P, it, rnd, rec, f"verdict of job {rec.get('job_name')} missing or bound to "
                                                  f"another job / package / epoch")
     norm = v["_normalized"]
+    if norm.get("verdict") and (rec.get("suspected_scopes") or v.get("probe_findings")):
+        norm = review.normalize(v, allow_human=bool(rv.get("allow_human")),
+                                suspected_scopes=rec.get("suspected_scopes", []))
     verdict = norm["verdict"]
     if verdict is None:
         return _review_invalid(P, it, rnd, rec, "; ".join(norm.get("problems") or ["invalid verdict"])[:400])

@@ -1,4 +1,4 @@
-"""Offline regressions for the review of the hard-task share."""
+"""Offline regressions for generation and review."""
 import csv
 import json
 from pathlib import Path
@@ -23,12 +23,11 @@ from tbsgen.statement import assumptions_stated, statement_clean, threshold_form
 
 
 def test_statement_hygiene_clean_statements():
-    # synthetic statements shaped like released tasks (no real task text in this public repository)
     fixture = json.loads((Path(__file__).parent / "fixtures/review_statements.json").read_text())
     assert len(fixture) == 3
     for name, text in fixture.items():
         assert not statement_clean(text), name
-    for heading in ("## Output-contract clarification (audit copy)", "## Additional hidden-output checks (audit revision)"):
+    for heading in ("## Toy example (audit copy)", "## Example table (audit revision)"):
         assert statement_clean(heading) == [heading]
 
 
@@ -39,11 +38,8 @@ def test_hygiene_forms_and_exceptions():
         assert statement_clean(word), word
     assert not statement_clean("Investigate, navigate and aggregate the hidden outputs.\nFit the baseline level.")
     # scientific homonyms stay clean
-    for line in ("# CMB polarization amplitude behind Galactic foregrounds, patch by patch",
-                 "- more spurious and more missed H&E detections, including a contiguous patch where H&E nuclei",
-                 "# Locating damage on a CFRP plate from a single guided-wave scan (no baseline)",
-                 "# Baseline-free damage localisation from time-reversal Lamb-wave reconstructions",
-                 "# Glass content of quartz–zincite–glass powders by internal-standard XRD"):
+    for line in ("# Heat flux in a square patch", "Fit a smooth baseline for each patch.",
+                 "# A baseline-free estimate of spring stiffness", "# Dye absorbance using an internal standard"):
         assert not statement_clean(line), line
     assert not statement_clean(package.instruction_text(load_config(), {"form": "PROG"}, "Hidden shift"))
 
@@ -51,19 +47,17 @@ def test_hygiene_forms_and_exceptions():
 def test_threshold_literals_and_unreadable_separation():
     thresholds = {"a": {"threshold": 0.1234567}, "b": {"threshold": 0.123456}}
     assert threshold_format("| cut | 12.34567% |\nT ≤ `1.234567e-4`", thresholds) == ["12.34567", "1.234567e-4"]
-    assert threshold_format("≥ 0.8665767420502813") == ["0.8665767420502813"]
-    assert threshold_format("value 0.8031095863545515 here") == ["0.8031095863545515"]   # float repr anywhere
+    assert threshold_format("≥ 0.1234567890123456") == ["0.1234567890123456"]
+    assert threshold_format("value 0.2345678901234567 here") == ["0.2345678901234567"]   # float repr anywhere
     assert not threshold_format("At most 0.123456 or 1e-9. Catalogue ID 12345678.", thresholds)
     # physical constants and small exact cutoffs stay allowed
-    assert not threshold_format("- GM = 398600.4418 km^3/s^2, equatorial radius = 6378.137 km, J2 = 1.08262668e-3.")
+    assert not threshold_format("The toy rotor has inertia 87654.3219 in model units and damping 3.45678912e-4.")
     assert not threshold_format("fitted slope **≥ −0.0000000001**, difference **≤ 0.000000001**")
-    # a released item: naive capped at the ref-margin floor and naive (0.912) clears even the exact
-    # floor 0.8666: the old code printed `>= 0.8665767420502813`; now a readable 2-digit threshold
-    ms = {w: {"0": {"p": a}, "1": {"p": b}} for w, a, b in (("ref", .9628630467225348, .9667504236545317),
-                                                          ("mid", .9628630467225348, .9667504236545317),
-                                                          ("naive", .8902762012864169, .9120052338894341))}
+    # The reference-margin floor still admits naive, so extra digits cannot separate it.
+    ms = {w: {"0": {"p": a}, "1": {"p": b}} for w, a, b in (
+        ("ref", .8723, .8812), ("mid", .8723, .8812), ("naive", .811, .824))}
     t = set_thresholds({"metrics": [{"name": "p", "direction": ">="}]}, ms, load_config())["thresholds"]["p"]
-    assert t["threshold"] == 0.86 and t["ref_passes"]
+    assert t["threshold"] == 0.78 and t["ref_passes"]
     # a separating metric whose mid sits right next to the midpoint still gets a readable threshold that rejects mid
     result = set_thresholds({"metrics": [{"name": "p", "direction": "<="}]},
                             {w: {"0": {"p": v}} for w, v in (("ref", 1.0), ("mid", 1.0000004), ("naive", 9.0))},
@@ -150,8 +144,8 @@ def test_pkg_checks_and_sandbox_inventory(tmp_path, monkeypatch):
     cfg = load_config()
     assert package.run_solution_timeouts("T = 780\nm.run_solution(timeout_sec=T)\nrun_solution(779.99)", 780) == [
         "line 2: run_solution timeout 780s >= verifier budget 780s"]
-    assert not package.run_solution_timeouts("run_solution(dynamic(2000))", 780)
-    assert not package.run_solution_timeouts("T=1200\ndef test(T): run_solution(T)", 780)
+    assert "unknown" in package.run_solution_timeouts("run_solution(dynamic(2000))", 780)[0]
+    assert "unknown" in package.run_solution_timeouts("T=1200\ndef test(T): run_solution(T)", 780)[0]
     assert package.run_solution_timeouts("from _metrics import run_solution as run\nrun(900)", 780)
     assert "h5py==3.12.1" in package.dockerfile(cfg, "selfcontained", ["h5py==3.12.1"])
     for p in package.REQUIRED:
@@ -214,7 +208,7 @@ def wired_gates(tmp_path, monkeypatch):
             (out / "out.csv").write_text("x\n1\n")
         return dict(rc=0, sec=1, err="", outdir=str(out))
     def verifier(cfg, task, gen, out, work, tag):
-        ref = tag.startswith("ref") or tag == "probe-ref0"
+        ref = tag.startswith("ref")
         value = .93 if ref else 2 if tag.startswith("nop") else 1.5
         rows = [dict(name=m["name"], value=value, direction="<=", threshold=1, passed=ref) for m in spec["metrics"]]
         rows.append(dict(name="_solution_cli_run", rc=0, aux=True))
@@ -252,13 +246,13 @@ def test_gate_wiring(tmp_path, monkeypatch, wired_gates):
     cfg["gen"]["seeds"] = [1]
     arms.clear()
     assert gates.run_gates(cfg, tmp_path, spec, {}, 4)["ok"]
-    assert arms == [("one_confident", "probe-gen0"), ("hidden_garbage", "probe-gen0")]
+    assert arms == [("one_confident", "detA"), ("hidden_garbage", "detA")]
     monkeypatch.setattr(runner, "output_probe", lambda *a: {"ok": False})
     cfg["gates"]["blocking"].extend(["one_confident", "hidden_garbage", "coverage"])
     only_probes = gates.run_gates(cfg, tmp_path, spec, {}, 5)
     assert only_probes["ok"] and not only_probes["blocking"] and only_probes["gates"]["exploit"]
     assert {"coverage", "hidden_garbage"} <= set(only_probes["nonblocking"])
-    (task / "instruction.md").write_text("## Audit copy\n≤ 0.8665767420502813")
+    (task / "instruction.md").write_text("## Audit copy\n≤ 0.1234567890123456")
     spec["generator_assumptions"] = [dict(assumption="a", stated=True, where="Noise is Gaussian")]
     rep = gates.run_gates(cfg, tmp_path, spec, {}, 3)
     assert {"threshold_format", "statement_clean", "assumptions_stated"} <= set(rep["blocking"])
@@ -302,7 +296,7 @@ def test_diversity_inventory_and_both_admissions(tmp_path, capsys):
                                                '{"item_id":"e"}\n{"item_id":"e","withdrawn":true}\n')
     P = SimpleNamespace(cfg=load_config(), store=store)
     P.cfg["diversity"]["enforce"] = True
-    # 2 released tasks: an area share of 100 % says nothing yet (min_released 20) -> only the template cap applies
+    # Below the configured minimum, only the template cap applies.
     assert stages_a._agent_admission(P, candidate, "S5G") == "diversity:template_full:a"
     P.cfg["diversity"].update(enforce=False, min_released=2)
     assert stages_a._agent_admission(P, candidate, "S5G") is None
@@ -517,7 +511,7 @@ def test_unsupported_files_are_skipped_not_fatal(tmp_path):
 
 
 @pytest.mark.parametrize("isolated", [True, False])
-def test_probes_use_isolated_seed_zero(tmp_path, monkeypatch, wired_gates, isolated):
+def test_probes_use_isolated_packaged_seed(tmp_path, monkeypatch, wired_gates, isolated):
     cfg, spec, _, _ = wired_gates
     cfg["gen"]["seeds"] = [7, 0]
     checked, used = [], []
@@ -530,7 +524,7 @@ def test_probes_use_isolated_seed_zero(tmp_path, monkeypatch, wired_gates, isola
     monkeypatch.setattr(runner, "truth_probe", truth)
     monkeypatch.setattr(runner, "output_probe", probe)
     rep = gates.run_gates(cfg, tmp_path, spec, {}, 1)
-    assert checked == [("gen0", "out-ref0")]
+    assert checked == [("detA", "out-ref7")]
     assert used == (checked * 2 if isolated else [])
     assert rep["gates"]["truth_isolation"] == isolated
     assert {"threshold_format", "statement_clean", "hidden_parity",
@@ -550,13 +544,12 @@ def test_hidden_margin_defaults_to_the_old_rule():
 
 
 def test_statement_science_words_stay_clean():
-    # finding 13 (+ real share lines: lever arm, convergence audit)
     for line in ("Measure gate voltage in volts.", "Estimate the strain hardening exponent.",
-                 "the LiDAR is mounted with a different lever arm;", "every case must pass a convergence audit.",
+                 "Measure the applied force at the end of the lever arm.", "Record the residuals in a convergence audit.",
                  "See Fig. S7 for the layout.", "Use the 2019 data revision."):
         assert not statement_clean(line), line
-    for line in ("## Output-contract clarification (audit copy)", "## Additional hidden-output checks (audit revision)",
-                 "The S7 gate rejects constant outputs.", "Hardening round 2 added noise.", "difficulty lever DSW03"):
+    for line in ("## Toy example (audit copy)", "## Example table (audit revision)",
+                 "The S7 gate rejects constant outputs.", "Hardening round 2 added noise.", "difficulty lever X"):
         assert statement_clean(line), line
 
 
@@ -605,7 +598,6 @@ def test_orphan_reservation_settled_before_relaunch(tmp_path, monkeypatch):
 
 
 def test_parity_matches_renamed_hidden_metrics():
-    # released-task metric names: public_rr10 vs hidden_rr10_set_a, public_rel_rmse vs hidden_large_rel_rmse_max
     rows = [{"name": n} for n in ("public_rr10", "hidden_rr10_set_a", "public_rel_rmse", "hidden_large_rel_rmse_max",
                                   "public_mean_clean_error", "hidden_max_clean_error", "public_host_accuracy")]
     assert gates.hidden_parity(rows, {"metrics": []})["missing_hidden"] == ["host_accuracy"]
@@ -1016,7 +1008,7 @@ def test_resume_b88e514_reservation(tmp_path, monkeypatch):
         assert db.execute("SELECT id,reservation_key FROM calls").fetchall() == [(old, resumed["reservation_key"])]
 
 
-def test_resume_b88e514_manifest(tmp_path):
+def test_resume_b88e514_manifest(tmp_path, monkeypatch):
     store = Store(tmp_path)
     it = store.item("x")
     it.state.update(stage="S10", calib_epoch=2, calib_label="hard")
@@ -1024,12 +1016,22 @@ def test_resume_b88e514_manifest(tmp_path):
     cfg["review"]["enabled"] = False
     manifest = tmp_path / "release/manifest.jsonl"
     manifest.parent.mkdir()
+    it.p("pkg").mkdir(parents=True, exist_ok=True)
     previous = dict(item_id="x", pkg=str(it.p("pkg")), label="hard", channel="main", calib_runs=[], result_types=[],
                     calib_epoch=2, review=None, difficulty=None, ts=42.)
     manifest.write_text(json.dumps(previous) + "\n")
+    hashed = []
+    hash_directory = stages_b.calib.pkg_sha
+
+    def track_hash(path):
+        hashed.append(path)
+        return hash_directory(path)
+
+    monkeypatch.setattr(stages_b.calib, "pkg_sha", track_hash)
     stages_b.s10(SimpleNamespace(cfg=cfg, store=store), it)
     assert it.state["status"] == "done"
     assert manifest.read_text().splitlines() == [json.dumps(previous)]
+    assert hashed == [it.p("pkg"), Path(previous["pkg"])]
 
 
 def test_release_records_changed_review_and_label(tmp_path):
@@ -1182,7 +1184,7 @@ def test_ans_control_in_s7_and_review_bundle(tmp_path, monkeypatch, wired_gates,
 
     def score(*args):
         result = verify(*args)
-        if args[-1] in ("ref0", "probe-ref0"):
+        if args[-1] == f"ref{seeds[0]}":
             result.update(rc=rc, reward=reward, passed=reward == "1")
         return result
 
@@ -1277,3 +1279,52 @@ def test_side_file_only_suspicion_identifies_transformed_path(tmp_path, monkeypa
     assert scope["status"] == "shortcut_suspected" and result["control"] is None
     assert scope["transformed_files"] == [dict(path="debug/scores.csv", declared_deliverable=expected)]
     assert scope["verifier"]["out"] == "public.csv accepted"
+
+
+@pytest.mark.parametrize("reason,baseline_passed,oracle_ok,advance", [
+    ("gates:coverage", False, True, True),
+    ("gates:hidden_garbage,exploit", False, True, True),
+    ("gates:exploit", False, True, True),
+    ("gates:exploit", True, True, False),
+    ("gates:coverage", False, False, False),
+])
+def test_resume_probe_only_repair(tmp_path, reason, baseline_passed, oracle_ok, advance):
+    cfg = load_config()
+    it = Store(tmp_path).item("toy")
+    limit = cfg["gates"]["max_repair_rounds"]
+    it.state.update(stage="S8", repair_from=reason, repair_rounds=limit)
+    folded = "exploit" in reason
+    flags = dict(oracle=oracle_ok, exploit=not folded, exploit_valid=True, hidden_garbage=not folded, coverage=False)
+    seed = dict(ref={"passed": True}, exploit_echo={"passed": baseline_passed}, exploit__hidden_garbage={"ok": False})
+    write_json(it.p("gates/attempt-10.json"), dict(gates=flags, details=dict(seeds={"7": seed}),
+                                                   blocking=reason[6:].split(","), ok=False))
+    stages_b.s8(SimpleNamespace(cfg=cfg), it)
+    if advance:
+        assert it.state["stage"] == "PKG" and it.state["status"] == "active"
+    else:
+        assert it.state["status"] == "dropped" and it.state["reason"].startswith("repair_limit:")
+    assert it.state["repair_rounds"] == limit
+
+
+@pytest.mark.parametrize("directive,expected", [
+    ("Write a.csv and b.csv from input.csv.", {"a.csv", "b.csv"}),
+    ("Submit a.csv, b.csv, or c.csv.", {"a.csv", "b.csv", "c.csv"}),
+    ("Save `a.csv`, `dir/b.csv` and `c.csv` using `raw.csv`.", {"a.csv", "dir/b.csv", "c.csv"}),
+    ("Produce `a.csv` or `b.csv`.", {"a.csv", "b.csv"}),
+])
+def test_declared_output_lists(directive, expected):
+    from tbsgen.statement import declared_outputs
+    assert declared_outputs({}, directive) == expected
+
+
+@pytest.mark.parametrize("change", ["t //= 10", "t = t / 10"])
+def test_timeout_after_reassignment(change):
+    assert not package.run_solution_timeouts(f"t=1200\n{change}\nrun_solution(t)", 780)
+    assert package.run_solution_timeouts(f"def verify():\n    t=9000\n    {change}\n    run_solution(t)", 780) == [
+        "line 4: run_solution timeout 900s >= verifier budget 780s"]
+
+
+def test_dynamic_reassignment_reports_unknown():
+    for change in ("t //= factor()", "t = choose()", "if maybe: t = 60"):
+        assert package.run_solution_timeouts(f"t=1200\n{change}\nrun_solution(t)", 780) == [
+            "line 3: run_solution timeout unknown"]

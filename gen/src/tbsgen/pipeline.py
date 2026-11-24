@@ -300,7 +300,7 @@ class Pipeline:
             out["until"] = until
         return out
 
-    def resume(self, reasons_prefix: tuple[str, ...] = ("budget:", "model:"), only: list[str] | None = None,
+    def resume(self, reasons_prefix: tuple[str, ...] = ("budget:", "model:", "parked:probe_unreviewed"), only: list[str] | None = None,
                stages: list[str] | None = None) -> list[str]:
         """Re-activate paused items whose reason starts with one of reasons_prefix; only: just these item ids;
         stages: just items paused at these stages."""
@@ -311,7 +311,9 @@ class Pipeline:
             hist = it.state.get("history") or [{}]
             if stages and hist[-1].get("paused_stage", it.state["stage"]) not in stages:
                 continue
-            if it.state["status"] == "paused" and str(it.state.get("reason", "")).startswith(reasons_prefix):
+            probe_park = (it.state["status"] == "parked" and it.state.get("reason") == "parked:probe_unreviewed"
+                          and (self.cfg.get("review") or {}).get("enabled"))
+            if (it.state["status"] == "paused" or probe_park) and str(it.state.get("reason", "")).startswith(reasons_prefix):
                 it.state["stage"] = hist[-1].get("paused_stage", it.state["stage"])
                 it.state["status"] = "active"
                 it.save()

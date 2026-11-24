@@ -155,7 +155,7 @@ def admission(P, it, stage):
     group = next(g for g in clusters([candidate, *live], early=stage == "S5G") if candidate.id in g)
     members = [i for i in group if i != candidate.id]
     reason = None
-    # an area share means nothing over a handful of releases (1 released astronomy task = 100 %)
+    # an area share means nothing over a handful of releases
     if len(live) >= int(cfg.get("min_released", 20)) and share > cfg["max_area_share"]:
         reason = f"diversity:area_full:{candidate.area}"
     elif len(members) >= cfg["max_per_template"]:

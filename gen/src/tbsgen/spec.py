@@ -269,8 +269,7 @@ def set_thresholds(spec: dict, measure: dict, cfg: dict) -> dict:
             thr = _round_sig(exact, tc["sig_digits"] + 2, d, toward_loose=False)
         if naive_capped and not _worse(d, n_best, exact):
             # the cap fell back to the reference-margin floor and the naive baseline clears even the exact value:
-            # this metric does not reject naive at any precision, so extra digits buy nothing (a released
-            # task once printed `>= 0.8665767420502813` this way).  Keep the readable rounding.
+            # this metric does not reject naive at any precision, so keep the readable rounding.
             naive_capped = False
         if naive_capped and not _worse(d, n_best, thr):  # nor the naive baseline (review #9)
             for extra in (1, 2, 3):

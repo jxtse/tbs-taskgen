@@ -509,7 +509,7 @@ def output_probe(cfg, task, gen, ref_out, work, arm, prog):
             status = "inconclusive"
             trial["error"] = "no failed non-resource check"
         else:
-            # ANS uses the already scored seed-zero reference. PROG shares one all-set control per arm.
+            # ANS uses the already scored package-seed reference. PROG shares one all-set control per arm.
             if prog and control is None:
                 control = _probe_run(cfg, task, gen, ref_out, work, tag + "__control", arm, prog, kind, name,
                                      identity=True)

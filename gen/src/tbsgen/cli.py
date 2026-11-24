@@ -97,7 +97,7 @@ def main(argv=None):
         if name == "resume":
             s.add_argument("--only", default="", help="ID[,ID]: just these items")
             s.add_argument("--stage", default="", help="STAGE[,STAGE]: just items paused at these stages")
-            s.add_argument("--reason", default="budget:,model:", help="reason prefixes (comma-separated)")
+            s.add_argument("--reason", default="budget:,model:,parked:probe_unreviewed", help="reason prefixes (comma-separated)")
         if name == "calib":
             s.add_argument("action", choices=["watch", "prepare"])
             s.add_argument("--only", default="", help="watch: ID[,ID]")

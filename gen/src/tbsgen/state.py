@@ -44,6 +44,17 @@ def read_json(path: Path, default=None):
         return default
 
 
+def gate_attempts(directory: Path) -> list[Path]:
+    """Numeric attempt order, shared by packaging and review."""
+    return sorted((p for p in directory.glob("attempt-*.json") if p.stem[8:].isdigit()),
+                  key=lambda p: int(p.stem[8:]))
+
+
+def latest_gate_report(directory: Path) -> dict:
+    attempts = gate_attempts(directory)
+    return read_json(attempts[-1], {}) if attempts else {}
+
+
 @dataclass
 class Item:
     root: Path

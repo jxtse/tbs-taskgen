@@ -1,4 +1,4 @@
-"""PKG: build the Harbor task directory items/<id>/pkg/ from the working tree + seed-0 generation.
+"""PKG: build the Harbor task directory items/<id>/pkg/ from the working tree + first configured seed's generation.
 
 Standard Harbor task layout, plus:
   * tests/hidden copied only into tests/ (never into environment/)
@@ -225,8 +225,8 @@ def instruction_text(cfg: dict, spec: dict, text: str) -> str:
             + "\n")
 
 
-def run_solution_timeouts(src: str, budget: float) -> list[str]:
-    """Statically resolve numeric literals and simple module constants without executing task code."""
+def run_solution_timeouts(src: str, budget: float, *, warnings: list[str] | None = None) -> list[str]:
+    """Resolve simple numeric bindings. Dynamic timeouts are diagnostics, not budget violations."""
     try:
         tree = ast.parse(src)
     except SyntaxError as e:
@@ -238,15 +238,42 @@ def run_solution_timeouts(src: str, budget: float) -> list[str]:
     errors = []
     # Module constants are taken in source order: a module-level call sees the value bound above it; a call inside a
     # function (run later, at pytest time) sees the final module-level value.
+    def divide(left, op, right):
+        if left is None or right in (None, 0):
+            return None
+        try:
+            if isinstance(op, ast.FloorDiv):
+                return left // right
+            if isinstance(op, ast.Div):
+                return left / right
+        except ArithmeticError:
+            pass
+        return None
+
+    def numeric(node, bindings):
+        if isinstance(node, ast.Name):
+            return bindings.get(node.id)
+        if isinstance(node, ast.Constant) and type(node.value) in (int, float):
+            return node.value
+        if isinstance(node, ast.BinOp):
+            return divide(numeric(node.left, bindings), node.op, numeric(node.right, bindings))
+        return None
+
     def bind(node, bindings):
         if isinstance(node, (ast.Assign, ast.AnnAssign)):
+            value = numeric(node.value, bindings)
             for target in (node.targets if isinstance(node, ast.Assign) else [node.target]):
                 if isinstance(target, ast.Name):
-                    bindings[target.id] = node.value.value if isinstance(node.value, ast.Constant) else None
-
-    final = {}
-    for node in tree.body:
-        bind(node, final)
+                    bindings[target.id] = value
+                else:
+                    for name in local_names(target):
+                        bindings[name] = None
+        elif isinstance(node, ast.AugAssign) and isinstance(node.target, ast.Name):
+            name = node.target.id
+            bindings[name] = divide(bindings.get(name), node.op, numeric(node.value, bindings))
+        else:
+            for name in local_names(node):
+                bindings[name] = None
 
     scopes = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)
 
@@ -259,6 +286,10 @@ def run_solution_timeouts(src: str, budget: float) -> list[str]:
             yield node.id
         for child in ast.iter_child_nodes(node):
             yield from local_names(child)
+
+    final = {}
+    for node in tree.body:
+        bind(node, final)
 
     def visit(node, visible, deferred, class_parent):
         if isinstance(node, scopes):
@@ -291,9 +322,17 @@ def run_solution_timeouts(src: str, budget: float) -> list[str]:
                 arg = next((k.value for k in node.keywords if k.arg == "timeout_sec"), None)
                 if arg is None and node.args:
                     arg = node.args[0]
-                value = visible.get(arg.id) if isinstance(arg, ast.Name) else getattr(arg, "value", None)
-                if type(value) in (int, float) and value >= budget:
+                value = numeric(arg, visible)
+                if value is None and arg is not None:
+                    diagnostics = warnings if warnings is not None else errors
+                    diagnostics.append(f"line {node.lineno}: run_solution timeout unknown")
+                elif value is not None and value >= budget:
                     errors.append(f"line {node.lineno}: run_solution timeout {value:g}s >= verifier budget {budget:g}s")
+        if isinstance(node, ast.stmt) and any(isinstance(c, ast.stmt) for c in ast.iter_child_nodes(node)):
+            # Branch/loop execution is unknown. Never reuse a binding it might overwrite.
+            visible = dict(visible)
+            for name in local_names(node):
+                visible[name] = None
         for child in ast.iter_child_nodes(node):
             visit(child, visible, deferred, class_parent)
 
@@ -353,7 +392,9 @@ def validate_pkg(pkg: Path, cfg: dict | None = None) -> dict:
         for name in ("measure.py", "test_outputs.py"):
             path = pkg / "tests" / name
             if path.is_file():
-                errs.extend(f"{name}: {e}" for e in run_solution_timeouts(path.read_text(), budget))
+                unknown = []
+                errs.extend(f"{name}: {e}" for e in run_solution_timeouts(path.read_text(), budget, warnings=unknown))
+                warnings.extend(f"{name}: {w}" for w in unknown)
     except Exception as e:  # noqa: BLE001
         errs.append(f"task.toml: {e}")
     if cfg is not None and not missing:

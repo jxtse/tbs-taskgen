@@ -250,7 +250,7 @@ items/<item_id>/
 | S6C | 规格 + 阈值 + 实测 | `tests/test_outputs.py`、`instruction.md`、`baselines/exploit_*.py` | Opus | 缺文件 `dropped` |
 | S7 | 完整工作树 | `gates/attempt-n.json` | 无（Docker） | 阻塞级 → S8；只有“阈值未写明”时由程序追加判据表 |
 | S8 | 门日志 + 依赖图 + 相关文件 | `repair/round-n/`（补丁 + 审查结论） | Opus 修复；审查为机械 diff | 审查不过算用掉 1 轮；2 轮后 `dropped: repair_limit` |
-| PKG | 通过 S7 的题 + 种子 0 产物 | `pkg/` + `PKG_check.json` | 无 | `parked: package_invalid` |
+| PKG | 通过 S7 的题 + 首个配置种子的产物 | `pkg/` + `PKG_check.json` | 无 | `parked: package_invalid` |
 | S9 | `pkg/` | `calib/*.json` 作业配置 + 启动命令；`runs.json` | 不调用（只调度） | 见 §5 |
 | S10 | 标签为 hard/unstable（channel main）或 frontier（channel frontier）的题 | `release/manifest.jsonl` | 无 | — |
 
@@ -437,7 +437,7 @@ S9 打出标签后，**hard / unstable**（`calib.keep_labels`）必须先过审
 
 | 配置 | 默认 | 说明 |
 |---|---|---|
-| `review.enabled` | true | 关闭后 S9 标签直接按原规则走 |
+| `review.enabled` | true | 关闭后有可疑探针范围的题暂存为 `parked:probe_unreviewed`，开启后可用 `tbsgen resume` 恢复 |
 | `review.model / agent / environment / agent_allowed_hosts / harbor_root / launcher / jobs_dir` | None（沿用教师路由） | 审核作业的模型、agent、Harbor 环境、agent 阶段放行主机、启动脚本目录与脚本、作业目录 |
 | `review.est_usd_per_run` | None（= `calib.est_usd_per_run`） | 账本预留 |
 | `review.timeout_sec` | 3600 | 审核任务的 agent 超时 |
@@ -501,14 +501,14 @@ S9 打出标签后，**hard / unstable**（`calib.keep_labels`）必须先过审
 
 ### 6c. 题面、隐藏集与题库分布（2026-11-24）
 
-- S6B 的阈值舍入最多增加 3 位有效数字。仍无法排除基线时记录 `threshold_unreadable`，进入原有修复流程。naive 基线连精确值都能通过时（该指标本来就拒不掉 naive），不再为它加位数，而是保留 2 位有效数字（例如曾出现过 `≥ 0.8665767420502813` 这样的阈值，现为 0.86）。S7 的 `threshold_format` 要求阈值处的数最多 6 位有效数字，题面任何数最多 12 位有效数字（GM、J2 等物理常数不受影响）。隐藏指标的参考余量可单独由 `thresholds.min_ref_margin_hidden` 设定，默认 None 即沿用旧规则（`min_ref_margin` 的一半，自定义过 `min_ref_margin` 的配置也一样）；设为 0.10 时已发布的题目中约有六分之一不过，提高前需重新校准。阈值格式、题面卫生、适用版本的隐藏指标覆盖和生成假设检查明确失败时进入 S8 修复。
+- S6B 的阈值舍入最多增加 3 位有效数字。仍无法排除基线时记录 `threshold_unreadable`，进入原有修复流程。naive 基线连精确值都能通过时（该指标本来就拒不掉 naive），不再为它加位数，而是保留 2 位有效数字。S7 的 `threshold_format` 要求阈值处的数最多 6 位有效数字，题面任何数最多 12 位有效数字（GM、J2 等物理常数不受影响）。隐藏指标的参考余量可单独由 `thresholds.min_ref_margin_hidden` 设定，默认 None 即沿用旧规则（`min_ref_margin` 的一半，自定义过 `min_ref_margin` 的配置也一样）；调整余量时需重新校准。阈值格式、题面卫生、适用版本的隐藏指标覆盖和生成假设检查明确失败时进入 S8 修复。
 - `statement_clean` 拦截内部编辑文字（audit copy / audit revision、reviewer note、S7 gate、hardening round、TODO、tbsgen、mid/naive baseline 等）和 HTML 注释；单独的 gate、hardening、lever、audit、revision、patch、internal standard、baseline-free 这类科学用法不拦（gate voltage、strain hardening、lever arm、convergence audit）。新 S5/S5G spec 列出 `generator_assumptions`，已明说的引文在合并空白后须至少 12 个字符。`assumptions_stated` 逐条核对题面原文，未明说的条件须填写 `recovered from data: <恢复方法>`。S9R 对照生成器和参考解复核。
 - PROG 的 `hidden_parity` 对照实际检查的公开、隐藏指标族。v2.7 / cg-v3 及更早版本只记录缺项。v2.8–v2.9 / cg-v4–cg-v5 按隐藏集合计覆盖，兼容内置 max、sum。v2.10 / cg-v6 起逐集检查来源（含单集）；PR #43 变基后须改用 cg-v7。新评分代码用 `hidden_value(d, name, value)` 标记测量值，聚合必须用 `hidden_aggregate("max", values)` 等显式操作，直接将结果传入 `check`。只有传入值携带的来源计入本次检查。指标族按去掉 mean/max/set_a 等聚合词后的词元匹配，公开指标可用 `public_only: true` 和 `public_only_reason` 声明例外。只在隐藏集上查的指标和只记录的资源指标均不算缺失。`hidden_shift` 在两个隐藏集完全相同、隐藏集与公开数据完全相同、或某个隐藏集一半以上字节是公开文件的拷贝（小文件也算）时阻塞；单个共用文件（训练表、时间网格）只记录在 `copied_files`。共用校准表等可按文件名列入 `shared_inputs`。
-- S7 在种子 0 运行两种输出探针。`one_confident`（报告中的 `coverage`）把超过 5 行的 CSV 缩为置信度最高的一行，`hidden_garbage` 重排隐藏表的答案。两者优先采用值唯一的标识列（如 `filename`、`patient_id`、`sample_key`），找不到时才考虑首列。多个标识列都可作键时跳过该表。纯行重排不算答案变化。
-- 每次只变换公开输出或一个隐藏集。行集合或按键对应的答案发生变化且评分器正常退出、给出 reward 1 时，该范围记为 `shortcut_suspected`，即使原值对照失败也保留。reward 0 且有非资源检查失败、原值对照通过时记为 `caught`。ANS 复用种子 0 的参考解评分。PROG 在真值隔离通过后运行探针，仅当有待确认的非资源拒绝时才运行一次该探针共用的全隐藏集原值对照。无适用变换记为 `na`，其余记为 `inconclusive` 并附原因。
-- 两种探针在所有提示词版本中都只提供审核证据。S9R 审核包的 `records/output_probes.json` 保存当前 S7 尝试的逐范围结果、变换文件的相对路径、是否为声明的交付物（无法确定时为 `unknown`）以及各次验证器输出。审核者须用评分器逐项复现 `shortcut_suspected`，在 `probe_findings` 以完整 ID（如 `hidden_garbage/hidden:A`）记录命令、结果与理由。确认评分漏洞须关联阻塞问题并按原规则修订或淘汰。探针误报须说明原因。漏答任一 ID 按无效裁决重审。
+- S7 在首个配置种子（打包种子）上运行两种输出探针。`one_confident`（报告中的 `coverage`）把超过 5 行的 CSV 缩为置信度最高的一行，`hidden_garbage` 重排隐藏表的答案。两者优先采用值唯一的标识列（如 `filename`、`patient_id`、`sample_key`），找不到时才考虑首列。多个标识列都可作键时跳过该表。纯行重排不算答案变化。
+- 每次只变换公开输出或一个隐藏集。行集合或按键对应的答案发生变化且评分器正常退出、给出 reward 1 时，该范围记为 `shortcut_suspected`，即使原值对照失败也保留。reward 0 且有非资源检查失败、原值对照通过时记为 `caught`。ANS 复用打包种子的参考解评分。PROG 在真值隔离通过后运行探针，仅当有待确认的非资源拒绝时才运行一次该探针共用的全隐藏集原值对照。无适用变换记为 `na`，其余记为 `inconclusive` 并附原因。
+- 两种探针在所有提示词版本中都只提供审核证据。S9R 审核包的 `records/output_probes.json` 保存当前 S7 尝试的逐范围结果、变换文件的相对路径、是否为声明的交付物（无法确定时为 `unknown`）以及各次验证器输出。审核者须用评分器逐项复现 `shortcut_suspected`，在 `probe_findings` 以完整 ID（如 `hidden_garbage/hidden:A`）填写实际执行的 `command`、`observed_reward`、至少 20 字符的 `observation` 和分类理由。确认评分漏洞须关联阻塞问题并按原规则修订或淘汰。探针误报须说明原因。漏答任一 ID 按无效裁决重审。
 - S7 报告中，`effort_floor` 提示参考解各次公开求解均少于 30 秒且专家估时至少 2 小时的题目。`data_realism` 提示所有公开文件均为 CSV/NPY/JSON/TXT 且总量小于 2 MB 的题目。两项供 S9R 参考，可分别在 spec 用 `effort_note`、`data_realism_note` 说明理由，`data_formats` 可列出实际格式。
 - PKG 静态检查两个评分脚本，要求显式的单次 `run_solution` 时限小于 verifier 超时减去 `package.verifier_overhead_sec`。题包必须声明 agent 和 verifier 的网络策略，verifier 始终离线，显式 public 对照组记录警告。`extra_pip` 最多 8 个 `name==version`，加入自包含 Dockerfile；PKG 在配置的沙箱镜像内离线核对安装版本，缺包或不匹配报 `extra_pip_unsupported`。
 - `tbsgen diversity --run DIR [--runs-root ROOT] [--json]` 按 14 个领域统计已发布和在途题目，列出空缺领域和相近方法簇。S5G 按候选主题和标题预估，S10 按完整 spec 复核。已发布题至少 `diversity.min_released`（20）道且领域占比超过 `diversity.max_area_share`（0.25），或同簇已有 `max_per_template`（2）题时，默认只写 state 和 event。`diversity.enforce=true` 时暂存为 parked：S5G 已预留但未启动的作业先把 run.json 退回 intent，再以 `diversity_parked`（不计入调用次数上限）结清预留；S10 对已在 manifest 中的版本不再重新判断，崩溃重试不会撤回已发布的题。
-- S10 以包哈希、校准 epoch、标签、审核摘要及其余发布元数据识别同一次追加，忽略写入时间。相同记录重放时直接完成，审核结论或其他发布字段变化时追加新行，消费者读取该题最后一条有效记录。末行中断时先补换行，再追加发布或撤回记录。恢复 `b88e514` 的旧行时按其已有字段比对，该版本未写入包哈希。
+- S10 以包哈希、校准 epoch、标签、审核摘要及其余发布元数据识别同一次追加，忽略写入时间。相同记录重放时直接完成，审核结论或其他发布字段变化时追加新行，消费者读取该题最后一条有效记录。末行中断时先补换行，再追加发布或撤回记录。旧行缺少包哈希时，从其记录的包目录计算后比对。
 - 只读审计分享包可运行 `python scripts/audit_share.py <share>/1-hard --runs-root <runs>`，标准输出为逐题表和 JSON 汇总。

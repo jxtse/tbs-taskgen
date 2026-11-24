@@ -10,7 +10,7 @@ teacher).  Its network is that of the teacher: the model endpoint during the age
 The agent writes /app/review_out/verdict.json:
     {"verdict": "pass" | "revise" | "drop",
      "checklist": {"a_consistency": {"status": "ok"|"issue"|"na", "note": ...}, ... "g_calibration": {...}},
-     "probe_findings": {"<arm>/<scope>": {"classification", "reproduction", "reason", ...}},
+     "probe_findings": {"<arm>/<scope>": {"classification", "command", "observed_reward", "observation", "reason", ...}},
      "issues": [{"id", "category", "severity": "blocking"|"minor", "fix_kind": "local"|"fundamental", "title",
                  "evidence": [...], "fix"}],
      "label_assessment": {"label": ..., "trustworthy": true|false|null, "reason": ...},
@@ -42,7 +42,7 @@ from pathlib import Path
 
 from . import calib
 from .probe_findings import finding_errors, has_evidence
-from .state import read_json
+from .state import gate_attempts, read_json
 
 VERDICTS = ("pass", "revise", "drop")
 ALLOWED_HUMAN = ("human",)          # accepted only behind review.allow_human (legacy verdicts stay readable)
@@ -68,7 +68,7 @@ CHECKLIST = ("a_consistency", "b_missing_conditions", "c_thresholds", "d_stabili
 CATEGORIES = {"a": "consistency", "b": "missing_conditions", "c": "thresholds", "d": "stability",
               "e": "shortcuts_leaks", "f": "network_readymade", "g": "calibration", "h": "timing_gate",
               "i": "author_code", "j": "genuine_difficulty"}
-REVIEW_PROMPT_VERSION = "s9r-v2"
+REVIEW_PROMPT_VERSION = "s9r-v3"
 VERDICT_PATH = "/app/review_out/verdict.json"
 # files a review revision (S8) may change: the statement, the data format notes (written by the generator), the
 # test / scoring scripts, and the exploit baselines.  Never the reference solution, the baselines' mid / naive,
@@ -271,6 +271,34 @@ def next_round(item_dir: Path, state: dict) -> int:
     return used
 
 
+PROBE_ARMS = {"coverage": "one_confident", "hidden_garbage": "hidden_garbage"}
+
+
+def suspected_scopes(report: dict) -> list[str]:
+    """Scope IDs from the current S7 attempt, including pre-status probe records."""
+    suspected = []
+    for gate, arm in PROBE_ARMS.items():
+        probe = report.get("details", {}).get(gate)
+        if not isinstance(probe, dict):
+            continue
+        accepted = set(probe.get("accepted_scopes", []))
+        for scope, trial in probe.get("scopes", {}).items():
+            if not isinstance(trial, dict):
+                continue
+            if "status" in trial:
+                hit = trial["status"] == "shortcut_suspected"
+            elif "rc" in trial or "count" in trial:
+                hit = trial.get("rc") == 0 and trial.get("count", 0) > 0 and trial.get("reward") == "1"
+            else:
+                hit = trial.get("reward") == "1" or scope in accepted
+            if hit:
+                accepted.add(scope)
+            else:
+                accepted.discard(scope)
+        suspected.extend(f"{arm}/{scope}" for scope in sorted(accepted))
+    return suspected
+
+
 def write_bundle(item_dir: Path, dest: Path, state: dict, digest_kb: int = 150) -> dict:
     """Everything the reviewer may read, under dest (becomes /review in the container)."""
     if dest.exists():
@@ -306,29 +334,17 @@ def write_bundle(item_dir: Path, dest: Path, state: dict, digest_kb: int = 150) 
         if prev_task.is_dir() and (item_dir / "task").is_dir():
             from .difficulty import version_diff
             (rec / "hardening" / f"{h.parent.name}-diff.patch").write_text(version_diff(prev_task, item_dir / "task"))
-    gates = sorted((item_dir / "gates").glob("attempt-*.json"), key=lambda p: int(p.stem.split("-")[-1]))
+    gates = gate_attempts(item_dir / "gates")
     probes, suspected = {}, []
     if gates:
         (rec / "s7_gates").mkdir()
         for g in gates:
             shutil.copy2(g, rec / "s7_gates" / g.name)
         # Older attempts describe earlier graders. Only the last S7 attempt binds the current verdict.
-        details = read_json(gates[-1], {}).get("details", {})
-        for gate, arm in (("coverage", "one_confident"), ("hidden_garbage", "hidden_garbage")):
-            if gate not in details:
-                continue
-            report = details[gate]
-            probes[arm] = report
-            if not isinstance(report, dict):
-                continue
-            for scope, trial in report.get("scopes", {}).items():
-                if not isinstance(trial, dict):
-                    continue
-                # Before per-scope statuses, a failed control could mask an accepted transformation.
-                legacy_hit = ("status" not in trial and trial.get("rc") == 0 and trial.get("reward") == "1"
-                              and trial.get("count", 0) > 0)
-                if trial.get("status") == "shortcut_suspected" or legacy_hit:
-                    suspected.append(f"{arm}/{scope}")
+        report = read_json(gates[-1], {})
+        details = report.get("details", {})
+        probes = {arm: details[gate] for gate, arm in PROBE_ARMS.items() if gate in details}
+        suspected = suspected_scopes(report)
     (rec / "output_probes.json").write_text(json.dumps(dict(probes=probes, suspected_scopes=suspected), indent=2))
     if probes:
         shutil.copy2(Path(__file__).with_name("probe_outputs.py"), rec / "probe_outputs.py")
@@ -434,8 +450,9 @@ def build_task(cfg: dict, item_dir: Path, state: dict, rnd: int, out: Path | Non
     (out / "tests" / "test.sh").write_text(TEST_SH)
     (out / "tests" / "test.sh").chmod(0o755)
     (out / "solution").mkdir()
-    smoke_findings = {scope: dict(classification="probe_artefact", reason="synthetic harness smoke test",
-                                   reproduction="synthetic harness smoke test") for scope in info["suspected_scopes"]}
+    smoke_finding = dict(classification="probe_artefact", reason="synthetic harness smoke test",
+                         command="python -m pytest", observed_reward=1, observation="Synthetic verifier smoke test.")
+    smoke_findings = {scope: smoke_finding for scope in info["suspected_scopes"]}
     (out / "solution" / "solve.sh").write_text(ORACLE_SH.replace("{findings}", json.dumps(smoke_findings)))
     (out / "solution" / "solve.sh").chmod(0o755)
     return out
@@ -606,10 +623,12 @@ e. **Shortcuts and leaks.**  Can the task be passed without doing the work (hard
    verifier output and identity controls. Required shortcut_suspected scope IDs for this package: {suspected}.
    For EACH ID, reproduce the scoped run with the packaged grader. The exact transformations and CLI wrapper are in
    `records/probe_outputs.py` when probes are present. Change only the named public or hidden scope and check
-   which changed values the statement requires and the grader scores. Record the command and observed reward/checks
-   in `probe_findings`, keyed by that exact ID. Classify a real grader gap as `grader_gap` and link its evidenced
-   blocking issue by `issue_id` (normal revision/drop rules). For a `probe_artefact`, explain why the changed
-   files or values do not demonstrate a grader defect. Use an empty object when no scopes are suspected.
+   which changed values the statement requires and the grader scores. In `probe_findings`, record the exact ID,
+   the `command` you ran, its `observed_reward` ("0", "1", or a number), and an `observation` of at least
+   20 characters describing the grader output. An optional `reproduction` note may add context.
+   Classify a real grader gap as `grader_gap` and link an evidenced blocking issue by `issue_id`. This applies
+   to additional grader gaps you find too. For a `probe_artefact`, explain why the changed files or values do
+   not demonstrate a grader defect.
 f. **Network / ready-made code.**  Does solving it need the internet or the paper's published implementation?
 g. **Calibration evidence.**  Using the traces: did failures come from the task's difficulty, from a task defect
    (ambiguity, contradiction), or from the harness / infrastructure (timeouts from a slow model, crashes, API
@@ -692,7 +711,8 @@ Write `{verdict_path}` (JSON, exactly these keys) and optionally `/app/review_ou
     "h_timing_gate": {{"status": "...", "note": "..."}}
   }},
   "probe_findings": {{"<required scope ID>": {{"classification": "grader_gap | probe_artefact",
-    "reproduction": "command and grader output", "reason": "why", "issue_id": "required for grader_gap"}}}},
+    "command": "exact command run", "observed_reward": 1, "observation": "describe the actual grader output",
+    "reason": "why", "issue_id": "required for grader_gap"}}}},
   "issues": [
     {{"id": "I1", "category": "a|b|c|d|e|f|g|h|i|j", "severity": "blocking | minor",
       "problem": "statement | format_notes | grader_io | exploit_baseline | test_gap | timing_gate | reference_wrong | truth_regen | core_invalid | calibration",
