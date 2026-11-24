@@ -17,7 +17,7 @@ cp examples/pipeline.toml examples/config.local.toml
 | 命令 | 产物与判定 |
 |---|---|
 | `ingest --run DIR ... --job DIR ...` | `tasks.jsonl` 记录题包内容哈希和发布记录，`trials.jsonl` 记录会话路径、模型、异常、时长、费用与验证器路径。额外作业目录可省略。 |
-| `difficulty` | `difficulty.jsonl` 给出学生及教师的有效尝试数、通过数、学生通过率和无效尝试数。同一校准作业优先使用原生 trial，避免重复计数。 |
+| `difficulty` | `difficulty.jsonl` 给出学生及教师的有效尝试数、通过数、学生通过率和无效尝试数。只计算发布清单中的校准作业，以及路径和已记录哈希均匹配发布包的额外 rollout。旧包 trial 在账本中标为 `stale_package`。同一校准作业优先使用原生 trial，避免重复计数。 |
 | `filter-tasks` | `filtered.jsonl` 逐项检查 S10 已完成、审核通过、标签可信、题面卫生及留出集。相同 DOI 或标题词集 Jaccard ≥ 0.8 时优先保留通过次数较多的题。可选模块 `tbsgen.statement` 缺失时记录跳过。 |
 | `screen` | `screen.jsonl` 给出 keep、strip 或 drop。检查得分、结束状态、模型身份、隐藏材料、离线任务联网及调用配对。只剥离可确认无实质结果的探查及其返回，保留同轮独立的并行调用。清理后的块记录在 `segments/`。 |
 | `judge --kind task` | 对题面、评分程序、指标规格分配文本窗口，判断科学性、公平性、完整性和估计难度，记录 keep、flag 或 drop 及原文证据。 |
@@ -28,13 +28,13 @@ cp examples/pipeline.toml examples/config.local.toml
 | `submit` | 本地校验通过后上传、读取平台报告，再执行训练 dry-run。加 `--confirm` 才会启动训练并读取 show 和 events。 |
 | `rollout` | 根据已选题写出 `rollout/job.json` 和 `rollout/launch.sh`。作业由操作员启动，完成后用 `ingest --job` 纳入下一轮。 |
 
-各子命令均支持 `--config FILE`。每阶段以输入内容、相关配置、上游产物键和阶段版本计算 SHA-256 键。完成结果位于 `<out>/.stages/`，同一输出目录用文件锁串行发布。重复执行会复用已有结果。当前阶段的摘要在 `reports/<stage>.json`，逐项原因在 `<stage>.ledger.jsonl`。上游回执的代码指纹必须与当前版本一致。容许错误比例内的评审结果可供选择阶段使用，重跑时重试出错条目。已验证的评审请求缓存在 `.judge-cache/`。
+各子命令均支持 `--config FILE`。每阶段以输入内容、相关配置、上游产物键和阶段版本计算 SHA-256 键。完成结果位于 `<out>/.stages/`，同一输出目录用文件锁串行发布。重复执行会复用已有结果。当前阶段的摘要在 `reports/<stage>.json`，逐项原因在 `<stage>.ledger.jsonl`。每次使用上游回执时，会根据当前配置和输入重新计算阶段键。容许错误比例内的评审结果可供选择阶段使用，重跑时重试出错条目。已验证的评审请求缓存在 `.judge-cache/`。
 
 ## 难度与配比
 
 学生通过率 ≤ 1/3 且教师至少通过一次为 hard，(1/3, 2/3] 为 medium，> 2/3 为 easy。所有模型均未通过为 unsolved。证据不足以定层的题标为 unclassified。环境、安装故障和无提交的 API 故障剔除，有提交且已评分的超时按实际得分统计。训练轨迹另需通过结束状态检查。
 
-题目和轨迹评审都须 keep。easy 还需质量 ≥ 4。默认目标为 hard 45%、medium 40%、easy 15%。每题最多选两条，优先不同 harness，再取监督 token 较短者。按最大余数分配整数名额，并检查每题监督 token 占比上限。数据不足时会缩小入选集。默认 2% 上限意味着少于 50 道题不能构成非空训练集；小规模合成测试在本地配置中显式放宽上限。
+题目和轨迹评审都须 keep。easy 还需质量 ≥ 4。默认 `easy_cap` 保留通过筛选的 hard 和 medium，按质量补入 easy，至多占最终集合的 15%。每题最多选两条，优先不同 harness，再取监督 token 较短者。显式设置 `mode="shares"` 时，按最大余数分配整数名额（默认权重 hard 45%、medium 40%、easy 15%），数据不足时缩小集合。两种模式都检查每题监督 token 占比上限。默认 2% 上限意味着少于 50 道题不能构成非空训练集；小规模合成测试在本地配置中显式放宽上限。
 
 ## 私有 wire profile 和请求比对
 

@@ -1,6 +1,7 @@
 """Operator-facing Harbor configuration generation and MinT submission."""
 
 import os
+import re
 import shlex
 import subprocess
 import time
@@ -51,8 +52,8 @@ def ignored_fields(value):
         for key, entry in value.items():
             if key in ("fields_ignored", "preflight.fields_ignored") and isinstance(entry, list):
                 found.update(str(v) for v in entry)
-            if isinstance(entry, str) and "preflight.fields_ignored" in entry and "loss_mask" in str(value):
-                found.add("loss_mask")
+            if entry == "preflight.fields_ignored" and isinstance(value.get("fields"), list):
+                found.update(str(v) for v in value["fields"])
             found.update(ignored_fields(entry))
     if isinstance(value, list):
         for entry in value:
@@ -159,6 +160,14 @@ def submit(ctx, confirm, allow_warn):
         if checked["max_tokens"] > maximum:
             raise ValueError(f"dataset row exceeds dry-run max_length {maximum}")
         fields = ignored_fields(dry)
+        required = {"train_on_what", "max_length", *checked["required_fields"]}
+        conflicts = []
+        for field in sorted(fields):
+            parts = re.findall(r"[a-zA-Z_]+", field)
+            if parts and (parts[-1] in required or required.intersection(parts) & {"tools", "tool_calls"}):
+                conflicts.append(field)
+        if conflicts:
+            raise ValueError(f"dry-run fields_ignored conflicts with export: {', '.join(conflicts)}")
         execution = None
         if confirm:
             started = call("start", *args, "--idempotency-key", digest([version, config_hash]))

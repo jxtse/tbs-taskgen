@@ -3,7 +3,7 @@ from types import SimpleNamespace
 import pytest
 
 from tbstrain.cli import main
-from tbstrain.core import atomic, code_version, lines, read, write_lines
+from tbstrain.core import atomic, lines, read, write_lines
 from tbstrain.native import codex, message, segment
 from tbstrain.screen import inspect_segment
 from tbstrain.select import select
@@ -12,24 +12,29 @@ from tbstrain.wire import check, render
 from conftest import codex_events, link_events, toy_profile
 
 
-def test_captured_codex_windows(tmp_path):
+@pytest.mark.parametrize("summary,expected", [
+    ("Intermediate summary.", "Intermediate summary."),
+    ("Summarize.\nIntermediate summary.", "Intermediate summary."),
+    ("Summarize.", None),
+])
+def test_captured_codex_windows(tmp_path, summary, expected):
     events = codex_events()
 
     def output(text):
         return dict(type="message", role="assistant", content=[dict(type="output_text", text=text)])
 
     events[6:6] = [
-        dict(type="response_item", payload=output("Intermediate summary.")),
+        dict(type="response_item", payload=output(summary)),
         events[-1],
         dict(
             type="compacted",
             timestamp="2025-01-01T00:02:30Z",
-            payload=dict(window_id="w", message="Intermediate summary."),
+            payload=dict(window_id="w", message=summary),
         ),
         dict(
             type="response_item",
             payload=dict(
-                type="message", role="user", content=[dict(type="input_text", text="Intermediate summary.")]
+                type="message", role="user", content=[dict(type="input_text", text=summary)]
             ),
         ),
     ]
@@ -50,14 +55,14 @@ def test_captured_codex_windows(tmp_path):
                     result,
                     dict(type="message", role="user", content=[dict(type="input_text", text="Summarize.")]),
                 ],
-                output("Intermediate summary."),
+                output(summary),
             ),
             (
                 [
                     dict(
                         type="message",
                         role="user",
-                        content=[dict(type="input_text", text="Intermediate summary.")],
+                        content=[dict(type="input_text", text=summary)],
                     )
                 ],
                 output("The synthetic slope is one."),
@@ -84,7 +89,11 @@ def test_captured_codex_windows(tmp_path):
     assert notes["captured_windows"] == 2
     converted = [render(r, {}) for r in records]
     assert all(not check(row) for row in converted)
-    assert converted[0]["messages"][-1]["content"] == "Intermediate summary."
+    if expected:
+        assert converted[0]["messages"][-1]["content"] == expected
+        assert converted[0]["meta"]["summary_model"] == "student-model"
+    else:
+        assert not any(r["meta"].get("compaction") for r in converted)
     assert sum(len(m.get("tool_calls", [])) for row in converted for m in row["messages"]) == 1
     calls[-1]["output"]["output"] = [output("Mismatched response.")]
     write_lines(path, calls)
@@ -92,7 +101,7 @@ def test_captured_codex_windows(tmp_path):
         codex(events, {}, {"capture": str(path)})
 
 
-def test_selection_caps_diversity_and_quality(tmp_path):
+def test_selection_caps_diversity_and_quality(tmp_path, monkeypatch):
     from tbstrain.core import Context
 
     cfg = tmp_path / "config.toml"
@@ -126,8 +135,7 @@ def test_selection_caps_diversity_and_quality(tmp_path):
     data("judge-task", [dict(task_id=t, verdict="keep") for t in ("one", "two")])
     data("judge-trajectory", trajectory)
     data("screen", screened)
-    for stage in ("difficulty", "screen", "judge-task", "judge-trajectory"):
-        atomic(ctx.out / "reports" / (stage + ".json"), {"key": stage, "code": code_version()})
+    monkeypatch.setattr(ctx, "dependencies", lambda *stages: list(stages))
     select(ctx)
     chosen = list(ctx.rows("selection"))
     assert sorted(r["trial_id"] for r in chosen) == ["one-1", "one-2", "two-1", "two-2"]
@@ -652,3 +660,139 @@ def test_dependency_rejects_old_code(completed):
     atomic(path, {**read(path), "code": "previous-code"})
     assert main(["export", "--config", str(cfg)]) == 1
     assert "run screen again: code changed" in read(out / "reports/export.json")["error"]
+
+
+def test_release_epoch_excludes_stale_trials(workspace, judge_stub):
+    from shutil import copytree
+
+    run = workspace.parent / "run"
+    manifest = run / "release/manifest.jsonl"
+    rows = list(lines(manifest))
+    hard = next(r for r in rows if r["item_id"] == "hard")
+    old = run / "calib-jobs/hard-0"
+    current = old.with_name("hard-student-e8")
+    old.rename(old.with_name("hard-student-e1"))
+    old = old.with_name("hard-student-e1")
+    copytree(old, current)
+    hard["calib_runs"][0].update(job_name=current.name, reward=0, outcome="fail")
+    write_lines(manifest, rows)
+    result = read(current / "one/result.json")
+    result.update(id="current-trial", verifier_result={"rewards": {"reward": 0}})
+    atomic(current / "one/result.json", result)
+    assert main(["run", "--config", str(workspace)], transport=judge_stub) == 0
+    out = workspace.parent / "out"
+    tier = next(r for r in lines(out / "difficulty.jsonl") if r["task_id"] == "hard")
+    assert (tier["student_passes"], tier["student_attempts"], tier["teacher_passes"]) == (0, 3, 1)
+    audit = {r.get("trial_id"): r["reason"] for r in lines(out / "ingest.ledger.jsonl")}
+    assert audit["hard-trial"] == "stale_package" and audit["current-trial"] == "matched"
+    stale = next(r for r in lines(out / "screen.jsonl") if r["trial_id"] == "hard-trial")
+    assert stale["disposition"] == "drop" and "stale_package" in stale["reasons"]
+    assert all(r["trial_id"] != "hard-trial" for r in lines(out / "judge-trajectory.jsonl"))
+
+
+@pytest.mark.parametrize("binding,accepted", [
+    ("path", True), ("package_hash", True), ("wrong_hash", False),
+    ("wrong_path", False), ("harbor_hash", True), ("wrong_harbor_hash", False),
+])
+def test_rollout_release_binding(workspace, binding, accepted):
+    from hashlib import sha256
+    from shutil import copytree
+    from tbstrain.core import tree_hash
+
+    run = workspace.parent / "run"
+    pkg = run / "items/easy/pkg"
+    job = workspace.parent / "extra"
+    trial = job / "two"
+    copytree(run / "calib-jobs/easy-0/one", trial)
+    result = read(trial / "result.json")
+    result["id"] = "extra-trial"
+    config = read(trial / "config.json")
+    if binding == "wrong_path":
+        config["task"]["path"] = str(copytree(pkg, workspace.parent / "old/easy/pkg"))
+    if binding in {"package_hash", "wrong_hash"}:
+        config["task"]["pkg_sha256"] = tree_hash(pkg) if accepted else "outdated"
+    if binding in {"harbor_hash", "wrong_harbor_hash"}:
+        def sha(text):
+            return sha256(text.encode()).hexdigest()
+        tests = sha("data:" + sha("assert measured_slope == 1") + "\0name:test_outputs.py")
+        checksum = sha("data:" + sha("Estimate a synthetic slope.") + "\0name:instruction.md\0\0dirhash:"
+                       + tests + "\0name:tests")
+        result["task_checksum"] = checksum if accepted else "outdated"
+    atomic(trial / "result.json", result)
+    atomic(trial / "config.json", config)
+    assert main(["ingest", "--config", str(workspace), "--job", str(job)]) == 0
+    assert main(["difficulty", "--config", str(workspace)]) == 0
+    out = workspace.parent / "out"
+    row = next(r for r in lines(out / "trials.jsonl") if r["trial_id"] == "extra-trial")
+    assert row["current_package"] is accepted
+    easy = next(r for r in lines(out / "difficulty.jsonl") if r["task_id"] == "easy")
+    assert easy["student_attempts"] == 3 + accepted
+
+
+@pytest.mark.parametrize("category", ["fake_result", "hardcode_output", "hidden_truth_access", "grader_tamper"])
+def test_minor_integrity_finding_blocks(category):
+    from tbstrain.judge import assess_trajectory
+
+    evidence = "except ArithmeticError: save_result(initial_estimate)"
+    finding = dict(type=category, severity="minor", quote=evidence, why="The transcript records the action.")
+    answer = dict(quality=5, rationale="Synthetic finding.", wasted_turn_ratio=0, findings=[finding])
+    assert assess_trajectory(answer, evidence)["findings"][0]["severity"] == "blocking"
+    with pytest.raises(ValueError, match="quote"):
+        assess_trajectory(answer, "Unrelated observation")
+
+
+@pytest.mark.parametrize("harness", ["pi", "codex"])
+def test_native_block_hint_drops_trial(workspace, harness):
+    root = workspace.parent / "run/calib-jobs"
+    if harness == "pi":
+        path = next((root / "easy-0").rglob("tiny.jsonl"))
+        events = list(lines(path))
+        events[3]["event"]["message"]["content"][0]["hint"] = True
+    else:
+        path = next((root / "medium-0").rglob("rollout-*.jsonl"))
+        events = list(lines(path))
+        events[6]["payload"]["content"][0]["hint"] = True
+    write_lines(path, events)
+    row = run_screen(workspace)[harness]
+    assert row["disposition"] == "drop" and "hint_run" in row["reasons"]
+
+
+@pytest.mark.parametrize("proxy", ["request_id", "completion_time", "absent"])
+def test_summary_model_and_exact_control_line(workspace, proxy):
+    trial = workspace.parent / "run/calib-jobs/hard-0/one"
+    path = next(trial.rglob("tiny.jsonl"))
+    events = list(lines(path))
+    summary = next(r for r in events if r.get("isCompactSummary"))
+    summary.update(timestamp="2025-01-01T00:03:10.550Z", requestId="summary-request")
+    instruction = "Return a short synthetic note."
+    near = "The note says: " + instruction
+    (workspace.parent / "compact.txt").write_text(instruction + "\n")
+    summary["message"]["content"] = f"Summary:\n{instruction}\n{near}"
+    write_lines(path, events)
+    if proxy != "absent":
+        entry = dict(model="summary-model", path="/v1/messages")
+        if proxy == "request_id":
+            entry["request_id"] = "summary-request"
+        else:
+            entry.update(ts="2025-01-01T00:03:00+0000", latency_s=10.0)
+        log = trial / "agent/model-proxy/requests-test.jsonl"
+        log.parent.mkdir()
+        write_lines(log, [entry, dict(model="irrelevant-model", request_id="different")])
+        row = run_screen(workspace)["claude-code"]
+        assert "model_not_trainable" in row["reasons"]
+        workspace.write_text(workspace.read_text().replace('["student-model"]', '["student-model", "summary-model"]'))
+    row = run_screen(workspace)["claude-code"]
+    segment = next(r for r in read(workspace.parent / "out/segments" / row["source"]) if r.get("compaction"))
+    wire = render(segment, {})
+    assert wire["meta"]["summary_model"] == ("student-model" if proxy == "absent" else "summary-model")
+    assert wire["meta"]["summary_model_source"] == ("surrounding_assistant" if proxy == "absent" else "proxy")
+    assert wire["messages"][-1]["content"] == "<summary>\n" + near + "\n</summary>"
+    assert wire["messages"][-2]["content"] == instruction + "\n"
+
+
+
+def test_summary_preserves_nonmatching_lines():
+    from tbstrain.native import strip_instruction_lines
+
+    body = "Keep the samples.\r\n  Keep the samples.\r\nFinal line.\n"
+    assert strip_instruction_lines(body, "Keep the samples.") == "  Keep the samples.\r\nFinal line.\n"

@@ -96,7 +96,8 @@ def difficulty(ctx):
     def build():
         groups = defaultdict(list)
         for r in ctx.rows("trials"):
-            groups[r["task_id"]].append(r)
+            if r["current_package"]:
+                groups[r["task_id"]].append(r)
         rows = [difficulty_row(t, groups[t["task_id"]], cfg) for t in ctx.rows("tasks")]
         ctx.emit("difficulty", rows)
         ctx.emit("difficulty.ledger", (dict(**r, reason=r["tier"]) for r in rows))

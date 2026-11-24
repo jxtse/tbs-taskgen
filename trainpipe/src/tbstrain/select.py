@@ -149,5 +149,5 @@ def select(ctx):
         (ctx.work / "selection_report.md").write_text("\n".join(report) + "\n", "utf-8")
         return {"count": len(selected), **summary}
 
-    parents = [ctx.dependency(k) for k in ("difficulty", "screen", "judge-task", "judge-trajectory")]
+    parents = ctx.dependencies("difficulty", "screen", "judge-task", "judge-trajectory")
     return ctx.stage("select", [parents, cfg], build)

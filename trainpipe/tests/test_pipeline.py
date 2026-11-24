@@ -172,3 +172,9 @@ def test_pi_reject_interior_partial():
     events.append(pi_events()[3])
     with pytest.raises(ValueError, match="interior"):
         pi(events, {}, {})
+
+
+def test_default_selection_uses_easy_cap(workspace, judge_stub):
+    workspace.write_text(workspace.read_text().replace('mode = "shares"\n', ''))
+    assert main(["run", "--config", str(workspace)], transport=judge_stub) == 0
+    assert sorted(r["tier"] for r in lines(workspace.parent / "out/selection.jsonl")) == ["hard", "medium"]

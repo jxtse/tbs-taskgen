@@ -100,6 +100,10 @@ def tree_hash(path):
     return digest(files)
 
 
+def stage_key(name, inputs, parents):
+    return digest([1, code_version(), name, inputs, parents])
+
+
 class Context:
     def __init__(self, config):
         self.base = config.absolute().parent if config else Path.cwd()
@@ -149,7 +153,7 @@ class Context:
 
     def stage(self, name, inputs, action):
         parents, self.parents = self.parents, {}
-        key = digest([1, code_version(), name, inputs, parents])
+        key = stage_key(name, inputs, parents)
         root = self.out / ".stages" / name
         root.mkdir(parents=True, exist_ok=True)
         dest = root / key
@@ -164,7 +168,8 @@ class Context:
                     raise RuntimeError(f"missing decision ledger for {name}")
                 if stats.get("retry_required"):
                     # Publish partial decisions for selection without filling the reusable cache slot.
-                    key = digest([key, self.work.name])
+                    stats["retry_generation"] = self.work.name
+                    key = digest([key, stats["retry_generation"]])
                     dest = root / key
                 receipt = dict(stage=name, version=1, code=code_version(), key=key, parents=parents, **stats)
                 atomic(self.work / ".receipt", receipt)
@@ -207,16 +212,53 @@ class Context:
         return receipt
 
     def dependency(self, stage):
+        return self.dependencies(stage)[0]
+
+    def dependencies(self, *stages):
+        probe = DependencyCheck(self)
+        keys = [probe.verify(stage) for stage in stages]
+        self.parents.update(zip(stages, keys, strict=True))
+        return keys
+
+
+class DependencyCheck(Context):
+    """Replay stage preparation against live inputs. Never run actions or publish artifacts."""
+
+    def __init__(self, ctx):
+        self.base, self.cfg, self.out, self.hashes = ctx.base, ctx.cfg, ctx.out, ctx.hashes
+        self.parents = {}
+        self.verified = {}
+
+    def stage(self, name, inputs, action):
+        return stage_key(name, inputs, self.parents)
+
+    def dependencies(self, *stages):
+        keys = [self.verify(stage) for stage in stages]
+        self.parents.update(zip(stages, keys, strict=True))
+        return keys
+
+    def verify(self, stage):
+        from .cli import pipeline_actions
+
+        if stage in self.verified:
+            return self.verified[stage]
         receipt = read(self.out / "reports" / f"{stage}.json")
         if not receipt or "error" in receipt:
             raise ValueError(f"run {stage} first")
         if receipt.get("code") != code_version():
             raise ValueError(f"run {stage} again: code changed")
         pointer = self.out / ".stages" / stage / "current"
-        if pointer.is_symlink() and os.readlink(pointer) != receipt["key"]:
+        if not pointer.is_symlink() or os.readlink(pointer) != receipt["key"]:
             raise ValueError(f"interrupted publication: rerun {stage}")
-        for parent, expected in receipt.get("parents", {}).items():
-            if self.dependency(parent) != expected:
-                raise ValueError(f"run {stage} again: {parent} changed")
-        self.parents[stage] = receipt["key"]
-        return receipt["key"]
+        outer, self.parents = self.parents, {}
+        try:
+            actions = pipeline_actions(self, receipt.get("ingest_overrides", {}))
+            expected = actions[stage]()
+            if receipt.get("retry_required"):
+                expected = digest([expected, receipt["retry_generation"]])
+        finally:
+            self.parents = outer
+        if expected != receipt["key"]:
+            raise ValueError(f"selection is stale: run select/export again (changed stage: {stage})")
+        self.verified[stage] = expected
+        return expected

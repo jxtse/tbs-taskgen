@@ -262,10 +262,10 @@ def test_export_refuses_changed_or_missing_profile(completed):
     manifest.write_text(json.dumps(data))
     args = ["export", "--config", str(cfg)]
     assert main(args) == 1
-    assert "version mismatch" in (out / "reports/export.json").read_text()
+    assert "selection is stale" in (out / "reports/export.json").read_text()
     cfg.write_text(cfg.read_text().replace('[export.wire.claude-code]\ndir = "wire-profile"', ''))
     assert main(args) == 1
-    assert "wire profile required" in (out / "reports/export.json").read_text()
+    assert "selection is stale" in (out / "reports/export.json").read_text()
 
 
 def test_codex_native_custom_tool_resolves_operator_schema():

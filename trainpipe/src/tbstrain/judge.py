@@ -4,12 +4,9 @@ from pathlib import Path
 from .core import dumps, read
 from .llm import Client
 
-CATEGORIES = {
-    "hardcode_output",
+ALWAYS_BLOCKING = {"fake_result", "hardcode_output", "hidden_truth_access", "grader_tamper"}
+CATEGORIES = ALWAYS_BLOCKING | {
     "special_case_inputs",
-    "hidden_truth_access",
-    "grader_tamper",
-    "fake_result",
     "requirement_bypass",
     "answer_search",
 }
@@ -70,6 +67,8 @@ def assess_trajectory(answer, prompt):
         if severity not in {"blocking", "minor"}:
             problems.append(f"finding {i}: severity must be blocking or minor")
             continue
+        if f.get("type") in ALWAYS_BLOCKING:
+            severity = "blocking"
         if severity == "blocking":
             if not f.get("why"):
                 problems.append(f"finding {i}: blocking finding needs why")
@@ -130,11 +129,35 @@ def windows(records, limit):
         yield "".join(parts)
 
 
+def task_prompt(task, statement, limit):
+    pkg = Path(task["pkg"])
+    graders = [p for p in (pkg / "tests/test_outputs.py", pkg / "tests/measure.py", pkg / "tests/test.sh")
+               if p.is_file()]
+    if not graders:
+        return None
+    inputs = [("instruction", statement), *((p.name, p.read_text("utf-8")) for p in graders),
+              ("metrics", dumps(task["metrics"]))]
+    return "\n".join(title + "\n" + excerpt(value, limit // len(inputs)) for title, value in inputs)
+
+
+def trajectory_prompts(statement, records, limit):
+    parts = list(windows(records, limit))
+    for number, window in enumerate(parts, 1):
+        yield (
+            "Task\n" + excerpt(statement, limit // 4)
+            + f"\nTranscript window {number} of {len(parts)}"
+            + (" (the trajectory continues in later windows; do not judge completeness from this window)"
+               if number < len(parts) else " (final window)")
+            + "\n" + window
+        )
+
+
 def judge(ctx, kind):
     ctx.check_sources("tasks")
     name = "judge-" + kind
     cfg = ctx.cfg["judge"]
-    rubric = (Path(__file__).parent / "rubrics" / (kind + "-v1.md")).read_text("utf-8")
+    filename = {"task": "task-v1.md", "trajectory": "trajectory-v3.md"}[kind]
+    rubric = (Path(__file__).parent / "rubrics" / filename).read_text("utf-8")
     dep = "filter-tasks" if kind == "task" else "screen"
 
     def build():
@@ -168,34 +191,17 @@ def judge(ctx, kind):
             pkg = Path(task["pkg"])
             statement = (pkg / "instruction.md").read_text("utf-8")
             if kind == "task":
-                files = [pkg / "tests/test_outputs.py", pkg / "tests/measure.py", pkg / "tests/test.sh"]
-                graders = [p for p in files if p.is_file()]
-                if not graders:
+                prompt = task_prompt(task, statement, limit)
+                if prompt is None:
                     decisions[tid] = dict(task_id=tid, verdict="drop", reasons=["missing_grader"])
                     return
-                inputs = [
-                    ("instruction", statement),
-                    *((p.name, p.read_text("utf-8")) for p in graders),
-                    ("metrics", dumps(task["metrics"])),
-                ]
-                prompt = "\n".join(
-                    title + "\n" + excerpt(value, limit // len(inputs)) for title, value in inputs
-                )
                 answer = await client.request(rubric, prompt, assess_task)
                 decisions[tid] = dict(task_id=tid, **answer, reasons=[answer["rationale"]])
             else:
                 key = r["trial_id"]
                 records = read(ctx.out / "segments" / r["source"])
                 answers = []
-                parts = list(windows(records, limit))
-                for number, w in enumerate(parts, 1):
-                    prompt = (
-                        "Task\n" + excerpt(statement, limit // 4)
-                        + f"\nTranscript window {number} of {len(parts)}"
-                        + (" (the trajectory continues in later windows; do not judge completeness from this window)"
-                           if number < len(parts) else " (final window)")
-                        + "\n" + w
-                    )
+                for prompt in trajectory_prompts(statement, records, limit):
                     answers.append(await client.request(rubric, prompt, assess_trajectory))
                 blocked = any(f["severity"] == "blocking" for a in answers for f in a["findings"])
                 decisions[key] = dict(

@@ -58,6 +58,19 @@ def parser():
     return root
 
 
+def pipeline_actions(ctx, ingest_overrides):
+    return {
+        "ingest": lambda: ingest(ctx, ingest_overrides),
+        "difficulty": lambda: difficulty(ctx),
+        "filter-tasks": lambda: filter_tasks(ctx),
+        "screen": lambda: screen(ctx),
+        "judge-task": lambda: judge(ctx, "task"),
+        "judge-trajectory": lambda: judge(ctx, "trajectory"),
+        "select": lambda: select(ctx),
+        "export": lambda: export(ctx),
+    }
+
+
 def execute(args, transport=None):
     ctx = Context(args.config)
     if args.command == "wire-profile":
@@ -68,20 +81,13 @@ def execute(args, transport=None):
         profile = configured_profiles(ctx).get("claude-code") if args.config else None
         return wire_check(args.captures, profile)
     ctx.transport = transport
-    cfg = ctx.cfg.get("ingest", {})
+    overrides = {
+        key: [str(Path(p).absolute()) for p in values]
+        for key, values in (("runs", getattr(args, "run", [])), ("jobs", getattr(args, "job", [])))
+        if values
+    }
     actions = {
-        "ingest": lambda: ingest(
-            ctx,
-            [str(Path(p).absolute()) for p in getattr(args, "run", [])] or cfg.get("runs", []),
-            [str(Path(p).absolute()) for p in getattr(args, "job", [])] or cfg.get("jobs", []),
-        ),
-        "difficulty": lambda: difficulty(ctx),
-        "filter-tasks": lambda: filter_tasks(ctx),
-        "screen": lambda: screen(ctx),
-        "judge-task": lambda: judge(ctx, "task"),
-        "judge-trajectory": lambda: judge(ctx, "trajectory"),
-        "select": lambda: select(ctx),
-        "export": lambda: export(ctx),
+        **pipeline_actions(ctx, overrides),
         "validate": lambda: validate(
             ctx,
             getattr(args, "file", ctx.out / "train.jsonl"),

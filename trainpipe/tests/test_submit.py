@@ -81,16 +81,21 @@ def test_report_gate(stub, status, fatal, warn, override, accepted):
 
 
 @pytest.mark.parametrize("case,reason", [("masked", "masked assistant"), ("length", "max_length"),
-                                         ("missing", "train_on_what")])
-def test_confirm_refuses_unsafe_dry_run(stub, case, reason):
+                                         ("missing", "train_on_what"), ("ignored_mask", "fields_ignored")])
+def test_confirm_refuses_unsafe_dry_run(stub, judge_stub, case, reason):
     from tbstrain.core import atomic, lines, write_lines
     from tbstrain.wire import render
 
     cfg, out = stub
     report(cfg)
     effective = dict(train_on_what="all_assistant_messages", max_length=194560)
-    if case == "masked":
+    ignored = []
+    if case in {"masked", "ignored_mask"}:
         cfg.write_text(cfg.read_text().replace("[export]", '[export]\ntrain_on_what="loss_mask"'))
+        assert main(["run", "--config", str(cfg)], transport=judge_stub) == 0
+        if case == "ignored_mask":
+            effective["train_on_what"] = "loss_mask"
+            ignored = ["loss_mask"]
         sources = list(lines(out / "train.sources.jsonl"))
         source = next(s for s in sources if sum(m["role"] == "assistant" for m in s["segment"]["messages"]) > 1)
         next(m for m in source["segment"]["messages"] if m["role"] == "assistant")["loss"] = 0
@@ -100,8 +105,47 @@ def test_confirm_refuses_unsafe_dry_run(stub, case, reason):
         effective["max_length"] = 1
     else:
         del effective["train_on_what"]
-    atomic(cfg.parent / "dry.json", {"config": effective})
+    atomic(cfg.parent / "dry.json", {"config": effective, "preflight": {"fields_ignored": ignored}})
     assert main(["submit", "--config", str(cfg), "--confirm"]) == 1
     assert reason in read(out / "reports/submit.json")["error"]
     commands = (cfg.parent / "invocations").read_text().splitlines()
     assert len(commands) == 3 and "--dry-run" in commands[-1]
+
+
+@pytest.mark.parametrize("change,stage", [("quality", "select"), ("holdout", "filter-tasks"),
+                                          ("result", "ingest"), ("tokenizer", "screen")])
+def test_submit_rechecks_selection_before_upload(stub, change, stage):
+    from tbstrain.core import atomic
+
+    cfg, out = stub
+    if change == "quality":
+        cfg.write_text(cfg.read_text().replace("[select]", "[select]\neasy_quality=5"))
+    elif change == "holdout":
+        cfg.write_text(cfg.read_text() + '\n[filter]\nexclude=["hard"]\n')
+    elif change == "result":
+        path = cfg.parent / "run/calib-jobs/hard-0/one/result.json"
+        atomic(path, {**read(path), "verifier_result": {"rewards": {"reward": 0}}})
+    else:
+        path = cfg.parent / "tokenizer.json"
+        path.write_text(path.read_text() + "\n")
+    assert main(["submit", "--config", str(cfg), "--confirm"]) == 1
+    assert f"selection is stale: run select/export again (changed stage: {stage})" in read(out / "reports/submit.json")["error"]
+    assert not (cfg.parent / "invocations").exists()
+
+
+@pytest.mark.parametrize("field,accepted", [("messages", False), ("tools", False),
+                                           ("messages[].reasoning_content", False),
+                                           ("loss_mask", True), ("meta", True)])
+def test_submit_ignored_export_fields(stub, field, accepted):
+    from tbstrain.core import atomic
+
+    cfg, out = stub
+    report(cfg)
+    dry = read(cfg.parent / "dry.json")
+    dry["preflight"] = {"fields_ignored": [field]}
+    atomic(cfg.parent / "dry.json", dry)
+    assert (main(["submit", "--config", str(cfg), "--confirm"]) == 0) is accepted
+    commands = (cfg.parent / "invocations").read_text().splitlines()
+    assert any("train start" in line and "--dry-run" not in line for line in commands) == accepted
+    if not accepted:
+        assert field in read(out / "reports/submit.json")["error"]

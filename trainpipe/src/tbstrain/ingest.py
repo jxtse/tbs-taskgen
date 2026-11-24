@@ -1,5 +1,6 @@
 from collections import defaultdict
 from datetime import datetime
+import hashlib
 from pathlib import Path
 import re
 
@@ -37,7 +38,7 @@ def released_task(ctx, run, tid, row):
         raise ValueError("invalid item_id")
     item = run / "items" / tid
     pkg = item / "pkg"
-    if not pkg.is_dir():
+    if row.get("pkg") and (run / row["pkg"]).is_dir():
         pkg = run / row["pkg"]
     state = read(item / "state.json", {})
     spec = read(item / "_spec/spec.json", {})
@@ -49,7 +50,7 @@ def released_task(ctx, run, tid, row):
     local = read(item / "calib/runs.json", [])
     local_by_key = {(r.get("job_name"), r.get("n")): r for r in local}
     cal = []
-    for attempt in row.get("calib_runs", local):
+    for attempt in row.get("calib_runs", []):
         detail = local_by_key.get((attempt.get("job_name"), attempt.get("n")), {})
         merged = {k: detail[k] for k in ("trial", "delivered", "api_status") if k in detail}
         cal.append({**merged, **attempt})
@@ -88,7 +89,53 @@ def released_task(ctx, run, tid, row):
     return task
 
 
-def harbor_trial(ctx, trial, data, tasks, by_job):
+def harbor_checksum(ctx, path, ancestors=()):
+    """Harbor task_checksum uses the default Dirhash name/data protocol."""
+    real = path.resolve()
+    if real in ancestors:
+        raise ValueError(f"cyclic package directory: {path}")
+    entries = []
+    for child in path.iterdir():
+        if child.is_dir():
+            checksum = harbor_checksum(ctx, child, (*ancestors, real))
+            if checksum:
+                entries.append(f"dirhash:{checksum}\0name:{child.name}")
+        elif child.is_file():
+            entries.append(f"data:{ctx.content_hash(child)}\0name:{child.name}")
+    if entries:
+        return hashlib.sha256("\0\0".join(sorted(entries)).encode()).hexdigest()
+
+
+def rollout_matches(ctx, config, data, task, packages):
+    spec = config.get("task") or {}
+    path = spec.get("path")
+    if not path:
+        return False
+    pkg = ctx.path(path).resolve()
+    if pkg not in packages or not pkg.is_dir():
+        return False
+    embedded = data.get("config") or {}
+    embedded_task = embedded.get("task") or {}
+    if embedded_task.get("path") and ctx.path(embedded_task["path"]).resolve() != pkg:
+        return False
+    for record in (spec, config, config.get("metadata") or {}, embedded_task, embedded,
+                   embedded.get("metadata") or {}, data):
+        for field in ("pkg_sha256", "package_sha256", "package_hash"):
+            if record.get(field) is not None and record[field] != task["pkg_sha256"]:
+                return False
+        if record.get("task_checksum") is not None and record["task_checksum"] != harbor_checksum(ctx, pkg):
+            return False
+        if record.get("pkg_sha") is not None:
+            # Taskgen records the first 16 hex digits over ordered paths and bytes.
+            h = hashlib.sha256()
+            for file in sorted(f for f in pkg.rglob("*") if f.is_file()):
+                h.update(str(file.relative_to(pkg)).encode() + b"\0" + file.read_bytes() + b"\0")
+            if record["pkg_sha"] != h.hexdigest()[:16]:
+                return False
+    return True
+
+
+def harbor_trial(ctx, trial, data, tasks, by_job, packages, extra):
     config = read(trial / "config.json", data.get("config") or {})
     job = trial.parent.name
     possible = [data.get("task_name"), data.get("task_id"), (config.get("task") or {}).get("path")]
@@ -98,6 +145,10 @@ def harbor_trial(ctx, trial, data, tasks, by_job):
             value = value.get("path")
         if value:
             ids.update(set(Path(value).parts) & tasks.keys())
+    configured_path = (config.get("task") or {}).get("path")
+    if configured_path:
+        path = ctx.path(configured_path).resolve()
+        ids.update(tid for tid, paths in packages.items() if path in paths)
     matches = by_job.get(job, [])
     if not ids and len({t for t, _ in matches}) == 1:
         ids.add(matches[0][0])
@@ -106,6 +157,7 @@ def harbor_trial(ctx, trial, data, tasks, by_job):
     calibration = next((r for r in matching if r.get("trial") == trial.name), {})
     if not calibration and len(matching) == 1:
         calibration = matching[0]
+    current = bool(matching) or bool(extra and tid and rollout_matches(ctx, config, data, tasks[tid], packages[tid]))
     kind, sessions = session_info(trial, config)
     agent = config.get("agent") or {}
     info = data.get("agent_info") or {}
@@ -143,7 +195,8 @@ def harbor_trial(ctx, trial, data, tasks, by_job):
             submitted = any(entries)
     response_models = set()
     api_status = calibration.get("api_status")
-    for log in sorted((trial / "agent/model-proxy").glob("requests-*.jsonl")):
+    proxy_logs = sorted((trial / "agent/model-proxy").glob("requests-*.jsonl"))
+    for log in proxy_logs:
         for entry in lines(log):
             response_models.update(v for v in (entry.get("response_models") or []) if isinstance(v, str))
             if entry.get("response_model"):
@@ -156,6 +209,7 @@ def harbor_trial(ctx, trial, data, tasks, by_job):
         trial_id=identity,
         trial_name=trial.name,
         calib_n=calibration.get("n"),
+        current_package=current,
         task_id=tid,
         job_name=job,
         harness=kind,
@@ -175,6 +229,7 @@ def harbor_trial(ctx, trial, data, tasks, by_job):
         cost_usd=(data.get("agent_result") or {}).get("cost_usd", calibration.get("cost_usd")),
         verifier=str(trial / "verifier"),
         sessions=list(map(str, sessions)),
+        proxy_logs=list(map(str, proxy_logs)),
         hint=hint,
         capture=str(captures[0]) if len(captures) == 1 else None,
         trial=str(trial),
@@ -183,6 +238,7 @@ def harbor_trial(ctx, trial, data, tasks, by_job):
     record["source_hashes"] = {}
     for path in [
         *sessions,
+        *proxy_logs,
         *captures,
         *(p.parent / "manifest.json" for p in captures),
         *(f for p in captures for f in (p.parent.parent / "blobs").glob("*")),
@@ -195,7 +251,10 @@ def harbor_trial(ctx, trial, data, tasks, by_job):
 def discover(ctx, runs, jobs):
     """Inventory only release inputs and Harbor trial artifacts; no recursive run-wide scan."""
     tasks, trials, evidence = {}, {}, []
-    roots = {ctx.path(p) for p in jobs}
+    packages = defaultdict(set)
+    extra_roots = {ctx.path(p).resolve() for p in jobs}
+    calibration_dirs = set()
+    roots = set(extra_roots)
     for run in sorted({ctx.path(p) for p in runs}):
         manifest = run / "release/manifest.jsonl"
         evidence.append((str(manifest), file_hash(manifest)))
@@ -203,6 +262,7 @@ def discover(ctx, runs, jobs):
         releases = {r["item_id"]: r for r in lines(manifest)}
         for tid, row in releases.items():
             task = released_task(ctx, run, tid, row)
+            packages[tid].add(Path(task["pkg"]).resolve())
             if tid not in tasks:
                 tasks[tid] = task
                 continue
@@ -212,7 +272,8 @@ def discover(ctx, runs, jobs):
             known = {digest(r) for r in prior["calib_runs"]}
             prior["calib_runs"].extend(r for r in task["calib_runs"] if digest(r) not in known)
         if (run / "calib-jobs").is_dir():
-            roots.update(p for p in (run / "calib-jobs").iterdir() if p.is_dir())
+            calibration_dirs.add((run / "calib-jobs").resolve())
+            roots.update(p.resolve() for p in (run / "calib-jobs").iterdir() if p.is_dir())
     by_job = defaultdict(list)
     for t in tasks.values():
         for r in t["calib_runs"]:
@@ -229,7 +290,8 @@ def discover(ctx, runs, jobs):
             data = read(result)
             if not any(k in data for k in ("task_name", "task_id", "verifier_result", "exception_info")):
                 continue  # Harbor job summary
-            record = harbor_trial(ctx, trial, data, tasks, by_job)
+            extra = root in extra_roots and trial.parent.parent.resolve() not in calibration_dirs
+            record = harbor_trial(ctx, trial, data, tasks, by_job, packages, extra)
             identity = record["trial_id"]
             if identity in trials and trials[identity] != record:
                 raise ValueError(f"conflicting trial id {identity}")
@@ -237,7 +299,9 @@ def discover(ctx, runs, jobs):
     return list(tasks.values()), list(trials.values()), sorted(set(evidence))
 
 
-def ingest(ctx, runs, jobs):
+def ingest(ctx, overrides):
+    cfg = {**ctx.cfg.get("ingest", {}), **overrides}
+    runs, jobs = cfg.get("runs", []), cfg.get("jobs", [])
     if not runs:
         raise ValueError("at least one run is required")
     tasks, trials, evidence = discover(ctx, runs, jobs)
@@ -250,11 +314,12 @@ def ingest(ctx, runs, jobs):
             [
                 *(dict(task_id=t["task_id"], reason="release_manifest") for t in tasks),
                 *(
-                    dict(trial_id=t["trial_id"], reason="matched" if t["task_id"] else "unknown_task")
+                    dict(trial_id=t["trial_id"], reason=("unknown_task" if not t["task_id"] else
+                                                   "matched" if t["current_package"] else "stale_package"))
                     for t in trials
                 ),
             ],
         )
-        return {"count": len(tasks), "trials": len(trials)}
+        return {"count": len(tasks), "trials": len(trials), "ingest_overrides": overrides}
 
-    return ctx.stage("ingest", [tasks, trials, evidence], build)
+    return ctx.stage("ingest", [runs, jobs, overrides, tasks, trials, evidence], build)

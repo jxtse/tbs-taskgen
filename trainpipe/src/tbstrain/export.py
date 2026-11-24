@@ -75,6 +75,7 @@ def validate(ctx, file, allow_masked=False, reference=None):
     def build():
         token_counter = Counter(tokenizer)
         failed = count = masked_assistants = max_tokens = 0
+        required_fields = {"messages", "role", "content"}
         with (
             file.open("rb") as stream,
             (ctx.work / "validate.ledger.jsonl").open("w", encoding="utf-8") as ledger,
@@ -96,6 +97,11 @@ def validate(ctx, file, allow_masked=False, reference=None):
                         if not errors:
                             n, _ = token_counter.counts(row)
                             max_tokens = max(max_tokens, n)
+                            if row["tools"]:
+                                required_fields.add("tools")
+                            for m in row["messages"]:
+                                required_fields.update(k for k in ("reasoning_content", "tool_calls", "tool_call_id")
+                                                       if m.get(k))
                             masked_assistants += sum(
                                 m["role"] == "assistant" and loss == 0
                                 for m, loss in zip(row["messages"], row["loss_mask"], strict=True)
@@ -123,7 +129,10 @@ def validate(ctx, file, allow_masked=False, reference=None):
             finally:
                 if source_stream:
                     source_stream.close()
+        if masked_assistants:
+            required_fields.add("loss_mask")
         return {
+            "required_fields": sorted(required_fields),
             "count": count, "failed": failed, "valid": not failed,
             "max_tokens": max_tokens, "masked_assistants": masked_assistants,
         }

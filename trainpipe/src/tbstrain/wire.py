@@ -89,7 +89,7 @@ def render(source, meta):
         else:
             raise ValueError("unknown_role")
     return dict(messages=messages, loss_mask=masks, tools=schemas,
-                meta={**meta, **{k: source[k] for k in ("codex_reasoning", "reasoning_source") if k in source},
+                meta={**meta, **{k: source[k] for k in ("codex_reasoning", "reasoning_source", "summary_model", "summary_model_source") if k in source},
                       "render_notes": {"dropped_tail": dropped}})
 
 

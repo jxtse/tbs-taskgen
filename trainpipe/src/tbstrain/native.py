@@ -1,6 +1,7 @@
 """Convert native journals into loss-bearing text, thinking, call and result blocks."""
 
 from collections import deque
+from datetime import datetime
 import json
 from pathlib import Path
 import re
@@ -48,17 +49,46 @@ def segment(messages, tools=()):
     return {"messages": messages, "tools": list(tools)}
 
 
-def summary_target(text):
+def strip_instruction_lines(text, instruction):
+    controls = {line for line in instruction.splitlines() if line.strip()}
+    return "".join(line for line in text.splitlines(keepends=True) if line.rstrip("\r\n") not in controls)
+
+
+def summary_target(text, instruction):
     match = re.search(r"(?:^|\n)Summary:\s*\n", text)
     if not match:
         raise ValueError("unrecognized_compaction_summary")
     body = re.split(
         r"\n(?:\s*\n)?(?:If you need specific details|Recent messages are preserved|Note: the earliest part|Continue the conversation from)",
         text[match.end() :],
-    )[0].strip()
+    )[0]
+    body = strip_instruction_lines(body, instruction).strip()
     if not body:
-        raise ValueError("empty_compaction_summary")
+        return None
     return "<summary>\n" + body + "\n</summary>"
+
+
+def summary_identity(summary, requests, previous, following):
+    """Join on request ID or proxy completion time (proxy start times have second precision)."""
+    request_id = summary.get("requestId") or summary["message"].get("request_id")
+    matches = [r for r in requests if request_id and request_id in (r.get("request_id"), r.get("requestId"))]
+    if not matches and summary.get("timestamp"):
+        end = datetime.fromisoformat(summary["timestamp"]).timestamp()
+        for r in requests:
+            if not r.get("ts") or r.get("latency_s") is None:
+                continue
+            finish = datetime.fromisoformat(r["ts"]).timestamp() + r["latency_s"]
+            if -0.1 <= end - finish <= 1.1:
+                matches.append(r)
+    if matches:
+        models = {m for r in matches for m in (
+            r.get("response_models") or [r.get("response_model") or r.get("model")]
+        )}
+        return (models.pop() if len(models) == 1 else None), "proxy"
+    neighbors = [next((r["message"].get("model") for r in turns if r["type"] == "assistant"), None)
+                 for turns in (reversed(previous), following)]
+    models = {model for model in neighbors if model}
+    return (models.pop() if len(models) == 1 else None), "surrounding_assistant"
 
 
 def validate_pairs(messages):
@@ -99,6 +129,11 @@ def claude(events, cfg, trial):
             raise ValueError("resume marker outside active branch")
         ends = ends[start:]
     models = []
+    requests = [
+        entry for path in trial.get("proxy_logs", []) for entry in lines(Path(path))
+        if entry.get("path", "/v1/messages").rstrip("/").endswith("/messages")
+        and entry.get("status", 200) == 200 and entry.get("complete") is not False
+    ] if len(ends) > 1 else []
     hinted = bool(trial.get("hint"))
     for i, end in enumerate(ends):
         chain = session.chain(end)
@@ -143,14 +178,18 @@ def claude(events, cfg, trial):
         }
         row["reasoning_source"] = "+".join(sorted(reasoning_sources)) or "none"
         if i + 1 < len(ends):
-            boundary = next(r for r in reversed(session.chain(ends[i+1])) if is_boundary(r))
-            summary = session.summary(boundary)["message"]["content"]
+            following = session.chain(ends[i+1])
+            boundary = next(r for r in reversed(following) if is_boundary(r))
+            summary = session.summary(boundary)
             instruction = profile.get("instruction") or cfg.get("instruction")
             if not instruction or not instruction.strip():
                 raise ProfileError("compaction_instruction_required")
-            messages.extend([message("user", instruction),
-                             message("assistant", summary_target(string_content(summary)))])
-            row["compaction"] = True
+            target = summary_target(string_content(summary["message"]["content"]), instruction)
+            if target:
+                model, source = summary_identity(summary, requests, chain, following[following.index(summary) + 1:])
+                models.append(model)
+                row.update(compaction=True, summary_model=model, summary_model_source=source)
+                messages.extend([message("user", instruction), message("assistant", target)])
         rows.append(row)
     return rows, models, {"resume_prefix_events": len(historical), "hint_run": hinted}
 
@@ -219,6 +258,7 @@ def pi(events, cfg, trial):
     open_turn = None
     previous_id = None
     pending = deque()
+    hinted = False
     for index, e in enumerate(events):
         kind = e.get("type")
         if e.get("parentId") and previous_id is not None and e["parentId"] != previous_id:
@@ -256,6 +296,7 @@ def pi(events, cfg, trial):
         m = event["message"]
         role = m["role"]
         blocks = m["content"]
+        hinted |= has_hint(blocks)
         if role == "toolResult":
             if not pending or pending.popleft() != m["toolCallId"]:
                 raise ValueError("tool_order")
@@ -298,7 +339,7 @@ def pi(events, cfg, trial):
     return (
         [pi_segment(current[:n], system, tools)],
         models,
-        {"cut_events": len(tail), "cut_messages": len(current) - n, "last_complete_event": i + 1},
+        {"hint_run": hinted, "cut_events": len(tail), "cut_messages": len(current) - n, "last_complete_event": i + 1},
     )
 
 
@@ -399,6 +440,10 @@ def responses_tools(specs, offered=None):
     return tools
 
 
+def has_hint(blocks):
+    return isinstance(blocks, list) and any(isinstance(b, dict) and b.get("hint") for b in blocks)
+
+
 def codex(events, cfg, trial):
     current_model = None
     models = []
@@ -406,6 +451,7 @@ def codex(events, cfg, trial):
     reasoning_mode = cfg.get("codex_reasoning", "drop")
     received_result = False
     boundaries = []
+    hinted = False
     for e in events:
         p = e.get("payload") or {}
         if e["type"] == "event_msg" and p.get("type") in {"turn_aborted", "task_failed"}:
@@ -415,10 +461,13 @@ def codex(events, cfg, trial):
             current_model = p["model"]
         if e["type"] == "compacted":
             boundaries.append(
-                {"timestamp": e.get("timestamp"), "event_id": p.get("window_id"), "summary": p.get("message")}
+                {"timestamp": e.get("timestamp"), "event_id": p.get("window_id"),
+                 "summary": p.get("message"), "model": current_model}
             )
         if e["type"] != "response_item":
             continue
+        hinted |= bool(p.get("hint") or has_hint(p.get("content")) or has_hint(p.get("summary"))
+                       or has_hint(p.get("output")))
         if kind in {"function_call", "custom_tool_call", "reasoning"} or p.get("role") == "assistant":
             if received_result and pending:
                 raise ValueError("unanswered_tool_call")
@@ -457,7 +506,7 @@ def codex(events, cfg, trial):
             actf["system_prompt"] = system_text(required_profile(profile, "codex", trial.get("agent_version"))["system"])
         record = actf_to_sft(actf)
         offered = platform_schemas(record["tools"], profile, "codex", trial.get("agent_version"))
-        return [{**from_sft(record, tools=offered), **provenance}], models, {}
+        return [{**from_sft(record, tools=offered), **provenance}], models, {"hint_run": hinted}
     path = Path(trial["capture"])
     calls = compaction._root_calls(list(lines(path)), read(path.parent / "manifest.json", {}))
     calls = load_blobs(calls, path.parent.parent / "blobs")
@@ -472,17 +521,47 @@ def codex(events, cfg, trial):
             context["tools"] = responses_tools(specs)
     summaries = set()
     verified = compaction._calls_matching_main_steps(actf, calls, boundaries, summaries)
-    records = compaction._segment_records(verified, boundaries, True, summaries)
+    # A native summary can also match a regular ACTF step. Bind it to the captured request in either case.
+    summary_calls = {}
+    for call, target in verified:
+        started = compaction._time(call["started_at"])
+        boundary = next((b for b in boundaries if compaction._time(b["timestamp"]) > started), None)
+        native_summary = (boundary and boundary["summary"] and len(target) == 1
+                          and target[0]["content"] == boundary["summary"])
+        if call["call_id"] in summaries or native_summary:
+            summary_calls[call["call_id"]] = call, boundary
+    records = compaction._segment_records(verified, boundaries, True, summary_calls.keys())
     for call in calls:
         for field in ("context", "output"):
             if call.get(field, {}).get("model"):
                 models.append(call[field]["model"])
     windows = []
     for metadata, record in records:
+        summary_meta = {}
+        if metadata["boundary_source"] == "summary_request":
+            call, boundary = summary_calls[metadata["first_call_id"]]
+            start = record["target_start_index"]
+            target = record["messages"][start]
+            prompt = record["messages"][start - 1]
+            if prompt["role"] == "user":
+                target["content"] = strip_instruction_lines(target["content"], string_content(prompt["content"]))
+            if not target["content"].strip():
+                # Keep any preceding work. The prompt also carries tool results for the previous window.
+                if not windows:
+                    continue
+                record["messages"] = record["messages"][:start - int(prompt["role"] == "user")]
+            else:
+                model = call["output"].get("model") or call["context"].get("model")
+                source = "capture"
+                if not model:
+                    model = boundary["model"]
+                    source = "surrounding_assistant"
+                models.append(model)
+                summary_meta.update(compaction=True, summary_model=model, summary_model_source=source)
         if metadata["boundary_source"] == "summary_request" and windows:
             # A captured summary request can close a preceding tool-call window with
             # its actual tool results. Only join if the entire replayed prefix matches.
-            prior = windows[-1]
+            prior, _ = windows[-1]
             n = len(prior["messages"])
             start = record["target_start_index"]
             if (
@@ -491,18 +570,19 @@ def codex(events, cfg, trial):
                 and compaction._replayed_prefix_matches(record["messages"][:n], prior["messages"])
                 and all(m["role"] != "assistant" for m in record["messages"][n:start])
             ):
-                windows[-1] = {**record, "target_start_index": prior["target_start_index"]}
+                windows[-1] = ({**record, "target_start_index": prior["target_start_index"]}, summary_meta)
                 continue
-        windows.append(record)
-    converted = [from_sft(r, tools=platform_schemas(r["tools"], profile, "codex", trial.get("agent_version")))
-                 for r in windows]
+        if record["target_start_index"] < len(record["messages"]):
+            windows.append((record, summary_meta))
+    converted = [{**from_sft(r, tools=platform_schemas(r["tools"], profile, "codex", trial.get("agent_version"))),
+                  **meta} for r, meta in windows]
     for row in converted:
         row.update(provenance)
         if row["messages"][0]["role"] != "system":
             prompt = actf["system_prompt"] or system_text(required_profile(
                 profile, "codex", trial.get("agent_version"))["system"])
             row["messages"].insert(0, message("system", prompt))
-    return converted, models, {"captured_windows": len(windows)}
+    return converted, models, {"captured_windows": len(windows), "hint_run": hinted}
 
 
 CONVERTERS = {"claude-code": claude, "codex": codex, "pi": pi}

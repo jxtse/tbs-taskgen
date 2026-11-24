@@ -305,6 +305,8 @@ def screen(ctx):
             stripped = []
             if trial["task_id"] not in admitted:
                 fatal.add("task_filtered")
+            if trial["task_id"] and not trial["current_package"]:
+                fatal.add("stale_package")
             if trial["reward"] != 1:
                 fatal.add("not_passing")
             if not valid(trial):
