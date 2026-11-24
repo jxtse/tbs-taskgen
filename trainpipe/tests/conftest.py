@@ -150,6 +150,7 @@ def workspace(tmp_path):
                 who="student",
                 model="student-model",
                 job_name=f"{tier}-{i}",
+                trial={"trial": "one"},
                 reward=int(i < n),
                 outcome="pass" if i < n else "fail",
                 result_type="pass" if i < n else "fail_delivered",
@@ -157,7 +158,8 @@ def workspace(tmp_path):
             for i in range(3)
         ]
         cal += [
-            dict(who="teacher", model="teacher-model", job_name=tier + "-teacher", reward=1, outcome="pass")
+            dict(who="teacher", model="teacher-model", job_name=tier + "-teacher", trial={"trial": "one"},
+                 reward=1, outcome="pass")
         ]
         atomic(item / "calib/runs.json", cal)
         manifests.append(

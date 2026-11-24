@@ -59,7 +59,7 @@ Codex 从 session_meta 和 turn_context 读取 instructions、base_instructions 
 ## 平台格式
 
 - 一行包含 `messages`、OpenAI function 形式的 `tools`、`loss_mask` 和 `meta`。裁尾前按调用顺序核对每个工具结果的 ID。并行结果须与发起调用的顺序一致。行首为系统提示。末尾截到最后一个有内容、推理或工具调用的 assistant，裁去的平台消息条数写入 `meta.render_notes.dropped_tail`。
-- Claude Code 在 `compact_boundary` 切段，合并同一消息 ID 的块。前段保留真实工具返回及系统提醒，再追加操作员提供的压缩指令和从下一段还原的摘要。续段按摘要、信封与保留片段恢复上下文。使用掩码训练时，保留片段和续跑前缀中的 assistant 均标记 loss 0。
+- Claude Code 在 `compact_boundary` 切段，合并同一消息 ID 的块。前段保留真实工具返回及系统提醒，再追加操作员提供的压缩指令和从下一段还原的摘要。摘要清理按整行匹配控制指令，较长句子中的转述会保留。续段按摘要、信封与保留片段恢复上下文。使用掩码训练时，保留片段和续跑前缀中的 assistant 均标记 loss 0。
 - Codex 使用 Roller 的 ACTF 转换与 SFT 校验。每个工具返回都结束前一个 assistant 回合，即使缺少 token_count 事件。发生压缩时需要捕获的根参与者调用、manifest 及原生边界。逐次匹配模型输出和上下文，仅在前缀一致时拼接。只有代理请求元数据的压缩会话记入跳过原因。Pi 支持原生 message 和 journal 中的 message_end，截至最后完整 assistant 答复，记录裁去的事件数、消息数和最后完成位置。
 - 托管训练使用 `all_assistant_messages`，会忽略 `loss_mask`。选用该目标时，筛选阶段实际移除应屏蔽的旧 assistant 轮及其工具结果。需要保留完整重放上下文并使用掩码的 SDK 导出可设置 `train_on_what = "loss_mask"`，然后重新运行筛选和选择。验证仅在显式配置 loss_mask 时默认接受 loss 为 0 的 assistant，`--allow-masked-assistant` 可用于检查其他训练方式生成的文件。
 - 用配置的 tokenizer JSON 对角色、推理、工具 schema、调用、结果和正文估算模板 token。平台端最终以数据集报告为准。`submit` 要求 available、0 fatal、0 warn，`--allow-warn` 仅放行 warning。dry-run 的有效训练模式必须兼容数据中的 assistant 掩码，实际 max_length 必须容纳最长行；检查通过后才可确认启动。上传幂等键使用文件 SHA-256，训练幂等键绑定数据集版本、基座模型与超参文件哈希。CLI 原始 JSON 及失败响应位于 `submit-responses/`，报告记录是否观察到平台忽略 loss_mask。

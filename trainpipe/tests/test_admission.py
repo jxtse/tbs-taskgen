@@ -234,6 +234,29 @@ def test_calibration_summary_survives_partial_job():
     assert result["student_attempts"] == 3 and result["student_passes"] == 1
 
 
+def test_nested_trial_with_extra_rollouts_counts_once(workspace):
+    run = workspace.parent / "run"
+    manifest = run / "release/manifest.jsonl"
+    hard = next(row for row in lines(manifest) if row["item_id"] == "hard")
+    hard["calib_runs"] = hard["calib_runs"][:2]
+    hard["calib_runs"][0].update(reward=0, outcome="fail")  # native verifier supersedes this summary
+    # The first trial name is in the release. Recover the second from local runs.json.
+    del hard["calib_runs"][1]["trial"]
+    write_lines(manifest, [hard])
+    source = run / "calib-jobs/hard-0/one"
+    config = read(source / "config.json")
+    for job, name, reward in [(run / "calib-jobs/hard-1", "one", 0),
+                              (workspace.parent / "extras", "two", 1),
+                              (workspace.parent / "extras", "three", 1)]:
+        atomic(job / name / "config.json", config)
+        atomic(job / name / "result.json", dict(id=job.name + name, task_name="hard",
+               verifier_result={"rewards": {"reward": reward}}))
+    assert main(["ingest", "--config", str(workspace), "--job", str(workspace.parent / "extras")]) == 0
+    assert main(["difficulty", "--config", str(workspace)]) == 0
+    row, = lines(workspace.parent / "out/difficulty.jsonl")
+    assert (row["attempts"], row["student_passes"], row["rate"], row["tier"]) == (4, 3, 0.75, "easy")
+
+
 def test_resume_prefix_audited_but_never_trained(tmp_path):
     from conftest import cc_message, block
     from tbstrain.native import claude
@@ -595,6 +618,38 @@ def test_shell_tools_resolve_probe_paths(tool, args):
     assert "answer_search" in inspect_segment(src, True)[1]
 
 
+@pytest.mark.parametrize("tool,key", [("Bash", "command"), ("functions.exec_command", "cmd")])
+@pytest.mark.parametrize("command,probe", [
+    ("cd .. && cat tests/palette.tsv", True),
+    ("pushd '../opt/toy tiles'; cd samples && rg palette_truth .", True),
+    ("cd '../opt/toy tiles' && cd /app; rg palette_truth .", False),
+    ("(cd ../opt); rg palette_truth .", False),
+    ("cd ../opt | cat; rg palette_truth .", False),
+])
+def test_shell_sequential_cwd(tool, key, command, probe):
+    src = _probe_segment("", "violet", name=tool)
+    src["messages"][0]["content"][0]["input"] = {key: command}
+    assert ("answer_search" in inspect_segment(src, True)[1]) is probe
+
+
+@pytest.mark.parametrize("helper", ["_metrics", "budget"])
+def test_task_judge_includes_timeout_helper(workspace, judge_stub, helper):
+    graders = workspace.parent / "run/items/easy/pkg/tests"
+    measure = f"from {helper} import run_solution\nrun_solution(1200)\n"
+    (graders / "measure.py").write_text(measure)
+    tail = "    return min(requested, remaining)\n"
+    (graders / (helper + ".py")).write_text("# synthetic padding\n" * 150 + "def run_solution(requested):\n" + tail)
+    workspace.write_text(workspace.read_text().replace("[judge]", "[judge]\nwindow_chars=700"))
+    for stage in ("ingest", "difficulty", "filter-tasks"):
+        assert main([stage, "--config", str(workspace)]) == 0
+    assert main(["judge", "--kind", "task", "--config", str(workspace)], transport=judge_stub) == 0
+    body, = [c for c in judge_stub.calls if "measure.py\n" in c["messages"][0]["content"]]
+    prompt = body["messages"][0]["content"]
+    assert len(prompt) <= 700 and measure in prompt and (graders / "test_outputs.py").read_text() in prompt
+    assert helper + ".py\n" in prompt and "[omitted]" in prompt and tail in prompt
+    assert "effective timeout" in body["system"]
+
+
 def test_judge_windows_cover_long_blocks():
     from tbstrain.judge import windows
 
@@ -701,7 +756,7 @@ def test_rollout_release_binding(workspace, binding, accepted):
 
     run = workspace.parent / "run"
     pkg = run / "items/easy/pkg"
-    job = workspace.parent / "extra"
+    job = workspace.parent / "easy-0"  # external job collides with a calibration job
     trial = job / "two"
     copytree(run / "calib-jobs/easy-0/one", trial)
     result = read(trial / "result.json")
@@ -727,6 +782,30 @@ def test_rollout_release_binding(workspace, binding, accepted):
     assert row["current_package"] is accepted
     easy = next(r for r in lines(out / "difficulty.jsonl") if r["task_id"] == "easy")
     assert easy["student_attempts"] == 3 + accepted
+
+
+def test_binding_requires_calibration_directory_and_trial_name(workspace):
+    from shutil import copytree
+
+    job = workspace.parent / "run/calib-jobs/easy-0"
+    extra = workspace.parent / "external"
+    for path, tid in [(job / "different", "wrong-name"), (extra / "easy-0/one", "external-twin"),
+                      (extra / "easy-1/one", "valid-twin")]:
+        copytree(job / "one", path)
+        atomic(path / "result.json", {**read(path / "result.json"), "id": tid})
+        if tid == "external-twin":
+            config = read(path / "config.json")
+            config["task"]["pkg_sha256"] = "superseded"
+            atomic(path / "config.json", config)
+    assert main(["ingest", "--config", str(workspace), "--job", str(extra)]) == 0
+    rows = {r["trial_id"]: r for r in lines(workspace.parent / "out/trials.jsonl")}
+    assert rows["easy-trial"]["current_package"]
+    assert rows["valid-twin"]["current_package"] and rows["valid-twin"]["who"] is None
+    for tid in ("wrong-name", "external-twin"):
+        assert not rows[tid]["current_package"] and rows[tid]["who"] is None
+    assert main(["difficulty", "--config", str(workspace)]) == 0
+    easy = next(r for r in lines(workspace.parent / "out/difficulty.jsonl") if r["task_id"] == "easy")
+    assert easy["student_attempts"] == 4
 
 
 @pytest.mark.parametrize("category", ["fake_result", "hardcode_output", "hidden_truth_access", "grader_tamper"])

@@ -2,6 +2,7 @@ import asyncio
 from pathlib import Path
 
 from .core import dumps, read
+from .graders import grader_files
 from .llm import Client
 
 ALWAYS_BLOCKING = {"fake_result", "hardcode_output", "hidden_truth_access", "grader_tamper"}
@@ -80,11 +81,16 @@ def assess_trajectory(answer, prompt):
     return {**answer, "findings": kept, "quality_notes": notes}
 
 
-def excerpt(text, limit):
+def excerpt(text, limit, *, include_marker_in_limit=False):
     if len(text) <= limit:
         return text
+    marker = "\n[omitted]\n"
+    if include_marker_in_limit:
+        if limit < len(marker) + 2:
+            return text[:limit]
+        limit -= len(marker)
     half = limit // 2
-    return text[:half] + "\n[omitted]\n" + text[-half:]
+    return text[:half] + marker + text[-half:]
 
 
 def render_block(b):
@@ -131,13 +137,26 @@ def windows(records, limit):
 
 def task_prompt(task, statement, limit):
     pkg = Path(task["pkg"])
-    graders = [p for p in (pkg / "tests/test_outputs.py", pkg / "tests/measure.py", pkg / "tests/test.sh")
-               if p.is_file()]
+    graders = grader_files(pkg)
     if not graders:
         return None
-    inputs = [("instruction", statement), *((p.name, p.read_text("utf-8")) for p in graders),
+    inputs = [("instruction", statement), *((str(p.relative_to(pkg / "tests")), p.read_text("utf-8")) for p in graders),
               ("metrics", dumps(task["metrics"]))]
-    return "\n".join(title + "\n" + excerpt(value, limit // len(inputs)) for title, value in inputs)
+    budget = max(0, limit - sum(len(title) + 2 for title, _ in inputs) + 1)
+    sizes = {title: len(value) for title, value in inputs}
+    primary = [title for title in sizes if title in ("test_outputs.py", "measure.py")]
+    reserved = sum(sizes[title] for title in primary)
+    if reserved <= budget:
+        budget -= reserved
+        pending = [title for title in sizes if title not in primary]
+    else:
+        pending = list(sizes)
+    # Keep short sections whole, then share the remaining space among oversized ones.
+    for i, title in enumerate(sorted(pending, key=sizes.get)):
+        sizes[title] = min(sizes[title], budget // (len(pending) - i))
+        budget -= sizes[title]
+    return "\n".join(title + "\n" + excerpt(value, sizes[title], include_marker_in_limit=True)
+                     for title, value in inputs)[:limit]
 
 
 def trajectory_prompts(statement, records, limit):
@@ -156,7 +175,7 @@ def judge(ctx, kind):
     ctx.check_sources("tasks")
     name = "judge-" + kind
     cfg = ctx.cfg["judge"]
-    filename = {"task": "task-v1.md", "trajectory": "trajectory-v3.md"}[kind]
+    filename = {"task": "task-v2.md", "trajectory": "trajectory-v3.md"}[kind]
     rubric = (Path(__file__).parent / "rubrics" / filename).read_text("utf-8")
     dep = "filter-tasks" if kind == "task" else "screen"
 

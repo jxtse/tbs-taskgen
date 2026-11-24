@@ -4,6 +4,7 @@ import re
 import unicodedata
 
 from .core import file_hash
+from .ingest import trial_identity
 
 
 def valid(r):
@@ -41,20 +42,15 @@ def difficulty_row(task, trials, cfg):
             raise ValueError(f"set {role}_model for mixed calibration models")
         models[role] = explicit or next(iter(inferred), None)
     # A partially recovered multi-attempt job replaces only the corresponding summaries.
-    remaining = list(cal)
-    for trial in trials:
-        candidates = [
-            r
-            for r in remaining
-            if r.get("job_name")
-            and r["job_name"] == trial["job_name"]
-            and (not r.get("trial") or r["trial"] == trial.get("trial_name"))
-            and (trial.get("calib_n") is None or r.get("n") == trial["calib_n"])
-        ]
-        if candidates:
-            match = next((r for r in candidates if r.get("reward") == trial.get("reward")), candidates[0])
-            remaining.remove(match)
-    attempts = remaining + trials
+    by_identity = {}
+    unnamed = []
+    for record in [*cal, *trials]:
+        key = trial_identity(record)
+        if key is None:
+            unnamed.append(record)
+        else:
+            by_identity[key] = record
+    attempts = [*by_identity.values(), *unnamed]
     scored = [r for r in attempts if valid(r)]
     counts = {}
     for role, model in models.items():

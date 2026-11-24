@@ -56,7 +56,7 @@ SENSITIVE_NAME = re.compile(
 
 
 def _subcommands(command):
-    """Split a shell command into argv lists with a shell tokenizer (quotes respected; heredoc bodies dropped)."""
+    """Yield tokenized commands with their terminating shell operator."""
     command = re.sub(r"<<-?\s*['\"]?(\w+)['\"]?[^\n]*\n.*?\n\s*\1\b", "", command, flags=re.S)
     argv = []
 
@@ -82,29 +82,50 @@ def _subcommands(command):
         tokens.append(";")
     for tok in tokens:
         if tok == "\n" or (tok and set(tok) <= set(";&|()\n")):
-            argv = flush(argv)
-            if argv:
-                yield argv
-            argv = []
+            for op in re.findall(r"&&|\|\||\|&|[;&|()]", tok):
+                yield flush(argv), op
+                argv = []
         elif tok and set(tok) <= set("<>"):
             argv.append(tok)
         else:
             argv.append(tok)
     argv = flush(argv)
     if argv:
-        yield argv
+        yield argv, ";"
 
 
 def _under(path, roots):
     return any(path == r or path.startswith(r + "/") for r in roots)
 
 
+def _commands_with_cwd(command, base):
+    stack = []
+    scopes = []
+    previous_op = None
+    for argv, op in _subcommands(command):
+        piped = previous_op in ("|", "|&") or op in ("|", "|&", "&")
+        previous_op = op
+        if argv:
+            yield argv, base
+        if argv and not piped and argv[0] in ("cd", "pushd", "popd"):
+            args = [a for a in argv[1:] if a not in {"--", "-L", "-P"}]
+            if argv[0] in ("cd", "pushd") and len(args) == 1 and not args[0].startswith(("-", "+")):
+                if argv[0] == "pushd":
+                    stack.append(base)
+                base = posixpath.normpath(posixpath.join(base, args[0]))
+            elif argv[0] == "popd" and not args and stack:
+                base = stack.pop()
+        if op == "(":
+            scopes.append((base, stack.copy()))
+        elif op == ")" and scopes:
+            base, stack = scopes.pop()
+
+
 def shell_probe(command, task_dirs, cwd=None):
     """True when a shell command looks for grader material outside the task and the agent's scratch space."""
     if HIDDEN.search(command):       # grader paths anywhere, including inline scripts (open('/tests/...'))
         return True
-    base = posixpath.join(task_dirs[0], cwd or ".")
-    for argv in _subcommands(command):
+    for argv, base in _commands_with_cwd(command, posixpath.join(task_dirs[0], cwd or ".")):
         cmd = argv[0].rsplit("/", 1)[-1]
         paths = [posixpath.normpath(posixpath.join(base, a)) for a in argv[1:] if not a.startswith("-")]
         # reading grader directories directly, by any command
@@ -191,7 +212,7 @@ def inspect_segment(source, offline, task_dirs=("/app", "/work")):
                     argv[0].rsplit("/", 1)[-1] in ("curl", "wget")
                     or (argv[0].rsplit("/", 1)[-1] in ("pip", "pip3", "uv", "conda", "mamba") and "install" in argv[1:3])
                     or (argv[0].startswith("python") and argv[1:4] == ["-m", "pip", "install"])
-                    for argv in _subcommands(value)
+                    for argv, _ in _subcommands(value) if argv
                 )
             else:
                 probe = bool(HIDDEN.search(value) and READ_OP.search(name + " " + value))

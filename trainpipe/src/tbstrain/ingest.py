@@ -5,6 +5,22 @@ from pathlib import Path
 import re
 
 from .core import digest, file_hash, lines, read, tree_hash
+from .graders import grader_files
+
+
+def trial_identity(record):
+    """Key a calibration by its release names and an independent rollout by its Harbor ID."""
+    if record.get("extra_rollout"):
+        return "rollout", record["trial_id"]
+    job = record.get("job_name")
+    trial = record.get("trial_name", record.get("trial"))
+    if isinstance(trial, dict):
+        trial = trial.get("trial")
+    if job and isinstance(trial, str) and trial:
+        return "trial", job, trial
+    number = record.get("calib_n", record.get("n"))
+    if job and number is not None:
+        return "slot", job, number
 
 
 def session_info(trial, config):
@@ -48,12 +64,23 @@ def released_task(ctx, run, tid, row):
     if isinstance(review, str):
         review = {"verdict": review}
     local = read(item / "calib/runs.json", [])
-    local_by_key = {(r.get("job_name"), r.get("n")): r for r in local}
+    local_by_trial = {trial_identity(r): r for r in local}
+    local_by_slot = defaultdict(list)
+    for r in local:
+        local_by_slot[r.get("job_name"), r.get("n")].append(r)
     cal = []
     for attempt in row.get("calib_runs", []):
-        detail = local_by_key.get((attempt.get("job_name"), attempt.get("n")), {})
+        job = attempt.get("job_name")
+        key = trial_identity(attempt)
+        slot = local_by_slot[job, attempt.get("n")]
+        detail = local_by_trial.get(key, {}) if key else {}
+        if not detail and len(slot) == 1 and (not attempt.get("trial") or not slot[0].get("trial")):
+            detail = slot[0]
         merged = {k: detail[k] for k in ("trial", "delivered", "api_status") if k in detail}
-        cal.append({**merged, **attempt})
+        summary = {**merged, **attempt}
+        if not attempt.get("trial") and detail.get("trial"):
+            summary["trial"] = detail["trial"]
+        cal.append(summary)
     network = prov.get("network") or {}
     thresholds = read(item / "thresholds.json", prov.get("thresholds") or {})
     task = dict(
@@ -83,8 +110,7 @@ def released_task(ctx, run, tid, row):
         offline=row.get("offline", not network.get("agent_hosts")),
     )
     task["source_hashes"] = {
-        str(pkg / name): ctx.content_hash(pkg / name)
-        for name in ("instruction.md", "tests/test_outputs.py", "tests/measure.py", "tests/test.sh")
+        str(path): ctx.content_hash(path) for path in [pkg / "instruction.md", *grader_files(pkg)]
     }
     return task
 
@@ -135,7 +161,7 @@ def rollout_matches(ctx, config, data, task, packages):
     return True
 
 
-def harbor_trial(ctx, trial, data, tasks, by_job, packages, extra):
+def harbor_trial(ctx, trial, data, tasks, by_trial, packages, extra):
     config = read(trial / "config.json", data.get("config") or {})
     job = trial.parent.name
     possible = [data.get("task_name"), data.get("task_id"), (config.get("task") or {}).get("path")]
@@ -149,15 +175,13 @@ def harbor_trial(ctx, trial, data, tasks, by_job, packages, extra):
     if configured_path:
         path = ctx.path(configured_path).resolve()
         ids.update(tid for tid, paths in packages.items() if path in paths)
-    matches = by_job.get(job, [])
+    key = trial_identity(dict(job_name=job, trial_name=trial.name))
+    matches = [] if extra else by_trial.get(key, [])
     if not ids and len({t for t, _ in matches}) == 1:
         ids.add(matches[0][0])
     tid = next(iter(ids)) if len(ids) == 1 else None
-    matching = [r for t, r in matches if t == tid]
-    calibration = next((r for r in matching if r.get("trial") == trial.name), {})
-    if not calibration and len(matching) == 1:
-        calibration = matching[0]
-    current = bool(matching) or bool(extra and tid and rollout_matches(ctx, config, data, tasks[tid], packages[tid]))
+    calibration = next((r for t, r in matches if t == tid), {})
+    current = bool(calibration) or bool(extra and tid and rollout_matches(ctx, config, data, tasks[tid], packages[tid]))
     kind, sessions = session_info(trial, config)
     agent = config.get("agent") or {}
     info = data.get("agent_info") or {}
@@ -209,6 +233,7 @@ def harbor_trial(ctx, trial, data, tasks, by_job, packages, extra):
         trial_id=identity,
         trial_name=trial.name,
         calib_n=calibration.get("n"),
+        extra_rollout=extra,
         current_package=current,
         task_id=tid,
         job_name=job,
@@ -274,10 +299,12 @@ def discover(ctx, runs, jobs):
         if (run / "calib-jobs").is_dir():
             calibration_dirs.add((run / "calib-jobs").resolve())
             roots.update(p.resolve() for p in (run / "calib-jobs").iterdir() if p.is_dir())
-    by_job = defaultdict(list)
+    by_trial = defaultdict(list)
     for t in tasks.values():
         for r in t["calib_runs"]:
-            by_job[r.get("job_name")].append((t["task_id"], r))
+            key = trial_identity(r)
+            if key:
+                by_trial[key].append((t["task_id"], r))
     for root in sorted(roots):
         if not root.is_dir():
             raise ValueError(f"missing job directory {root}")
@@ -291,7 +318,7 @@ def discover(ctx, runs, jobs):
             if not any(k in data for k in ("task_name", "task_id", "verifier_result", "exception_info")):
                 continue  # Harbor job summary
             extra = root in extra_roots and trial.parent.parent.resolve() not in calibration_dirs
-            record = harbor_trial(ctx, trial, data, tasks, by_job, packages, extra)
+            record = harbor_trial(ctx, trial, data, tasks, by_trial, packages, extra)
             identity = record["trial_id"]
             if identity in trials and trials[identity] != record:
                 raise ValueError(f"conflicting trial id {identity}")
