@@ -20,7 +20,7 @@ marked "leak": true (ground truth / answers readable or copyable, or scoring tam
 whatever severity the reviewer gave it.  Every blocking issue carries a fix_kind: "local" (fixable by editing the
 statement, the format notes, the test / scoring scripts, or an exploit baseline, without loosening a threshold and
 without touching the reference) or "fundamental" (the reference itself is wrong, the truth must be regenerated, or
-the task's core does not hold).  The final verdict is derived from the blocking issues, not taken from the reviewer:
+the task's core does not hold). An evidenced drop stands. Other verdicts follow the blocking issues:
 any "fundamental" blocking issue -> drop; only "local" ones -> revise; none -> pass.  Each blocking issue names its
 problem class (PROBLEM_CLASSES); the class, not the reviewer's own fix_kind, decides local vs fundamental.  A
 malformed verdict (unknown verdict or problem class, blocking issue without a class, verifier reward != 1) is
@@ -41,7 +41,8 @@ import time
 from pathlib import Path
 
 from . import calib
-from .probe_findings import finding_errors, has_evidence
+from .gates import current_probe_report
+from .probe_findings import CURRENT_CONTRACT, finding_errors, has_evidence
 from .state import gate_attempts, read_json
 
 VERDICTS = ("pass", "revise", "drop")
@@ -68,7 +69,7 @@ CHECKLIST = ("a_consistency", "b_missing_conditions", "c_thresholds", "d_stabili
 CATEGORIES = {"a": "consistency", "b": "missing_conditions", "c": "thresholds", "d": "stability",
               "e": "shortcuts_leaks", "f": "network_readymade", "g": "calibration", "h": "timing_gate",
               "i": "author_code", "j": "genuine_difficulty"}
-REVIEW_PROMPT_VERSION = "s9r-v3"
+REVIEW_PROMPT_VERSION = CURRENT_CONTRACT
 VERDICT_PATH = "/app/review_out/verdict.json"
 # files a review revision (S8) may change: the statement, the data format notes (written by the generator), the
 # test / scoring scripts, and the exploit baselines.  Never the reference solution, the baselines' mid / naive,
@@ -275,28 +276,12 @@ PROBE_ARMS = {"coverage": "one_confident", "hidden_garbage": "hidden_garbage"}
 
 
 def suspected_scopes(report: dict) -> list[str]:
-    """Scope IDs from the current S7 attempt, including pre-status probe records."""
-    suspected = []
-    for gate, arm in PROBE_ARMS.items():
-        probe = report.get("details", {}).get(gate)
-        if not isinstance(probe, dict):
-            continue
-        accepted = set(probe.get("accepted_scopes", []))
-        for scope, trial in probe.get("scopes", {}).items():
-            if not isinstance(trial, dict):
-                continue
-            if "status" in trial:
-                hit = trial["status"] == "shortcut_suspected"
-            elif "rc" in trial or "count" in trial:
-                hit = trial.get("rc") == 0 and trial.get("count", 0) > 0 and trial.get("reward") == "1"
-            else:
-                hit = trial.get("reward") == "1" or scope in accepted
-            if hit:
-                accepted.add(scope)
-            else:
-                accepted.discard(scope)
-        suspected.extend(f"{arm}/{scope}" for scope in sorted(accepted))
-    return suspected
+    """Only the current probe policy defines findings for review."""
+    if not current_probe_report(report):
+        return []
+    return [f"{arm}/{scope}" for gate, arm in PROBE_ARMS.items()
+            for scope, trial in sorted(report.get("details", {}).get(gate, {}).get("scopes", {}).items())
+            if trial.get("status") == "shortcut_suspected"]
 
 
 def write_bundle(item_dir: Path, dest: Path, state: dict, digest_kb: int = 150) -> dict:
@@ -342,7 +327,7 @@ def write_bundle(item_dir: Path, dest: Path, state: dict, digest_kb: int = 150) 
             shutil.copy2(g, rec / "s7_gates" / g.name)
         # Older attempts describe earlier graders. Only the last S7 attempt binds the current verdict.
         report = read_json(gates[-1], {})
-        details = report.get("details", {})
+        details = report.get("details", {}) if current_probe_report(report) else {}
         probes = {arm: details[gate] for gate, arm in PROBE_ARMS.items() if gate in details}
         suspected = suspected_scopes(report)
     (rec / "output_probes.json").write_text(json.dumps(dict(probes=probes, suspected_scopes=suspected), indent=2))
@@ -624,7 +609,7 @@ e. **Shortcuts and leaks.**  Can the task be passed without doing the work (hard
    For EACH ID, reproduce the scoped run with the packaged grader. The exact transformations and CLI wrapper are in
    `records/probe_outputs.py` when probes are present. Change only the named public or hidden scope and check
    which changed values the statement requires and the grader scores. In `probe_findings`, record the exact ID,
-   the `command` you ran, its `observed_reward` ("0", "1", or a number), and an `observation` of at least
+   the executable command line you ran in `command`, its `observed_reward` ("0", "1", or a number), and an `observation` of at least
    20 characters describing the grader output. An optional `reproduction` note may add context.
    Classify a real grader gap as `grader_gap` and link an evidenced blocking issue by `issue_id`. This applies
    to additional grader gaps you find too. For a `probe_artefact`, explain why the changed files or values do
@@ -731,11 +716,16 @@ Finish by writing the file; the run ends when you stop.  Do not modify anything 
 
 
 # ------------------------------------------------------------------ verdict
-def normalize(raw: dict | None, reward: float | None = None, allow_human: bool = False, suspected_scopes=()) -> dict:
+def job_contract(job):
+    return job.get("review_contract_version", job.get("review_prompt_version", "s9r-v1"))
+
+
+def normalize(raw: dict | None, reward: float | None = None, allow_human: bool = False, suspected_scopes=(),
+              contract=CURRENT_CONTRACT) -> dict:
     """Apply the contract to a raw verdict: returns {verdict, raw_verdict, issues, blocking, minor, downgraded,
     label_assessment, checklist, problems}.  verdict None = invalid (structural problem: unknown verdict or
     severity, non-object issue, blocking issue without a fix_kind, verifier reward != 1 when known) — the caller
-    retries the review run; it is not a routing outcome.  The routed verdict is derived from the blocking issues:
+    retries the review run. An explicit drop with an evidenced blocking issue stands. Otherwise:
     any fundamental one -> drop, otherwise any blocking one -> revise, none -> pass.  The only silent rewrites are
     the contract's own rules (a blocking issue without evidence counts as minor; a leak with evidence is
     blocking); a raw verdict that disagrees with its issues is recorded in problems but does not make the verdict
@@ -794,7 +784,7 @@ def normalize(raw: dict | None, reward: float | None = None, allow_human: bool =
                 problems.append(f"{it['id']}: blocking issue without a problem class (or fix_kind)")
                 hard.append(it["id"])
         issues.append(it)
-    errors = finding_errors(raw, suspected_scopes)
+    errors = finding_errors(raw, suspected_scopes, contract)
     hard.extend(errors)
     problems.extend(errors)
     if reward is not None and reward != 1:
@@ -804,6 +794,8 @@ def normalize(raw: dict | None, reward: float | None = None, allow_human: bool =
     if rv not in VERDICTS and not (allow_human and rv in ALLOWED_HUMAN):
         problems.append(f"verdict {rv!r} not one of {VERDICTS}")
         v = None
+    elif rv == "drop" and blocking:
+        v = "drop"
     elif hard:
         v = None
     elif allow_human and rv in ALLOWED_HUMAN:
@@ -848,7 +840,8 @@ def read_verdict(trial: Path) -> dict | None:
     return None
 
 
-def classify(job_dir: Path, model: str | None, prices: dict, allow_human: bool = False, suspected_scopes=()) -> dict:
+def classify(job_dir: Path, model: str | None, prices: dict, allow_human: bool = False, suspected_scopes=(),
+              contract=CURRENT_CONTRACT) -> dict:
     """A finished review job: outcome "done" (a verdict file came back; verdict may still be None = invalid,
     retried by routing) or "infra"; cost as for calibration."""
     trials = calib.collect(job_dir, model, prices)
@@ -864,8 +857,8 @@ def classify(job_dir: Path, model: str | None, prices: dict, allow_human: bool =
         rw = ((json.loads((trial / "result.json").read_text()).get("verifier_result") or {}).get("rewards") or {})
         reward = rw.get("reward")
         reward = float(reward) if isinstance(reward, (int, float)) else 0.0
-    return dict(outcome="done" if raw is not None else "infra", verdict_raw=raw,
-                verdict=normalize(raw, reward, allow_human, suspected_scopes) if raw is not None else None,
+    return dict(outcome="done" if raw is not None else "infra", verdict_raw=raw, verifier_reward=reward,
+                verdict=normalize(raw, reward, allow_human, suspected_scopes, contract) if raw is not None else None,
                 trial=dict(last, job_dir=str(Path(job_dir).resolve()),
                            verdict_trial=trial.name if trial else None),
                 minutes=last.get("minutes"), cost_usd=usd, cost_kind=kind, usage=usage, n_trials=len(trials))
@@ -905,7 +898,8 @@ def prepare(cfg: dict, item_dir: Path, task: Path, rnd: int, attempt: int, epoch
                job_dir=str(Path(c["jobs_dir"]) / name), task=str(task.resolve()), outcome=None,
                ledger_stage="S9R", pkg_sha=calib.pkg_sha(item_dir / "pkg"), calib_epoch=epoch)
     evidence = read_json(task / "environment/review/records/output_probes.json", {})
-    rec.update(review_prompt_version=REVIEW_PROMPT_VERSION, suspected_scopes=evidence.get("suspected_scopes", []))
+    rec.update(review_prompt_version=REVIEW_PROMPT_VERSION, review_contract_version=CURRENT_CONTRACT,
+               suspected_scopes=evidence.get("suspected_scopes", []))
     why = calib.network_problem(rc, task, conf) or route_problem(cfg)
     if why:
         rec["blocked" if c.get("allow_submit") else "warning"] = why

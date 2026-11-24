@@ -146,6 +146,8 @@ class Pipeline:
             return self._step(it)
 
     def _step(self, it) -> str:
+        if B.migrate_probe_report(self, it):
+            return "ok"
         st = it.state["stage"]
         role = MODEL_STAGES.get(st)
         alias = resolve_role(self.cfg, role) if role else None
@@ -265,7 +267,7 @@ class Pipeline:
                 return False
             if last is not None and _stage_pos(it.state["stage"]) > last:
                 return False
-            if it.state["status"] == "active":
+            if it.state["status"] == "active" or B.legacy_report_id(it):
                 return True
             if B.harden_needs_step(it):         # an interrupted hardening transaction (any status)
                 return it.item_id not in polled
@@ -286,7 +288,7 @@ class Pipeline:
                     polled.add(it.item_id)
                 elif it.state["status"] == "waiting" and it.state["stage"] in AGENT_STAGES:
                     polled.add(it.item_id)
-                elif it.state["status"] == "waiting":
+                elif it.state["status"] == "waiting" and not B.legacy_report_id(it):
                     rewoken.add(it.item_id)
                     if not B.rewake(self.cfg, it):      # re-checked under the item lock
                         continue
@@ -310,6 +312,9 @@ class Pipeline:
                 continue
             hist = it.state.get("history") or [{}]
             if stages and hist[-1].get("paused_stage", it.state["stage"]) not in stages:
+                continue
+            if B.migrate_probe_report(self, it):
+                out.append(it.item_id)
                 continue
             probe_park = (it.state["status"] == "parked" and it.state.get("reason") == "parked:probe_unreviewed"
                           and (self.cfg.get("review") or {}).get("enabled"))

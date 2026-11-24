@@ -598,9 +598,9 @@ def test_orphan_reservation_settled_before_relaunch(tmp_path, monkeypatch):
 
 
 def test_parity_matches_renamed_hidden_metrics():
-    rows = [{"name": n} for n in ("public_rr10", "hidden_rr10_set_a", "public_rel_rmse", "hidden_large_rel_rmse_max",
-                                  "public_mean_clean_error", "hidden_max_clean_error", "public_host_accuracy")]
-    assert gates.hidden_parity(rows, {"metrics": []})["missing_hidden"] == ["host_accuracy"]
+    rows = [{"name": n} for n in ("public_toy_overlap", "hidden_toy_overlap_regime_b", "public_toy_distance",
+                                  "hidden_large_toy_distance_max", "public_mean_toy_offset", "hidden_max_toy_offset", "public_toy_precision")]
+    assert gates.hidden_parity(rows, {"metrics": []})["missing_hidden"] == ["toy_precision"]
 
 
 def test_public_probe_command_survives_the_shell(tmp_path, monkeypatch):
@@ -1190,6 +1190,7 @@ def test_ans_control_in_s7_and_review_bundle(tmp_path, monkeypatch, wired_gates,
 
     monkeypatch.setattr(runner, "test", score)
     report = gates.run_gates(cfg, tmp_path, spec, {}, 1)
+    assert report["probe_policy_version"] == gates.PROBE_POLICY_VERSION
     assert not arms and report["gates"]["coverage"] and "coverage" not in report["blocking"]
     detail = report["details"]["coverage"]
     assert detail["inconclusive"] and detail["reference"]["verifier_rc"] == rc and detail["reference"]["reward"] == reward
@@ -1279,31 +1280,6 @@ def test_side_file_only_suspicion_identifies_transformed_path(tmp_path, monkeypa
     assert scope["status"] == "shortcut_suspected" and result["control"] is None
     assert scope["transformed_files"] == [dict(path="debug/scores.csv", declared_deliverable=expected)]
     assert scope["verifier"]["out"] == "public.csv accepted"
-
-
-@pytest.mark.parametrize("reason,baseline_passed,oracle_ok,advance", [
-    ("gates:coverage", False, True, True),
-    ("gates:hidden_garbage,exploit", False, True, True),
-    ("gates:exploit", False, True, True),
-    ("gates:exploit", True, True, False),
-    ("gates:coverage", False, False, False),
-])
-def test_resume_probe_only_repair(tmp_path, reason, baseline_passed, oracle_ok, advance):
-    cfg = load_config()
-    it = Store(tmp_path).item("toy")
-    limit = cfg["gates"]["max_repair_rounds"]
-    it.state.update(stage="S8", repair_from=reason, repair_rounds=limit)
-    folded = "exploit" in reason
-    flags = dict(oracle=oracle_ok, exploit=not folded, exploit_valid=True, hidden_garbage=not folded, coverage=False)
-    seed = dict(ref={"passed": True}, exploit_echo={"passed": baseline_passed}, exploit__hidden_garbage={"ok": False})
-    write_json(it.p("gates/attempt-10.json"), dict(gates=flags, details=dict(seeds={"7": seed}),
-                                                   blocking=reason[6:].split(","), ok=False))
-    stages_b.s8(SimpleNamespace(cfg=cfg), it)
-    if advance:
-        assert it.state["stage"] == "PKG" and it.state["status"] == "active"
-    else:
-        assert it.state["status"] == "dropped" and it.state["reason"].startswith("repair_limit:")
-    assert it.state["repair_rounds"] == limit
 
 
 @pytest.mark.parametrize("directive,expected", [

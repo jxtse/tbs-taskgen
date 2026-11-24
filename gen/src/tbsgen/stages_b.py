@@ -12,7 +12,7 @@ from . import calib, difficulty, gates, package, repair, review
 from .models import parse_files
 from .prompts import METRICS_API, S6C_TESTS, S8_EXPLOIT, S8_REPAIR, S8_REVIEW, SYSTEM
 from .stages_a import _write_files, chat_files, save_raw
-from .state import latest_gate_report, read_json, write_json
+from .state import gate_attempts, latest_gate_report, read_json, write_json
 
 
 def s6c(P, it):
@@ -104,9 +104,6 @@ def s8(P, it):
         return _s8_review(P, it)
     reason = str(it.state.get("repair_from", ""))
     gate_log = latest_gate_report(it.p("gates"))
-    if gates.legacy_probe_pass(P.cfg, gate_log, reason):
-        it.state.pop("repair_from", None)
-        return it.goto("PKG", "S7 deterministic gates passed; output probes require review")
     if it.state.get("repair_from") == "gates:exploit_valid":
         return _s8_exploits(P, it)
     if it.state.get("thresholds_locked"):
@@ -152,6 +149,65 @@ def s8(P, it):
     it.goto(back, f"repaired round {rounds + 1}")
 
 
+_POST_PROBE_STAGES = ("S8", "PKG", "S9", "S9R", "S10")
+
+
+def legacy_report_id(it):
+    if it.state.get("stage") not in _POST_PROBE_STAGES or it.state.get("status") in ("done", "dropped"):
+        return None
+    reports = gate_attempts(it.p("gates"))
+    if not reports or gates.current_probe_report(read_json(reports[-1])):
+        return None
+    # An attempt number can be reused by another hardening round.
+    report_id = f"{reports[-1].stem}:{_sha_file(reports[-1])}"
+    if not any(r.get("probe_report_id") == report_id for r in it.state.get("regates", [])):
+        return report_id
+    return None
+
+
+def migrate_probe_report(P, it):
+    if not legacy_report_id(it):
+        return False
+    with item_lock(it):
+        it.load()
+        report_id = legacy_report_id(it)
+        if not report_id:
+            return True  # another worker already moved this item
+        stage = it.state["stage"]
+        if stage == "S8" and it.state.get("review_revision_pending"):
+            _finish_revision(P, it, it.state["review_revision_pending"])
+        if stage in ("S9", "S9R"):
+            records = read_json(it.p("review" if stage == "S9R" else "calib", "runs.json"), [])
+            save = _save_review if stage == "S9R" else _save_run
+            for rec in records:
+                if stage == "S9R" and _received_drop(it, rec):
+                    _route_review(P, it, rec, rec["n"])
+                    return True
+                if rec.get("outcome") is None:
+                    if rec.get("state") == "launched" or calib.job_started(rec):
+                        # Keep the original job identity and slot until its result and spend are settled.
+                        rec["state"] = "launched"
+                        save(it, rec)
+                        it.state["probe_migration_job_stage"] = stage
+                    else:
+                        if rec.get("ledger_call"):
+                            P.ledger.settle(rec["ledger_call"], 0.0, status="error", kind="not_launched")
+                        save(it, dict(rec, outcome="infra", result_type="infra", obsolete_probe_job=True))
+        _regate(P, it, "probe_policy_migration", False, report_id)
+        return True
+
+
+def _received_drop(it, rec):
+    if (rec.get("outcome") not in ("done", "invalid") or rec.get("n") != it.state.get("review_round")
+            or rec.get("calib_epoch", 0) != it.state.get("calib_epoch", 0)):
+        return False
+    v = _bound_verdict(it, rec, rec["n"])
+    if v and (v.get("verdict") == "drop" or v["_normalized"].get("verdict") == "drop"):
+        return (rec.get("pkg_sha") == calib.pkg_sha(it.p("pkg"))
+                and _job_judgment(v, rec, allow_human=False)["verdict"] == "drop")
+    return False
+
+
 def regate(P, it, reason: str, recalibrate: bool = False) -> dict:
     """Re-gate a packaged item after a harness change (the shared verifier template tests/_metrics.py / test.sh, the
     S7 gates): the statement, scoring script, generator, reference and thresholds stay as they are.
@@ -164,36 +220,50 @@ def regate(P, it, reason: str, recalibrate: bool = False) -> dict:
     reviewed again before S10."""
     with item_lock(it):
         it.load()
-        st = it.state
-        if st.get("stage") not in ("S9", "S9R", "S10") and st.get("status") not in ("done", "parked"):
-            raise ValueError(f"regate: item at {st.get('stage')}/{st.get('status')} is not packaged")
-        if not it.p("pkg").exists() or not it.p("thresholds.json").exists():
-            raise ValueError("regate: no pkg/ or thresholds.json")
-        if any(r.get("outcome") is None for r in read_json(it.p("calib", "runs.json"), []) or []):
-            raise ValueError("regate: a calibration run is still pending")
-        old_sha = calib.pkg_sha(it.p("pkg"))
-        # withdraw first (idempotent): the package must be out of the manifest before the item can run again
-        # and overwrite pkg/; a crash after this line leaves a withdrawn, still finished item -> regate again
-        withdrawn = withdraw(P, it.item_id, f"regate: {reason}")
-        rec = dict(ts=time.time(), reason=reason, from_stage=st.get("stage"), from_status=st.get("status"),
-                   pkg_sha=old_sha, calib_epoch=st.get("calib_epoch", 0), label=st.get("calib_label"))
-        st.setdefault("regates", []).append(rec)
-        st["thresholds_locked"] = True
-        st["revision_data_hash"] = review.pkg_data_hash(it.p("pkg"))
-        st["post_regate"] = True
-        if recalibrate or not (P.cfg.get("review") or {}).get("rescore_scoring_only", True):
-            # re-scoring switched off: the kept calibration cannot be checked against the new grader -> redo it
+        return _regate(P, it, reason, recalibrate)
+
+
+def _regate(P, it, reason, recalibrate, report_id=None):
+    st = it.state
+    if not report_id and st.get("stage") not in ("S9", "S9R", "S10") and st.get("status") not in ("done", "parked"):
+        raise ValueError(f"regate: item at {st.get('stage')}/{st.get('status')} is not packaged")
+    packaged = it.p("pkg").is_dir()
+    if (not report_id and not packaged) or not it.p("thresholds.json").exists():
+        raise ValueError("regate: no pkg/ or thresholds.json")
+    if not report_id and any(r.get("outcome") is None for r in read_json(it.p("calib", "runs.json"), []) or []):
+        raise ValueError("regate: a calibration run is still pending")
+    old_sha = calib.pkg_sha(it.p("pkg")) if packaged else None
+    # withdraw first (idempotent): the package must be out of the manifest before the item can run again
+    # and overwrite pkg/; a crash after this line leaves a withdrawn, still finished item -> regate again
+    withdrawn = withdraw(P, it.item_id, f"regate: {reason}")
+    rec = dict(ts=time.time(), reason=reason, from_stage=st.get("stage"), from_status=st.get("status"),
+               pkg_sha=old_sha, calib_epoch=st.get("calib_epoch", 0), label=st.get("calib_label"))
+    if report_id:
+        rec["probe_report_id"] = report_id
+        st.pop("repair_from", None)
+        st.pop("regen_6c", None)
+        st.pop("post_revision", None)
+    st.setdefault("regates", []).append(rec)
+    if not st.get("thresholds_locked") or not st.get("revision_data_hash"):
+        st["revision_data_hash"] = review.pkg_data_hash(it.p("pkg")) if packaged else None
+    st["thresholds_locked"] = True
+    st["post_regate"] = True
+    if packaged and (recalibrate or not (P.cfg.get("review") or {}).get("rescore_scoring_only", True)):
+        # re-scoring switched off: the kept calibration cannot be checked against the new grader -> redo it
+        if st.get("probe_migration_job_stage"):
+            st["rescore_pending"] = dict(recalibrate=True)
+        else:
             rec["archived_epoch"] = _archive_calibration(it)
-            st.pop("calib_label", None)
-        elif not st.get("rescore_pending"):
-            # the shared verifier template changed: the kept calibration stands until S9 re-scores the saved
-            # deliverables with the new grader (review.rescore_item), as the reference re-measurement does
-            st["rescore_pending"] = dict(reason="regate", files=["tests/_metrics.py", "tests/test.sh"], ts=time.time())
-        st.setdefault("history", []).append(dict(stage=st.get("stage"), result="regate", to="S6A_run", reason=reason,
-                                                 ts=time.time()))
-        st.update(stage="S6A_run", status="active")
-        st.pop("reason", None)
-        it.save()
+        st.pop("calib_label", None)
+    elif packaged and not st.get("rescore_pending"):
+        # the shared verifier template changed: the kept calibration stands until S9 re-scores the saved
+        # deliverables with the new grader (review.rescore_item), as the reference re-measurement does
+        st["rescore_pending"] = dict(reason="regate", files=["tests/_metrics.py", "tests/test.sh"], ts=time.time())
+    st.setdefault("history", []).append(dict(stage=st.get("stage"), result="regate", to="S6A_run", reason=reason,
+                                             ts=time.time()))
+    st.update(stage="S6A_run", status="waiting" if st.get("probe_migration_job_stage") else "active")
+    st.pop("reason", None)
+    it.save()
     P.store.event("regate", item=it.item_id, reason=reason, pkg_sha=old_sha)
     return dict(item=it.item_id, stage="S6A_run", pkg_sha=old_sha, withdrawn=withdrawn)
 
@@ -417,6 +487,11 @@ def _rescore_pending(P, it):
     waits (infrastructure, not an attempt)."""
     pend = it.state.get("rescore_pending") or {}
     runs = read_json(it.p("calib", "runs.json"), []) or []
+    if pend.get("recalibrate"):
+        _archive_calibration(it)
+        it.state.pop("rescore_pending", None)
+        it.save()
+        return None
     decisive = [r for r in runs if r.get("outcome") in ("pass", "fail")]
     if decisive:
         try:
@@ -448,13 +523,18 @@ def _cap_reached(P) -> float | None:
     return None
 
 
+def job_stage(it):
+    """The stage owning the outstanding job while a probe migration drains it."""
+    return it.state.get("probe_migration_job_stage") or it.state.get("stage")
+
+
 def running_jobs(P) -> list[str]:
     """Harbor jobs holding a calib.max_concurrent_jobs slot: records of the item's current stage (S9 -> calibration
     runs, S9R -> review runs; the stage's watcher is what settles them) without an outcome that are launched,
     reserved (about to launch / recovering), or whose job already exists."""
     out = []
     for it in P.store.items():
-        st = it.state.get("stage")
+        st = job_stage(it)
         rf = ("calib", "runs.json") if st == "S9" else ("review", "runs.json") if st == "S9R" else None
         if rf is None:
             continue
@@ -602,8 +682,14 @@ def _s9(P, it):
             return start_hardening(P, it, kind=difficulty.KIND_VARIANT)
         if not P.cfg.get("review", {}).get("enabled"):
             scopes = _probe_scopes(it)
-            if scopes:
-                return _park_unreviewed(P, it, scopes)
+            if scopes or what == "frontier":
+                why = review_gate(P, it, scopes)
+                if why and scopes:
+                    return _park_unreviewed(it, scopes)
+                if why:
+                    return it.finish("parked", f"frontier:unreviewed ({why})")
+                if what == "frontier" or what in c["keep_labels"]:
+                    return it.advance("S9", "S10", label=what)
         if review.reviewable(P.cfg, what):
             # S9R: kept labels must pass the review before S10; parked:teacher_failed is reviewed as a diagnosis.
             # A fresh round number per version: review job names / verdict records never collide with an earlier
@@ -612,9 +698,6 @@ def _s9(P, it):
             return it.goto("S9R", f"label:{what}")
         if what.startswith("parked"):
             return it.finish("parked", what)
-        if what == "frontier":
-            withdraw(P, it.item_id, "frontier unreviewed (review disabled)")
-            return it.finish("parked", "frontier:unreviewed (review disabled: never released without S9R)")
         if what in c["keep_labels"]:
             return it.advance("S9", "S10", label=what)
         if what == "easy" and difficulty.variant_enabled(P.cfg, it):
@@ -670,9 +753,18 @@ def ingest(P, it, job_dir: str | None = None) -> dict:
     state (review #3/#4)."""
     with item_lock(it):
         it.load()
-        if it.state.get("stage") == "S9R":
+        if job_stage(it) == "S9R":
             return _ingest_review(P, it, job_dir)
         return _ingest(P, it, job_dir)
+
+
+def _after_ingest(P, it, rec, stage):
+    if it.state.pop("probe_migration_job_stage", None):
+        if stage == "S9R" and _received_drop(it, rec):
+            return _route_review(P, it, rec, rec["n"])
+        stage = "S6A_run"
+    it.state.update(stage=stage, status="active")
+    it.save()
 
 
 def _ingest(P, it, job_dir: str | None = None) -> dict:
@@ -680,8 +772,7 @@ def _ingest(P, it, job_dir: str | None = None) -> dict:
     pend = [r for r in runs if r.get("outcome") is None and r.get("state", "launched") == "launched"]
     if not pend:
         if runs and runs[-1].get("outcome") is not None and it.state.get("status") == "waiting":
-            it.state["stage"], it.state["status"] = "S9", "active"     # recover the item state
-            it.save()
+            _after_ingest(P, it, runs[-1], "S9")
             return dict(recovered=True, job_name=runs[-1]["job_name"])
         raise ValueError("no pending calibration run for this item")
     rec = pend[0]
@@ -713,8 +804,7 @@ def _ingest(P, it, job_dir: str | None = None) -> dict:
         P.ledger.settle(rec["ledger_call"], usd, kind=kind, usage=usage,
                         note=f"S9 cost {kind}, outcome={t['outcome']}, result_type={t['result_type']}")
     write_json(it.p("calib", "runs.json"), runs)
-    it.state["stage"], it.state["status"] = "S9", "active"
-    it.save()
+    _after_ingest(P, it, rec, "S9")
     return t
 
 
@@ -728,22 +818,17 @@ def _probe_scopes(it):
     return review.suspected_scopes(latest_gate_report(it.p("gates")))
 
 
-def _park_unreviewed(P, it, scopes):
+def _park_unreviewed(it, scopes):
     why = "parked:probe_unreviewed"
-    withdraw(P, it.item_id, why)
     return it.finish("parked", why, detail={"suspected_scopes": scopes})
 
 
 def review_gate(P, it, scopes=None) -> str | None:
     """Why S10 must not release this item yet (None = may release): with review on and a reviewable label, the
-    current package, calibration epoch and review round need a recorded pass.  A frontier task always does (with
-    review disabled it can never be released)."""
+    current package, calibration epoch and review round need a recorded pass.  Frontier tasks also need a confirmed reference."""
     scopes = _probe_scopes(it) if scopes is None else scopes
-    if scopes and not (P.cfg.get("review") or {}).get("enabled"):
-        return "parked:probe_unreviewed"
-    if it.state.get("calib_label") == "frontier" and not (P.cfg.get("review") or {}).get("enabled"):
-        return "frontier needs an S9R review (review disabled)"
-    if not scopes and not review.reviewable(P.cfg, it.state.get("calib_label")):
+    frontier = it.state.get("calib_label") == "frontier"
+    if not frontier and not scopes and not review.reviewable(P.cfg, it.state.get("calib_label")):
         return None
     v = read_json(it.p("review", "verdict.json"), None)
     if not v:
@@ -754,8 +839,14 @@ def review_gate(P, it, scopes=None) -> str | None:
     if scopes:
         runs = read_json(it.p("review", "runs.json"), [])
         job = next((r for r in runs if r.get("job_name") == v.get("job")), {})
-        if not set(scopes) <= set(job.get("suspected_scopes", [])):
-            return "probe scopes require review: " + ", ".join(scopes)
+        if (job.get("outcome") != "done" or job.get("n") != v.get("round") or job.get("pkg_sha") != v.get("pkg_sha")
+                or job.get("calib_epoch", 0) != v.get("calib_epoch", 0)):
+            return "probe verdict of another review job"
+        if _job_judgment(v, job, allow_human=False)["verdict"] != "pass":
+            return "invalid verdict for the submitted review contract"
+        if not P.cfg["review"]["enabled"] and review.job_contract(job) != review.CURRENT_CONTRACT:
+            return "current review contract required"
+        scopes = set(scopes) | set(job.get("suspected_scopes", []))
     if (scopes or v.get("probe_findings")) and review.normalize(v, suspected_scopes=scopes)["verdict"] != "pass":
         return "probe findings require a new review"
     if it.state.get("calib_label") == "frontier":
@@ -777,8 +868,6 @@ def s10(P, it):
         # A version already released (manifest append done, crash before "done") keeps its release: the diversity
         # decision is taken once per item, before the first append, not re-taken against a later inventory.
         scopes = _probe_scopes(it)
-        if scopes and not (P.cfg.get("review") or {}).get("enabled"):
-            return _park_unreviewed(P, it, scopes)
         previous = _live_release(P, it.item_id)
         why = None if previous else diversity.admission(P, it, "S10")
         if why:
@@ -789,8 +878,9 @@ def s10(P, it):
 
 def _release_reviewed(P, it, previous, scopes):
     why = review_gate(P, it, scopes)
-    if why and it.state.get("calib_label") == "frontier" and not (P.cfg.get("review") or {}).get("enabled"):
-        withdraw(P, it.item_id, why)
+    if why and not P.cfg["review"]["enabled"]:
+        if scopes:
+            return _park_unreviewed(it, scopes)
         return it.finish("parked", f"frontier:unreviewed ({why})")
     if why:
         # a release whose current package / epoch / round has no confirming pass must not stay published while the
@@ -831,7 +921,7 @@ def _release_reviewed(P, it, previous, scopes):
     it.advance("S10", None, status="done")
 
 
-def _settle_dead_job(P, it, rec: dict) -> None:
+def _settle_dead_job(P, it, rec: dict, save=_save_run) -> None:
     """The Harbor job of a launched run ended without finished_at (crash / kill): an infra run.  Its cost is what
     the trials written so far show (tokens), else unknown (reservation kept, not counted as actual spend)."""
     jd = Path(rec["job_dir"])
@@ -847,7 +937,7 @@ def _settle_dead_job(P, it, rec: dict) -> None:
     ex = exf.read_text().strip() if exf.exists() else "none (session gone)"
     rec.update(state="died", outcome="infra", result_type="infra", cost_usd=usd, cost_kind=kind,
                error=f"launcher exit {ex}; harbor job has no finished_at")
-    _save_run(it, rec)
+    save(it, rec)
     P.store.event("calib_job_died", item=it.item_id, job=rec["job_name"], cost_kind=kind)
 
 
@@ -884,12 +974,15 @@ def watch_tick(P, only: list[str] | None = None, max_steps: int = 50) -> dict:
     for it in P.store.items():
         if only and it.item_id not in only:
             continue
-        if it.state.get("stage") not in ("S9", "S9R") or it.state.get("status") != "waiting":
+        stage = job_stage(it)
+        if stage not in ("S9", "S9R") or it.state.get("status") != "waiting":
             continue
-        rf = ("calib", "runs.json") if it.state["stage"] == "S9" else ("review", "runs.json")
+        rf = ("calib" if stage == "S9" else "review", "runs.json")
         runs = read_json(it.p(*rf), [])
         pend = [r for r in runs if r.get("outcome") is None and r.get("state", "launched") == "launched"]
         if not pend:
+            if it.state.get("probe_migration_job_stage"):
+                ingest(P, it)  # recover a crash after saving runs.json
             continue
         rec = pend[0]
         jr = read_json(Path(rec["job_dir"]) / "result.json", {}) or {}
@@ -906,15 +999,19 @@ def watch_tick(P, only: list[str] | None = None, max_steps: int = 50) -> dict:
                 it.load()                   # re-check under the lock: another watcher / run may have moved it
                 runs = read_json(it.p(*rf), [])
                 cur = next((r for r in runs if r.get("job_name") == rec["job_name"]), {})
-                if it.state.get("stage") != rf_stage(rf) or it.state.get("status") != "waiting" or \
+                if job_stage(it) != rf_stage(rf) or it.state.get("status") != "waiting" or \
                         cur.get("outcome") is not None or cur.get("state") != "launched":
                     continue
                 kind = "launcher_failed" if calib.launcher_failed(cur, c) else \
                     "job_died" if calib.launcher_died(cur, c) else None
                 if kind is None:
                     continue
-                it.state["status"] = "active"       # s9() / s9r() reconcile the dead launch
-                it.save()
+                if it.state.get("probe_migration_job_stage"):
+                    _settle_dead_job(P, it, cur, save=_save_run if stage == "S9" else _save_review)
+                    _after_ingest(P, it, cur, stage)
+                else:
+                    it.state["status"] = "active"       # s9() / s9r() reconcile the dead launch
+                    it.save()
             did.append(dict(item=it.item_id, action=kind, job=rec["job_name"]))
     s9 = [i.item_id for i in P.store.items() if (not only or i.item_id in only) and
           (i.state.get("stage") in ("S9", "S9R") or (_in_revision(i) and i.state.get("status") == "active") or
@@ -978,19 +1075,22 @@ def _s9r(P, it):
     runs = [r for r in read_json(it.p("review", "runs.json"), []) if r.get("n") == rnd]
     sha, epoch = calib.pkg_sha(it.p("pkg")), int(it.state.get("calib_epoch", 0))
     scopes = _probe_scopes(it)
-    if scopes and not rv.get("enabled"):
-        return _park_unreviewed(P, it, scopes)
+    for rec in runs:
+        if _received_drop(it, rec):
+            return _route_review(P, it, rec, rnd)
     for rec in runs:                                     # reconcile interrupted submissions / dead launches
-        current_version = rec.get("pkg_sha") == sha and int(rec.get("calib_epoch") or 0) == epoch
-        if current_version and set(scopes) - set(rec.get("suspected_scopes", [])):
-            pending_intent = rec.get("outcome") is None and rec.get("state") in ("intent", "reserved")
-            if rec.get("outcome") == "done" or (pending_intent and not calib.job_started(rec)):
-                if pending_intent and rec.get("ledger_call"):
-                    P.ledger.settle(rec["ledger_call"], 0.0, status="error", kind="not_launched")
-                rec.update(outcome="infra", obsolete_probe_review=True)
-                save(rec)
-                continue
+        if (rec.get("outcome") is None and rec.get("state") in ("intent", "reserved")
+                and not calib.job_started(rec)
+                and (review.job_contract(rec) != review.CURRENT_CONTRACT
+                     or set(scopes) - set(rec.get("suspected_scopes", [])))):
+            if rec.get("ledger_call"):
+                P.ledger.settle(rec["ledger_call"], 0.0, status="error", kind="not_launched")
+            rec.update(outcome="infra", obsolete_probe_review=True)
+            save(rec)
+            continue
         if rec.get("outcome") is None and rec.get("state") in ("intent", "reserved"):
+            if scopes and not rv.get("enabled") and not calib.job_started(rec):
+                return _park_unreviewed(it, scopes)
             if not c.get("allow_submit"):
                 return it.finish("waiting", f"review {rec['job_name']} in state {rec['state']}; submit disabled")
             why = review.route_problem(P.cfg) if not calib.job_started(rec) else None
@@ -1040,12 +1140,24 @@ def _s9r(P, it):
         return it.finish("waiting", f"awaiting review run {pending[-1]['job_name']}")
     # a verdict counts only for the package and calibration epoch it was submitted with
     runs = [r for r in all_rnd if r.get("pkg_sha") == sha and int(r.get("calib_epoch") or 0) == epoch]
+    for rec in runs:
+        if rec.get("outcome") == "invalid" and review.job_contract(rec) != review.CURRENT_CONTRACT:
+            v = _bound_verdict(it, rec, rnd)
+            if v:
+                norm = _job_judgment(v, rec, bool(rv.get("allow_human")))
+                if norm["verdict"]:
+                    rec.update(outcome="done", verdict=norm["verdict"])
+                    if _needs_new_review(rec, dict(v, _normalized=norm), scopes):
+                        rec.update(outcome="infra", obsolete_probe_review=True)
+                    save(rec)
     done = [r for r in runs if r.get("outcome") == "done"]
     if done:
         return _route_review(P, it, done[-1], rnd)
+    if scopes and not rv.get("enabled"):
+        return _park_unreviewed(it, scopes)
     # a run the model relay refused at its preflight is no attempt and uses up no retry (calib.relay_preflight_refused)
     n_infra = sum(1 for r in runs if r.get("outcome") == "infra" and not r.get("preflight_refused")
-                  and not r.get("obsolete_probe_review"))
+                  and not r.get("obsolete_probe_review") and not r.get("obsolete_probe_job"))
     n_invalid = sum(1 for r in runs if r.get("outcome") == "invalid")
     if n_infra + n_invalid > int(rv.get("infra_retries", 2)):
         if n_invalid:
@@ -1094,8 +1206,7 @@ def _ingest_review(P, it, job_dir: str | None = None) -> dict:
     pend = [r for r in runs if r.get("outcome") is None and r.get("state", "launched") == "launched"]
     if not pend:
         if runs and runs[-1].get("outcome") is not None and it.state.get("status") == "waiting":
-            it.state["status"] = "active"
-            it.save()
+            _after_ingest(P, it, runs[-1], "S9R")
             return dict(recovered=True, job_name=runs[-1]["job_name"])
         raise ValueError("no pending review run for this item")
     rec = pend[0]
@@ -1116,31 +1227,31 @@ def _ingest_review(P, it, job_dir: str | None = None) -> dict:
     assigned = rec.get("suspected_scopes", [])
     res = review.classify(jd, rec.get("model"), P.cfg["models"].get("prices", {}),
                           allow_human=bool((P.cfg.get("review") or {}).get("allow_human")),
-                          suspected_scopes=set(scopes) | set(assigned))
+                          suspected_scopes=assigned, contract=review.job_contract(rec))
     rec.update(outcome="invalid" if (res["outcome"] == "done" and (res["verdict"] or {}).get("verdict") is None)
                else res["outcome"],
                minutes=res["minutes"], cost_usd=res["cost_usd"], cost_kind=res["cost_kind"],
                trial=res["trial"], n_trials=res["n_trials"], usage=res["usage"])
-    if set(scopes) - set(assigned):
-        rec.update(outcome="infra", obsolete_probe_review=True)
-    elif res["verdict"] is not None:
+    if res["verdict"] is not None:
         d = it.p("review", f"r{rec['n']}")
         d.mkdir(parents=True, exist_ok=True)
         raw = res["verdict_raw"]
         write_json(d / "verdict.raw.json", raw)
         body = dict(raw if isinstance(raw, dict) else {"_raw": raw}, _normalized=res["verdict"],
+                    verifier_reward=res["verifier_reward"],
                     pkg_sha=rec.get("pkg_sha"), calib_epoch=rec.get("calib_epoch", 0), job=rec["job_name"])
         jf = d / f"{rec['job_name']}.verdict.json"           # one immutable verdict per job
         if not jf.exists():
             write_json(jf, body)
         write_json(d / "verdict.json", body)                  # latest of the round (records for the next round)
         rec["verdict"] = res["verdict"]["verdict"]
+        if _needs_new_review(rec, body, scopes):
+            rec.update(outcome="infra", obsolete_probe_review=True)
     if rec.get("ledger_call"):
         P.ledger.settle(rec["ledger_call"], res["cost_usd"], kind=res["cost_kind"], usage=res["usage"],
                         note=f"S9R review r{rec['n']} outcome={rec['outcome']} verdict={rec.get('verdict')}")
     _save_review(it, rec)
-    it.state["status"] = "active"
-    it.save()
+    _after_ingest(P, it, rec, "S9R")
     outcome = "infra" if rec.get("obsolete_probe_review") else res["outcome"]
     return dict(outcome=outcome, verdict=rec.get("verdict"), job_name=rec["job_name"])
 
@@ -1202,24 +1313,56 @@ def _revision_retry(P, it, why: str):
     return it.finish("dropped", f"review:gate_failed ({why[:300]})")
 
 
+def _bound_verdict(it, rec, rnd):
+    v = read_json(it.p("review", f"r{rnd}", f"{rec.get('job_name')}.verdict.json"), {}) or {}
+    if (v.get("job") == rec.get("job_name") and v.get("pkg_sha") == rec.get("pkg_sha")
+            and v.get("calib_epoch", 0) == rec.get("calib_epoch", 0) and isinstance(v.get("_normalized"), dict)):
+        return v
+    return None
+
+
+def _job_judgment(v, rec, allow_human):
+    reward = v.get("verifier_reward")
+    if reward is None and v["_normalized"].get("verdict") is None:
+        # Older records did not persist the verifier reward separately. Only reconsider a rejected
+        # non-drop verdict if the trial that actually produced it passed its bundled verifier.
+        trial = rec.get("trial") or {}
+        matched = trial.get("trial") and trial["trial"] == trial.get("verdict_trial")
+        reward = trial.get("reward") if matched and trial.get("reward") is not None else 0
+    return review.normalize(v, reward=reward, allow_human=allow_human, suspected_scopes=rec.get("suspected_scopes", []),
+                            contract=review.job_contract(rec))
+
+
+def _needs_new_review(rec, verdict, scopes):
+    """A valid judgment whose job did not require the evidence now needed."""
+    routed = verdict["_normalized"].get("verdict")
+    if routed in (None, "drop"):
+        return False
+    assigned = rec.get("suspected_scopes", [])
+    if review.job_contract(rec) == review.CURRENT_CONTRACT and not set(scopes) - set(assigned):
+        return False
+    return bool(review.finding_errors(verdict, set(assigned) | set(scopes)))
+
+
 def _route_review(P, it, rec: dict, rnd: int):
     """pass -> S10 (kept label) / stays parked (parked label); revise -> S8 review revision while rounds remain
     (review.max_revisions, default 3; after that drop); drop -> dropped.  An invalid verdict (malformed, blocking
     issue without a fix_kind, bound to another job / package / epoch) re-runs the review within the round, up to
     review.infra_retries invalid verdicts; after that the item is dropped (or parked behind review.allow_human)."""
     rv = P.cfg.get("review") or {}
-    v = read_json(it.p("review", f"r{rnd}", f"{rec.get('job_name')}.verdict.json"), {}) or {}
-    if (v.get("job") != rec.get("job_name") or v.get("pkg_sha") != rec.get("pkg_sha") or
-            int(v.get("calib_epoch") or 0) != int(rec.get("calib_epoch") or 0) or "_normalized" not in v):
+    v = _bound_verdict(it, rec, rnd)
+    if not v:
         return _review_invalid(P, it, rnd, rec, f"verdict of job {rec.get('job_name')} missing or bound to "
                                                  f"another job / package / epoch")
-    norm = v["_normalized"]
-    if norm.get("verdict") and (rec.get("suspected_scopes") or v.get("probe_findings")):
-        norm = review.normalize(v, allow_human=bool(rv.get("allow_human")),
-                                suspected_scopes=rec.get("suspected_scopes", []))
+    norm = _job_judgment(v, rec, bool(rv.get("allow_human")))
+    if _needs_new_review(rec, dict(v, _normalized=norm), _probe_scopes(it)):
+        _save_review(it, dict(rec, outcome="infra", obsolete_probe_review=True))
+        return it.goto("S9R", "review contract changed; re-running")
     verdict = norm["verdict"]
     if verdict is None:
         return _review_invalid(P, it, rnd, rec, "; ".join(norm.get("problems") or ["invalid verdict"])[:400])
+    if rec.get("outcome") != "done" or rec.get("verdict") != verdict:
+        _save_review(it, dict(rec, outcome="done", verdict=verdict))
     # the current verdict (S10's review gate checks round, calibration epoch and package hash)
     write_json(it.p("review", "verdict.json"), dict(v, _normalized=norm, round=rnd,
                                                     calib_epoch=int(rec.get("calib_epoch") or 0),

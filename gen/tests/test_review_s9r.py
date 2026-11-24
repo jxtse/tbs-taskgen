@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from tbsgen import review
+from tbsgen import gates, review
 from tbsgen.config import load_config
 from tbsgen.models import FakeClient
 from tbsgen.pipeline import Pipeline
@@ -160,7 +160,7 @@ def test_problem_class_decides_fixability():
         assert any("contradicts" in p for p in n["problems"])
     mixed = [BLOCK, dict(BLOCK, id="I3", problem="reference_wrong")]
     assert review.normalize(V("revise", mixed))["verdict"] == "drop"
-    assert review.normalize(V("drop", [BLOCK]))["verdict"] == "revise"          # only a local blocking issue
+    assert review.normalize(V("drop", [BLOCK]))["verdict"] == "drop"
     # unknown class / no class at all -> invalid; a legacy verdict with fix_kind only is still accepted
     assert review.normalize(V("revise", [dict(BLOCK, problem="typo")]))["verdict"] is None
     nb = {k: v for k, v in BLOCK.items() if k != "problem"}
@@ -250,7 +250,7 @@ FRONTIER_OK = dict(V("pass", [MINOR]), reference_check=dict(reward=1.0, notes="r
 
 def _oracle_ok(P, iid, ok=True):
     it = P.store.item(iid)
-    write_json(it.p("gates", "attempt-9.json"), dict(ok=ok, gates=dict(oracle=ok)))
+    write_json(it.p("gates", "attempt-9.json"), dict(probe_policy_version=gates.PROBE_POLICY_VERSION, ok=ok, gates=dict(oracle=ok)))
 
 
 def test_frontier_released_on_its_own_channel_after_a_confirming_review(tmp_path):
@@ -364,7 +364,7 @@ def test_frontier_s10_without_a_confirming_verdict_goes_back_to_review(tmp_path)
     assert stages_b.review_gate(P, it).startswith("frontier not confirmed")
 
 
-def test_frontier_relabelled_with_review_disabled_withdraws_the_release(tmp_path):
+def test_frontier_relabelled_with_review_disabled_keeps_confirmed_release(tmp_path):
     P, iid, jobs = _env(tmp_path)
     _to_label(P, iid, jobs, seq=(0.0, 0.0, 0.0))
     _oracle_ok(P, iid)
@@ -378,9 +378,9 @@ def test_frontier_relabelled_with_review_disabled_withdraws_the_release(tmp_path
     it.save()
     P.run(only=[iid])
     st = P.store.item(iid).state
-    assert st["status"] == "parked" and st["reason"].startswith("frontier:unreviewed"), st
-    last = json.loads((P.store.root / "release" / "manifest.jsonl").read_text().splitlines()[-1])
-    assert last["item_id"] == iid and last["withdrawn"]
+    assert st["status"] == "done"
+    rows = (P.store.root / "release/manifest.jsonl").read_text().splitlines()
+    assert len(rows) == 1 and not json.loads(rows[0]).get("withdrawn")
 
 
 def test_frontier_s10_gate_sends_it_back_to_review(tmp_path):
@@ -996,7 +996,8 @@ def test_suspected_scopes_bind_bundle_validator_and_ingest(tmp_path):
                  verifier=dict(out="accepted", err="", metrics=[]), reward="1")
     report = dict(scopes={"hidden:A": trial})
     write_json(it.p("gates/attempt-9.json"), dict(details={"coverage": dict(scopes={"public": trial})}))
-    write_json(it.p("gates/attempt-10.json"), dict(details={"coverage": report, "hidden_garbage": report}))
+    write_json(it.p("gates/attempt-10.json"), dict(probe_policy_version=gates.PROBE_POLICY_VERSION,
+                                                   details={"coverage": report, "hidden_garbage": report}))
     _to_label(P, iid, jobs)
     [rec] = _runs(P, iid, "review")
     task = Path(rec["task"])
@@ -1032,6 +1033,7 @@ def test_suspected_scopes_bind_bundle_validator_and_ingest(tmp_path):
         assert validate().returncode == 0
         assert review.normalize(verdict, suspected_scopes=[first, second])["verdict"] == routed
     verdict.update(issues=[], probe_findings={first: artifact, second: artifact})
+    artifact["observation"] = "5 passed, 1 skipped in 0.3s"
     assert validate().returncode == 0
     # The bundled verifier and host enforce the same contract on required and additional gaps.
     for scope in (first, "extra/public"):
@@ -1040,9 +1042,10 @@ def test_suspected_scopes_bind_bundle_validator_and_ingest(tmp_path):
         verdict["probe_findings"][scope] = good
         assert validate().returncode == 0
         assert review.normalize(verdict, suspected_scopes=[first, second])["verdict"] == "revise"
-        for field, value in (("command", "  "), ("command", "NOT RUN"), ("observation", "short"),
+        for field, value in (("command", "  "), ("command", "x"), ("command", "all checks passed"),
+                             ("command", "NOT RUN"), ("observation", "short"),
                              ("observation", "Did not run the verifier on this table."),
-                             ("command", "unable to run"), ("observation", "This step was skipped today."),
+                             ("command", "unable to run"), ("observation", "Skipped running the verifier for this table."),
                              ("observed_reward", True), ("observed_reward", "unknown"), ("issue_id", "absent")):
             verdict["probe_findings"][scope] = dict(good, **{field: value})
             assert validate().returncode == 1
@@ -1085,7 +1088,7 @@ def test_pkg_and_bundle_use_latest_numeric_attempt(tmp_path):
         d = it.p(f"runs/s7-{n}/detA")
         write_json(d / "environment/data/seed.json", n)
         write_json(d / "tests/truth/sample.json", n)
-        write_json(it.p(f"gates/attempt-{n}.json"), dict(attempt=n, gates={"oracle": True},
+        write_json(it.p(f"gates/attempt-{n}.json"), dict(probe_policy_version=gates.PROBE_POLICY_VERSION, attempt=n, gates={"oracle": True},
                    details={"coverage": dict(scopes={str(n): dict(status="shortcut_suspected")})}))
     stages_b.pkg(P, it)
     assert read_json(it.p("pkg/environment/data/seed.json")) == 10
@@ -1093,58 +1096,17 @@ def test_pkg_and_bundle_use_latest_numeric_attempt(tmp_path):
     assert bundle["suspected_scopes"] == ["one_confident/10"]
 
 
-@pytest.mark.parametrize("probe", [
-    dict(accepted_scopes=["public"], scopes={"public": dict(reward="1"), "side": "na"}),
-    dict(accepted_scopes=[], scopes={"public": dict(rc=0, count=1, reward="1", inconclusive=True),
-                                    "side": dict(rc=2, count=1, reward="1")}),
-    dict(scopes={"public": dict(status="shortcut_suspected"), "side": dict(status="inconclusive", reward="1")}),
-], ids=["accepted-scopes", "rc-count-reward", "status"])
-def test_upgrade_submitted_review_and_stored_pass(tmp_path, probe):
-    from tbsgen import stages_b
-    P, iid, jobs = _env(tmp_path, review_kw={"infra_retries": 0})
-    _to_label(P, iid, jobs)
-    it = P.store.item(iid)
-    [old] = _runs(P, iid, "review")
-    old.pop("suspected_scopes")
-    old["review_prompt_version"] = "s9r-v1"
-    write_json(it.p("review/runs.json"), [old])
-    write_json(it.p("gates/attempt-1.json"), dict(details=dict(coverage=probe)))
-    _finish(jobs, old["job_name"], verdict=V("pass"))
-    assert ingest(P, it)["outcome"] == "infra"
-    P.run(only=[iid])
-    obsolete, fresh = _runs(P, iid, "review")
-    assert obsolete["outcome"] == "infra" and fresh["suspected_scopes"] == ["one_confident/public"]
-    assert fresh["review_prompt_version"] == "s9r-v3"
-    # Older code may already have routed the same pass to S10.
-    it = P.store.item(iid)
-    it.state.update(stage="S10", status="active")
-    write_json(it.p("review/verdict.json"), dict(V("pass"), _normalized=review.normalize(V("pass")),
-               round=old["n"], job=old["job_name"], pkg_sha=old["pkg_sha"], calib_epoch=0))
-    stages_b.s10(P, it)
-    assert it.state["stage"] == "S9R" and not stages_b._released(P, iid)
-
-
-def test_completed_legacy_job_is_replaced_on_routing(tmp_path):
-    P, iid, jobs = _env(tmp_path, review_kw={"infra_retries": 0})
-    _to_label(P, iid, jobs)
-    it = P.store.item(iid)
-    [rec] = _runs(P, iid, "review")
-    rec.pop("suspected_scopes")
-    write_json(it.p("review/runs.json"), [rec])
-    _finish(jobs, rec["job_name"], verdict=V("pass"))
-    ingest(P, it)
-    write_json(it.p("gates/attempt-1.json"), dict(details=dict(coverage=dict(accepted_scopes=["public"]))))
-    P.run(only=[iid])
-    old, fresh = _runs(P, iid, "review")
-    assert old["outcome"] == "infra" and fresh["suspected_scopes"] == ["one_confident/public"]
+def _current_probe(it):
+    write_json(it.p("gates/attempt-1.json"), dict(probe_policy_version=gates.PROBE_POLICY_VERSION,
+               details=dict(coverage=dict(scopes={"public": dict(status="shortcut_suspected")}))))
+    return "one_confident/public"
 
 
 def test_disabled_review_parks_and_resumes(tmp_path):
     from tbsgen import stages_b
     P, iid, jobs = _env(tmp_path, review_kw={"enabled": False})
     it = P.store.item(iid)
-    scope = "one_confident/public"
-    write_json(it.p("gates/attempt-1.json"), dict(details=dict(coverage=dict(accepted_scopes=["public"]))))
+    scope = _current_probe(it)
     _to_label(P, iid, jobs)
     it.load()
     assert it.state["status"] == "parked" and it.state["reason"] == "parked:probe_unreviewed"
@@ -1163,3 +1125,206 @@ def test_disabled_review_parks_and_resumes(tmp_path):
     _finish(jobs, rec["job_name"], verdict=dict(V("pass"), probe_findings={scope: finding}))
     watch_tick(P, only=[iid])
     assert P.store.item(iid).state["status"] == "done" and stages_b._released(P, iid)
+
+
+@pytest.mark.parametrize("stage,status", [("S8", "active"), ("PKG", "active"), ("S9", "paused"),
+                                          ("S9R", "waiting"), ("S10", "active")])
+def test_legacy_report_regates_once_without_spend(tmp_path, stage, status):
+    import shutil
+    P, iid, _ = _env(tmp_path)
+    it = P.store.item(iid)
+    if stage in ("S8", "PKG"):
+        shutil.rmtree(it.p("pkg"))
+    it.state.update(stage=stage, status=status, repair_rounds=2, review_revisions=1,
+                    attempts={"S7": 4, "S5G": 2}, repair_from="gates:coverage")
+    it.save()
+    legacy = dict(details={"coverage": {"scopes": "unreadable by the current parser"}})
+    write_json(it.p("gates/attempt-4.json"), legacy)
+    assert review.suspected_scopes(legacy) == []
+    before = P.item_cost(iid)
+    if status == "paused":
+        assert P.resume(only=[iid]) == [iid]
+    else:
+        P.run(max_steps=1, only=[iid])
+    it.load()
+    assert (it.state["stage"], it.state["status"]) == ("S6A_run", "active")
+    [record] = it.state["regates"]
+    assert record["probe_report_id"] and record["reason"] == "probe_policy_migration"
+    assert it.state["thresholds_locked"] and "repair_from" not in it.state
+    assert it.state["attempts"] == {"S7": 4, "S5G": 2}
+    assert it.state["repair_rounds"] == 2 and it.state["review_revisions"] == 1
+    assert P.item_cost(iid) == before and _runs(P, iid, "review") == []
+    it.state.update(stage=stage, status="active")
+    it.save()
+    assert P.resume(only=[iid]) == []
+    assert it.load().state["regates"] == [record]
+    write_json(it.p("gates/attempt-5.json"), legacy)
+    assert P.resume(only=[iid]) == [iid]
+    assert it.load().state["regates"][-1]["probe_report_id"] != record["probe_report_id"]
+
+
+@pytest.mark.parametrize("status,current", [("done", False), ("dropped", False), ("active", True)])
+def test_terminal_and_current_reports_stay_put(tmp_path, status, current):
+    P, iid, _ = _env(tmp_path)
+    it = P.store.item(iid)
+    it.state.update(stage="S10", status=status)
+    it.save()
+    manifest = P.store.root / "release/manifest.jsonl"
+    manifest.parent.mkdir()
+    manifest.write_text(json.dumps(dict(item_id=iid)) + "\n")
+    _current_probe(it)
+    if not current:
+        write_json(it.p("gates/attempt-1.json"), dict(probe_policy_version="old"))
+    before = it.p("state.json").read_bytes(), manifest.read_bytes()
+    assert not P.resume(only=[iid])
+    if status != "active":
+        P.run(only=[iid])
+    assert (it.p("state.json").read_bytes(), manifest.read_bytes()) == before
+
+
+def _v2_job(it, rec):
+    rec.pop("review_contract_version")
+    rec["review_prompt_version"] = "s9r-v2"
+    write_json(it.p("review/runs.json"), [rec])
+
+
+@pytest.mark.parametrize("state", ["launched", "done", "invalid"])
+def test_v2_valid_verdict_gets_one_free_review(tmp_path, state):
+    P, iid, jobs = _env(tmp_path, review_kw={"infra_retries": 0})
+    it = P.store.item(iid)
+    scope = _current_probe(it)
+    _to_label(P, iid, jobs)
+    rec, = _runs(P, iid, "review")
+    _v2_job(it, rec)
+    finding = dict(reproduction="Ran the packaged verifier", reason="Only diagnostic output changed.",
+                   classification="probe_artefact")
+    verdict = dict(V("pass"), probe_findings={scope: finding})
+    if state != "launched":
+        contract = "s9r-v2" if state == "done" else review.CURRENT_CONTRACT
+        norm = review.normalize(verdict, suspected_scopes=[scope], contract=contract)
+        write_json(it.p("review/r1", rec["job_name"] + ".verdict.json"),
+                   dict(verdict, _normalized=norm, pkg_sha=rec["pkg_sha"], calib_epoch=0, job=rec["job_name"]))
+        write_json(it.p("review/runs.json"), [dict(rec, outcome=state, verdict=norm["verdict"],
+                   trial=dict(trial="trial", verdict_trial="trial", reward=1))])
+        it.load().state["status"] = "active"
+        it.save()
+    else:
+        _finish(jobs, rec["job_name"], verdict=verdict)
+        assert ingest(P, it)["outcome"] == "infra"
+    P.run(only=[iid])
+    obsolete, fresh = _runs(P, iid, "review")
+    assert obsolete["outcome"] == "infra" and obsolete["obsolete_probe_review"]
+    assert fresh["review_contract_version"] == review.CURRENT_CONTRACT
+    P.resume(only=[iid])
+    P.run(only=[iid])
+    assert len(_runs(P, iid, "review")) == 2
+    _finish(jobs, fresh["job_name"], verdict=verdict)
+    watch_tick(P, only=[iid])
+    assert it.load().state["reason"].startswith("review:invalid") and len(_runs(P, iid, "review")) == 2
+
+
+def test_invalid_v2_verdict_spends_invalid_budget(tmp_path):
+    P, iid, jobs = _env(tmp_path, review_kw={"infra_retries": 0})
+    it = P.store.item(iid)
+    _current_probe(it)
+    _to_label(P, iid, jobs)
+    rec, = _runs(P, iid, "review")
+    _v2_job(it, rec)
+    _finish(jobs, rec["job_name"], verdict=V("pass"))
+    watch_tick(P, only=[iid])
+    assert it.load().state["reason"].startswith("review:invalid")
+    assert _runs(P, iid, "review")[0]["outcome"] == "invalid"
+
+
+@pytest.mark.parametrize("old", [True, False])
+@pytest.mark.parametrize("legacy_report", [True, False])
+def test_received_drop_survives_contract_and_regate(tmp_path, old, legacy_report):
+    from tbsgen.stages_b import running_jobs
+    P, iid, jobs = _env(tmp_path)
+    it = P.store.item(iid)
+    _current_probe(it)
+    _to_label(P, iid, jobs)
+    rec, = _runs(P, iid, "review")
+    if old:
+        _v2_job(it, rec)
+    if legacy_report:
+        write_json(it.p("gates/attempt-1.json"), {})
+        P.resume(only=[iid])
+        from tbsgen.cli import _running
+        assert it.load().state["stage"] == "S6A_run" and running_jobs(P) == [rec["job_name"]]
+        assert _running(P, iid)
+    _finish(jobs, rec["job_name"], reward=0, verdict=V("drop", [BLOCK]))
+    watch_tick(P, only=[iid])
+    assert it.load().state["status"] == "dropped" and it.state["reason"].startswith("review:drop")
+    assert _runs(P, iid, "review")[0]["outcome"] == "done" and running_jobs(P) == []
+
+
+@pytest.mark.parametrize("change", ["complete", "finding", "package", "round", "epoch", "contract"])
+def test_s10_review_disabled_checks_bound_findings(tmp_path, change):
+    from tbsgen import stages_b
+    P, iid, jobs = _env(tmp_path)
+    it = P.store.item(iid)
+    scope = _current_probe(it)
+    _to_label(P, iid, jobs)
+    rec, = _runs(P, iid, "review")
+    finding = dict(classification="probe_artefact", command="pytest", observed_reward="1",
+                   observation="5 passed, 1 skipped in 0.3s", reason="Only diagnostic output changed.")
+    _finish(jobs, rec["job_name"], verdict=dict(V("pass"), probe_findings={scope: finding}))
+    ingest(P, it)
+    P.run(only=[iid], max_steps=1)
+    assert it.load().state["stage"] == "S10"
+    P.cfg["review"]["enabled"] = False
+    if change == "finding":
+        verdict = read_json(it.p("review/verdict.json"))
+        verdict["probe_findings"] = {}
+        write_json(it.p("review/verdict.json"), verdict)
+    elif change == "package":
+        it.p("pkg/instruction.md").write_text("New package statement.")
+    elif change in ("round", "epoch"):
+        it.state.update({"round": {"review_round": 2}, "epoch": {"calib_epoch": 1}}[change])
+        it.save()
+    elif change == "contract":
+        job, = _runs(P, iid, "review")
+        write_json(it.p("review/runs.json"), [dict(job, review_contract_version="s9r-v2")])
+    stages_b.s10(P, it)
+    if change == "complete":
+        assert it.state["status"] == "done" and stages_b._released(P, iid)
+        manifest = P.store.root / "release/manifest.jsonl"
+        before = manifest.read_bytes()
+        write_json(it.p("review/verdict.json"), {})
+        it.state.update(stage="S10", status="active")
+        stages_b.s10(P, it)
+        assert manifest.read_bytes() == before and stages_b._released(P, iid)
+    else:
+        assert it.state["reason"] == "parked:probe_unreviewed" and not stages_b._released(P, iid)
+
+
+@pytest.mark.parametrize("phrase", ["not run", "did not run", "didn't run", "was not executed", "could not run",
+                                    "unable to run", "skipped running", "no run"])
+@pytest.mark.parametrize("field", ["observation", "command"])
+def test_reproduction_rejects_explicit_negations(phrase, field):
+    finding = dict(classification="probe_artefact", command="pytest", observed_reward=0.5,
+                   observation="5 passed, 1 skipped in 0.3s", reason="Only diagnostic output changed.")
+    verdict = dict(V("pass"), probe_findings={"scope": finding})
+    assert not review.finding_errors(verdict, ["scope"])
+    finding[field] = f"pytest ./checks.py ({phrase} in this environment)"
+    assert review.finding_errors(verdict, ["scope"])
+
+
+@pytest.mark.parametrize("started", [True, False])
+def test_regate_settles_old_calibration_without_charging_a_retry(tmp_path, started):
+    from tbsgen import calib
+    P, iid, jobs = _env(tmp_path, allow_submit=started, infra_retries=0)
+    P.run(only=[iid])
+    rec, = _runs(P, iid)
+    it = P.store.item(iid)
+    write_json(it.p("gates/attempt-1.json"), {})
+    assert P.resume(only=[iid]) == [iid]
+    assert it.load().state["stage"] == "S6A_run"
+    if started:
+        _finish(jobs, rec["job_name"], reward=0.0)
+        watch_tick(P, only=[iid], max_steps=0)
+        assert it.load().state["status"] == "active" and _runs(P, iid)[0]["outcome"] == "fail"
+    else:
+        old, = _runs(P, iid)
+        assert old["obsolete_probe_job"] and calib.next_action([old], P.cfg) == ("run", "glm")

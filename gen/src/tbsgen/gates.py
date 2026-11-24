@@ -39,6 +39,13 @@ from .state import read_json
 from .statement import FILE_TOKEN, assumptions_stated, output_relative_path, statement_clean, threshold_format
 
 
+PROBE_POLICY_VERSION = "s7-probes-v1"
+
+
+def current_probe_report(report):
+    return isinstance(report, dict) and report.get("probe_policy_version") == PROBE_POLICY_VERSION
+
+
 CLI_RE = re.compile(r"solution_cli\.py\s+<input_dir>\s+<output_dir>")
 # a declaration is "Header: `a,b,c`" / "Columns: `a,b,c`": the keyword, a colon, then directly the backticked list
 _DECL = re.compile(r"(?:^|[\s(*_|>-])(?:header|columns)\s*:\s*`([^`\n]+)`", re.I)
@@ -248,9 +255,7 @@ def hidden_parity(metrics: list, spec: dict, hidden_sets=None) -> dict:
         reason = m.get("public_only_reason")
         if on == "public" and m.get("public_only") is True and isinstance(reason, str) and reason.strip():
             exempt.add(family)
-    # Names vary between splits (public_rr10 vs hidden_rr10_set_a, public_rel_rmse vs hidden_large_rel_rmse_max,
-    # mean vs max of the same error): a public family is covered when its tokens, minus aggregation / regime words,
-    # all occur in some hidden family.
+    # Ignore aggregation and split qualifiers when matching a public family to its hidden counterpart.
     def covered(fam, others):
         want = _core_tokens(fam)
         return any(want and want <= _core_tokens(o) | _tokens(o) for o in others)
@@ -483,7 +488,7 @@ def run_gates(cfg: dict, item_dir: Path, spec: dict, thresholds: dict, attempt: 
                                         read_json(item_dir / "_spec" / "difficulty_design.json", None))
         g["targeting_leak"] = not tl
         det["targeting_leak"] = tl
-    return dict(attempt=attempt, gates=g, details=det, **gate_policy(cfg, g))
+    return dict(attempt=attempt, probe_policy_version=PROBE_POLICY_VERSION, gates=g, details=det, **gate_policy(cfg, g))
 
 
 def gate_policy(cfg, g):
@@ -506,26 +511,3 @@ def _blocking(cfg) -> set[str]:
     if "oracle" in b:
         b.add("oracle_margin")
     return b | {"nop", "naive", "mid", "exploit", "exploit_valid", "targeting_leak"}
-
-def legacy_probe_pass(cfg, report, reason):
-    """Recover an S8 stop caused solely by gates that are advisory today."""
-    if not reason.startswith("gates:") and reason not in OUTPUT_PROBES:
-        return False
-    reasons = set(reason.removeprefix("gates:").split(","))
-    if not reasons <= OUTPUT_PROBES | {"exploit"}:
-        return False
-    results = dict(report.get("gates", {}))
-    if not results or not any(results.get(k) is False for k in OUTPUT_PROBES):
-        return False
-    if results.get("exploit") is False and results.get("hidden_garbage") is False:
-        # Old S7 folded hidden_garbage into exploit. Recover the original baseline
-        # decision for each scored seed (old probe-only extra seeds had no ref).
-        seeds = report.get("details", {}).get("seeds", {})
-        probe_tags = {"exploit__one_confident", "exploit__hidden_garbage"}
-        scored = [sd for sd in seeds.values() if set(sd) - probe_tags]
-        for sd in scored:
-            arms = [v for k, v in sd.items() if k.startswith("exploit_") and k not in probe_tags]
-            if not arms or not all(arm.get("passed") is False for arm in arms):
-                return False
-        results["exploit"] = bool(scored)
-    return gate_policy(cfg, results)["ok"]

@@ -325,10 +325,11 @@ def _calib(P: Pipeline, a) -> int:
 
 
 def _running(P: Pipeline, item_id: str) -> bool:
+    from .stages_b import job_stage
     it = P.store.item(item_id)
     if it.state.get("stage") == "S5G":                  # a hardening round's authoring job
         return (read_json(it.p("S5G", "run.json"), {}) or {}).get("state") == "launched"
-    runs = read_json(it.p("review" if it.state.get("stage") == "S9R" else "calib", "runs.json"), []) or []
+    runs = read_json(it.p("review" if job_stage(it) == "S9R" else "calib", "runs.json"), []) or []
     return any(r.get("outcome") is None and r.get("state", "launched") == "launched" for r in runs)
 
 

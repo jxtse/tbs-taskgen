@@ -91,7 +91,7 @@ FRONTIER_CHECKS = ("a_consistency", "b_missing_conditions", "e_shortcuts_leaks",
 def frontier_evidence(runs: list[dict], cfg: dict) -> dict:
     """Release record of a frontier task: decisive / infra / timeout counts of the teacher runs of this epoch."""
     tea = [r for r in runs if r.get("who") == "teacher" and r.get("outcome") is not None and
-           not r.get("preflight_refused")]
+           not r.get("preflight_refused") and not r.get("obsolete_probe_job")]
     dec = [r for r in tea if r["outcome"] != "infra"]
     return dict(teacher_runs=len(tea), teacher_decisive=len(dec), teacher_infra=len(tea) - len(dec),
                 teacher_timeouts=sum(1 for r in dec if is_timeout(r)),
@@ -110,8 +110,8 @@ def next_action(runs: list[dict], cfg: dict) -> tuple[str, str | None]:
         return "label", str(e)
     trailing_infra = 0
     for r in reversed(runs):
-        if r.get("preflight_refused"):
-            continue                    # the relay refused before Harbor: no attempt, no infra retry used up
+        if r.get("preflight_refused") or r.get("obsolete_probe_job"):
+            continue                    # no attempt was made
         if r["outcome"] != "infra":
             break
         trailing_infra += 1
