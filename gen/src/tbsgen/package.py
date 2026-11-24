@@ -235,14 +235,15 @@ def run_solution_timeouts(src: str, budget: float) -> list[str]:
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom):
             names.update(a.asname for a in node.names if a.name == "run_solution" and a.asname)
-    constants = {}
+    errors = []
+    # Module constants are taken in source order: a module-level call sees the value bound above it; a call inside a
+    # function (run later, at pytest time) sees the final module-level value.
+    final = {}
     for node in tree.body:
         if isinstance(node, (ast.Assign, ast.AnnAssign)):
-            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-            for target in targets:
+            for target in (node.targets if isinstance(node, ast.Assign) else [node.target]):
                 if isinstance(target, ast.Name):
-                    constants[target.id] = node.value.value if isinstance(node.value, ast.Constant) else None
-    errors = []
+                    final[target.id] = node.value.value if isinstance(node.value, ast.Constant) else None
 
     def visit(node, visible):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
@@ -262,7 +263,16 @@ def run_solution_timeouts(src: str, budget: float) -> list[str]:
         for child in ast.iter_child_nodes(node):
             visit(child, visible)
 
-    visit(tree, constants)
+    sofar = {}
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            visit(node, final)
+        else:
+            visit(node, dict(sofar))
+            if isinstance(node, (ast.Assign, ast.AnnAssign)):
+                for target in (node.targets if isinstance(node, ast.Assign) else [node.target]):
+                    if isinstance(target, ast.Name):
+                        sofar[target.id] = node.value.value if isinstance(node.value, ast.Constant) else None
     return errors
 
 

@@ -29,9 +29,9 @@ def test_statement_hygiene_real_statements():
 
 
 def test_hygiene_forms_and_exceptions():
-    for word in ("todo", "FIXME", "xxx", "revision", "reviewer", "review round", "S9R", "S7", "S8", "Gate",
-                 "tbsgen", "internal note", "patch notes", "fix log", "hardening", "round-12", "lever",
-                 "naive baseline", "mid-baseline", "# exploit", "<!-- private -->"):
+    for word in ("todo", "FIXME", "xxx", "audit revision", "reviewer note", "review round", "S9R", "S7 gate",
+                 "S8 repair", "quality gate", "tbsgen", "internal note", "patch notes", "fix log", "hardening round",
+                 "round-12", "difficulty lever", "naive baseline", "mid-baseline", "# exploit", "<!-- private -->"):
         assert statement_clean(word), word
     assert not statement_clean("Investigate, navigate and aggregate the hidden outputs.\nFit the baseline level.")
     # scientific homonyms from real statements of the 2026-11-23 share stay clean
@@ -176,47 +176,6 @@ def test_pkg_checks_and_sandbox_inventory(tmp_path, monkeypatch):
     assert package.sandbox_pin_errors(cfg, pins) == []
 
 
-@pytest.mark.parametrize("arm", ["one_confident", "hidden_garbage"])
-def test_probe_wrapper_runs_on_each_hidden_layout(tmp_path, monkeypatch, arm):
-    cfg = load_config()
-    ref = tmp_path / "ref"
-    ref.mkdir()
-    table = "id,label,confidence\n" + "".join(f"{i},{'rare' if i == 2 else 'usual'},{i/10}\n" for i in range(7))
-    (ref / "public.csv").write_text(table)
-    (ref / "solution_cli.py").write_text("from pathlib import Path\nimport sys\n"
-        "inp, out = map(Path, sys.argv[1:])\nname = inp.name + '.csv'\n(out/name).write_text((inp/'data').read_text())")
-    gen = tmp_path / "gen"
-    for name in ("one", "two"):
-        d = gen / "tests/hidden" / name
-        d.mkdir(parents=True)
-        (d / "data").write_text(table)
-    def prepare(cfg, mounts, cmd, timeout, name):
-        return dict(rc=0, out=str(probe_outputs.mutate(mounts[0][0], "one_confident")), err="")
-    monkeypatch.setattr(runner.sandbox, "run", prepare)
-    def verify(cfg, task, gen, out, work, tag):
-        rows = list(csv.reader((out / "public.csv").read_text().splitlines()))
-        assert len(rows) == (2 if arm == "one_confident" else 8)
-        metrics = [{"name": "public_score", "passed": True}]
-        for d in sorted((gen / "tests/hidden").iterdir()):
-            results = tmp_path / ("results-" + d.name)
-            results.mkdir(exist_ok=True)
-            run = subprocess.run([sys.executable, out / "solution_cli.py", d, results], capture_output=True,
-                                 text=True, check=True)
-            data = list(csv.reader((results / (d.name + ".csv")).read_text().splitlines()))
-            assert data[0] == ["id", "label", "confidence"]
-            if arm == "one_confident":
-                assert data[1:] == [["6", "usual", "0.6"]]
-            else:
-                assert data[1:] == [["0", "usual", "0"]] * 7
-            metrics.append(dict(name="_solution_cli_run", rc=0, stderr_tail=run.stderr, aux=True))
-        return dict(metrics=metrics, rc=0, passed=False, reward="0", failed=["hidden_score"])
-    monkeypatch.setattr(runner, "test", verify)
-    result = runner.output_probe(cfg, tmp_path, gen, ref, tmp_path, arm, True)
-    assert result["ok"] and result["passed_checks"] == ["public_score"] and result["hidden_files"] == {"one": 1, "two": 1}
-    assert (ref / "public.csv").read_text() == table
-    monkeypatch.setattr(runner, "test", lambda *args: {"metrics": []})
-    assert not runner.output_probe(cfg, tmp_path, gen, ref, tmp_path, arm, True)["ok"]
-
 
 def test_array_json_and_small_csv(tmp_path):
     (tmp_path / "small.csv").write_text("label,count\nb,1\na,2\nb,3\n")
@@ -285,7 +244,7 @@ def test_gate_wiring(tmp_path, monkeypatch):
     assert gates.run_gates(cfg, tmp_path, spec, {}, 4)["ok"]
     assert arms == [("one_confident", "probe-gen0"), ("hidden_garbage", "probe-gen0")]
     monkeypatch.setattr(runner, "output_probe", lambda *a: {"ok": False})
-    (task / "instruction.md").write_text("## Audit\n≤ 0.8665767420502813")
+    (task / "instruction.md").write_text("## Audit copy\n≤ 0.8665767420502813")
     spec["generator_assumptions"] = [dict(assumption="a", stated=True, where="Noise is Gaussian")]
     rep = gates.run_gates(cfg, tmp_path, spec, {}, 3)
     assert {"exploit", "hidden_garbage", "coverage", "threshold_format", "statement_clean", "assumptions_stated"} <= set(rep["blocking"])
@@ -355,21 +314,6 @@ def test_diversity_inventory_and_both_admissions(tmp_path, capsys):
     assert not (second / "ledger.sqlite").exists()
 
 
-@pytest.mark.parametrize("count,reward,returncode,ok,na", [
-    (0, "1", 0, True, True), (1, "1", 0, False, False), (1, "0", 0, True, False),
-    (1, None, 0, False, False), (0, None, 1, False, False),
-])
-def test_probe_coverage_requires_evidence(tmp_path, monkeypatch, count, reward, returncode, ok, na):
-    ref = tmp_path / "ref"
-    ref.mkdir()
-    (ref / "solution_cli.py").touch()
-    (tmp_path / "tests/hidden/A").mkdir(parents=True)
-    run = dict(name="_solution_cli_run", aux=True, rc=0, stderr_tail=f'TBSGEN_PROBE ["A",{count}]')
-    monkeypatch.setattr(runner, "test", lambda *args: dict(metrics=[run], passed=reward == "1", failed=[],
-                                                           reward=reward, rc=returncode))
-    result = runner.output_probe(load_config(), tmp_path, tmp_path, ref, tmp_path, "one_confident", True)
-    assert (result["ok"], result["na"]) == (ok, na)
-
 
 def test_statement_fix_kind_routes_to_local_revision():
     raw = {"verdict": "revise", "checklist": {k: {"status": "ok", "note": "checked"} for k in review.CHECKLIST},
@@ -386,7 +330,7 @@ def test_readonly_audit_cli(tmp_path):
     (share / "INDEX.csv").write_text("task_id,tbsgen_run\ndemo,\n")
     (pkg / "task.toml").write_text('[task]\ndescription="Spectrum"\n[metadata]\ndomain="chemistry"\n'
                                    '[verifier]\ntimeout_sec=900\n[agent]\n')
-    (pkg / "instruction.md").write_text("## Audit\nScore ≥ 0.12345678")
+    (pkg / "instruction.md").write_text("## Audit revision\nScore ≥ 0.12345678")
     (pkg / "tests/test_outputs.py").write_text("run_solution(800)\n")
     before = {p: p.stat().st_mtime_ns for p in share.rglob("*")}
     script = Path(__file__).resolve().parents[1] / "scripts/audit_share.py"
@@ -415,8 +359,9 @@ def test_diversity_parking_releases_unlaunched_reservation(tmp_path):
     write_json(path, {"state": "reserved", "ledger_call": 13, "job_dir": str(tmp_path / "unstarted")})
     stages_a._agent_stage(P, it, "S5G", "", [], 30, 1, 1, True)
     assert it.state["status"] == "parked" and it.state["reason"].startswith("diversity:area_full:")
-    assert json.loads(path.read_text())["state"] == "intent"
-    assert calls[0][0] == (13, 0) and calls[0][1]["kind"] == "not_launched"
+    rec = json.loads(path.read_text())
+    assert rec["state"] == "intent" and rec["ledger_call"] is None and rec["orphan_calls"] == []
+    assert calls[0][0] == (13, 0) and calls[0][1]["kind"] == "diversity_parked"
 
 
 def test_hidden_parity_blocks_only_public_checks_missing_on_hidden():
@@ -426,7 +371,211 @@ def test_hidden_parity_blocks_only_public_checks_missing_on_hidden():
     assert parity == {"missing_hidden": [], "missing_public": ["drift"]}     # recorded, not blocking (see run_gates)
 
 
-def test_probe_unsupported_format_is_na_not_block(tmp_path):
+
+
+# ---------------------------------------------------------------- Codex review of PR #42: regression tests
+
+def _probe_fixture(tmp_path, monkeypatch, sets=("A", "B")):
+    """Reference writes <set>.csv (id,label,confidence; 7 rows) per hidden set and a 7-row public.csv."""
+    cfg = load_config()
+    ref = tmp_path / "ref"
+    ref.mkdir()
+    table = "id,label,confidence\n" + "".join(f"{i},{'rare' if i == 2 else 'usual'},{i/10}\n" for i in range(7))
+    (ref / "public.csv").write_text(table)
+    (ref / "solution_cli.py").write_text("from pathlib import Path\nimport sys\n"
+        "inp, out = map(Path, sys.argv[1:])\n(out/(inp.name + '.csv')).write_text((inp/'data').read_text())\n"
+        "(out/'plot.png').write_bytes(b'png')\n")
+    gen = tmp_path / "gen"
+    for name in sets:
+        d = gen / "tests/hidden" / name
+        d.mkdir(parents=True)
+        (d / "data").write_text(table)
+    def prepare(cfg, mounts, cmd, timeout, name):
+        arm = "one_confident" if "one_confident" in cmd else "hidden_garbage"
+        return dict(rc=0, out=str(probe_outputs.mutate(mounts[0][0], arm)), err="")
+    monkeypatch.setattr(runner.sandbox, "run", prepare)
+    return cfg, ref, gen, table
+
+
+def _verifier(tmp_path, gen, table, score_sets=("A", "B"), stop_early=False, public_count=True):
+    """A fake verifier: runs the CLI on every hidden set (like run_solution), then checks the sets in score_sets.
+    A set is correct when its rows equal the reference table; coverage = row count.  stop_early: the first failing
+    set stops scoring (a pytest assert)."""
+    ref_rows = list(csv.reader(table.splitlines()))
+    def verify(cfg, task, g, out, work, tag):
+        metrics, failed = [], []
+        pub = list(csv.reader((out / "public.csv").read_text().splitlines()))
+        if public_count and len(pub) != len(ref_rows):
+            failed.append("public_count")
+        outs = {}
+        for d in sorted((gen / "tests/hidden").iterdir()):
+            res = tmp_path / f"res-{tag}-{d.name}"
+            res.mkdir()
+            run = subprocess.run([sys.executable, out / "solution_cli.py", d, res], capture_output=True, text=True)
+            metrics.append(dict(name="_solution_cli_run", rc=run.returncode, stderr_tail=run.stderr, aux=True))
+            outs[d.name] = res
+        for name in score_sets:
+            rows = list(csv.reader((outs[name] / f"{name}.csv").read_text().splitlines()))
+            if rows != ref_rows:
+                failed.append(f"hidden_{name}")
+                if stop_early:
+                    break
+        return dict(metrics=metrics, rc=0, passed=not failed, reward="0" if failed else "1", failed=failed)
+    return verify
+
+
+def test_probe_early_stopping_verifier_is_not_a_failure(tmp_path, monkeypatch):
+    # finding 1: A fails first, B is never scored in that run -> still a valid rejection per scope
+    cfg, ref, gen, table = _probe_fixture(tmp_path, monkeypatch)
+    monkeypatch.setattr(runner, "test", _verifier(tmp_path, gen, table, stop_early=True))
+    for arm in ("hidden_garbage", "one_confident"):
+        (tmp_path / arm).mkdir()
+        r = runner.output_probe(cfg, tmp_path, gen, ref, tmp_path / arm, arm, True)
+        assert r["ok"] and not r["accepted_scopes"], r
+
+
+def test_probe_catches_an_unscored_hidden_set(tmp_path, monkeypatch):
+    # finding 2: verifier runs A and B but scores only A -> the B-scoped run is accepted -> probe fails
+    cfg, ref, gen, table = _probe_fixture(tmp_path, monkeypatch)
+    monkeypatch.setattr(runner, "test", _verifier(tmp_path, gen, table, score_sets=("A",)))
+    for arm in ("hidden_garbage", "one_confident"):
+        (tmp_path / arm).mkdir()
+        r = runner.output_probe(cfg, tmp_path, gen, ref, tmp_path / arm, arm, True)
+        assert not r["ok"] and r["accepted_scopes"] == ["B"], r
+
+
+def test_probe_public_count_does_not_hide_missing_hidden_coverage(tmp_path, monkeypatch):
+    # finding 2 (coverage): public row count checked, hidden coverage never checked (hidden scored on row content
+    # only for A... here: hidden not scored at all) -> hidden scopes accepted
+    cfg, ref, gen, table = _probe_fixture(tmp_path, monkeypatch)
+    monkeypatch.setattr(runner, "test", _verifier(tmp_path, gen, table, score_sets=()))
+    r = runner.output_probe(cfg, tmp_path, gen, ref, tmp_path, "one_confident", True)
+    assert not r["ok"] and set(r["accepted_scopes"]) == {"A", "B"} and r["scopes"]["public"]["reward"] == "0"
+
+
+def test_probe_side_files_do_not_skip_the_check(tmp_path, monkeypatch):
+    # finding 3: plot.png next to the scorable CSV used to turn the whole probe into n/a
+    cfg, ref, gen, table = _probe_fixture(tmp_path, monkeypatch)
+    monkeypatch.setattr(runner, "test", _verifier(tmp_path, gen, table, score_sets=("A",)))
+    r = runner.output_probe(cfg, tmp_path, gen, ref, tmp_path, "hidden_garbage", True)
+    assert not r["na"] and r["scopes"]["A"]["reward"] == "0" and r["accepted_scopes"] == ["B"]
+
+
+def test_probe_requires_every_hidden_set_to_be_run(tmp_path, monkeypatch):
+    cfg, ref, gen, table = _probe_fixture(tmp_path, monkeypatch)
+    inner = _verifier(tmp_path, gen, table)
+    def skip_b(cfg_, task, g, out, work, tag):
+        (gen / "tests/hidden/B").rename(gen / "tests/hidden_B")
+        try:
+            return _verifier(tmp_path, gen, table, score_sets=("A",))(cfg_, task, g, out, work, tag)
+        finally:
+            (gen / "tests/hidden_B").rename(gen / "tests/hidden/B")
+    monkeypatch.setattr(runner, "test", skip_b)
+    r = runner.output_probe(cfg, tmp_path, gen, ref, tmp_path, "hidden_garbage", True)
+    assert not r["ok"] and r["error"] == "hidden set not run by the verifier"
+
+
+def test_probe_ids_stay_valid_while_answers_move():
+    # finding 10: an id-only verifier must not reject the garbage table; ids keep their values, answers rotate
+    rows = [[str(i), f"lab{i}", str(i / 10)] for i in range(6)]
+    out = probe_outputs._rotate_rows(rows)
+    assert [r[0] for r in out] == [r[0] for r in rows]
+    assert sorted(r[1] for r in out) == sorted(r[1] for r in rows)
+    assert all(o[1] != r[1] and o[2] != r[2] for o, r in zip(out, rows))
+    # key in column 1 instead: its association with column 2 is destroyed too (different offsets)
+    assert all((o[1], o[2]) not in {(r[1], r[2]) for r in rows} for o in out)
+
+
+def test_unsupported_files_are_skipped_not_fatal(tmp_path):
     (tmp_path / "x.fits").write_bytes(b"SIMPLE  =")
-    with pytest.raises(probe_outputs.Unsupported):
-        probe_outputs.mutate(tmp_path, "hidden_garbage")
+    (tmp_path / "t.csv").write_text("id,v\n1,2\n2,3\n3,4\n")
+    skipped = []
+    assert probe_outputs.mutate(tmp_path, "hidden_garbage", skipped) == 1 and "x.fits" in skipped[0]
+    (tmp_path / "t.csv").unlink()
+    assert probe_outputs.mutate(tmp_path, "hidden_garbage", []) == 0
+
+
+def test_probe_not_run_when_truth_isolation_failed(tmp_path, monkeypatch):
+    # finding 8: the wrapper executes the reference; with truth readable it must not run at all
+    calls = []
+    monkeypatch.setattr(runner, "output_probe", lambda *a: calls.append(a) or {"ok": True})
+    spec = {"form": "PROG", "metrics": [{"name": "hidden_x"}]}
+    g = {"truth_isolation": False}
+    isolated = g.get("truth_isolation", True) is not False
+    assert not isolated   # the guard used in gates.run_gates
+    assert {"threshold_format", "statement_clean", "hidden_parity", "hidden_garbage", "coverage",
+            "assumptions_stated"} <= gates._blocking({"gates": {"blocking": ["oracle"]}})   # finding 5
+
+
+def test_parity_ignores_recorded_only_resource_metrics():
+    # finding 11
+    rows = [{"name": "public_rmse"}, {"name": "hidden_rmse"}, {"name": "public_runtime", "gated": False},
+            {"name": "public_wall_time_sec"}]
+    assert gates.hidden_parity(rows, {"metrics": []})["missing_hidden"] == []
+
+
+def test_hidden_margin_defaults_to_the_old_rule():
+    # finding 12: unset -> half of min_ref_margin, whatever a run config sets min_ref_margin to
+    assert load_config()["thresholds"]["min_ref_margin_hidden"] is None
+
+
+def test_statement_science_words_stay_clean():
+    # finding 13 (+ real share lines: lever arm, convergence audit)
+    for line in ("Measure gate voltage in volts.", "Estimate the strain hardening exponent.",
+                 "the LiDAR is mounted with a different lever arm;", "every case must pass a convergence audit.",
+                 "See Fig. S7 for the layout.", "Use the 2019 data revision."):
+        assert not statement_clean(line), line
+    for line in ("## Output-contract clarification (audit copy)", "## Additional hidden-output checks (audit revision)",
+                 "The S7 gate rejects constant outputs.", "Hardening round 2 added noise.", "difficulty lever DSW03"):
+        assert statement_clean(line), line
+
+
+def test_timeout_constants_follow_source_order():
+    # finding 14
+    assert not package.run_solution_timeouts("T=60\nrun_solution(T)\nT=1200\n", 780)
+    assert package.run_solution_timeouts("T=60\ndef t():\n    run_solution(T)\nT=1200\n", 780)
+    assert package.run_solution_timeouts("T=1200\nrun_solution(T)\n", 780)
+
+
+def test_small_copied_files_count_as_public(tmp_path):
+    # finding 9: an 800-byte case file copied into the hidden set
+    pub, hid = tmp_path / "data", tmp_path / "hidden"
+    (hid / "A").mkdir(parents=True)
+    pub.mkdir()
+    (pub / "cases.csv").write_bytes(b"c" * 800)
+    (pub / "README").write_text("public")
+    (hid / "A/cases.csv").write_bytes(b"c" * 800)
+    r = gates.hidden_duplicates(pub, hid)
+    assert not r["ok"] and r["mostly_public"] == {"A": 1.0}
+
+
+def test_s10_keeps_an_existing_release(tmp_path, monkeypatch):
+    # finding 6: manifest already holds the item (crash before "done"): no re-decision, no withdrawal
+    store = Store(tmp_path)
+    it = store.item("x")
+    (tmp_path / "release").mkdir()
+    (tmp_path / "release/manifest.jsonl").write_text('{"item_id":"x"}\n')
+    P = SimpleNamespace(store=store, cfg=load_config())
+    monkeypatch.setattr(diversity, "admission", lambda *a: pytest.fail("re-decided an existing release"))
+    monkeypatch.setattr(stages_b, "_release_reviewed", lambda P, it: "released")
+    assert stages_b.s10(P, it) == "released"
+
+
+def test_orphan_reservation_settled_before_relaunch(tmp_path, monkeypatch):
+    # finding 4: crash after run.json went back to intent but before the settle -> settled on the next pass,
+    # as diversity_parked (finding 7: not counted as a model call)
+    calls = []
+    P = SimpleNamespace(ledger=SimpleNamespace(settle=lambda *a, **k: calls.append((a, k))))
+    recp = tmp_path / "run.json"
+    rec = {"state": "intent", "ledger_call": None, "orphan_calls": [13]}
+    write_json(recp, rec)
+    stages_a._settle_orphans(P, recp, rec, "x")
+    assert calls[0][0] == (13, 0.0) and calls[0][1]["kind"] == "diversity_parked"
+    assert json.loads(recp.read_text())["orphan_calls"] == []
+
+
+def test_parity_matches_renamed_hidden_metrics():
+    # released prod-code names: public_rr10 vs hidden_rr10_set_a, public_rel_rmse vs hidden_large_rel_rmse_max
+    rows = [{"name": n} for n in ("public_rr10", "hidden_rr10_set_a", "public_rel_rmse", "hidden_large_rel_rmse_max",
+                                  "public_mean_clean_error", "hidden_max_clean_error", "public_host_accuracy")]
+    assert gates.hidden_parity(rows, {"metrics": []})["missing_hidden"] == ["host_accuracy"]

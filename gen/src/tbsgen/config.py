@@ -396,10 +396,10 @@ DEFAULTS: dict[str, Any] = {
     },
     "thresholds": {
         "frac": 0.5,                        # 待定: threshold position between ref and mid (log-midpoint)
-        # hidden-set metrics: the share of the reference's margin S7 demands.  0.05 = the old rule (half of
-        # min_ref_margin).  A full 0.10 would block 4 of the 25 tasks released by prod-code on 2026-11-24
-        # (hidden margins 6.8-9.7 %); raise it only together with a recalibration.
-        "min_ref_margin_hidden": 0.05,
+        # hidden-set metrics: the relative reference margin S7 demands.  None = the old rule (half of
+        # min_ref_margin, also when a run config customises min_ref_margin).  0.10 would block 4 of the 25 tasks
+        # released by prod-code on 2026-11-24 (hidden margins 6.8-9.7 %); set it only together with a recalibration.
+        "min_ref_margin_hidden": None,
         "min_ref_margin": 0.10,             # reference must clear each threshold by >=10% (relative)
         "loose_margin": 0.50,               # non-separating metrics: threshold = ref worsened by 50%
         "noise_floor_abs": 1e-9,            # two values both below this are floating-point noise: never "separating"

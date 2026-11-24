@@ -34,7 +34,7 @@ from pathlib import Path
 
 from . import runner
 from .leakcheck import leak_report
-from .spec import metric_family
+from .spec import is_resource_metric, metric_family
 from .state import read_json
 from .statement import assumptions_stated, statement_clean, threshold_format
 
@@ -202,7 +202,7 @@ def hidden_duplicates(pub: Path, hid: Path, shared_inputs=(), copied_share_max: 
         return result
 
     public = index(pub)
-    by_digest = {}
+    by_digest, any_digest = {}, {d for _, d in public.values()}
     for path, (size, digest) in public.items():
         if size > 1024:
             by_digest.setdefault(digest, []).append(str(path))
@@ -218,8 +218,10 @@ def hidden_duplicates(pub: Path, hid: Path, shared_inputs=(), copied_share_max: 
     mostly = {}
     for name, tree in ({".": hidden} if not sets else trees).items():
         total = sum(size for size, _ in tree.values())
+        # every byte-identical file counts here, small ones too (a hidden set of copied 800-byte case files);
+        # empty files carry nothing
         copied = sum(size for p, (size, digest) in tree.items()
-                     if digest in by_digest and size > 1024 and Path(p).name not in shared_inputs)
+                     if size and digest in any_digest and Path(p).name not in shared_inputs)
         if total and copied >= copied_share_max * total:
             mostly[name] = round(copied / total, 3)
     return dict(ok=bool(hidden) and not (same_sets or same_public or mostly), copied_files=copies,
@@ -232,9 +234,11 @@ def hidden_parity(metrics: list, spec: dict) -> dict:
     exempt = set()
     for row in metrics:
         name = row.get("name")
-        if not name or row.get("aux") or name.startswith("_"):
-            continue
+        if not name or row.get("aux") or name.startswith("_") or row.get("gated") is False:
+            continue        # recorded-only resource metrics decide nothing, on either split
         m = declared.get(name, {})
+        if is_resource_metric(m) or is_resource_metric({"name": name}):
+            continue
         on = m.get("on")
         if on not in families:
             on = "hidden" if name.startswith("hidden_") or name.endswith("_hidden") else "public"
@@ -243,8 +247,26 @@ def hidden_parity(metrics: list, spec: dict) -> dict:
         reason = m.get("public_only_reason")
         if on == "public" and m.get("public_only") is True and isinstance(reason, str) and reason.strip():
             exempt.add(family)
-    return dict(missing_hidden=sorted(families["public"] - families["hidden"] - exempt),
-                missing_public=sorted(families["hidden"] - families["public"]))
+    # Names vary between splits (public_rr10 vs hidden_rr10_set_a, public_rel_rmse vs hidden_large_rel_rmse_max,
+    # mean vs max of the same error): a public family is covered when its tokens, minus aggregation / regime words,
+    # all occur in some hidden family.
+    def covered(fam, others):
+        want = _core_tokens(fam)
+        return any(want and want <= _core_tokens(o) | _tokens(o) for o in others)
+    return dict(missing_hidden=sorted(f for f in families["public"] - exempt if not covered(f, families["hidden"])),
+                missing_public=sorted(f for f in families["hidden"] if not covered(f, families["public"])))
+
+
+_AGG = {"mean", "median", "max", "min", "worst", "avg", "average", "best", "p95", "p90", "total", "overall", "all",
+        "set", "a", "b", "c", "d", "regime", "case", "field", "split"}
+
+
+def _tokens(name: str) -> set:
+    return {t for t in re.split(r"[^a-z0-9]+", name.lower()) if t}
+
+
+def _core_tokens(name: str) -> set:
+    return {t for t in _tokens(name) if t not in _AGG and not re.fullmatch(r"\d|set\w|h\d+", t)}
 
 
 def realism(spec, public, runs):
@@ -328,8 +350,10 @@ def run_gates(cfg: dict, item_dir: Path, spec: dict, thresholds: dict, attempt: 
             th = m.get("threshold_effective", m["threshold"])          # machine-speed scaled time threshold
             room = (th - m["value"]) if m["direction"] == "<=" else (m["value"] - th)
             hidden_metric = m["name"].startswith("hidden_") or m["name"] in hidden_names
-            fraction = (cfg["thresholds"]["min_ref_margin_hidden"] if hidden_metric
-                        else 0.5 * cfg["thresholds"]["min_ref_margin"])
+            half = 0.5 * cfg["thresholds"]["min_ref_margin"]
+            hm = cfg["thresholds"].get("min_ref_margin_hidden")
+            # unset (None) = the old rule for every metric, also for configs that customised min_ref_margin
+            fraction = (half if hm is None else float(hm)) if hidden_metric else half
             required = fraction * max(abs(th), 1e-12)
             if room < required and not math.isclose(room, required, rel_tol=1e-12):
                 det["oracle_margin"].setdefault(s, []).append(m["name"])
@@ -345,8 +369,15 @@ def run_gates(cfg: dict, item_dir: Path, spec: dict, thresholds: dict, attempt: 
             parity = hidden_parity(ref["metrics"], spec)
             det["hidden_parity"][s] = parity
             # only public checks missing on the hidden sets block (the reviewer's finding); a hidden-only metric
-            # measures the shift itself and is normal (14 of 18 prod-code tasks have one)
-            ok["hidden_parity"] &= not parity["missing_hidden"]
+            # measures the shift itself and is normal (14 of 18 prod-code tasks have one).  Specs written before
+            # the prompts asked for it (no public_only declarations: 6 of 25 released prod-code tasks have a
+            # public-only metric) are recorded for S9R, not blocked.
+            from .spec import _requires_assumptions
+            new_rules = _requires_assumptions(spec.get("prompt_version")) or \
+                _requires_assumptions(read_json(item_dir / "_spec" / "provenance.json", {}).get("prompt_version"))
+            parity["enforced"] = new_rules
+            if new_rules:
+                ok["hidden_parity"] &= not parity["missing_hidden"]
             if s == seeds[0]:
                 tp = runner.truth_probe(cfg, task, gen, work / f"out-ref{s}", work, f"truthprobe{s}")
                 g["truth_isolation"] = tp["ok"]
@@ -370,9 +401,11 @@ def run_gates(cfg: dict, item_dir: Path, spec: dict, thresholds: dict, attempt: 
     arms = [("coverage", "one_confident")]
     if prog:
         arms.append(("hidden_garbage", "hidden_garbage"))
+    isolated = g.get("truth_isolation", True) is not False      # never run the reference wrapper with truth readable
     for gate, arm in arms:
-        result = (runner.output_probe(cfg, task, gen, ref_out, work, arm, prog) if reference_ok
-                  else dict(ok=False, error="seed 0 reference failed"))
+        result = (runner.output_probe(cfg, task, gen, ref_out, work, arm, prog) if reference_ok and isolated
+                  else dict(ok=False, error="seed 0 reference failed" if not reference_ok
+                            else "not run: truth isolation failed"))
         det["seeds"].setdefault(0 if seed0 is None else seed0, {})[f"exploit__{arm}"] = result
         g[gate] = result["ok"]
         det[gate] = "na" if result.get("na") else result
@@ -450,8 +483,14 @@ def run_gates(cfg: dict, item_dir: Path, spec: dict, thresholds: dict, attempt: 
                 details=det)
 
 
+# gates added after the 2026-11-23 colleague review: blocking even when a run config pins an older gates.blocking
+# list (otherwise a fixable failure lands in nonblocking and S7 drops the item without an S8 round)
+REVIEW_GATES = {"threshold_format", "statement_clean", "hidden_parity", "hidden_garbage", "coverage",
+                "assumptions_stated"}
+
+
 def _blocking(cfg) -> set[str]:
-    b = set(cfg["gates"]["blocking"])
+    b = set(cfg["gates"]["blocking"]) | REVIEW_GATES
     if "oracle" in b:
         b.add("oracle_margin")
     return b | {"nop", "naive", "mid", "exploit", "exploit_valid", "targeting_leak"}

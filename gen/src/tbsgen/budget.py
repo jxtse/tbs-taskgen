@@ -168,7 +168,7 @@ class Ledger:
             cap_r = (b.get("run_calls_per_model") or {}).get(model)
             # call-count caps count calls that were made: a reservation the model relay refused at its preflight
             # (cost_kind relay_refused, calib.relay_preflight_refused: no Harbor job, no model call) is no call
-            made = "AND COALESCE(cost_kind,'') != 'relay_refused'"
+            made = "AND COALESCE(cost_kind,'') NOT IN ('relay_refused', 'diversity_parked')"
             if cap_r is not None:
                 n = db.execute(f"SELECT count(*) FROM calls WHERE model=? AND real=1 {made}", (model,)).fetchone()[0]
                 if n >= int(cap_r):

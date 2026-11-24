@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import shutil
 from pathlib import Path
 
@@ -363,62 +364,90 @@ def truth_probe(cfg: dict, task: Path, gen: Path, ref_out: Path, work: Path, tag
                 n_targets=len(targets), readable=[x[-400:] for x in bad][:3], passed=t["passed"])
 
 def output_probe(cfg, task, gen, ref_out, work, arm, prog):
-    """Keep the reference public deliverables. In each verifier invocation the replacement CLI runs
-    the original CLI once in a private temp dir, then transforms its actual output. This uses the
-    same hidden layout, permissions and time limit as the scored reference, including on SSH.
-    A missing run, wrapper crash or missing reward cannot establish rejection of a probe."""
+    """Shortcut probe on seed 0, one verifier run per scope: the public deliverables, then each hidden set.  In a
+    scope run only that scope's outputs are transformed (probe_outputs.py); every other scope gets the reference's
+    own output.  A scope whose transformed output the verifier still accepts (reward 1) fails the probe, so a
+    verifier that stops at its first failed check cannot hide an unscored hidden set, and a public row-count check
+    cannot hide a missing hidden coverage check.  A scope with nothing the probe can transform (count 0: no table,
+    or only images / FITS / HDF5) is n/a for that scope.  A missing run, wrapper crash, missing hidden-set call or
+    missing reward fails the probe (no evidence of rejection).  The hidden runs use the reference CLI wrapped in
+    the same verifier sandbox (nobody, truth locked) as any agent program."""
     from .codeagent import safe_copytree
 
-    tag = f"exploit__{arm}"
-    out = work / f"out-{tag}"
-    if out.exists():
-        shutil.rmtree(out)
-    out.mkdir(parents=True)
-    refused = safe_copytree(ref_out, out)
-    if refused:
-        return dict(ok=False, error=f"invalid reference outputs: {refused[:3]}")
-    public = 0
     script = Path(__file__).with_name("probe_outputs.py")
-    if arm == "one_confident" and any(p.suffix.lower() == ".csv" for p in out.rglob("*")):
-        command = """cd / && python -c 'from pathlib import Path; from probe_outputs import mutate; print(mutate(Path("/app/output"), "one_confident"))'"""
-        prep = sandbox.run(cfg, [(out, "/app/output", "rw"), (script, "/probe_outputs.py", "ro")],
-                           command, cfg["gen"]["baseline_timeout"], f"tbsgen-prepare-{tag}")
-        if prep["rc"] != 0 or not prep["out"].strip().isdigit():
-            return dict(ok=False, error="public coverage probe failed", stderr=prep["err"][-500:])
-        public = int(prep["out"].strip())
-    if prog:
-        cli = out / "solution_cli.py"
-        original = out / "_probe_reference.py"
-        if not cli.is_file() or original.exists():
-            return dict(ok=False, error="cannot wrap reference CLI")
-        cli.rename(original)
-        cli.write_text(script.read_text() + f"\nhidden_main({arm!r})\n")
-    elif not public:
-        return dict(ok=True, na=True)
-    t = test(cfg, task, gen, out, work, tag)
-    runs = [m for m in t["metrics"] if m.get("name") == "_solution_cli_run"]
-    counts = {}
-    for run in runs:
-        lines = run.get("stderr_tail", "").splitlines()
-        if run.get("rc") == 0 and lines and lines[-1].startswith("TBSGEN_PROBE_NA "):
-            # an output format the probe cannot transform: no evidence either way, recorded for S9R
-            return dict(ok=True, na=True, unsupported=lines[-1].removeprefix("TBSGEN_PROBE_NA ")[:300])
-        if run.get("rc") != 0 or not lines or not lines[-1].startswith("TBSGEN_PROBE "):
-            return dict(ok=False, error="probe CLI failed", stderr=lines[-2:])
-        try:
-            name, count = json.loads(lines[-1].removeprefix("TBSGEN_PROBE "))
-            if not isinstance(name, str) or type(count) is not int or count < 0:
-                raise ValueError("invalid probe counts")
-        except (TypeError, ValueError):
-            return dict(ok=False, error="invalid probe CLI record", stderr=lines[-1:])
-        counts[name] = count
-    if prog:
-        hidden = gen / "tests" / "hidden"
-        expected = {d.name for d in hidden.iterdir() if d.is_dir()} or {hidden.name}
-        if set(counts) != expected or (arm == "hidden_garbage" and not all(counts.values())):
-            return dict(ok=False, error="incomplete hidden outputs", expected=sorted(expected), counts=counts)
-    valid = t["rc"] == 0 and t["reward"] in ("0", "1")
-    na = arm == "one_confident" and not public and not any(counts.values())
-    return dict(ok=valid and (na or not t["passed"]), na=na and valid, public_files=public, hidden_files=counts,
-                reward=t["reward"], passed_checks=[m["name"] for m in t["metrics"] if m.get("passed")
-                                                   and not m.get("aux")], failed=t["failed"])
+    hidden = gen / "tests" / "hidden"
+    sets = sorted(d.name for d in hidden.iterdir() if d.is_dir()) if prog and hidden.is_dir() else []
+    if prog and not sets:
+        sets = [hidden.name]
+    # hidden_garbage is about the hidden sets (public garbage is the exploit / nop gates' job): hidden scopes only
+    scopes = ([] if arm == "hidden_garbage" else ["public"]) + sets
+    per, rewards = {}, {}
+    for scope in scopes:
+        tag = f"exploit__{arm}__{re.sub(r'[^A-Za-z0-9_.-]', '-', scope)}"
+        out = work / f"out-{tag}"
+        if out.exists():
+            shutil.rmtree(out)
+        out.mkdir(parents=True)
+        refused = safe_copytree(ref_out, out)
+        if refused:
+            return dict(ok=False, error=f"invalid reference outputs: {refused[:3]}")
+        if scope == "public":
+            command = ("cd / && python -c 'from pathlib import Path; from probe_outputs import mutate; "
+                       f"print(mutate(Path(\"/app/output\"), {arm!r}))'")
+            # the delivered program is not output data: keep it out of the transformation
+            keep = [p for p in (out / "solution_cli.py",) if p.exists()]
+            stash = work / f"stash-{tag}"
+            if stash.exists():
+                shutil.rmtree(stash)
+            stash.mkdir()
+            for p in keep:
+                p.rename(stash / p.name)
+            prep = sandbox.run(cfg, [(out, "/app/output", "rw"), (script, "/probe_outputs.py", "ro")],
+                               command, cfg["gen"]["baseline_timeout"], f"tbsgen-prepare-{tag}")
+            for p in keep:
+                (stash / p.name).rename(p)
+            if prep["rc"] != 0 or not prep["out"].strip().splitlines()[-1:] or \
+                    not prep["out"].strip().splitlines()[-1].isdigit():
+                return dict(ok=False, error="public probe transformation failed", stderr=prep["err"][-500:])
+            count = int(prep["out"].strip().splitlines()[-1])
+            if not count:
+                per[scope] = "na"
+                continue
+        if prog:
+            cli, original = out / "solution_cli.py", out / "_probe_reference.py"
+            if not cli.is_file() or original.exists():
+                return dict(ok=False, error="cannot wrap reference CLI")
+            cli.rename(original)
+            target = scope if scope != "public" else "\x00none"
+            cli.write_text(script.read_text() + f"\nhidden_main({arm!r}, {target!r})\n")
+        t = test(cfg, task, gen, out, work, tag)
+        runs = [m for m in t["metrics"] if m.get("name") == "_solution_cli_run"]
+        seen, hit = set(), 0
+        for run in runs:
+            lines = run.get("stderr_tail", "").splitlines()
+            if run.get("rc") != 0 or not lines or not lines[-1].startswith("TBSGEN_PROBE "):
+                return dict(ok=False, error="probe CLI failed", scope=scope, stderr=lines[-2:])
+            try:
+                name, count, targeted, _skipped = json.loads(lines[-1].removeprefix("TBSGEN_PROBE "))
+                if not isinstance(name, str) or type(count) is not int or count < 0:
+                    raise ValueError("invalid probe counts")
+            except (TypeError, ValueError):
+                return dict(ok=False, error="invalid probe CLI record", scope=scope, stderr=lines[-1:])
+            seen.add(name)
+            if targeted:
+                hit += count
+        if scope != "public":
+            if scope not in seen:
+                # the verifier never ran the program on this hidden set: it cannot be scored
+                return dict(ok=False, error="hidden set not run by the verifier", scope=scope, ran=sorted(seen))
+            if not hit:
+                per[scope] = "na"
+                continue
+        if not (t["rc"] == 0 and t["reward"] in ("0", "1")):
+            return dict(ok=False, error="verifier gave no reward", scope=scope)
+        rewards[scope] = t["reward"]
+        per[scope] = dict(reward=t["reward"], failed=t["failed"],
+                          passed_checks=[m["name"] for m in t["metrics"] if m.get("passed") and not m.get("aux")])
+    accepted = [s for s, r in rewards.items() if r == "1"]
+    na = not rewards
+    return dict(ok=not accepted, na=na, accepted_scopes=accepted, scopes=per)

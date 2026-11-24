@@ -750,7 +750,9 @@ def s10(P, it):
     from .stages_a import _agent_slot_lock
     # Serialize the inventory read and manifest append with other S10 and S5G admissions in this run.
     with _agent_slot_lock(P):
-        why = diversity.admission(P, it, "S10")
+        # A version already released (manifest append done, crash before "done") keeps its release: the diversity
+        # decision is taken once per item, before the first append, not re-taken against a later inventory.
+        why = None if _released(P, it.item_id) else diversity.admission(P, it, "S10")
         if why:
             withdraw(P, it.item_id, why)
             return it.finish("parked", why)

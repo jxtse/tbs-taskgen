@@ -6,9 +6,14 @@ from .package import strip_time_note
 
 # Scientific homonyms stay allowed: "patch" (sky patch, tissue patch), "internal standard", "baseline-free" (structural
 # health monitoring) all occur in real statements of the 2026-11-23 share; only their process senses are flagged.
-PROCESS_WORDS = (r"audit", r"revision", r"reviewer", r"review\s+round", r"S9R", r"S7", r"S8", r"gate",
-                 r"tbsgen", r"TODO", r"FIXME", r"XXX", r"internal\s+(?:note|review|use|only)", r"hardening",
-                 r"round-\d+", r"lever", r"(?:hot)?fix\s+log", r"patch(?:ed)?\s+(?:notes?|version|round)")
+# Bare "gate" (gate voltage, logic gate), "hardening" (strain hardening), "lever" (lever arm), "audit" (convergence
+# audit) and "revision" (data revision) are science too: only their editorial / pipeline phrasings are flagged.
+PROCESS_WORDS = (r"audit\s+(?:copy|revision|note|round|fix|finding)s?", r"(?:task|statement|audit|review)\s+revision",
+                 r"revision\s+(?:note|history|round)s?", r"reviewer(?:'s)?\s+(?:note|comment|request)s?",
+                 r"review\s+round", r"S9R", r"S[5-9][A-Z]?\s+(?:gate|stage|repair|review)", r"(?:quality|S7|leak)\s+gates?",
+                 r"tbsgen", r"TODO", r"FIXME", r"XXX", r"internal\s+(?:note|review|use|only)",
+                 r"hardening\s+(?:round|lever|pass)s?", r"difficulty\s+levers?", r"round-\d+",
+                 r"(?:hot)?fix\s+log", r"patch(?:ed)?\s+(?:notes?|version|round)")
 _PROCESS = re.compile(r"\b(?:" + "|".join(PROCESS_WORDS) + r")\b", re.I)
 _HEADING_WORDS = re.compile(r"\bexploit\b", re.I)
 _BASELINE = re.compile(r"\b(?:mid|naive)[ -]+baseline\b", re.I)

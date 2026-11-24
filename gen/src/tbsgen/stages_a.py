@@ -639,6 +639,7 @@ def _agent_stage(P, it, kind: str, instruction: str, need: list[str], timeout_s:
         # resumed: reuse the persisted reservation amount (clamped to the paper cap when the job was set up); the
         # record already holds its slot (intent / reserved count as running) and its admission is per paper
         with _agent_slot_lock(P):
+            _settle_orphans(P, recp, rec, "diversity: reservation released before launch")
             started = rec.get("launch_attempted") or (rec.get("job_dir") and
                                                       (Path(rec["job_dir"]) / "config.json").exists())
             if rec["state"] == "intent" or not started:
@@ -647,11 +648,15 @@ def _agent_stage(P, it, kind: str, instruction: str, need: list[str], timeout_s:
                 why = _agent_admission(P, it, kind)
                 if why:
                     if why.startswith("diversity:") and rec["state"] == "reserved":
-                        # A parked paper releases its unused money and its concurrent authoring slot.
-                        if rec.get("ledger_call"):
-                            P.ledger.settle(rec["ledger_call"], 0., status="error", kind="not_launched", note=why)
-                        rec.update(state="intent", ledger_call=None)
+                        # A parked paper releases its unused money and its concurrent authoring slot.  Order: the
+                        # record goes back to intent first (a resume re-reserves through ledger.reserve), then the
+                        # old row is settled; a crash in between leaves the row in orphan_calls, settled below
+                        # on the next pass -- never a "reserved" record whose ledger row is already closed.
+                        orphan = rec.get("ledger_call")
+                        rec.update(state="intent", ledger_call=None,
+                                   orphan_calls=list(rec.get("orphan_calls") or []) + ([orphan] if orphan else []))
                         write_json(recp, rec)
+                        _settle_orphans(P, recp, rec, why)
                     it.finish(_admission_status(why), why, paused_stage=kind)
                     return None
             rec = codeagent.launch_agent(P.cfg, it, kind, json.loads(Path(rec["config"]).read_text()), P.ledger,
@@ -678,6 +683,16 @@ def _agent_stage(P, it, kind: str, instruction: str, need: list[str], timeout_s:
         it.finish("waiting", preflight_wait(P.cfg, rec) or "relay_down: preflight refused", job=rec.get("job_name"))
         return None
     return rec
+
+
+def _settle_orphans(P, recp, rec, note: str) -> None:
+    """Close ledger rows of reservations a diversity park released (run.json is back at intent).  Idempotent: the
+    row id leaves orphan_calls only after its settle committed; settling a closed row again is harmless.
+    cost_kind diversity_parked = no model call was made (excluded from the call-count caps)."""
+    for call in list(rec.get("orphan_calls") or []):
+        P.ledger.settle(call, 0., status="error", kind="diversity_parked", note=note[:300])
+        rec["orphan_calls"].remove(call)
+        write_json(recp, rec)
 
 
 def relay_waiting(cfg: dict, it) -> bool:
