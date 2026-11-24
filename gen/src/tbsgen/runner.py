@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import shlex
 import shutil
 from pathlib import Path
 
@@ -392,8 +393,9 @@ def output_probe(cfg, task, gen, ref_out, work, arm, prog):
         if refused:
             return dict(ok=False, error=f"invalid reference outputs: {refused[:3]}")
         if scope == "public":
-            command = ("cd / && python -c 'from pathlib import Path; from probe_outputs import mutate; "
-                       f"print(mutate(Path(\"/app/output\"), {arm!r}))'")
+            # shlex.quote: repr(arm) has single quotes, which must not end a single-quoted shell word
+            command = "cd / && python -c " + shlex.quote(
+                f"from pathlib import Path; from probe_outputs import mutate; print(mutate(Path('/app/output'), {arm!r}))")
             # the delivered program is not output data: keep it out of the transformation
             keep = [p for p in (out / "solution_cli.py",) if p.exists()]
             stash = work / f"stash-{tag}"

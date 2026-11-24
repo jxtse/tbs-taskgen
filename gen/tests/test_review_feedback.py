@@ -2,6 +2,7 @@
 import csv
 import json
 from pathlib import Path
+import os
 import subprocess
 import sys
 from types import SimpleNamespace
@@ -579,3 +580,35 @@ def test_parity_matches_renamed_hidden_metrics():
     rows = [{"name": n} for n in ("public_rr10", "hidden_rr10_set_a", "public_rel_rmse", "hidden_large_rel_rmse_max",
                                   "public_mean_clean_error", "hidden_max_clean_error", "public_host_accuracy")]
     assert gates.hidden_parity(rows, {"metrics": []})["missing_hidden"] == ["host_accuracy"]
+
+
+def test_public_probe_command_survives_the_shell(tmp_path, monkeypatch):
+    # The public-scope command runs as `bash -lc <cmd>` in the sandbox. A fake sandbox that only greps the command
+    # hid a quoting bug (repr(arm) closed the single-quoted python -c argument: NameError one_confident). Run the
+    # real command through bash with the probe module on PYTHONPATH.
+    import shutil as _sh
+    cfg = load_config()
+    ref = tmp_path / "ref"
+    ref.mkdir()
+    (ref / "public.csv").write_text("id,label,confidence\n" + "".join(f"{i},x,{i/10}\n" for i in range(7)))
+    seen = []
+    def run(cfg, mounts, cmd, timeout, name, *a, **k):
+        root = tmp_path / ("root-" + str(len(seen)))
+        out = root / "app/output"
+        _sh.copytree(mounts[0][0], out)
+        _sh.copy(mounts[1][0], root / "probe_outputs.py")
+        p = subprocess.run(["bash", "-c", cmd.replace("cd / ", f"cd {root} ").replace("/app/output", str(out))],
+                           capture_output=True, text=True, env=dict(os.environ, PYTHONPATH=str(root)))
+        seen.append((cmd, p.returncode, p.stderr))
+        if p.returncode == 0:
+            _sh.rmtree(mounts[0][0]); _sh.copytree(out, mounts[0][0])
+        return dict(rc=p.returncode, out=p.stdout, err=p.stderr)
+    monkeypatch.setattr(runner.sandbox, "run", run)
+    monkeypatch.setattr(runner, "test", lambda *a, **k: dict(metrics=[], rc=0, passed=False, reward="0", failed=["x"]))
+    gen = tmp_path / "gen"
+    gen.mkdir()
+    for arm in ("one_confident", "hidden_garbage"):
+        (tmp_path / arm).mkdir()
+        runner.output_probe(cfg, tmp_path, gen, ref, tmp_path / arm, arm, True)
+    public = [s for s in seen if "probe_outputs import mutate" in s[0]]
+    assert public and all(rc == 0 for _, rc, _ in public), public
