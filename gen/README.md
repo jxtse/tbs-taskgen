@@ -309,6 +309,11 @@ uv run tbsgen reset  --run runs/R --item ID --stage S6B [--regen]    # 管线修
 uv run tbsgen ping --run state/ping --calls 1 --budget-usd 1        # Opus 连通性（真实调用）
 ```
 
+**人工处理远端校准或审核作业**。条目以 `remote_unknown: NAME` 暂存时，原预算预留和并发槽位继续占用。`tbsgen status` 和 `tbsgen report` 会显示待处理的作业数。
+
+- 已将完整作业同步到记录的本地目录时，运行 `tbsgen calib resolve-remote --run runs/R --config config.toml --item ID --job NAME --synced`。命令核对作业身份、结束标记、配置要求的试次数和各试次的 `result.json`，再结算费用并处理裁决。
+- 确认远端从未启动该作业时，将同一命令的 `--synced` 换为 `--not-started`，按零费用结算。本地已有作业 `config.json` 或试次结果时，命令会拒绝零费用结算。
+
 `config.toml` 示例（只需写要覆盖的项）：
 
 ```toml

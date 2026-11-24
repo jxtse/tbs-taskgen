@@ -192,6 +192,15 @@ are documented in [`gen/README.md`](gen/README.md) §3; calibrating only some it
 (`calib.prepare_command`), teacher-only routing (`calib.teacher_*`) and the S9R review settings (`review.*`, on by
 default; routed like the teacher unless set) are in §4–§5b there.
 
+### Resolving a parked remote job
+
+For S9 and S9R, `tbsgen status` and `tbsgen report` count unresolved `remote_unknown` runs. The item reason
+`remote_unknown: NAME` identifies the job. Its budget reservation and concurrency slot stay held until an
+operator resolves it. After syncing the complete remote job directory to its recorded local location, run
+`tbsgen calib resolve-remote --run RUN --config CFG --item ID --job NAME --synced` to ingest the trials,
+settle their cost and process the verdict. If you have verified that the remote job never started, use
+`--not-started` to release the reservation at zero. A local job config or trial result blocks that option.
+
 ### Running unattended
 
 A long-running deployment uses a small driver script, written for the deployment; the repository has no such

@@ -394,6 +394,9 @@ def bind_started_call(cfg, rec, ledger, cost=None):
 
 def adopt_started(cfg, rec, ledger, save):
     """Recover an existing Harbor job with its original identity and without a new submission."""
+    if remote_job(rec):
+        reconcile_remote(cfg, rec, ledger, save)
+        return rec
     if ledger is not None:
         stage = rec.get("ledger_stage", "S9")
         jd = Path(rec["job_dir"])
@@ -401,7 +404,7 @@ def adopt_started(cfg, rec, ledger, save):
         if read_json(jd / "result.json", {}).get("finished_at"):
             check_job_identity(jd, rec, review=stage == "S9R")
             cost = job_cost(collect(jd, rec["model"], cfg["models"].get("prices", {})))
-        if not rec.get("ledger_call") or remote_job(rec):
+        if not rec.get("ledger_call"):
             bind_started_call(cfg, rec, ledger, cost)
         elif cost is not None:
             usd, kind, usage = cost
@@ -416,7 +419,7 @@ def launch(cfg: dict, rec: dict, ledger, save) -> dict:
     crash at any point is recoverable: a reserved-but-not-started job is launched once on resume, a started job
     is never launched again.  Any launch exception settles the reservation at 0 and marks the run failed."""
     c = cfg["calib"]
-    if rec["state"] == "intent" and job_started(rec):
+    if remote_job(rec) or (rec["state"] == "intent" and job_started(rec)):
         return adopt_started(cfg, rec, ledger, save)
     if rec["state"] == "intent":
         # an intent has no side effect outside item_dir.  It may have been written while submit was off, before
@@ -491,28 +494,17 @@ def launch(cfg: dict, rec: dict, ledger, save) -> dict:
     return _start_launcher(c, rec, ledger, save)
 
 
-def _start_launcher(c, rec, ledger, save, *, attach=False):
+def _start_launcher(c, rec, ledger, save):
     import shlex
     import subprocess
 
-    if attach:
-        config = _load(rec["config"]) if rec.get("config") else None
-        if not config or config.get("job_name") != rec["job_name"]:
-            rec["launch_uncertain"] = "cannot attach: original job config is unavailable or names another job"
-            save(rec)
-            return rec
     item_dir = Path(rec["config"]).parent.parent
-    suffix = ".attach.log" if attach else ".log"
-    log = item_dir / "calib" / (rec["job_name"] + suffix)
+    log = item_dir / "calib" / (rec["job_name"] + ".log")
     log.parent.mkdir(parents=True, exist_ok=True)
     launcher = rec.get("launcher_script") or c.get("student_launcher" if rec["who"] == "glm" else "teacher_launcher")
     root = rec.get("launcher_root") or role(c, rec["who"], "harbor_root")
     if not (launcher and root):
         err = "no launcher / harbor_root for this role"
-        if attach:
-            rec["launch_uncertain"] = err
-            save(rec)
-            return rec
         if ledger is not None and rec.get("ledger_call"):
             ledger.settle(rec["ledger_call"], 0.0, status="error", kind="not_launched", note=f"launch failed: {err}")
         rec.update(state="launch_failed", outcome="infra", result_type="infra", cost_usd=0.0, cost_kind="not_launched", error=err)
@@ -524,9 +516,6 @@ def _start_launcher(c, rec, ledger, save, *, attach=False):
              f"echo $? > {shlex.quote(str(log) + '.exit')}")
     rec.update(log=str(log), tmux=rec.get("tmux") or rec["job_name"][-60:], launch_attempted=time.time(),
                launcher_script=launcher, launcher_root=root)
-    if attach:
-        rec["attach_attempted"] = True
-        rec.pop("launch_uncertain", None)
     if Path(str(log) + ".exit").exists():
         Path(str(log) + ".exit").unlink()                  # a previous attempt's exit status
     save(rec)                                              # persisted before the side effect
@@ -538,11 +527,6 @@ def _start_launcher(c, rec, ledger, save, *, attach=False):
     except Exception as e:  # noqa: BLE001  (missing tmux, timeout, ...)
         err = f"{type(e).__name__}: {e}"
         uncertain = isinstance(e, subprocess.TimeoutExpired)    # tmux may have started the session anyway
-    if attach:
-        if err:
-            rec["launch_uncertain"] = err[:300]
-            save(rec)
-        return rec
     if err:
         alive = session_alive(c, rec)
         if job_started(rec) or alive or (uncertain and alive is None):
@@ -595,42 +579,44 @@ def preflight_wait(cfg: dict, rec: dict | None) -> str | None:
     return f"relay_down: preflight refused, retry after {time.strftime('%H:%M', time.localtime(time.time() + left))}"
 
 
+def complete_remote_trials(jd: Path) -> bool:
+    """A synced Harbor job has a final summary and a result for every configured trial."""
+    summary = _load(jd / "result.json")
+    config = _load(jd / "config.json")
+    if not isinstance(summary, dict) or not summary.get("finished_at") or not isinstance(config, dict):
+        return False
+    tasks, agents = config.get("tasks"), config.get("agents")
+    attempts = config.get("n_attempts", 1)
+    if (not isinstance(tasks, list) or not tasks or not isinstance(agents, list) or not agents
+            or type(attempts) is not int or attempts < 1):
+        return False
+    expected = len(tasks) * len(agents) * attempts
+    trials = [p for p in jd.iterdir() if p.is_dir()]
+    return len(trials) >= expected and all(isinstance(_load(p / "result.json"), dict) for p in trials)
+
+
 def reconcile_remote(cfg, rec, ledger, save):
-    """Poll the original submission. Only an attach's GONE status confirms a marker-only job is absent."""
-    c = cfg["calib"]
+    """Observe the original submission locally. Only the operator can clear remote_unknown."""
     jd = Path(rec["job_dir"])
-    rec.setdefault("tmux", rec["job_name"][-60:])
-    alive = session_alive(c, rec)
-    log = rec.get("log")
-    ex = Path(log + ".exit") if log else None
-    code = ex.read_text().strip() if ex and ex.exists() else ""
-    finished = read_json(jd / "result.json", {}).get("finished_at")
-    observing = alive is True and not code and rec.get("state") != "remote_unknown"
-    state = "launched" if finished or observing else "remote_unknown"
-    if state != rec.get("state") or not rec.get("ledger_call"):
-        # A crashed submitter may still point at yesterday's expired reservation.
-        bind_started_call(cfg, rec, ledger)
-        rec.update(state=state, submitted=True)
+    state = rec.get("state")
+    if state == "remote_unknown":
+        action = "remote_unknown"
+    elif complete_remote_trials(jd):
+        action = "awaiting_ingest"
+    else:
+        rec.setdefault("tmux", rec["job_name"][-60:])
+        exited = rec.get("log") and Path(rec["log"] + ".exit").exists()
+        summary = _load(jd / "result.json")
+        finished = isinstance(summary, dict) and summary.get("finished_at")
+        observing = not exited and not finished and session_alive(cfg["calib"], rec) is True
+        action = "waiting" if observing else "remote_unknown"
+    new_state = "remote_unknown" if action == "remote_unknown" else "launched"
+    if state != new_state or not rec.get("ledger_call"):
+        if ledger is not None:
+            bind_started_call(cfg, rec, ledger)
+        rec.update(state=new_state, submitted=True)
         save(rec)
-    if finished:
-        return "awaiting_ingest"
-    if not code and alive is not False:
-        return "waiting"
-    synced = (jd / "config.json").exists() or (jd / "result.json").exists() or any(jd.glob("*/result.json"))
-    # The remote runner can also exit 5. Its log distinguishes that from the launcher's GONE signal.
-    remote_exit = False
-    if code and Path(log).is_file():
-        tail = Path(log).read_text(errors="replace").splitlines()
-        remote_exit = bool(tail and tail[-1].endswith(f"{rec['job_name']}: harbor exit {code}"))
-    if code == "5" and rec.get("attach_attempted") and not (synced or remote_exit):
-        return "not_launched"
-    # A local failure after a partial sync says nothing about whether the remote job is still running.
-    if synced and (code == "5" or remote_exit):
-        return "awaiting_ingest" if read_json(jd / "result.json", {}).get("finished_at") else "job_died"
-    if code == "3" and not synced and relay_preflight_refused(rec):
-        return "not_launched"
-    _start_launcher(c, rec, ledger, save, attach=True)
-    return "remote_unknown" if rec.get("launch_uncertain") else "remote_attach"
+    return action
 
 
 def launcher_failed(rec: dict, c: dict | None = None) -> str | None:

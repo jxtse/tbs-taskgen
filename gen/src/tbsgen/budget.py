@@ -159,8 +159,8 @@ class Ledger:
             if rows:
                 return rows[-1][0]
             # A previous cancellation may have committed before the replacement id reached runs.json.
-            row = db.execute("SELECT MAX(id) FROM calls WHERE item=? AND stage=? AND day=? "
-                             "AND (reservation_key=? OR id=?)", (item, stage, today(), key, saved_id)).fetchone()
+            row = db.execute("SELECT MAX(id) FROM calls WHERE item=? AND stage=? AND reservation_key=? "
+                             "AND status IN ('cancelled','ok','error')", (item, stage, key)).fetchone()
             return row[0] or saved_id
 
     def adopt_started_job(self, model, stage, item, job_name, launch_key, estimate, cost, saved_id=None):

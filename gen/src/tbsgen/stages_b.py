@@ -164,7 +164,13 @@ def s8(P, it):
 _POST_PROBE_STAGES = ("S8", "PKG", "S9", "S9R", "S10")
 
 
+def _remote_parked(it):
+    return it.state.get("status") == "parked" and str(it.state.get("reason", "")).startswith("remote_unknown: ")
+
+
 def legacy_report_id(it):
+    if _remote_parked(it):
+        return None
     if it.state.get("stage") not in _POST_PROBE_STAGES or it.state.get("status") in ("done", "dropped"):
         return None
     attempt = passed_gate_attempt(it.state)
@@ -204,7 +210,8 @@ def migrate_probe_report(P, it):
                     return True
                 if rec.get("outcome") is None:
                     if calib.remote_job(rec):
-                        _reconcile_remote(P, it, rec, save)
+                        if _reconcile_remote(P, it, rec, save) == "remote_unknown":
+                            return True
                     elif not (rec.get("state") == "launched" or rec.get("launch_attempted") or calib.job_started(rec)):
                         _cancel_probe_job(P, it, rec, save)
                     elif rec.get("state") == "intent" and calib.job_started(rec):
@@ -236,10 +243,8 @@ def _reconcile_remote(P, it, rec, save):
     rec.setdefault("item", it.item_id)
     rec.setdefault("ledger_stage", stage)
     action = calib.reconcile_remote(cfg, rec, P.ledger, lambda r: save(it, r))
-    if action == "not_launched":
-        _settle_not_launched(P, it, rec, save, "remote launcher confirmed no job")
-    elif action == "job_died":
-        _settle_dead_job(P, it, rec, save)
+    if action == "remote_unknown":
+        it.finish("parked", f"remote_unknown: {rec['job_name']}")
     return action
 
 
@@ -278,11 +283,11 @@ def finish_job_stage(P, it, status, reason, **info):
     for directory, save in (("review", _save_review), ("calib", _save_run)):
         for rec in read_json(it.p(directory, "runs.json"), []):
             if rec.get("outcome") is None and calib.remote_job(rec):
-                _reconcile_remote(P, it, rec, save)
-                if rec.get("outcome") is None:
-                    it.state["pending_job_finish"] = dict(stage="S9R" if save is _save_review else "S9",
-                                                          status=status, reason=reason, info=info)
-                    return it.finish("waiting", f"awaiting remote job {rec['job_name']}")
+                it.state["pending_job_finish"] = dict(stage="S9R" if save is _save_review else "S9",
+                                                      status=status, reason=reason, info=info)
+                if _reconcile_remote(P, it, rec, save) == "remote_unknown":
+                    return
+                return it.finish("waiting", f"awaiting remote job {rec['job_name']}")
             if _unstarted(rec):
                 _cancel_probe_job(P, it, rec, save, kind="cancelled_unstarted")
     return it.finish(status, reason, **info)
@@ -724,7 +729,8 @@ def _s9(P, it):
     runs = read_json(it.p("calib", "runs.json"), [])
     for rec in runs:                                         # reconcile interrupted submissions
         if rec.get("outcome") is None and calib.remote_job(rec):
-            _reconcile_remote(P, it, rec, _save_run)
+            if _reconcile_remote(P, it, rec, _save_run) == "remote_unknown":
+                return
             continue
         if rec.get("outcome") is None and rec.get("state") in ("intent", "reserved"):
             if not c.get("allow_submit"):
@@ -856,37 +862,79 @@ def ingest(P, it, job_dir: str | None = None) -> dict:
     state (review #3/#4)."""
     with item_lock(it):
         it.load()
-        if job_stage(it) == "S9R":
-            return _ingest_review(P, it, job_dir)
-        return _ingest(P, it, job_dir)
+        stage = "S9R" if job_stage(it) == "S9R" else "S9"
+        directory = "review" if stage == "S9R" else "calib"
+        runs = read_json(it.p(directory, "runs.json"), [])
+        rec = next((r for r in runs if calib.pending_launcher(r)), None)
+        if rec is None:
+            if runs and runs[-1].get("outcome") is not None and it.state.get("status") == "waiting":
+                _after_ingest(P, it, runs[-1], stage)
+                return dict(recovered=True, job_name=runs[-1]["job_name"])
+            raise ValueError(f"no pending {'review' if stage == 'S9R' else 'calibration'} run for this item")
+        if calib.remote_job(rec):
+            if _remote_parked(it):
+                raise ValueError("remote_unknown requires calib resolve-remote")
+            save = _save_review if stage == "S9R" else _save_run
+            if _reconcile_remote(P, it, rec, save) == "remote_unknown":
+                raise ValueError("remote_unknown requires calib resolve-remote")
+        return _ingest_run(P, it, rec, stage, Path(job_dir or rec["job_dir"]))
+
+
+def resolve_remote(P, it, job, *, synced):
+    """Resolve one named parked run under the same lock as the watcher."""
+    if not it.p("state.json").is_file():
+        raise ValueError(f"unknown item: {it.item_id}")
+    with item_lock(it):
+        it.load()
+        stage = job_stage(it)
+        if stage not in ("S9", "S9R"):
+            raise ValueError("no pending remote run for this item")
+        directory = "review" if stage == "S9R" else "calib"
+        runs = read_json(it.p(directory, "runs.json"), [])
+        rec = next((r for r in runs if r.get("job_name") == job), None)
+        if (rec and rec.get("outcome") is not None and _remote_parked(it)
+                and it.state["reason"] == f"remote_unknown: {job}"):
+            # Resolution committed to runs.json before the item transition.
+            _after_ingest(P, it, rec, stage)
+            return dict(job_name=job, recovered=True)
+        if not rec or rec.get("state") != "remote_unknown" or rec.get("outcome") is not None:
+            raise ValueError(f"no remote_unknown run named {job} for this item")
+        jd = Path(rec["job_dir"])
+        if synced:
+            return _ingest_run(P, it, rec, stage, jd)
+        if (jd / "config.json").exists() or any(jd.glob("*/result.json")):
+            raise ValueError("cannot confirm not-started with a job config or trial results")
+        save = _save_review if stage == "S9R" else _save_run
+        _settle_not_launched(P, it, rec, save, "operator confirmed remote job did not start")
+        _after_ingest(P, it, rec, stage)
+        return dict(job_name=job, cost_usd=0.0, cost_kind=rec["cost_kind"])
 
 
 def _after_ingest(P, it, rec, stage):
     finish = it.state.pop("pending_job_finish", None)
+    migrating = it.state.pop("probe_migration_job_stage", None)
+    parked = _remote_parked(it)
+    if parked:
+        it.state.pop("reason", None)
+    # A drop from the parked job takes precedence over the deferred item transition.
+    if stage == "S9R" and (parked or migrating or finish and calib.remote_job(rec)) and _received_drop(it, rec):
+        return _route_review(P, it, rec, rec["n"])
     if finish:
         return finish_job_stage(P, it, finish["status"], finish["reason"], **finish["info"])
-    if it.state.pop("probe_migration_job_stage", None):
-        if stage == "S9R" and _received_drop(it, rec):
-            return _route_review(P, it, rec, rec["n"])
-        stage = "S6A_run"
-    it.state.update(stage=stage, status="active")
+    it.state.update(stage="S6A_run" if migrating else stage, status="active")
     it.save()
 
 
-def _ingest(P, it, job_dir: str | None = None) -> dict:
-    runs = read_json(it.p("calib", "runs.json"), [])
-    pend = [r for r in runs if calib.pending_launcher(r)]
-    if not pend:
-        if runs and runs[-1].get("outcome") is not None and it.state.get("status") == "waiting":
-            _after_ingest(P, it, runs[-1], "S9")
-            return dict(recovered=True, job_name=runs[-1]["job_name"])
-        raise ValueError("no pending calibration run for this item")
-    rec = pend[0]
-    jd = Path(job_dir or rec["job_dir"])
+def _ingest_run(P, it, rec, stage, jd):
+    if calib.remote_job(rec) and not calib.complete_remote_trials(jd):
+        raise ValueError(f"incomplete remote trial set: {jd}")
     jr = read_json(jd / "result.json", {})
-    if not jr.get("finished_at"):           # Harbor writes result.json at job start; finished_at marks the end
+    if not jr.get("finished_at"):
         raise ValueError(f"job not finished yet: {jd}")
-    calib.check_job_identity(jd, rec)
+    calib.check_job_identity(jd, rec, review=stage == "S9R")
+    if stage == "S9R":
+        return _ingest_review(P, it, rec, jd)
+    runs = read_json(it.p("calib", "runs.json"), [])
     used = {r.get("trial", {}).get("job_dir") for r in runs if r.get("outcome") is not None}
     if str(jd.resolve()) in used:
         raise ValueError(f"job dir already consumed: {jd}")
@@ -904,7 +952,7 @@ def _ingest(P, it, job_dir: str | None = None) -> dict:
         # unknown cost: the reservation stands in (cost_kind "reservation"), but actual_spend() does not count it
         P.ledger.settle(rec["ledger_call"], usd, kind=kind, usage=usage,
                         note=f"S9 cost {kind}, outcome={t['outcome']}, result_type={t['result_type']}")
-    write_json(it.p("calib", "runs.json"), runs)
+    _save_run(it, rec)
     _after_ingest(P, it, rec, "S9")
     return t
 
@@ -1102,49 +1150,48 @@ def watch_tick(P, only: list[str] | None = None, max_steps: int = 50) -> dict:
                 ingest(P, it)  # recover a crash after saving runs.json
             continue
         rec = pend[0]
-        jr = read_json(Path(rec["job_dir"]) / "result.json", {}) or {}
-        if jr.get("finished_at"):
-            try:
-                t = ingest(P, it)
-                did.append(dict(item=it.item_id, action="ingest", job=rec["job_name"], outcome=t.get("outcome"),
-                                result_type=t.get("result_type")))
-            except ValueError as e:
-                did.append(dict(item=it.item_id, action="ingest_error", job=rec["job_name"], error=str(e)[:300]))
-        else:
+        with item_lock(it):
+            it.load()                   # re-check under the lock: another watcher / run may have moved it
+            runs = read_json(it.p(*rf), [])
+            cur = next((r for r in runs if r.get("job_name") == rec["job_name"]), {})
+            if job_stage(it) != stage or it.state.get("status") != "waiting" or \
+                    not cur or not calib.pending_launcher(cur):
+                continue
+            if calib.remote_job(cur):
+                save = _save_run if stage == "S9" else _save_review
+                action = _reconcile_remote(P, it, cur, save)
+                if action == "remote_unknown":
+                    did.append(dict(item=it.item_id, action=action, job=cur["job_name"]))
+                if action != "awaiting_ingest":
+                    continue
+            jd = Path(cur["job_dir"])
+            if (read_json(jd / "result.json", {}) or {}).get("finished_at"):
+                try:
+                    t = _ingest_run(P, it, cur, stage, jd)
+                    did.append(dict(item=it.item_id, action="ingest", job=cur["job_name"], outcome=t.get("outcome"),
+                                    result_type=t.get("result_type")))
+                except ValueError as e:
+                    did.append(dict(item=it.item_id, action="ingest_error", job=cur["job_name"], error=str(e)[:300]))
+                continue
             c = P.cfg["calib"]
-            with item_lock(it):
-                it.load()                   # re-check under the lock: another watcher / run may have moved it
-                runs = read_json(it.p(*rf), [])
-                cur = next((r for r in runs if r.get("job_name") == rec["job_name"]), {})
-                if job_stage(it) != rf_stage(rf) or it.state.get("status") != "waiting" or \
-                        not cur or not calib.pending_launcher(cur):
-                    continue
-                if calib.remote_job(cur):
-                    save = _save_run if stage == "S9" else _save_review
-                    kind = _reconcile_remote(P, it, cur, save)
-                    if cur.get("outcome") is not None:
-                        _after_ingest(P, it, cur, stage)
-                    if kind not in ("remote_unknown", "waiting", "awaiting_ingest"):
-                        did.append(dict(item=it.item_id, action=kind, job=cur["job_name"]))
-                    continue
-                kind = "launcher_failed" if calib.launcher_failed(cur, c) else \
-                    "job_died" if calib.launcher_died(cur, c) else None
-                if kind is None:
-                    continue
-                if it.state.get("probe_migration_job_stage"):
-                    save = _save_run if stage == "S9" else _save_review
-                    job_dir = Path(cur["job_dir"])
-                    if ((job_dir / "config.json").exists() or (job_dir / "result.json").exists()
-                            or any(job_dir.glob("*/result.json"))):
-                        _settle_dead_job(P, it, cur, save=save)
-                    else:
-                        _cancel_probe_job(P, it, cur, save)
-                    if cur.get("outcome") is not None:
-                        _after_ingest(P, it, cur, stage)
+            kind = "launcher_failed" if calib.launcher_failed(cur, c) else \
+                "job_died" if calib.launcher_died(cur, c) else None
+            if kind is None:
+                continue
+            if it.state.get("probe_migration_job_stage"):
+                save = _save_run if stage == "S9" else _save_review
+                job_dir = Path(cur["job_dir"])
+                if ((job_dir / "config.json").exists() or (job_dir / "result.json").exists()
+                        or any(job_dir.glob("*/result.json"))):
+                    _settle_dead_job(P, it, cur, save=save)
                 else:
-                    it.state["status"] = "active"       # s9() / s9r() reconcile the dead launch
-                    it.save()
-            did.append(dict(item=it.item_id, action=kind, job=rec["job_name"]))
+                    _cancel_probe_job(P, it, cur, save)
+                if cur.get("outcome") is not None:
+                    _after_ingest(P, it, cur, stage)
+            else:
+                it.state["status"] = "active"       # s9() / s9r() reconcile the dead launch
+                it.save()
+        did.append(dict(item=it.item_id, action=kind, job=rec["job_name"]))
     s9 = [i.item_id for i in P.store.items() if (not only or i.item_id in only) and
           (i.state.get("stage") in ("S9", "S9R") or (_in_revision(i) and i.state.get("status") == "active") or
            _in_hardening(i))]
@@ -1170,10 +1217,6 @@ def _in_hardening(it) -> bool:
 def _in_revision(it) -> bool:
     return bool(it.state.get("review_revisions") or it.state.get("thresholds_locked") or
                 it.state.get("review_revision_pending") or str(it.state.get("repair_from", "")).startswith("review:"))
-
-
-def rf_stage(rf: tuple) -> str:
-    return "S9" if rf[0] == "calib" else "S9R"
 
 
 # ------------------------------------------------------------------ S9R review
@@ -1213,7 +1256,8 @@ def _s9r(P, it):
     review_disabled = not rv.get("enabled")
     for rec in runs:                                     # reconcile interrupted submissions / dead launches
         if rec.get("outcome") is None and calib.remote_job(rec):
-            _reconcile_remote(P, it, rec, _save_review)
+            if _reconcile_remote(P, it, rec, _save_review) == "remote_unknown":
+                return
             continue
         if rec.get("outcome") is None and rec.get("state") in ("intent", "reserved"):
             started = calib.job_started(rec)
@@ -1345,20 +1389,7 @@ def _s9r(P, it):
     return it.goto("S9R", f"review launch failed: {rec.get('error', '')[:120]}")
 
 
-def _ingest_review(P, it, job_dir: str | None = None) -> dict:
-    runs = read_json(it.p("review", "runs.json"), [])
-    pend = [r for r in runs if calib.pending_launcher(r)]
-    if not pend:
-        if runs and runs[-1].get("outcome") is not None and it.state.get("status") == "waiting":
-            _after_ingest(P, it, runs[-1], "S9R")
-            return dict(recovered=True, job_name=runs[-1]["job_name"])
-        raise ValueError("no pending review run for this item")
-    rec = pend[0]
-    jd = Path(job_dir or rec["job_dir"])
-    jr = read_json(jd / "result.json", {})
-    if not jr.get("finished_at"):
-        raise ValueError(f"job not finished yet: {jd}")
-    calib.check_job_identity(jd, rec, review=True)
+def _ingest_review(P, it, rec, jd):
     assigned = rec.get("suspected_scopes", [])
     res = review.classify(jd, rec.get("model"), P.cfg["models"].get("prices", {}),
                           allowed_verdicts=rec.get("allowed_verdicts"), allow_human=True,
@@ -1856,6 +1887,8 @@ def harden_needs_step(it) -> bool:
     """An unfinished hardening / S9b variant transaction (start or revert) that must be completed whatever the
     item's status.  Same eligibility as harden_revert (a version that never reached S9: no review runs of it)."""
     st = it.state
+    if _remote_parked(it):
+        return False
     if st.get("harden_pending") or st.get("harden_revert_pending"):
         return True
     return bool(st.get("harden_active") and st.get("status") in ("dropped", "parked") and

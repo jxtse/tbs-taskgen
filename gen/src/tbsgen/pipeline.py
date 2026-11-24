@@ -359,4 +359,7 @@ class Pipeline:
         return dict(n=len(items), by_status=dict(Counter(i.state["status"] for i in items)),
                     by_stage=dict(Counter(f"{i.state['stage']}/{i.state['status']}" for i in items)),
                     reasons=dict(Counter(i.state.get("reason") for i in items if i.state.get("reason"))),
+                    remote_unknown=sum(r.get("state") == "remote_unknown" and r.get("outcome") is None
+                                       for i in items for directory in ("calib", "review")
+                                       for r in read_json(i.p(directory, "runs.json"), [])),
                     ledger_today=self.ledger.summary(today()))
