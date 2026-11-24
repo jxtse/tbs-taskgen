@@ -48,7 +48,7 @@ def _mode(values):
     return counts.most_common(1)[0][0] if counts else ""
 
 
-_KEY_NAME = re.compile(r"(?:.*_)?(?:ids?|keys?|identifiers?|index|idx)|name|sample", re.I)
+_KEY_NAME = re.compile(r"(?:.*_)?(?:ids?|keys?|identifiers?|index|idx)|name|sample|filename|file|path", re.I)
 
 
 def _unique(values):
@@ -63,8 +63,17 @@ def _unique(values):
 
 
 def _key_column(columns):
-    candidates = [i for i, (name, values) in enumerate(columns)
-                  if (i == 0 or _KEY_NAME.fullmatch(name.strip())) and _unique(values)]
+    candidates = []
+    first_unique = False
+    for i, (name, values) in enumerate(columns):
+        named = _KEY_NAME.fullmatch(name.strip())
+        if (i == 0 or named) and _unique(values):
+            if named:
+                candidates.append(i)
+            if i == 0:
+                first_unique = True
+    if not candidates and first_unique:
+        return 0
     if len(candidates) != 1:
         raise UncertainTable("ambiguous keys" if candidates else "no unique key")
     return candidates[0]
@@ -269,7 +278,7 @@ def _mutate_file(path, arm, identity):
     raise Unsupported(f"unsupported output format: {path.name}")
 
 
-def mutate(root, arm, skipped=None, *, identity=False, uncertain=None):
+def mutate(root, arm, skipped=None, *, identity=False, uncertain=None, files=None):
     """Transform every supported file under root; unsupported files stay as they are (listed in `skipped`).
     An identity control computes the same candidate and serializes the original values for each applicable file.
     Returns the number of applicable files."""
@@ -280,7 +289,10 @@ def mutate(root, arm, skipped=None, *, identity=False, uncertain=None):
         if not path.is_file():
             continue
         try:
-            count += _mutate_file(path, arm, identity)
+            if _mutate_file(path, arm, identity):
+                count += 1
+                if files is not None:
+                    files.append(path.relative_to(root).as_posix())
         except UncertainTable as e:
             if uncertain is not None:
                 uncertain.append(f"{path.name}: {e}")
@@ -292,8 +304,9 @@ def mutate(root, arm, skipped=None, *, identity=False, uncertain=None):
 
 def mutation_report(root, arm, identity=False):
     uncertain = []
-    count = mutate(root, arm, identity=identity, uncertain=uncertain)
-    return count, [reason[:120] for reason in uncertain[:2]]
+    files = []
+    mutate(root, arm, identity=identity, uncertain=uncertain, files=files)
+    return files, uncertain
 
 
 def hidden_main(arm, target, identity=False):
@@ -308,6 +321,6 @@ def hidden_main(arm, target, identity=False):
         subprocess.run([sys.executable, str(Path(__file__).with_name("_probe_reference.py")), input_dir, tmp],
                        check=True)
         # The timer includes this wrapper on every set. Do the same work on non-target sets as the shared control.
-        count, uncertain = mutation_report(Path(tmp), arm, identity=identity or name != target)
+        files, uncertain = mutation_report(Path(tmp), arm, identity=identity or name != target)
         shutil.copytree(tmp, dest, dirs_exist_ok=True)
-    print("TBSGEN_PROBE " + json.dumps([name, count, identity or name == target, uncertain]), file=sys.stderr)
+    print("\nTBSGEN_PROBE " + json.dumps([name, files, identity or name == target, uncertain]), file=sys.stderr)

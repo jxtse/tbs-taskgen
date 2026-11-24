@@ -36,7 +36,7 @@ from . import runner
 from .leakcheck import leak_report
 from .spec import _requires_assumptions, is_resource_metric, metric_family, requires_hidden_provenance
 from .state import read_json
-from .statement import assumptions_stated, statement_clean, threshold_format
+from .statement import FILE_TOKEN, assumptions_stated, output_relative_path, statement_clean, threshold_format
 
 
 CLI_RE = re.compile(r"solution_cli\.py\s+<input_dir>\s+<output_dir>")
@@ -56,16 +56,9 @@ def _split_header(text: str) -> list[str] | None:
     return cols
 
 
-# any file-like token: name.ext, including multi-part extensions (input.csv.gz) and <output_dir>/ prefixes
-_FILE_TOK = re.compile(r"(?<![\w./<>-])(?:<\w+>/)?[\w./-]*\w\.[A-Za-z][\w]*(?:\.[A-Za-z][\w]*)*(?![\w-])")
 _PARTIAL = re.compile(r"(?:\b(?:includ\w*|at least|additional|extra|optional|among|such as|for example|subset|"
                       r"other columns|more columns|may also|derived from|same as|like|whose|corresponds?)\b|"
                       r"\be\.g\.|\bi\.e\.)", re.I)
-_OUT_PREFIX = re.compile(r"^(?:\./|/app/output/|output/|<output_dir>/)")
-
-
-def _norm_path(tok: str) -> str:
-    return _OUT_PREFIX.sub("", tok.strip())
 
 
 def stated_csv_headers(ins: str, names: list[str]) -> dict[str, list[dict]]:
@@ -85,13 +78,13 @@ def stated_csv_headers(ins: str, names: list[str]) -> dict[str, list[dict]]:
         by_base.setdefault(n.rsplit("/", 1)[-1], []).append(n)
 
     def resolve(tok: str) -> str | None:
-        t = _norm_path(tok)
+        t = output_relative_path(tok)
         if t in names:
             return t
         same = by_base.get(t.rsplit("/", 1)[-1]) or []
         return same[0] if "/" not in t and len(same) == 1 else None
 
-    files_on = [{_norm_path(m.group(0)) for m in _FILE_TOK.finditer(line)} for line in lines]
+    files_on = [{output_relative_path(m.group(0)) for m in FILE_TOKEN.finditer(line)} for line in lines]
     out: dict[str, list[dict]] = {}
     for k, toks in enumerate(files_on):
         outs = {r for r in (resolve(t) for t in toks) if r is not None}
@@ -351,6 +344,8 @@ def run_gates(cfg: dict, item_dir: Path, spec: dict, thresholds: dict, attempt: 
                                                             "rc", "wall_times", "gated", "threshold_effective",
                                                             "speed_ratio", "hidden_sets") if k in m}
                                     for m in t["metrics"]])
+            if str(s) == "0" and tag == "ref":
+                sd[tag]["verifier"] = {k: t[k] for k in ("out", "err", "metrics") if k in t}
         ref = sd["ref"]
         ok["oracle"] &= ref["passed"] and ref["solve_rc"] == 0
         ok["nop"] &= not sd["nop"]["passed"]
@@ -408,12 +403,13 @@ def run_gates(cfg: dict, item_dir: Path, spec: dict, thresholds: dict, attempt: 
             reference["solve_rc"] = sv["rc"]
             if sv["rc"] == 0:
                 t = runner.test(cfg, task, gen, ref_out, work, "probe-ref0")
-                reference.update(verifier_rc=t["rc"], reward=t.get("reward"))
+                reference.update(verifier_rc=t["rc"], reward=t.get("reward"),
+                                 verifier={k: t[k] for k in ("out", "err", "metrics") if k in t})
     else:
         gen = work / ("detA" if seed0 == seeds[0] else "gen0")
         ref_out = work / "out-ref0"
         scored = det["seeds"][seed0].get("ref", {})
-        reference = {k: scored.get(k) for k in ("solve_rc", "verifier_rc", "reward")}
+        reference = {k: scored.get(k) for k in ("solve_rc", "verifier_rc", "reward", "verifier")}
     reference_ok = (reference.get("solve_rc") == 0 and reference.get("verifier_rc") == 0
                     and reference.get("reward") == "1")
     prog = spec.get("form") == "PROG"
@@ -425,14 +421,18 @@ def run_gates(cfg: dict, item_dir: Path, spec: dict, thresholds: dict, attempt: 
         arms.append(("hidden_garbage", "hidden_garbage"))
     isolated = g.get("truth_isolation", True) is not False      # never run the reference wrapper with truth readable
     for gate, arm in arms:
-        result = (runner.output_probe(cfg, task, gen, ref_out, work, arm, prog) if reference_ok and isolated
-                  else dict(ok=True, inconclusive=True, reference=reference,
-                            error="seed 0 reference failed" if not reference_ok else "not run: truth isolation failed"))
+        if reference_ok and isolated:
+            result = runner.output_probe(cfg, task, gen, ref_out, work, arm, prog)
+            if not prog:
+                result["control"] = reference
+        else:
+            reason = "seed 0 reference failed" if not reference_ok else "not run: truth isolation failed"
+            scopes = {scope: dict(status="inconclusive", error=reason, transformed_files=[])
+                      for scope, _ in runner.probe_scopes(arm, prog, gen)}
+            result = dict(ok=True, inconclusive=True, reference=reference, error=reason, scopes=scopes)
         det["seeds"].setdefault(0 if seed0 is None else seed0, {})[f"exploit__{arm}"] = result
         g[gate] = result["ok"]
-        det[gate] = "na" if result.get("na") else result
-        if gate == "hidden_garbage":
-            ok["exploit"] &= result["ok"]
+        det[gate] = result
     g.update(ok)
     # thresholds stated
     ins = (task / "instruction.md").read_text() if (task / "instruction.md").exists() else ""
@@ -502,18 +502,20 @@ def run_gates(cfg: dict, item_dir: Path, spec: dict, thresholds: dict, attempt: 
         det["targeting_leak"] = tl
     blocking = [k for k, v in g.items() if not v and k in _blocking(cfg)]
     nonblocking = [k for k, v in g.items() if not v and k not in _blocking(cfg)]
-    return dict(attempt=attempt, gates=g, blocking=blocking, nonblocking=nonblocking, ok=not blocking and not set(nonblocking) - {"effort_floor", "data_realism"},
-                details=det)
+    advisory = OUTPUT_PROBES | {"effort_floor", "data_realism"}
+    return dict(attempt=attempt, gates=g, blocking=blocking, nonblocking=nonblocking,
+                ok=not blocking and set(nonblocking) <= advisory, details=det)
 
+
+OUTPUT_PROBES = {"coverage", "one_confident", "hidden_garbage"}
 
 # gates added after the 2026-11-23 colleague review: blocking even when a run config pins an older gates.blocking
 # list (otherwise a fixable failure lands in nonblocking and S7 drops the item without an S8 round)
-REVIEW_GATES = {"threshold_format", "statement_clean", "hidden_parity", "hidden_garbage", "coverage",
-                "assumptions_stated"}
+REVIEW_GATES = {"threshold_format", "statement_clean", "hidden_parity", "assumptions_stated"}
 
 
 def _blocking(cfg) -> set[str]:
-    b = set(cfg["gates"]["blocking"]) | REVIEW_GATES
+    b = (set(cfg["gates"]["blocking"]) - OUTPUT_PROBES) | REVIEW_GATES
     if "oracle" in b:
         b.add("oracle_margin")
     return b | {"nop", "naive", "mid", "exploit", "exploit_valid", "targeting_leak"}

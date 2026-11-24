@@ -23,6 +23,55 @@ _CUTOFF = re.compile(r"(?:[<>]=?|[≤≥]|\\(?:leq?|geq?)\b|\bat (?:least|most)|
                      r"\bthreshold(?:\s+(?:of|is))?)\s*[:=`$* ]*$", re.I)
 
 
+# any file-like token: name.ext, including multi-part extensions (input.csv.gz) and <output_dir>/ prefixes
+FILE_TOKEN = re.compile(r"(?<![\w./<>-])(?:<\w+>/)?[\w./-]*\w\.[A-Za-z][\w]*(?:\.[A-Za-z][\w]*)*(?![\w-])")
+_OUT_PREFIX = re.compile(r"^(?:\./|/app/output/|output/|<output_dir>/)")
+
+
+def output_relative_path(tok: str) -> str:
+    return _OUT_PREFIX.sub("", tok.strip())
+
+
+def declared_outputs(spec, statement):
+    """Output paths explicitly named by the spec or statement. An empty set means unknown."""
+    declared = set()
+
+    def add_entries(entries):
+        if isinstance(entries, str):
+            if FILE_TOKEN.fullmatch(entries.strip()):
+                declared.add(output_relative_path(entries))
+        elif isinstance(entries, list):
+            for entry in entries:
+                add_entries(entry)
+        elif isinstance(entries, dict):
+            for key, value in entries.items():
+                if key in ("files", "deliverables", "outputs", "path", "file", "filename", "name"):
+                    add_entries(value)
+                elif FILE_TOKEN.fullmatch(key):
+                    declared.add(output_relative_path(key))
+
+    for key in ("output_contract", "deliverables", "output_files", "outputs"):
+        add_entries(spec.get(key))
+    graph = spec.get("depgraph") or {}
+    add_entries(graph.get("deliverables"))
+    for node in graph.get("nodes", []):
+        if node.get("kind") == "deliverable":
+            add_entries(node.get("carrier"))
+    in_outputs = False
+    for line in statement.splitlines():
+        if line.lstrip().startswith("#"):
+            in_outputs = bool(re.search(r"\b(?:outputs?|deliverables?)\b", line, re.I))
+        for match in FILE_TOKEN.finditer(line):
+            path = match[0]
+            explicit_path = path.startswith(("/app/output/", "<output_dir>/", "output/"))
+            relative = not path.startswith(("/", "data/"))
+            declaration = re.search(r"\b(?:write|produce|submit|save|deliverables?:|outputs?:)\s+[`*]*$",
+                                    line[:match.start()], re.I)
+            if explicit_path or (relative and (in_outputs or declaration)):
+                declared.add(output_relative_path(path))
+    return declared
+
+
 def statement_clean(text: str) -> list[str]:
     text = strip_time_note(text)
     return [line for line in text.splitlines() if "<!--" in line or _PROCESS.search(line) or _BASELINE.search(line)

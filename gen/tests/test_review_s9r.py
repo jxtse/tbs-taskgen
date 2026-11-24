@@ -2,6 +2,8 @@
 (normalize), the S8 review revision (thresholds locked, only allowed files, calibration archived and restarted
 from GLM), the second-review rule, manifest notes and withdrawal.  No Docker, no network, no real jobs."""
 import json
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -985,3 +987,50 @@ def test_review_relay_refusals_do_not_park(tmp_path):
     last = _runs(P, iid, "review")[-1]
     assert last["state"] == "launched" and not last.get("preflight_refused") and \
         (jobs / last["job_name"] / "config.json").exists(), last
+
+
+def test_suspected_scopes_bind_bundle_validator_and_ingest(tmp_path):
+    P, iid, jobs = _env(tmp_path)
+    it = P.store.item(iid)
+    trial = dict(status="shortcut_suspected", transformed_files=[dict(path="side.csv", declared_deliverable=False)],
+                 verifier=dict(out="accepted", err="", metrics=[]), reward="1")
+    report = dict(scopes={"hidden:A": trial})
+    write_json(it.p("gates/attempt-9.json"), dict(details={"coverage": dict(scopes={"public": trial})}))
+    write_json(it.p("gates/attempt-10.json"), dict(details={"coverage": report, "hidden_garbage": report}))
+    _to_label(P, iid, jobs)
+    [rec] = _runs(P, iid, "review")
+    task = Path(rec["task"])
+    bundle = read_json(task / "environment/review/records/output_probes.json")
+    first, second = "one_confident/hidden:A", "hidden_garbage/hidden:A"
+    assert bundle["suspected_scopes"] == rec["suspected_scopes"] == [first, second]
+    assert bundle["probes"]["one_confident"] == report
+    prompt = (task / "instruction.md").read_text()
+    assert all(s in prompt for s in (first, second, review.REVIEW_PROMPT_VERSION, "reproduce"))
+    artifact = dict(classification="probe_artefact", reproduction="grader returned reward 1",
+                    reason="Only the diagnostic file changed.")
+    verdict = dict(V("pass"), probe_findings={first: artifact})
+
+    def validate():
+        src = tmp_path / "verdict.json"
+        write_json(src, verdict)
+        return subprocess.run([sys.executable, task / "tests/s9r_validate.py", src, tmp_path / "parsed.json"],
+                              capture_output=True, text=True)
+
+    partial = validate()
+    assert partial.returncode == 1 and second in partial.stdout
+    _finish(jobs, rec["job_name"], reward=1, verdict=verdict)
+    watch_tick(P, only=[iid])
+    invalid, retry = _runs(P, iid, "review")
+    assert invalid["outcome"] == "invalid" and retry["suspected_scopes"] == [first, second]
+    verdict["probe_findings"][second] = dict(classification="grader_gap", issue_id="I1",
+                                            reproduction="grader accepted incorrect results", reason="missing check")
+    assert validate().returncode == 1
+    for problem, routed in (("test_gap", "revise"), ("core_invalid", "drop")):
+        verdict["issues"] = [dict(BLOCK, problem=problem)]
+        assert validate().returncode == 0
+        assert review.normalize(verdict, suspected_scopes=[first, second])["verdict"] == routed
+    verdict.update(issues=[], probe_findings={first: artifact, second: artifact})
+    assert validate().returncode == 0
+    _finish(jobs, retry["job_name"], verdict=verdict)
+    watch_tick(P, only=[iid])
+    assert P.store.item(iid).state["status"] == "done"

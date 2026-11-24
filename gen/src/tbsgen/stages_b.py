@@ -249,7 +249,7 @@ def _slim(g):
     if isinstance(det, dict):
         out["details"] = {k: det[k] for k in ("determinism", "unstated", "isolation", "runs", "truth_isolation",
                                               "statement_clean", "threshold_format", "hidden_parity", "hidden_shift",
-                                              "assumptions_stated", "hidden_garbage", "coverage", "oracle_margin")
+                                              "assumptions_stated", "oracle_margin")
                           if k in det}
         if "exploit_valid" in out.get("blocking", []):
             out["fix_hint"] = ("an exploit baseline did not really run (details.seeds.<seed>.exploit_*.valid.why): fix "
@@ -1070,7 +1070,8 @@ def _ingest_review(P, it, job_dir: str | None = None) -> dict:
     if ident != want:
         raise ValueError(f"job identity mismatch: job {ident} vs pending review run {want}")
     res = review.classify(jd, rec.get("model"), P.cfg["models"].get("prices", {}),
-                          allow_human=bool((P.cfg.get("review") or {}).get("allow_human")))
+                          allow_human=bool((P.cfg.get("review") or {}).get("allow_human")),
+                          suspected_scopes=rec.get("suspected_scopes", []))
     rec.update(outcome="invalid" if (res["outcome"] == "done" and (res["verdict"] or {}).get("verdict") is None)
                else res["outcome"],
                minutes=res["minutes"], cost_usd=res["cost_usd"], cost_kind=res["cost_kind"],

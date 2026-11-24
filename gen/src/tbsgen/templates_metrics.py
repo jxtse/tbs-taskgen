@@ -616,7 +616,13 @@ def _run_once(entry, input_dir, out, timeout_sec, sb, home=None):
         except subprocess.TimeoutExpired:
             pass
         fe.seek(0)
-        err = fe.read()[-4000:].decode("utf-8", "replace") + err_extra
+        stderr = fe.read()
+        # S7 wrappers end stderr with a JSON file list which may exceed the diagnostic tail.
+        if os.environ.get("TBSGEN_PROBE_REPORT") == "1":
+            stderr = stderr.rstrip(b"\n").rsplit(b"\n", 1)[-1]
+        else:
+            stderr = stderr[-4000:]
+        err = stderr.decode("utf-8", "replace") + err_extra
     return rc, err, sec, left
 
 
@@ -754,7 +760,8 @@ def run_solution(timeout_sec, input_dir=HIDDEN, entry=ENTRY):
     if left:                                          # could not kill what it left running: no score
         rc, err = -10, (err + f"\nsandbox processes survived SIGKILL: {left[:5]}")[-2000:]
     med = max(_median(times), sec / MAX_SPEEDUP)
-    _record({"name": "_solution_cli_run", "value": med, "rc": rc, "stderr_tail": err[-500:],
+    _record({"name": "_solution_cli_run", "value": med, "rc": rc,
+             "stderr_tail": err if os.environ.get("TBSGEN_PROBE_REPORT") == "1" and err.startswith("TBSGEN_PROBE ") else err[-500:],
              "threshold": float(timeout_sec), "timeout_effective": round(t_first, 3) if math.isfinite(t_first) else None, "direction": "<=",
              "passed": rc == 0, "aux": True, "sandboxed": sb is not None, "entry": entry, "entry_exists": entry_exists,
              "wall_times": [round(t, 6) if math.isfinite(t) else None for t in times], "timing_repeats": len(times),

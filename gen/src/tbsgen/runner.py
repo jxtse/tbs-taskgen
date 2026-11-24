@@ -293,9 +293,10 @@ def test(cfg: dict, task: Path, gen: Path, outd: Path, work: Path, tag: str) -> 
     logs.mkdir(parents=True)
     logs.chmod(0o777)
     settle = float(cfg["gen"].get("verifier_settle_sec", 1.0))
+    probe_env = "TBSGEN_PROBE_REPORT=1 " if tag.startswith(("exploit__one_confident__", "exploit__hidden_garbage__")) else ""
     r = sandbox.run(cfg, [(outd, "/src/output", "ro"), (tests, "/src/tests", "ro"), (logs, "/logs/verifier", "rw"),
                           (gen / "environment" / "data", "/src/data", "ro")],
-                    VERIFIER_PRE + f"cd /tests && bash /tests/test.sh; rc=$?; sleep {settle:g}; exit $rc",
+                    VERIFIER_PRE + f"cd /tests && {probe_env}bash /tests/test.sh; rc=$?; sleep {settle:g}; exit $rc",
                     int(cfg["gen"]["test_timeout"] + timing_budget(cfg, task_spec(task))), f"tbsgen-test-{tag}", root=True)
     mf = logs / "metrics.jsonl"
     metrics = []
@@ -373,8 +374,9 @@ def hidden_set_names(gen):
 def _prepare_public_probe(cfg, out, script, work, tag, arm, identity=False):
     # shlex.quote: repr(arm) has single quotes, which must not end a single-quoted shell word
     command = "cd / && python -c " + shlex.quote(
-        f"import json; from pathlib import Path; from probe_outputs import mutation_report; "
-        f"print(json.dumps(mutation_report(Path('/app/output'), {arm!r}, identity={identity!r})))")
+        "import json; from pathlib import Path; from probe_outputs import mutation_report; "
+        f"report = mutation_report(Path('/app/output'), {arm!r}, identity={identity!r}); "
+        "Path('/probe-info/report.json').write_text(json.dumps(report))")
     # the delivered program is not output data: keep it out of the transformation
     keep = [p for p in (out / "solution_cli.py",) if p.exists()]
     stash = work / f"stash-{tag}"
@@ -383,20 +385,21 @@ def _prepare_public_probe(cfg, out, script, work, tag, arm, identity=False):
     stash.mkdir()
     for p in keep:
         p.rename(stash / p.name)
-    prep = sandbox.run(cfg, [(out, "/app/output", "rw"), (script, "/probe_outputs.py", "ro")],
+    info = work / f"info-{tag}"
+    info.mkdir(exist_ok=True)
+    report = info / "report.json"
+    report.unlink(missing_ok=True)
+    prep = sandbox.run(cfg, [(out, "/app/output", "rw"), (script, "/probe_outputs.py", "ro"), (info, "/probe-info", "rw")],
                        command, cfg["gen"]["baseline_timeout"], f"tbsgen-prepare-{tag}")
     for p in keep:
         (stash / p.name).rename(p)
-    lines = prep["out"].strip().splitlines()
-    if prep["rc"] != 0 or not lines:
+    if prep["rc"] != 0 or not report.is_file():
         raise ValueError(f"public probe transformation failed: {prep['err'][-500:]}")
-    report = json.loads(lines[-1])
-    if not isinstance(report, list) or len(report) != 2:
+    data = json.loads(report.read_text())
+    if not (isinstance(data, list) and len(data) == 2 and
+            all(isinstance(part, list) and all(isinstance(x, str) for x in part) for part in data)):
         raise ValueError("invalid public probe record")
-    count, uncertain = report
-    if type(count) is not int or count < 0 or not isinstance(uncertain, list):
-        raise ValueError("invalid public probe counts")
-    return count, uncertain
+    return data
 
 
 def _probe_run(cfg, task, gen, ref_out, work, tag, arm, prog, kind, name, *, identity=False):
@@ -410,49 +413,54 @@ def _probe_run(cfg, task, gen, ref_out, work, tag, arm, prog, kind, name, *, ide
     refused = safe_copytree(ref_out, out)
     if refused:
         return dict(error=f"invalid reference outputs: {refused[:3]}")
-    count = 0
-    uncertain = []
+    files, uncertain = [], []
+    trial = dict(files=files, uncertain=uncertain)
     if kind == "public" or (identity and arm == "one_confident"):
         try:
-            count, uncertain = _prepare_public_probe(cfg, out, script, work, tag, arm, identity)
+            public_files, issues = _prepare_public_probe(cfg, out, script, work, tag, arm, identity)
+            files.extend(public_files)
+            uncertain.extend(issues)
         except ValueError as exc:
-            return dict(error=str(exc))
-        if not count and not identity:
-            return dict(count=0, uncertain=uncertain)   # no verifier was launched
+            return dict(trial, error=str(exc))
+        if not files and not identity:
+            return trial   # no verifier was launched
     if prog:
         cli, original = out / "solution_cli.py", out / "_probe_reference.py"
         if not cli.is_file() or original.exists():
-            return dict(error="cannot wrap reference CLI")
+            return dict(trial, error="cannot wrap reference CLI")
         cli.rename(original)
         target = name if kind == "hidden" else None
         cli.write_text(script.read_text() + f"\nhidden_main({arm!r}, {target!r}, identity={identity!r})\n")
     t = test(cfg, task, gen, out, work, tag)
-    if t["rc"] != 0 or t.get("reward") not in ("0", "1"):
-        return dict(error="verifier gave no reward", rc=t["rc"], reward=t.get("reward"))
+    trial.update(rc=t["rc"], reward=t.get("reward"), verifier={k: t[k] for k in ("out", "err", "metrics") if k in t})
     seen = set()
     for run in t["metrics"]:
         if run.get("name") != "_solution_cli_run":
             continue
         lines = run.get("stderr_tail", "").splitlines()
         if run.get("rc") != 0 or not lines or not lines[-1].startswith("TBSGEN_PROBE "):
-            return dict(error="probe CLI failed", stderr=lines[-2:])
+            trial["error"] = "probe CLI failed"
+            continue
         try:
-            called, changes, targeted, issues = json.loads(lines[-1].removeprefix("TBSGEN_PROBE "))
-            if (not isinstance(called, str) or type(changes) is not int or changes < 0
+            called, changed, targeted, issues = json.loads(lines[-1].removeprefix("TBSGEN_PROBE "))
+            if (not isinstance(called, str) or not isinstance(changed, list) or not all(isinstance(p, str) for p in changed)
                     or type(targeted) is not bool or not isinstance(issues, list)):
-                raise ValueError("invalid probe counts")
+                raise ValueError("invalid probe record")
         except (TypeError, ValueError):
-            return dict(error="invalid probe CLI record", stderr=lines[-1:])
+            trial["error"] = "invalid probe CLI record"
+            continue
         if targeted:
             seen.add(called)
         if kind == "hidden" and called == name and targeted:
-            count += changes
+            files.extend(changed)
             uncertain.extend(issues)
     required = {name} if kind == "hidden" else set()
     if identity:
         required = set(hidden_set_names(gen))
-    if required - seen:
-        return dict(error="hidden set not run by the verifier", ran=sorted(seen))
+    if t["rc"] != 0 or t.get("reward") not in ("0", "1"):
+        trial["error"] = "verifier gave no reward"
+    elif required - seen:
+        trial.setdefault("error", "hidden set not run by the verifier")
     # test() already filters failed to gated, non-auxiliary checks. Older metric logs mark resource
     # rows with an effective threshold, even for custom names that do not mention time or memory.
     from .spec import is_resource_metric
@@ -461,42 +469,55 @@ def _probe_run(cfg, task, gen, ref_out, work, tag, arm, prog, kind, name, *, ide
         if is_resource_metric(m) or "threshold_effective" in m or m.get("resource_kind") in ("time", "memory"):
             resources.add(m["name"])
     failed_quality = [name for name in t["failed"] if name not in resources]
-    return dict(count=count, uncertain=uncertain, rc=t["rc"], reward=t["reward"], failed=t["failed"],
-                failed_non_resource=failed_quality,
-                passed_checks=[m["name"] for m in t["metrics"] if m.get("passed") and not m.get("aux")])
+    return dict(trial, failed=t["failed"], failed_non_resource=failed_quality)
+
+
+def probe_scopes(arm, prog, gen):
+    scopes = [] if arm == "hidden_garbage" else [("public", None)]
+    if prog:
+        scopes.extend((f"hidden:{name}", name) for name in hidden_set_names(gen))
+    return scopes
 
 
 def output_probe(cfg, task, gen, ref_out, work, arm, prog):
-    """Only interpret a rejection after the same wrapped reference passes an identity control.
-    One all-set identity run per PROG arm. ANS already has a passing unwrapped reference."""
-    scopes = [] if arm == "hidden_garbage" else [("public", None)]
-    if prog:
-        scopes.extend(("hidden", name) for name in hidden_set_names(gen))
+    """Collect reviewer evidence per scope. Only a quality rejection needs an identity control."""
+    from .statement import declared_outputs
+
+    statement = task / "instruction.md"
+    declared = declared_outputs(task_spec(task) or {}, statement.read_text() if statement.is_file() else "")
     per, accepted = {}, []
     control = None
-    for index, (kind, name) in enumerate(scopes):
-        scope = "public" if kind == "public" else f"hidden:{name}"
+    for index, (scope, name) in enumerate(probe_scopes(arm, prog, gen)):
+        kind = "public" if name is None else "hidden"
         tag = f"exploit__{arm}__{kind}{index}"
-        # Prepare/score the mutation first so an inapplicable scope needs no control sandbox.
         trial = _probe_run(cfg, task, gen, ref_out, work, tag, arm, prog, kind, name)
-        if "error" in trial:
-            per[scope] = dict(trial, inconclusive=True)
-            continue
-        if not trial["count"]:
-            per[scope] = dict(trial, inconclusive=True) if trial["uncertain"] else "na"
-            continue
-        if prog and control is None:
-            control = _probe_run(cfg, task, gen, ref_out, work, tag + "__control", arm, prog, kind, name,
-                                 identity=True)
-        per[scope] = trial
-        if prog:
-            trial["control_reward"] = control.get("reward")
-            if control.get("reward") != "1" or "error" in control:
-                trial.update(inconclusive=True, error="identity control failed", control=control)
-                continue
-        if trial["reward"] == "1":
+        files = sorted(set(trial.pop("files", [])))
+        trial["transformed_files"] = [dict(path=p, declared_deliverable=p in declared if declared else "unknown")
+                                      for p in files]
+        trial["count"] = len(files)
+        if trial.get("rc") == 0 and trial.get("reward") == "1" and files:
+            status = "shortcut_suspected"
             accepted.append(scope)
+        elif "error" in trial:
+            status = "inconclusive"
+        elif not files:
+            status = "na"
+            if trial["uncertain"]:
+                status = "inconclusive"
+                trial["error"] = "; ".join(trial["uncertain"])
         elif not trial["failed_non_resource"]:
-            trial.update(inconclusive=True, error="no failed non-resource check")
-    return dict(ok=not accepted, na=all(v == "na" for v in per.values()), accepted_scopes=accepted, scopes=per,
-                inconclusive=any(isinstance(v, dict) and v.get("inconclusive") for v in per.values()))
+            status = "inconclusive"
+            trial["error"] = "no failed non-resource check"
+        else:
+            # ANS uses the already scored seed-zero reference. PROG shares one all-set control per arm.
+            if prog and control is None:
+                control = _probe_run(cfg, task, gen, ref_out, work, tag + "__control", arm, prog, kind, name,
+                                     identity=True)
+            status = "caught"
+            if prog and ("error" in control or control.get("reward") != "1"):
+                status = "inconclusive"
+                trial["error"] = "identity control failed"
+        trial["status"] = status
+        per[scope] = trial
+    return dict(ok=not accepted, na=all(v["status"] == "na" for v in per.values()), accepted_scopes=accepted,
+                scopes=per, control=control, inconclusive=any(v["status"] == "inconclusive" for v in per.values()))

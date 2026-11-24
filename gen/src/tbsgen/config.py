@@ -427,7 +427,7 @@ DEFAULTS: dict[str, Any] = {
         "max_exploit_repair_rounds": 2,     # S8 rounds when exploit_valid is the only blocking gate: only the broken
                                             # baselines/exploit_*.py are rewritten (allowed with locked thresholds)
         "blocking": ["oracle", "hidden_shift", "leak", "isolation", "infeasible", "determinism", "truth_isolation",
-                     "threshold_format", "statement_clean", "hidden_parity", "hidden_garbage", "coverage",
+                     "threshold_format", "statement_clean", "hidden_parity",
                      "assumptions_stated", "cli_contract", "output_contract", "tdm_verbatim", "readymade", "author_leak"],
         # readymade (prerelease.readymade_check): the task image installs, or the reference / a baseline imports,
         # the paper's own implementation (code_links repo names, method_names of the S5 spec).  Rules only.
