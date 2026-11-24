@@ -45,6 +45,22 @@ jobs:
       - run: uv sync --locked
       - run: uv run --locked pytest -q
 
+  trainpipe:
+    name: trainpipe (all tests)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: trainpipe
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.3.3
+        with:
+          enable-cache: true
+          cache-dependency-glob: trainpipe/uv.lock
+      - run: uv sync --locked
+      - run: uv run --locked pytest -q
+
   gen-unit:
     name: gen (unit tests)
     runs-on: ubuntu-latest

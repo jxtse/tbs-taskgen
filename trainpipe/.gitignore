@@ -1,0 +1,19 @@
+# Local datasets, judge caches, transcripts, platform receipts and operator configuration.
+/out/
+/exports/
+/rollout/
+/reports/
+**/.stages/
+**/.judge-cache/
+**/submit-responses/
+*.jsonl
+*.jsonl.zst
+*.local.toml
+
+
+# Operator-supplied wire evidence and payloads.
+first_request_raw.json
+post_compaction_request_*.json
+compaction.txt
+system.json
+tools.json

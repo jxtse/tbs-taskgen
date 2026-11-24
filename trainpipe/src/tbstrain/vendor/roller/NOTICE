@@ -1,0 +1,4 @@
+Roller, revision cd4c7f2. Distributed under the Apache License 2.0.
+Selected in-memory Codex ACTF, SFT, captured-call segmentation and blob-reading routines.
+Local changes isolate dependencies, omit file writers and pass the converted trajectory in memory.
+Codex instruction extraction includes turn contexts and preserves recorded whitespace.

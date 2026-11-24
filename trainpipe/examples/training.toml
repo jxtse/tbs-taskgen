@@ -1,0 +1,13 @@
+# Managed SFT hyperparameters (validated with `mint-recursive train start --dry-run`).
+# The package schema requires save_every >= 5. The managed trainer supervises every assistant message
+# (train_on_what = "all_assistant_messages") and ignores per-message loss_mask, so the exporter removes anything
+# that must not be trained instead of masking it.
+batch_size = 8
+learning_rate = 0.0001
+lr_schedule = "constant"
+max_length = 194560
+num_epochs = 1
+rank = 32
+save_every = 5
+train_on_what = "all_assistant_messages"
+warmup_ratio = 0
