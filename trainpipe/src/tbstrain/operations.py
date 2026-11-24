@@ -145,6 +145,19 @@ def submit(ctx, confirm, allow_warn):
             str(hyper),
         ]
         dry = call("dry-run", *args, "--dry-run")
+        effective = dry.get("effective_config", dry.get("config", dry))
+        if not isinstance(effective, dict):
+            raise ValueError("dry-run missing effective configuration")
+        mode = effective.get("train_on_what")
+        maximum = effective.get("max_length")
+        if mode not in ("all_assistant_messages", "loss_mask"):
+            raise ValueError("dry-run missing or unsupported train_on_what")
+        if type(maximum) is not int or maximum <= 0:
+            raise ValueError("dry-run missing or invalid max_length")
+        if mode == "all_assistant_messages" and checked["masked_assistants"]:
+            raise ValueError("dry-run all_assistant_messages would train masked assistant messages")
+        if checked["max_tokens"] > maximum:
+            raise ValueError(f"dataset row exceeds dry-run max_length {maximum}")
         fields = ignored_fields(dry)
         execution = None
         if confirm:
@@ -156,6 +169,8 @@ def submit(ctx, confirm, allow_warn):
             "count": len(log),
             "dataset_version": version,
             "execution_id": execution,
+            "train_on_what": mode,
+            "max_length": maximum,
             "fields_ignored": sorted(fields),
             "loss_mask_ignored_observed": "loss_mask" in fields,
         }

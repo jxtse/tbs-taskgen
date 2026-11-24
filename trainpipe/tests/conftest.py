@@ -50,7 +50,7 @@ def claude_events():
         a,
         calls,
         cc_message(
-            "user", [{"type": "tool_result", "tool_use_id": f"sample-{n}", "content": str(n)} for n in (2, 1)]
+            "user", [{"type": "tool_result", "tool_use_id": f"sample-{n}", "content": str(n)} for n in (1, 2)]
         ),
         {"type": "attachment", "rendered": [{"content": "Synthetic context limit reached."}]},
         {
@@ -206,6 +206,8 @@ def workspace(tmp_path):
     cfg.write_text("""out = "out"
 [ingest]
 runs = ["run"]
+[screen]
+train_models = ["student-model"]
 [judge]
 model = "judge-model"
 base_url = "https://judge.example/v1"

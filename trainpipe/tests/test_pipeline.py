@@ -57,7 +57,7 @@ def test_new_native_content_invalidates_stage(completed, judge_stub):
     assert main(["run", "--config", str(cfg)], transport=judge_stub) == 0
     assert old != (out / "screen.jsonl").resolve()
     row = next(r for r in lines(out / "screen.jsonl") if r["harness"] == "codex")
-    assert "model_mismatch" in row["flags"] and row["disposition"] == "drop"
+    assert "model_not_trainable" in row["flags"] and row["disposition"] == "drop"
 
 
 @pytest.mark.parametrize(

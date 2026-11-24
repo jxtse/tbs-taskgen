@@ -14,6 +14,7 @@ review_allow = ["pass"]
 exclude = []
 
 [screen]
+train_models = ["student-model"]
 hint_mode = "exclude"
 allow_timeout = false
 
@@ -41,6 +42,7 @@ easy_quality = 4
 seed = 0
 
 [export]
+codex_reasoning = "drop"
 tokenizer = "../state/tokenizer.json"
 train_on_what = "all_assistant_messages"
 max_length = 194560

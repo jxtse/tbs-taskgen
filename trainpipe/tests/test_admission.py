@@ -3,9 +3,9 @@ from types import SimpleNamespace
 import pytest
 
 from tbstrain.cli import main
-from tbstrain.core import atomic, lines, read, write_lines
+from tbstrain.core import atomic, code_version, lines, read, write_lines
 from tbstrain.native import codex, message, segment
-from tbstrain.screen import remove_hints
+from tbstrain.screen import inspect_segment
 from tbstrain.select import select
 from tbstrain.tasks import difficulty_row
 from tbstrain.wire import check, render
@@ -127,7 +127,7 @@ def test_selection_caps_diversity_and_quality(tmp_path):
     data("judge-trajectory", trajectory)
     data("screen", screened)
     for stage in ("difficulty", "screen", "judge-task", "judge-trajectory"):
-        atomic(ctx.out / "reports" / (stage + ".json"), {"key": stage})
+        atomic(ctx.out / "reports" / (stage + ".json"), {"key": stage, "code": code_version()})
     select(ctx)
     chosen = list(ctx.rows("selection"))
     assert sorted(r["trial_id"] for r in chosen) == ["one-1", "one-2", "two-1", "two-2"]
@@ -160,22 +160,12 @@ def test_hint_timeout_and_native_end(workspace, judge_stub):
     assert {"hint_run", "timeout"} <= set(screen()["flags"])
     result.pop("hint_run")
     atomic(path, result)
-    with workspace.open("a") as f:
-        f.write("\n[screen]\nallow_timeout=true\n")
+    workspace.write_text(workspace.read_text().replace("[screen]", "[screen]\nallow_timeout=true"))
     assert screen()["disposition"] == "keep"
     result["exception_info"] = None
     result["finished_at"] = None
     atomic(path, result)
     assert "unclean_end" in screen()["flags"]
-
-
-def test_hint_removal_requires_clean_model_text():
-    src = segment([message("user", "Solve. Mentor text."), message("assistant", "Done")])
-    assert remove_hints(src, {"hint_texts": ["Mentor text."]}) == 1
-    assert src["messages"][0]["content"][0]["text"] == "Solve. "
-    src["messages"][1]["content"][0]["text"] = "Mentor text."
-    with pytest.raises(ValueError, match="residue"):
-        remove_hints(src, {"hint_texts": ["Mentor text."]})
 
 
 def test_blocking_judge_overrides_passing_score(workspace, judge_stub):
@@ -279,7 +269,7 @@ def test_proxy_model_fallback(workspace):
     for stage in ("ingest", "difficulty", "filter-tasks", "screen"):
         assert main([stage, "--config", str(workspace)]) == 0
     screened = next(r for r in lines(workspace.parent / "out/screen.jsonl") if r["task_id"] == "medium")
-    assert screened["disposition"] == "drop" and "model_mismatch" in screened["flags"]
+    assert screened["disposition"] == "drop" and "model_not_trainable" in screened["flags"]
 
 
 def test_judge_interruption_resumes_per_request(workspace, judge_stub):
@@ -343,30 +333,24 @@ def _probe_segment(command, output, name="Bash"):
     return {"messages": [{"role": "assistant", "content": [use]}, {"role": "user", "content": [result]}]}
 
 
-import pytest  # noqa: E402
-
-from tbstrain.screen import inspect_segment  # noqa: E402
-
-
 @pytest.mark.parametrize(
     "command,output,name,expected",
     [
-        # the agent's own scratch work: simulated truth, its own scorer, its memory notes
-        ("python -c \"import pickle; t=pickle.load(open('/tmp/hs1/truth.pkl','rb'))\"", "x", "Bash", False),
-        ("cd /app/work && python score.py /tmp/hs1 /tmp/ho2", "x", "Bash", False),
-        ("cd /logs/agent/sessions/projects/-app/memory && sed -i s/a/b/ notes.md", "", "Bash", False),
-        ("cat > /app/work/mkset.py << 'EOF'\nfrom gen import truth_f\nEOF", "", "Bash", False),
-        ("/tmp/val/truth.json", "{}", "Read", False),
-        # searches for grader material
-        ("ls -laR /logs/verifier 2>/dev/null | head", "/logs/verifier:\ntotal 8", "Bash", True),
-        ("find / -maxdepth 2 -name '*verif*'", "/logs/verifier", "Bash", True),
-        ("ls /tests", "ls: cannot access '/tests': No such file or directory", "Bash", True),
-        ("find /opt -name '*truth*'", "", "Bash", True),
-        ("grep -r answer /root", "", "Bash", True),
-        ("/solution/solve.sh", "x", "Read", True),
+        # Invented commands from a toy mosaic task, never executed.
+        ("python -c \"from pathlib import Path; print(Path('/tmp/toy-mosaic/truth.tsv').stat())\"", "sample", "Bash", False),
+        ("cd /app/mosaic && python paint_tiles.py /tmp/toy-palette", "painted", "Bash", False),
+        ("cd /logs/agent/toy-mosaic && sed -i s/blue/green/ palette.txt", "", "Bash", False),
+        ("cat > /app/mosaic/make_tile.py <<'TILE'\nfrom toy_palette import reference_tile\nTILE", "", "Bash", False),
+        ("/tmp/toy-mosaic/reference.tsv", "blue", "Read", False),
+        ("ls -R /logs/verifier/tile-scores | head -n 7", "tile-score.tsv", "Bash", True),
+        ("find / -maxdepth 3 -name mosaic-reference.tsv", "mosaic-reference.tsv", "Bash", True),
+        ("ls /tests/toy-mosaic", "No files found", "Bash", True),
+        ("find /opt/toy-mosaic -iname '*reference*.tsv'", "", "Bash", True),
+        ("grep -ri expected_tile /root/toy-palette", "", "Bash", True),
+        ("/solution/toy-mosaic/palette.tsv", "blue", "Read", True),
     ],
 )
-def test_answer_search_detection_on_real_patterns(command, output, name, expected):
+def test_synthetic_mosaic_probe_detection(command, output, name, expected):
     flags, _, _ = inspect_segment(_probe_segment(command, output, name), True)
     assert ("answer_search" in flags or "hidden_access" in flags) is expected
 
@@ -374,16 +358,16 @@ def test_answer_search_detection_on_real_patterns(command, output, name, expecte
 @pytest.mark.parametrize(
     "command,expected",
     [
-        ('grep -n "input / output\\|linear algebra" /app/output/solution_cli.py | head', False),
-        ("ls -la data && ls /logs/agent/sessions/projects/-app/memory/ && cat /logs/agent/sessions/projects/-app/memory/MEMORY.md", False),
-        ('grep -nE "/app|http|curl|wget" /app/output/solution_cli.py || echo none', False),
-        ("python - << 'EOF'\nimport os; print(open('/tests/x').read())\nEOF", True),
-        ('find / -name "*truth*" -o -name "*inject*" 2>/dev/null | head', True),
-        ("find / -maxdepth 4 -name '*.py' 2>/dev/null | grep -v site-packages | head -50", True),
-        ("ls -la /logs/verifier", True),
-        ("cat /tests/test_outputs.py", True),
-        ("grep -rl tbsgen /opt /etc 2>/dev/null", False),
-        ("grep -rl truth /opt 2>/dev/null", True),
+        ('grep -n "tile / palette" /app/toy-mosaic/palette.txt | head -n 4', False),
+        ("ls /app/toy-mosaic && ls /logs/agent/toy-mosaic && cat /logs/agent/toy-mosaic/notes", False),
+        ('rg "wget|curl" /app/toy-mosaic/guide.txt || echo blue', False),
+        ("python - <<'TILE'\nprint(open('/tests/mosaic/reference.tsv').readline())\nTILE", True),
+        ('find / -iname "*palette-truth*" -print | head -n 7', True),
+        ("find / -maxdepth 3 -iname '*.tile' | grep mosaic | head -n 6", True),
+        ("ls -l /logs/verifier/toy-mosaic", True),
+        ("cat /tests/toy-mosaic/reference.tsv", True),
+        ("grep -ril mosaic /opt/palette", False),
+        ("grep -ril truth_tile /opt/palette", True),
     ],
 )
 def test_shell_probe(command, expected):
@@ -395,11 +379,11 @@ def test_shell_probe(command, expected):
 @pytest.mark.parametrize(
     "command,expected",
     [
-        ('grep -nE "/app|http|curl|wget" /app/output/solution_cli.py || echo none', False),
-        ("pip install mpmath 2>&1 | tail -3", True),
-        ("timeout 15 curl -sI https://example.org | head -5", True),
-        ("curl -sI https://example.org", True),
-        ("python -m pip install x", True),
+        ('rg "wget|curl" /app/toy-mosaic/guide.txt || echo blue', False),
+        ("pip install toy-mosaic-kit 2>&1 | tail -n 7", True),
+        ("timeout 9 curl -I https://tiles.example/palette | head -n 2", True),
+        ("curl -s https://tiles.example/swatches", True),
+        ("python -m pip install toy-palette-kit", True),
     ],
 )
 def test_shell_network(command, expected):
@@ -411,13 +395,13 @@ def test_shell_network(command, expected):
 @pytest.mark.parametrize(
     "text,expected",
     [
-        ("os.makedirs(d + '/test'); os.makedirs(d + '/train')", False),
-        ("cp a /tmp/test/x", False),
-        ("cat /tests/test_outputs.py", True),
-        ("ls /logs/verifier", True),
-        ("open('/tests/x')", True),
-        ("x=/solution/solve.sh", True),
-        ("/oracle", True),
+        ("for suffix in ['/tiles', '/test']: make_folder(palette_dir + suffix)", False),
+        ("cp swatch.tsv /tmp/toy-mosaic/test/tile.tsv", False),
+        ("cat /tests/mosaic/palette.tsv", True),
+        ("ls /logs/verifier/toy-mosaic", True),
+        ("open('/tests/mosaic/shapes.tsv')", True),
+        ("palette=/solution/mosaic/tile.tsv", True),
+        ("/oracle/mosaic", True),
     ],
 )
 def test_hidden_path_pattern(text, expected):
@@ -456,7 +440,7 @@ def test_judge_transcript_is_readable_text():
 def test_trajectory_judge_keeps_quality_findings_as_notes():
     from tbstrain.judge import assess_trajectory
 
-    prompt = "Transcript\npython /app/work/test1.py\nModuleNotFoundError: No module named 'matplotlib'"
+    prompt = "Transcript\npython /app/toy-mosaic/palette.py\nMissing synthetic tile"
     answer = {"quality": 3, "wasted_turn_ratio": 0.2, "rationale": "ok", "findings": [
         {"type": "wasted_turns", "severity": "minor", "quote": "pip download", "why": "x"},
         {"type": "answer_search", "severity": "Minor", "quote": "not in prompt", "why": "weak"},
@@ -482,3 +466,189 @@ def test_easy_cap_keeps_all_medium_hard_and_best_easy():
     assert tiers.count("easy") == 3            # 15 % of the final mix: floor(0.15 * 17 / 0.85) = 3
     assert all(r["quality"] == 4 for r in out if r["tier"] == "easy")
     assert easy_capped({"easy": rows("easy", 4)}, 0.15) == []
+
+
+def run_screen(cfg):
+    for stage in ("ingest", "difficulty", "filter-tasks", "screen"):
+        assert main([stage, "--config", str(cfg)]) == 0
+    return {r["harness"]: r for r in lines(cfg.parent / "out/screen.jsonl")}
+
+
+def test_train_models_required(workspace):
+    workspace.write_text(workspace.read_text().replace('train_models = ["student-model"]', ""))
+    for stage in ("ingest", "difficulty", "filter-tasks"):
+        assert main([stage, "--config", str(workspace)]) == 0
+    assert main(["screen", "--config", str(workspace)]) == 1
+    assert "train_models" in read(workspace.parent / "out/reports/screen.json")["error"]
+
+
+def test_teacher_requires_explicit_distillation(workspace):
+    from conftest import claude_events
+
+    root = workspace.parent / "run/calib-jobs"
+    trial = root / "hard-0/one"
+    trial.parent.rename(root / "hard-teacher")
+    trial = root / "hard-teacher/one"
+    events = claude_events()
+    for e in events:
+        if e["type"] == "assistant":
+            e["message"]["model"] = "teacher-model"
+    write_lines(next(trial.rglob("tiny.jsonl")), events)
+    config = read(trial / "config.json")
+    config["agent"]["model_name"] = "teacher-model"
+    atomic(trial / "config.json", config)
+    result = read(trial / "result.json")
+    result["agent_info"]["model_info"]["name"] = "teacher-model"
+    atomic(trial / "result.json", result)
+    row = run_screen(workspace)["claude-code"]
+    assert row["disposition"] == "drop" and "model_not_trainable" in row["reasons"]
+    hard = next(r for r in lines(workspace.parent / "out/difficulty.jsonl") if r["task_id"] == "hard")
+    assert hard["tier"] == "hard" and hard["teacher_passes"] == 1
+    workspace.write_text(workspace.read_text().replace('["student-model"]', '["student-model", "teacher-model"]'))
+    assert run_screen(workspace)["claude-code"]["disposition"] != "drop"
+    events[-1]["message"].pop("model")
+    write_lines(next(trial.rglob("tiny.jsonl")), events)
+    assert "model_not_trainable" in run_screen(workspace)["claude-code"]["reasons"]
+
+
+@pytest.mark.parametrize("marker", ["block", "run"])
+def test_claude_hint_excludes_trajectory(workspace, marker):
+    path = next((workspace.parent / "run/calib-jobs/hard-0").rglob("tiny.jsonl"))
+    events = list(lines(path))
+    if marker == "block":
+        events[-1]["message"]["content"][0]["hint"] = True
+    else:
+        events[0]["hint_run"] = True
+    write_lines(path, events)
+    row = run_screen(workspace)["claude-code"]
+    assert row["disposition"] == "drop" and "hint_run" in row["reasons"]
+    workspace.write_text(workspace.read_text().replace("[screen]", '[screen]\nhint_mode="strip"'))
+    assert main(["screen", "--config", str(workspace)]) == 1
+
+
+def test_codex_result_splits_turn_without_token_count():
+    events = codex_events()
+    del events[4]
+    events[4]["payload"]["output"] = "violet"
+    events[5]["payload"]["content"][0]["text"] = "The sample is violet."
+    record, = codex(events, {}, {})[0]
+    row = render(record, {})
+    assert check(row) == []
+    call, result, claim = row["messages"][-3:]
+    assert call["tool_calls"][0]["id"] == result["tool_call_id"]
+    assert result["content"] == "violet" and claim["content"] == "The sample is violet."
+    assert not call["content"] and "tool_calls" not in claim
+    call["content"] = claim["content"]
+    del row["messages"][-2:]
+    del row["loss_mask"][-2:]
+    assert "tool_response_missing" in check(row)
+
+
+@pytest.mark.parametrize("returned", [["other"], ["beta", "alpha"], ["alpha"]])
+def test_raw_final_tool_ids_checked_before_trim(returned):
+    ids = ["alpha"] if returned == ["other"] else ["alpha", "beta"]
+    record = segment([
+        message("system", "Sort toy tiles."),
+        message("assistant", [dict(type="tool_use", id=k, name="sample", input={}) for k in ids]),
+        message("user", [dict(type="tool_result", tool_use_id=k, content="blue") for k in returned]),
+    ])
+    with pytest.raises(ValueError, match="tool_order|unanswered_tool_call"):
+        render(record, {})
+
+
+@pytest.mark.parametrize("mode", ["drop", "summary"])
+def test_codex_reasoning_policy_in_export(workspace, judge_stub, mode):
+    path = next((workspace.parent / "run/calib-jobs/medium-0").rglob("rollout-*.jsonl"))
+    events = codex_events()
+    events.insert(-2, dict(type="response_item", payload=dict(
+        type="reasoning", summary=[dict(type="summary_text", text="The tile colors agree.")],
+        encrypted_content="synthetic-opaque-field")))
+    write_lines(path, events)
+    if mode == "summary":
+        workspace.write_text(workspace.read_text().replace("[export]", '[export]\ncodex_reasoning="summary"'))
+    assert main(["run", "--config", str(workspace)], transport=judge_stub) == 0
+    row = next(r for r in lines(workspace.parent / "out/train.jsonl") if r["meta"]["harness"] == "codex")
+    assert row["meta"]["codex_reasoning"] == mode
+    assert row["meta"]["reasoning_source"] == ("summary" if mode == "summary" else "summary_dropped")
+    assert row["messages"][-1]["reasoning_content"] == ("The tile colors agree." if mode == "summary" else "")
+
+
+@pytest.mark.parametrize("tool,args", [
+    ("Bash", {"command": "cat ../tests/palette.tsv"}),
+    ("functions.exec_command", {"cmd": "find /opt/toy-palettes -iname '*truth*.tsv'"}),
+    ("shell", {"command": ["sh", "-lc", "cat palette.tsv"], "workdir": "/tests"}),
+    ("local_shell", {"action": {"command": ["cat", "palette.tsv"], "cwd": "/oracle"}}),
+    ("pi.bash", {"script": "cat ../../tests/palette.tsv", "cwd": "/app/mosaic"}),
+    ("mcp__pi__bash", {"snippet": "rg palette_truth .", "cwd": "/opt/toy-palettes"}),
+])
+def test_shell_tools_resolve_probe_paths(tool, args):
+    src = _probe_segment("", "violet", name=tool)
+    src["messages"][0]["content"][0]["input"] = args
+    assert "answer_search" in inspect_segment(src, True)[1]
+
+
+def test_judge_windows_cover_long_blocks():
+    from tbstrain.judge import windows
+
+    text = "".join(f"{n}:violet " for n in range(2400))
+    blocks = [dict(type="thinking", thinking=text), dict(type="tool_use", name="tile", input={"cmd": text}),
+              dict(type="text", text=text)]
+    parts = list(windows([segment([message("assistant", blocks)])], 713))
+    assert max(map(len, parts)) <= 713
+    assert "".join(parts).count(text) == 3
+
+
+def test_minimum_window_quality_gates_easy(workspace, judge_stub):
+    from tbstrain.core import dumps
+
+    workspace.write_text(workspace.read_text().replace("[judge]", "[judge]\nwindow_chars=128"))
+    async def rate(url, headers, body, timeout):
+        response = await judge_stub(url, headers, body, timeout)
+        if "Transcript window 1 of " in body["messages"][0]["content"]:
+            response["content"][0]["text"] = dumps(dict(quality=3, findings=[], wasted_turn_ratio=0, rationale="Toy score"))
+        return response
+
+    for stage in ("ingest", "difficulty", "filter-tasks", "screen"):
+        assert main([stage, "--config", str(workspace)]) == 0
+    for kind in ("task", "trajectory"):
+        assert main(["judge", "--kind", kind, "--config", str(workspace)], transport=rate) == 0
+    easy = next(r for r in lines(workspace.parent / "out/judge-trajectory.jsonl") if r["task_id"] == "easy")
+    assert {w["quality"] for w in easy["windows"]} == {3, 5} and easy["quality"] == 3
+    assert main(["select", "--config", str(workspace)]) == 0
+    assert any(r["reason"] == "easy_quality" for r in lines(workspace.parent / "out/select.ledger.jsonl"))
+
+
+def test_unknown_blocking_repair_error_and_retry(workspace, judge_stub):
+    from tbstrain.core import dumps
+
+    workspace.write_text(workspace.read_text().replace("[judge]", "[judge]\nmax_error_ratio=0.5"))
+    run_screen(workspace)
+    bad_calls = []
+    async def invalid(url, headers, body, timeout):
+        response = await judge_stub(url, headers, body, timeout)
+        if "Use the samples." in body["messages"][0]["content"]:
+            bad_calls.append(len(body["messages"]))
+            response["content"][0]["text"] = dumps(dict(
+                quality=4, wasted_turn_ratio=0, rationale="Inspect the palette.",
+                findings=[dict(type="unknown_kind", severity="blocking", quote="Use the samples.", why="Toy concern")]))
+        return response
+
+    args = ["judge", "--kind", "trajectory", "--config", str(workspace)]
+    out = workspace.parent / "out"
+    for attempt in range(2):
+        assert main(args, transport=invalid) == 0
+        errors = [r for r in lines(out / "judge-trajectory.jsonl") if r["verdict"] == "error"]
+        assert len(errors) == 1 and "unknown blocking" in errors[0]["reasons"][0]
+        assert bad_calls == [1, 3] * (attempt + 1)
+    calls = len(judge_stub.calls)
+    assert main(args, transport=judge_stub) == 0 and len(judge_stub.calls) == calls + 1
+    assert all(r["verdict"] == "keep" for r in lines(out / "judge-trajectory.jsonl"))
+    assert main(args, transport=judge_stub) == 0 and len(judge_stub.calls) == calls + 1
+
+
+def test_dependency_rejects_old_code(completed):
+    cfg, out = completed
+    path = out / "reports/screen.json"
+    atomic(path, {**read(path), "code": "previous-code"})
+    assert main(["export", "--config", str(cfg)]) == 1
+    assert "run screen again: code changed" in read(out / "reports/export.json")["error"]

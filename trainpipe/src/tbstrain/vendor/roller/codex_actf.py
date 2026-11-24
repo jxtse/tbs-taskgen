@@ -70,28 +70,27 @@ def _instruction_text(value: Any) -> str:
     return ""
 
 
-def _reasoning_text(payload: Mapping[str, Any]) -> str:
-    content = payload.get("content")
-    visible_parts: list[str] = []
-    if isinstance(content, list):
-        for item in content:
-            if isinstance(item, str):
-                visible_parts.append(item)
-            elif isinstance(item, Mapping) and isinstance(item.get("text"), str):
-                visible_parts.append(item["text"])
-    if visible_parts:
-        return "\n".join(part for part in visible_parts if part)
-
-    summary = payload.get("summary")
-    if not isinstance(summary, list):
-        return ""
-    parts: list[str] = []
-    for item in summary:
-        if isinstance(item, str):
-            parts.append(item)
-        elif isinstance(item, Mapping) and isinstance(item.get("text"), str):
-            parts.append(item["text"])
-    return "\n".join(part for part in parts if part)
+def _reasoning_text(payload: Mapping[str, Any], include_summary: bool) -> tuple[str, str]:
+    visible = []
+    summaries = []
+    for block in payload.get("content") or []:
+        if isinstance(block, str):
+            visible.append(block)
+        elif isinstance(block, Mapping) and block.get("text"):
+            if block.get("type") == "summary_text":
+                summaries.append(block["text"])
+            elif block.get("type") in (None, "text", "reasoning_text"):
+                visible.append(block["text"])
+    if any(visible):
+        return "\n".join(filter(None, visible)), "visible"
+    for block in payload.get("summary") or []:
+        if isinstance(block, str):
+            summaries.append(block)
+        elif isinstance(block, Mapping) and block.get("text"):
+            summaries.append(block["text"])
+    if any(summaries):
+        return ("\n".join(filter(None, summaries)), "summary") if include_summary else ("", "summary_dropped")
+    return "", "redacted" if payload.get("encrypted_content") else "none"
 
 
 def _arguments(payload: Mapping[str, Any]) -> tuple[dict[str, Any], Any]:
@@ -335,6 +334,7 @@ def codex_events_to_actf(
     *,
     user_messages: Iterable[str] | None = None,
     keep_thinking: bool = True,
+    include_summary: bool = False,
     tools: list[dict[str, Any]] | None = None,
     tools_capture: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -343,7 +343,8 @@ def codex_events_to_actf(
     Codex emits reasoning, messages and tool calls as separate response items.
     A ``token_count`` event closes the corresponding model request, so all
     response items before that boundary are grouped into one ACTF assistant
-    step. Tool outputs are paired by ``call_id`` even though they arrive after
+    step. Each tool output also closes the step before any subsequent assistant
+    item. Tool outputs are paired by ``call_id`` even though they arrive after
     the model-request boundary.
     """
 
@@ -353,6 +354,7 @@ def codex_events_to_actf(
     pending_user: str | list[Any] = ""
     pending_user_time: str | None = None
     pending_reasoning: list[str] = []
+    reasoning_sources = set()
     system_parts: list[str] = []
     system_seen: set[str] = set()
     groups: list[dict[str, Any]] = []
@@ -395,6 +397,9 @@ def codex_events_to_actf(
         nonlocal current
         if current is None:
             return
+        if pending_reasoning:
+            current["reasoning"].extend(pending_reasoning)
+            pending_reasoning.clear()
         info = payload.get("info")
         last_usage = info.get("last_token_usage") if isinstance(info, Mapping) else None
         if isinstance(last_usage, Mapping):
@@ -448,6 +453,7 @@ def codex_events_to_actf(
                     }
                     group(timestamp)["tool_calls"].append(call)
                     calls_by_id[call_id] = call
+                    close_group({}, timestamp)
             continue
 
         if event_type == "compacted":
@@ -478,7 +484,9 @@ def codex_events_to_actf(
 
         payload_type = payload.get("type")
         if payload_type == "reasoning":
-            reasoning = _reasoning_text(payload)
+            reasoning, source = _reasoning_text(payload, include_summary)
+            if source != "none":
+                reasoning_sources.add(source)
             if reasoning:
                 pending_reasoning.append(reasoning)
             continue
@@ -543,6 +551,7 @@ def codex_events_to_actf(
             continue
 
         if payload_type in {"function_call_output", "custom_tool_call_output"}:
+            close_group({}, timestamp)
             call_id = payload.get("call_id")
             call = calls_by_id.get(call_id) if isinstance(call_id, str) else None
             if call is None:
@@ -640,6 +649,7 @@ def codex_events_to_actf(
             "status": "captured" if tools is not None else "missing",
         },
         "steps": steps,
+        "reasoning_source": "+".join(sorted(reasoning_sources)) or "none",
         "started_at": steps[0]["started_at"] if steps else first_time or "",
         "finished_at": steps[-1]["finished_at"] if steps else last_time or first_time or "",
     }

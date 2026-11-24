@@ -21,14 +21,14 @@ cp examples/pipeline.toml examples/config.local.toml
 | `filter-tasks` | `filtered.jsonl` 逐项检查 S10 已完成、审核通过、标签可信、题面卫生及留出集。相同 DOI 或标题词集 Jaccard ≥ 0.8 时优先保留通过次数较多的题。可选模块 `tbsgen.statement` 缺失时记录跳过。 |
 | `screen` | `screen.jsonl` 给出 keep、strip 或 drop。检查得分、结束状态、模型身份、隐藏材料、离线任务联网及调用配对。只剥离可确认无实质结果的探查及其返回，保留同轮独立的并行调用。清理后的块记录在 `segments/`。 |
 | `judge --kind task` | 对题面、评分程序、指标规格分配文本窗口，判断科学性、公平性、完整性和估计难度，记录 keep、flag 或 drop 及原文证据。 |
-| `judge --kind trajectory` | 对清理后的轨迹分窗检查作弊、推理质量和浪费回合比例。任一窗口有 blocking 发现就淘汰，轨迹质量取各窗口最低分。 |
+| `judge --kind trajectory` | 对清理后的轨迹分窗检查作弊、推理质量和浪费回合比例。任一窗口有 blocking 发现就淘汰，长块连续分窗覆盖全文。轨迹质量取各窗口推理质量的最低分，局部窗口不因缺少任务结尾而扣分。 |
 | `select` | `selection.jsonl` 和 `selection_report.md` 列出每层、领域、harness 的数量、监督 token 和每条排除原因。 |
 | `export --target mint-sft` | 写出 `train.jsonl` 和逐行对应的 `train.sources.jsonl`。超长行记入账本，报告列出导出长度的 p50、p90、最大值。 |
 | `validate FILE` | 检查 UTF-8、数值、消息及工具 schema、调用顺序、loss、长度与源块。与 FILE 同目录的 `<stem>.sources.jsonl` 用于逐行核验。失败返回非零，行号和原因在 `validate.ledger.jsonl`。 |
 | `submit` | 本地校验通过后上传、读取平台报告，再执行训练 dry-run。加 `--confirm` 才会启动训练并读取 show 和 events。 |
 | `rollout` | 根据已选题写出 `rollout/job.json` 和 `rollout/launch.sh`。作业由操作员启动，完成后用 `ingest --job` 纳入下一轮。 |
 
-各子命令均支持 `--config FILE`。每阶段以输入内容、相关配置、上游产物键和阶段版本计算 SHA-256 键。完成结果位于 `<out>/.stages/`，同一输出目录用文件锁串行发布。重复执行会复用已有结果。当前阶段的摘要在 `reports/<stage>.json`，逐项原因在 `<stage>.ledger.jsonl`。中途失败的阶段可以重跑，已验证的评审请求缓存在 `.judge-cache/`。
+各子命令均支持 `--config FILE`。每阶段以输入内容、相关配置、上游产物键和阶段版本计算 SHA-256 键。完成结果位于 `<out>/.stages/`，同一输出目录用文件锁串行发布。重复执行会复用已有结果。当前阶段的摘要在 `reports/<stage>.json`，逐项原因在 `<stage>.ledger.jsonl`。上游回执的代码指纹必须与当前版本一致。容许错误比例内的评审结果可供选择阶段使用，重跑时重试出错条目。已验证的评审请求缓存在 `.judge-cache/`。
 
 ## 难度与配比
 
@@ -58,11 +58,11 @@ Codex 从 session_meta 和 turn_context 读取 instructions、base_instructions 
 
 ## 平台格式
 
-- 一行包含 `messages`、OpenAI function 形式的 `tools`、`loss_mask` 和 `meta`。并行工具结果按前一条 assistant 的调用 ID 顺序紧邻排列。行首为系统提示。末尾截到最后一个有内容、推理或工具调用的 assistant，裁去的平台消息条数写入 `meta.render_notes.dropped_tail`。
+- 一行包含 `messages`、OpenAI function 形式的 `tools`、`loss_mask` 和 `meta`。裁尾前按调用顺序核对每个工具结果的 ID。并行结果须与发起调用的顺序一致。行首为系统提示。末尾截到最后一个有内容、推理或工具调用的 assistant，裁去的平台消息条数写入 `meta.render_notes.dropped_tail`。
 - Claude Code 在 `compact_boundary` 切段，合并同一消息 ID 的块。前段保留真实工具返回及系统提醒，再追加操作员提供的压缩指令和从下一段还原的摘要。续段按摘要、信封与保留片段恢复上下文。使用掩码训练时，保留片段和续跑前缀中的 assistant 均标记 loss 0。
-- Codex 使用 Roller 的 ACTF 转换与 SFT 校验。发生压缩时需要捕获的根参与者调用、manifest 及原生边界。逐次匹配模型输出和上下文，仅在前缀一致时拼接。只有代理请求元数据的压缩会话记入跳过原因。Pi 支持原生 message 和 journal 中的 message_end，截至最后完整 assistant 答复，记录裁去的事件数、消息数和最后完成位置。
-- 托管训练使用 `all_assistant_messages`，会忽略 `loss_mask`。选用该目标时，筛选阶段实际移除应屏蔽的旧 assistant 轮及其工具结果。需要保留完整重放上下文并使用掩码的 SDK 导出可设置 `train_on_what = "loss_mask"`，然后重新运行筛选和选择。验证默认拒绝 loss 为 0 的 assistant，`--allow-masked-assistant` 可用于检查其他训练方式生成的文件。
-- 用配置的 tokenizer JSON 对角色、推理、工具 schema、调用、结果和正文估算模板 token。平台端最终以数据集报告为准。`submit` 要求 available、0 fatal、0 warn，`--allow-warn` 仅放行 warning。上传幂等键使用文件 SHA-256，训练幂等键绑定数据集版本、基座模型与超参文件哈希。CLI 原始 JSON 及失败响应位于 `submit-responses/`，报告记录是否观察到平台忽略 loss_mask。
+- Codex 使用 Roller 的 ACTF 转换与 SFT 校验。每个工具返回都结束前一个 assistant 回合，即使缺少 token_count 事件。发生压缩时需要捕获的根参与者调用、manifest 及原生边界。逐次匹配模型输出和上下文，仅在前缀一致时拼接。只有代理请求元数据的压缩会话记入跳过原因。Pi 支持原生 message 和 journal 中的 message_end，截至最后完整 assistant 答复，记录裁去的事件数、消息数和最后完成位置。
+- 托管训练使用 `all_assistant_messages`，会忽略 `loss_mask`。选用该目标时，筛选阶段实际移除应屏蔽的旧 assistant 轮及其工具结果。需要保留完整重放上下文并使用掩码的 SDK 导出可设置 `train_on_what = "loss_mask"`，然后重新运行筛选和选择。验证仅在显式配置 loss_mask 时默认接受 loss 为 0 的 assistant，`--allow-masked-assistant` 可用于检查其他训练方式生成的文件。
+- 用配置的 tokenizer JSON 对角色、推理、工具 schema、调用、结果和正文估算模板 token。平台端最终以数据集报告为准。`submit` 要求 available、0 fatal、0 warn，`--allow-warn` 仅放行 warning。dry-run 的有效训练模式必须兼容数据中的 assistant 掩码，实际 max_length 必须容纳最长行；检查通过后才可确认启动。上传幂等键使用文件 SHA-256，训练幂等键绑定数据集版本、基座模型与超参文件哈希。CLI 原始 JSON 及失败响应位于 `submit-responses/`，报告记录是否观察到平台忽略 loss_mask。
 
 ## 配置
 
@@ -73,10 +73,10 @@ Codex 从 session_meta 和 turn_context 读取 instructions、base_instructions 
 | 顶层、`ingest` | `out` 指向专用私有产物目录。`runs`、`jobs` 为路径列表。 |
 | `difficulty` | `student_model`、`teacher_model` 可显式指定；默认从发布校准角色推断。`hard_max`、`medium_max` 指定闭区间上界。 |
 | `filter` | `review_allow` 默认仅 pass。`exclude` 接受官方基准 ID、DOI 或标题。 |
-| `screen` | `models` 按 harness 指定期望模型，默认取 trial 配置。`task_dirs` 为容器内任务目录。`allow_timeout` 默认关闭。`hint_mode` 默认 exclude；strip 需在私有 `hint_texts` 中提供可逐字移除的提示，残留原文或无法定位提示即淘汰。`resume_marker` 可指定续跑标记。 |
+| `screen` | 必填 `train_models` 列出允许训练的模型名；每个 assistant 回合都须有可核对的模型身份且在列表内。教师 trial 仍参与难度统计。需要蒸馏教师时，显式将其模型名加入列表。`task_dirs` 为容器内任务目录。`allow_timeout` 默认关闭。`hint_mode` 仅支持默认值 exclude；带 hint 标记的块或 hint-run 标记会使整条轨迹淘汰，因为删除提示原文仍可能留下 assistant 对提示的转述。`resume_marker` 可指定续跑标记。 |
 | `judge` | `base_url`、`model`、`api_key_env` 配置 Messages API。`concurrency` 默认 64，可设 128。`timeout` 以秒计，`retries`、`backoff` 控制 429 和 5xx 重试。`window_chars`、`max_tokens` 限制输入窗口和输出。`input_tokens_per_million`、`output_tokens_per_million` 为每百万 token 美元单价。 |
 | `select` | `shares` 指定三层权重，`per_task`、`max_token_share`、`easy_quality` 和 `seed` 指定题内数量、监督占比、easy 质量及同分顺序。 |
-| `export` | `tokenizer` 必填。`compaction_instruction` 可兼容指定私有指令文件，profile 中的 `compaction.txt` 优先。`max_length` 默认 194560。`train_on_what` 默认 all_assistant_messages。 |
+| `export` | `tokenizer` 必填。`compaction_instruction` 可兼容指定私有指令文件，profile 中的 `compaction.txt` 优先。`codex_reasoning` 默认 drop，忽略提供方生成的推理摘要；显式设为 summary 才可导出摘要。行的 `meta.reasoning_source` 记录推理来源，Codex 行还记录所用策略。可见的原生推理正文保留。 `max_length` 默认 194560。`train_on_what` 默认 all_assistant_messages。 |
 | `submit` | `cli` 指定程序，`cli_env` 指定可覆盖程序路径的环境变量。`config_file` 为训练超参 TOML/JSON，`base_model` 选择基座，`note` 最多 80 字符，`timeout` 默认为 30m。 |
 | `rollout` | `harness`、`model`、`attempts`、`concurrency`、`job_name`、`jobs_dir` 选择作业参数。`agents.<harness>` 和 `environment` 透传 Harbor 配置，`harbor_cli` 指定启动脚本使用的命令。 |
 

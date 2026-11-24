@@ -33,13 +33,13 @@ def export(ctx):
                 profile = profiles.get(r["harness"])
                 if r["harness"] == "claude-code":
                     required_profile(profile, r["harness"], r.get("agent_version"))
-                if r.get("wire_context_hash") != digest([profile, target]):
+                if r.get("wire_context_hash") != digest([profile, target, cfg.get("codex_reasoning", "drop")]):
                     raise ValueError("wire context changed: rerun screen and select")
                 for i, segment in enumerate(read(ctx.out / "segments" / r["source"])):
                     meta = {k: r[k] for k in ("task_id", "trial_id", "harness", "tier", "domain")}
                     meta.update(segment=i, compaction=segment.get("compaction", False))
                     row = render(segment, meta)
-                    errors = check(row, allow_masked=target != "all_assistant_messages")
+                    errors = check(row, allow_masked=target == "loss_mask")
                     if errors:
                         raise ValueError(f"invalid screened row: {errors}")
                     tokens, _ = token_counter.counts(row)
@@ -74,7 +74,7 @@ def validate(ctx, file, allow_masked=False, reference=None):
 
     def build():
         token_counter = Counter(tokenizer)
-        failed = count = 0
+        failed = count = masked_assistants = max_tokens = 0
         with (
             file.open("rb") as stream,
             (ctx.work / "validate.ledger.jsonl").open("w", encoding="utf-8") as ledger,
@@ -89,12 +89,17 @@ def validate(ctx, file, allow_masked=False, reference=None):
                         errors = check(
                             row,
                             allow_masked=allow_masked
-                            or cfg.get("train_on_what", "all_assistant_messages") != "all_assistant_messages",
+                            or cfg.get("train_on_what") == "loss_mask",
                         )
                         if not errors and reference:
                             errors.extend(reference_shape(row, exemplar))
                         if not errors:
                             n, _ = token_counter.counts(row)
+                            max_tokens = max(max_tokens, n)
+                            masked_assistants += sum(
+                                m["role"] == "assistant" and loss == 0
+                                for m, loss in zip(row["messages"], row["loss_mask"], strict=True)
+                            )
                             if n > cfg.get("max_length", 194560):
                                 errors.append("max_length")
                         if src is None:
@@ -118,7 +123,10 @@ def validate(ctx, file, allow_masked=False, reference=None):
             finally:
                 if source_stream:
                     source_stream.close()
-        return {"count": count, "failed": failed, "valid": not failed}
+        return {
+            "count": count, "failed": failed, "valid": not failed,
+            "max_tokens": max_tokens, "masked_assistants": masked_assistants,
+        }
 
     return ctx.stage(
         "validate",

@@ -310,3 +310,47 @@ def test_wire_check_reports_body_mismatch_without_exposing_text(tmp_path, capsys
     assert main(args) == 1
     report = json.loads(capsys.readouterr().out)["first_request"]
     assert report["mismatch"] == 1 and report["first_difference"]["difference"] == "$.max_tokens value differs"
+
+
+def test_claude_result_ends_fragment_group(tmp_path):
+    events = link_events([
+        cc_message("user", "Inspect the toy swatch."),
+        cc_message("assistant", [call("sample", "swatch")]),
+        cc_message("user", [result("swatch", "violet")]),
+        cc_message("assistant", [block("The swatch is violet.")]),
+    ])
+    for e in (events[1], events[3]):
+        e["message"]["id"] = "reused-id"
+    record, = claude(events, {"profile": toy_profile()}, {"agent_version": "1", "trial": str(tmp_path)})[0]
+    row = render(record, {})
+    assert check(row) == []
+    assert [m["role"] for m in row["messages"][-3:]] == ["assistant", "tool", "assistant"]
+
+
+def test_pi_rejects_mismatched_result_in_unfinished_tail():
+    events = pi_events()
+    events.extend([
+        dict(type="message", message=dict(role="assistant", model="student-model", stopReason="toolUse",
+             content=[dict(type="toolCall", name="sample", id="violet", arguments={})])),
+        dict(type="message", message=dict(role="toolResult", toolCallId="green", content="3")),
+    ])
+    with pytest.raises(ValueError, match="tool_order"):
+        pi(events, {}, {})
+
+
+@pytest.mark.parametrize("harness", ["claude", "pi"])
+def test_redacted_thinking_provenance(harness, tmp_path):
+    if harness == "claude":
+        events = link_events([
+            cc_message("user", "Pick a tile."),
+            cc_message("assistant", [dict(type="redacted_thinking", data="toy-hidden"), block("Violet.")]),
+        ])
+        records, _, _ = claude(events, {"profile": toy_profile()}, {"agent_version": "1", "trial": str(tmp_path)})
+    else:
+        events = pi_events()
+        events[3]["event"]["message"]["content"].insert(0, dict(type="thinking", redacted=True, thinking="toy-hidden"))
+        records, _, _ = pi(events, {}, {})
+    row = render(records[0], {})
+    assert check(row) == []
+    assert row["meta"]["reasoning_source"] == "redacted"
+    assert not row["messages"][-1].get("reasoning_content")

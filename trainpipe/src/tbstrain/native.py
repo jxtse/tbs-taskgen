@@ -1,5 +1,6 @@
 """Convert native journals into loss-bearing text, thinking, call and result blocks."""
 
+from collections import deque
 import json
 from pathlib import Path
 import re
@@ -60,6 +61,23 @@ def summary_target(text):
     return "<summary>\n" + body + "\n</summary>"
 
 
+def validate_pairs(messages):
+    """Check observed results before replay removal, canonicalization or tail trimming."""
+    pending = deque()
+    for m in messages:
+        if m["role"] == "assistant" and pending:
+            raise ValueError("unanswered_tool_call")
+        blocks = m["content"]
+        for b in blocks if isinstance(blocks, list) else ():
+            if b["type"] == "tool_use":
+                pending.append(b["id"])
+            elif b["type"] == "tool_result":
+                if not pending or pending.popleft() != b["tool_use_id"]:
+                    raise ValueError("tool_order")
+    if pending:
+        raise ValueError("unanswered_tool_call")
+
+
 def claude(events, cfg, trial):
     rows = []
     profile = required_profile(cfg.get("profile"), "claude-code", trial.get("agent_version"))
@@ -81,9 +99,13 @@ def claude(events, cfg, trial):
             raise ValueError("resume marker outside active branch")
         ends = ends[start:]
     models = []
+    hinted = bool(trial.get("hint"))
     for i, end in enumerate(ends):
         chain = session.chain(end)
         for r in chain:
+            content = r.get("message", {}).get("content")
+            hinted |= bool(r.get("hint_run") or r.get("message", {}).get("hint_run")
+                           or (isinstance(content, list) and any(b.get("hint") for b in content)))
             if r["type"] != "assistant":
                 continue
             models.append(r["message"].get("model"))
@@ -91,7 +113,9 @@ def claude(events, cfg, trial):
                 raise ValueError("incomplete_assistant_response")
         messages = [message("system", system_text(profile["system"]))]
         skip_results = set()
-        for m in session.state(end, historical):
+        state = session.state(end, historical)
+        validate_pairs(state)
+        for m in state:
             content = m["content"]
             # The managed trainer supervises every assistant. Remove replay and its paired
             # results only for this target. Mask-aware targets keep the entire wire state.
@@ -112,6 +136,12 @@ def claude(events, cfg, trial):
             entry["loss"] = m.get("loss", 0)
             messages.append(entry)
         row = segment(messages, profile["tools"])
+        reasoning_sources = {
+            ("native_thinking" if b["type"] == "thinking" else "redacted")
+            for m in messages if m["role"] == "assistant" for b in m["content"]
+            if b["type"] in {"thinking", "redacted_thinking"}
+        }
+        row["reasoning_source"] = "+".join(sorted(reasoning_sources)) or "none"
         if i + 1 < len(ends):
             boundary = next(r for r in reversed(session.chain(ends[i+1])) if is_boundary(r))
             summary = session.summary(boundary)["message"]["content"]
@@ -122,7 +152,7 @@ def claude(events, cfg, trial):
                              message("assistant", summary_target(string_content(summary)))])
             row["compaction"] = True
         rows.append(row)
-    return rows, models, {"resume_prefix_events": len(historical)}
+    return rows, models, {"resume_prefix_events": len(historical), "hint_run": hinted}
 
 
 def pi_segment(messages, system, tools):
@@ -130,6 +160,7 @@ def pi_segment(messages, system, tools):
     steps = []
     users = []
     errors = set()
+    reasoning_sources = set()
     schemas = list(function_schemas(tools or []))
     for m in messages:
         role = m["role"]
@@ -155,7 +186,11 @@ def pi_segment(messages, system, tools):
                 if b["type"] == "text":
                     text.append(b["text"])
                 elif b["type"] == "thinking":
-                    reasoning.append(b["thinking"])
+                    if b.get("redacted"):
+                        reasoning_sources.add("redacted")
+                    else:
+                        reasoning_sources.add("native_thinking")
+                        reasoning.append(b["thinking"])
                 elif b["type"] == "toolCall":
                     calls.append(dict(id=b["id"], name=b["name"], arguments=b["arguments"]))
                 else:
@@ -170,6 +205,7 @@ def pi_segment(messages, system, tools):
         for b in m["content"]:
             if b.get("tool_use_id") in errors:
                 b["is_error"] = True
+    converted["reasoning_source"] = "+".join(sorted(reasoning_sources)) or "none"
     return converted
 
 
@@ -182,6 +218,7 @@ def pi(events, cfg, trial):
     request_model = None
     open_turn = None
     previous_id = None
+    pending = deque()
     for index, e in enumerate(events):
         kind = e.get("type")
         if e.get("parentId") and previous_id is not None and e["parentId"] != previous_id:
@@ -219,7 +256,13 @@ def pi(events, cfg, trial):
         m = event["message"]
         role = m["role"]
         blocks = m["content"]
+        if role == "toolResult":
+            if not pending or pending.popleft() != m["toolCallId"]:
+                raise ValueError("tool_order")
+        elif pending:
+            raise ValueError("unanswered_tool_call")
         if role == "assistant":
+            pending.extend(b["id"] for b in blocks if b["type"] == "toolCall")
             models.append(m.get("model") or request_model)
             if m.get("stopReason") in {"aborted", "error", "length"}:
                 if any(
@@ -237,6 +280,8 @@ def pi(events, cfg, trial):
             and not any(b["type"] == "toolCall" for b in blocks)
         ):
             end = (index, len(current))
+    if pending:
+        raise ValueError("unanswered_tool_call")
     if not end:
         raise ValueError("pi_no_complete_turn")
     i, n = end
@@ -357,7 +402,9 @@ def responses_tools(specs, offered=None):
 def codex(events, cfg, trial):
     current_model = None
     models = []
-    pending = set()
+    pending = deque()
+    reasoning_mode = cfg.get("codex_reasoning", "drop")
+    received_result = False
     boundaries = []
     for e in events:
         p = e.get("payload") or {}
@@ -373,13 +420,16 @@ def codex(events, cfg, trial):
         if e["type"] != "response_item":
             continue
         if kind in {"function_call", "custom_tool_call", "reasoning"} or p.get("role") == "assistant":
+            if received_result and pending:
+                raise ValueError("unanswered_tool_call")
             models.append(p.get("model") or current_model)
         if kind in {"function_call", "custom_tool_call"}:
-            pending.add(p["call_id"])
+            received_result = False
+            pending.append(p["call_id"])
         elif kind in {"function_call_output", "custom_tool_call_output"}:
-            if p["call_id"] not in pending:
-                raise ValueError("orphan_tool_result")
-            pending.remove(p["call_id"])
+            if not pending or pending.popleft() != p["call_id"]:
+                raise ValueError("tool_order")
+            received_result = True
     if pending:
         raise ValueError("unanswered_tool_call")
     if boundaries and not trial.get("capture"):
@@ -399,13 +449,15 @@ def codex(events, cfg, trial):
         offered = platform_schemas(specs, profile, "codex", trial.get("agent_version"))
         tools = responses_tools(specs, {t["function"]["name"]: t["function"] for t in offered})
         status = "captured"
-    actf = codex_events_to_actf(events, tools=tools, tools_capture={"source": "session", "status": status})
+    actf = codex_events_to_actf(events, tools=tools, include_summary=reasoning_mode == "summary",
+                                tools_capture={"source": "session", "status": status})
+    provenance = {"codex_reasoning": reasoning_mode, "reasoning_source": actf["reasoning_source"]}
     if not boundaries:
         if not actf["system_prompt"]:
             actf["system_prompt"] = system_text(required_profile(profile, "codex", trial.get("agent_version"))["system"])
         record = actf_to_sft(actf)
         offered = platform_schemas(record["tools"], profile, "codex", trial.get("agent_version"))
-        return [from_sft(record, tools=offered)], models, {}
+        return [{**from_sft(record, tools=offered), **provenance}], models, {}
     path = Path(trial["capture"])
     calls = compaction._root_calls(list(lines(path)), read(path.parent / "manifest.json", {}))
     calls = load_blobs(calls, path.parent.parent / "blobs")
@@ -445,6 +497,7 @@ def codex(events, cfg, trial):
     converted = [from_sft(r, tools=platform_schemas(r["tools"], profile, "codex", trial.get("agent_version")))
                  for r in windows]
     for row in converted:
+        row.update(provenance)
         if row["messages"][0]["role"] != "system":
             prompt = actf["system_prompt"] or system_text(required_profile(
                 profile, "codex", trial.get("agent_version"))["system"])

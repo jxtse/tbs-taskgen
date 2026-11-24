@@ -37,8 +37,9 @@ def native_content(record, preserved):
     for b in content:
         kind = b["type"]
         if kind == "text":
-            if b.get("text"):
-                blocks.append(text_block(b["text"]))
+            if not b.get("text") and not b.get("hint"):
+                continue
+            blocks.append(text_block(b["text"]))
         elif kind == "thinking":
             blocks.append(dict(type=kind, thinking=b.get("thinking") or "", signature=b.get("signature", "")))
         elif kind == "tool_use":
@@ -48,6 +49,8 @@ def native_content(record, preserved):
             if preserved and kind == "tool_result" and isinstance(block.get("content"), str):
                 block["content"] = block["content"].lstrip()
             blocks.append(block)
+        if b.get("hint"):
+            blocks[-1]["hint"] = b["hint"]
     return blocks
 
 
@@ -113,6 +116,8 @@ class Turns:
             return
         content = native_content(record, preserved)
         mid = record["message"].get("id")
+        if role == "user" and isinstance(content, list) and any(b["type"] == "tool_result" for b in content):
+            self.assistants.clear()
         if role == "assistant" and mid in self.assistants:
             self.assistants[mid]["content"].extend(content)
             return

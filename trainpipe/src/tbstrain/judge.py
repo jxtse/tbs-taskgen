@@ -44,10 +44,7 @@ def assess_task(answer, prompt):
 
 
 def assess_trajectory(answer, prompt):
-    """Integrity findings gate the trajectory and need exact evidence; anything else is a quality note.
-
-    Observed on real DeepSeek answers: the judge also reports quality problems (wasted turns, unfinished windows) as
-    findings with its own type names. Those are kept as notes instead of failing the whole judgment."""
+    """Keep unknown minor findings as notes and require valid integrity evidence for blocking findings."""
     findings = answer.get("findings")
     if (
         type(answer.get("quality")) is not int
@@ -64,7 +61,10 @@ def assess_trajectory(answer, prompt):
             problems.append(f"finding {i} is not an object")
             continue
         severity = str(f.get("severity", "")).lower()
-        if f.get("type") not in CATEGORIES:
+        if f.get("type") not in CATEGORIES and severity == "blocking":
+            problems.append(f"finding {i}: unknown blocking finding type")
+            continue
+        if f.get("type") not in CATEGORIES and severity == "minor":
             notes.append({k: f.get(k) for k in ("type", "severity", "quote", "why")})
             continue
         if severity not in {"blocking", "minor"}:
@@ -116,7 +116,7 @@ def windows(records, limit):
     for number, record in enumerate(records, 1):
         for i, m in enumerate(record["messages"], 1):
             blocks = m["content"] if isinstance(m["content"], list) else [{"type": "text", "text": m["content"]}]
-            content = "\n".join(excerpt(render_block(b), min(limit // 2, 6000)) for b in blocks)
+            content = "\n".join(render_block(b) for b in blocks)
             entry = f"=== segment {number}, message {i}, {m['role']}\n{content}\n"
             for start in range(0, len(entry), limit):
                 piece = entry[start : start + limit]
@@ -202,8 +202,7 @@ def judge(ctx, kind):
                     trial_id=key,
                     task_id=tid,
                     verdict="drop" if blocked else "keep",
-                    quality=answers[-1]["quality"] if len(answers) == 1 else round(
-                        sum(a["quality"] for a in answers) / len(answers)),
+                    quality=min(a["quality"] for a in answers),
                     final_quality=answers[-1]["quality"],
                     windows=answers,
                     reasons=[f["type"] for a in answers for f in a["findings"]] or ["passed"],
@@ -218,6 +217,6 @@ def judge(ctx, kind):
             raise RuntimeError(f"{len(failed)}/{len(rows)} judgments failed; first: {failed[0]['reasons'][0]}")
         ctx.emit(name, rows)
         ctx.emit(name + ".ledger", rows)
-        return {"count": len(rows), **client.stats}
+        return {"count": len(rows), "retry_required": bool(failed), **client.stats}
 
     return ctx.stage(name, [ctx.dependency(dep), cfg, rubric], build)

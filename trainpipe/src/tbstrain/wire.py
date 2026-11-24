@@ -5,10 +5,11 @@ import json
 from tokenizers import Tokenizer
 
 from .core import dumps, loads
-from .native import function_schemas, string_content
+from .native import function_schemas, string_content, validate_pairs
 
 
 def render(source, meta):
+    validate_pairs(source["messages"])
     schemas = list(function_schemas(source["tools"]))
     messages = []
     masks = []
@@ -60,7 +61,7 @@ def render(source, meta):
                 elif kind != "redacted_thinking":
                     raise ValueError("unsupported_assistant_block")
             wire = {"role": role, "content": "\n".join(content)}
-            if reasoning:
+            if reasoning or "codex_reasoning" in source:
                 wire["reasoning_content"] = "\n\n".join(reasoning)
             if calls:
                 wire["tool_calls"] = calls
@@ -88,7 +89,8 @@ def render(source, meta):
         else:
             raise ValueError("unknown_role")
     return dict(messages=messages, loss_mask=masks, tools=schemas,
-                meta={**meta, "render_notes": {"dropped_tail": dropped}})
+                meta={**meta, **{k: source[k] for k in ("codex_reasoning", "reasoning_source") if k in source},
+                      "render_notes": {"dropped_tail": dropped}})
 
 
 class Counter:
@@ -224,6 +226,10 @@ def check(row, *, allow_masked=False):
                     errors.append("message_keys")
             else:
                 errors.append("role")
+        # A rendered final call may lose its matched result only at the recorded tail cut.
+        notes = row["meta"].get("render_notes", {}) if isinstance(row["meta"], dict) else {}
+        if pending and "dropped_tail" in notes and len(pending) > notes["dropped_tail"]:
+            errors.append("tool_response_missing")
     except (ValueError, KeyError, TypeError, AttributeError, IndexError):
         errors.append("malformed_row")
     return sorted(set(errors))

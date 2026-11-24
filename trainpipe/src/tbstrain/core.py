@@ -162,6 +162,10 @@ class Context:
                 ledger = self.work / (name + ".ledger.jsonl")
                 if not ledger.is_file():
                     raise RuntimeError(f"missing decision ledger for {name}")
+                if stats.get("retry_required"):
+                    # Publish partial decisions for selection without filling the reusable cache slot.
+                    key = digest([key, self.work.name])
+                    dest = root / key
                 receipt = dict(stage=name, version=1, code=code_version(), key=key, parents=parents, **stats)
                 atomic(self.work / ".receipt", receipt)
                 self.work.rename(dest)
@@ -206,6 +210,8 @@ class Context:
         receipt = read(self.out / "reports" / f"{stage}.json")
         if not receipt or "error" in receipt:
             raise ValueError(f"run {stage} first")
+        if receipt.get("code") != code_version():
+            raise ValueError(f"run {stage} again: code changed")
         pointer = self.out / ".stages" / stage / "current"
         if pointer.is_symlink() and os.readlink(pointer) != receipt["key"]:
             raise ValueError(f"interrupted publication: rerun {stage}")

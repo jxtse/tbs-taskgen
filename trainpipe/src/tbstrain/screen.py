@@ -1,5 +1,6 @@
 from collections import Counter as Frequencies
 from pathlib import Path
+import posixpath
 import re
 import shlex
 
@@ -98,13 +99,14 @@ def _under(path, roots):
     return any(path == r or path.startswith(r + "/") for r in roots)
 
 
-def shell_probe(command, task_dirs):
+def shell_probe(command, task_dirs, cwd=None):
     """True when a shell command looks for grader material outside the task and the agent's scratch space."""
     if HIDDEN.search(command):       # grader paths anywhere, including inline scripts (open('/tests/...'))
         return True
+    base = posixpath.join(task_dirs[0], cwd or ".")
     for argv in _subcommands(command):
         cmd = argv[0].rsplit("/", 1)[-1]
-        paths = [a for a in argv[1:] if a.startswith("/")]
+        paths = [posixpath.normpath(posixpath.join(base, a)) for a in argv[1:] if not a.startswith("-")]
         # reading grader directories directly, by any command
         if any(_under(p.rstrip("/*"), GRADER_ROOTS) for p in paths) and cmd not in ("mkdir", "echo", "printf"):
             return True
@@ -127,6 +129,33 @@ def shell_probe(command, task_dirs):
     return False
 
 
+def shell_input(args, default_dir):
+    """Read shell text or an argv vector from a native tool payload."""
+    cwd = default_dir
+    if isinstance(args, dict):
+        cwd = args.get("cwd") or args.get("workdir") or default_dir
+        if isinstance(args.get("action"), dict):
+            return shell_input(args["action"], cwd)
+        for key in ("command", "cmd", "script", "input"):
+            if key in args:
+                args = args[key]
+                break
+        else:
+            options = {"cwd", "workdir", "description", "shell"}
+            candidates = [v for k, v in args.items() if k not in options and isinstance(v, (str, list))]
+            if len(candidates) != 1:
+                raise ValueError("ambiguous shell command")
+            args = candidates[0]
+    if isinstance(args, list) and args:
+        if len(args) >= 3 and args[0].rsplit("/", 1)[-1] in {"sh", "bash", "zsh", "dash"} and args[1] in ("-c", "-lc"):
+            args = args[2]
+        else:
+            args = shlex.join(args)
+    if not isinstance(args, str):
+        raise ValueError("missing shell command")
+    return args, cwd
+
+
 def inspect_segment(source, offline, task_dirs=("/app", "/work")):
     results = {
         b["tool_use_id"]: b for m in source["messages"] for b in m["content"] if b["type"] == "tool_result"
@@ -142,9 +171,12 @@ def inspect_segment(source, offline, task_dirs=("/app", "/work")):
         for b in m["content"]:
             if b["type"] != "tool_use":
                 continue
-            name = b["name"].lower().split(".")[-1]
+            name = b["name"].lower().rsplit(".", 1)[-1].rsplit("__", 1)[-1]
             args = b["input"]
             value = " ".join(str(v) for v in args.values()) if isinstance(args, dict) else str(args)
+            shell = name in {"bash", "exec_command", "shell", "local_shell"}
+            if shell:
+                value, cwd = shell_input(args, task_dirs[0])
             result = results.get(b["id"])
             output = string_content(result["content"]).strip() if result else ""
             simple = not re.search(r"[;&|\n]", value)
@@ -152,28 +184,27 @@ def inspect_segment(source, offline, task_dirs=("/app", "/work")):
             if not output and re.match(r"^\s*(find|grep|rg|locate)\b", value):
                 no_matches = True
             immaterial = result is not None and simple and (no_matches or bool(FAIL.fullmatch(output)))
-            if name == "bash" and isinstance(args, dict) and isinstance(args.get("command"), str):
+            if shell:
+                probe = shell_probe(value, task_dirs, cwd)
                 # only when curl/wget/pip install is the command itself, not a grep pattern mentioning it
                 shell_net = any(
                     argv[0].rsplit("/", 1)[-1] in ("curl", "wget")
                     or (argv[0].rsplit("/", 1)[-1] in ("pip", "pip3", "uv", "conda", "mamba") and "install" in argv[1:3])
                     or (argv[0].startswith("python") and argv[1:4] == ["-m", "pip", "install"])
-                    for argv in _subcommands(args["command"])
+                    for argv in _subcommands(value)
                 )
-            else:
-                shell_net = bool(NET.search(value))
-            network = offline and (name in ("websearch", "webfetch", "web_search", "web_fetch") or shell_net)
-            if name == "bash" and isinstance(args, dict) and isinstance(args.get("command"), str):
-                probe = shell_probe(args["command"], task_dirs)
             else:
                 probe = bool(HIDDEN.search(value) and READ_OP.search(name + " " + value))
+                shell_net = bool(NET.search(value))
+            network = offline and (name in ("websearch", "webfetch", "web_search", "web_fetch") or shell_net)
             # Read/Glob/Grep tools: a sensitive path outside the task and scratch areas.
-            if name in ("read", "glob", "grep", "ls"):
-                outside = any(
-                    not any(Path(path).is_relative_to(base) for base in (*task_dirs, *SCRATCH))
-                    for path in PATH_TOKEN.findall(" " + value)
-                )
-                if (outside or "../" in value) and SENSITIVE.search(value):
+            if name in ("read", "glob", "grep", "ls") and isinstance(args, dict):
+                base = posixpath.join(task_dirs[0], args.get("cwd") or args.get("workdir") or ".")
+                targets = [args[k] for k in ("file_path", "path", "pattern") if isinstance(args.get(k), str)]
+                paths = [posixpath.normpath(posixpath.join(base, t)) for t in targets or ["."]]
+                if any(_under(p, GRADER_ROOTS) for p in paths) or (
+                    SENSITIVE.search(value) and any(not _under(p, (*task_dirs, *SCRATCH)) for p in paths)
+                ):
                     probe = True
             if network:
                 flags.add("network")
@@ -245,9 +276,17 @@ def screen(ctx):
     exp = ctx.cfg["export"]
     profiles = configured_profiles(ctx)
     cfg["train_on_what"] = exp.get("train_on_what", "all_assistant_messages")
-    allow_masked = cfg["train_on_what"] != "all_assistant_messages"
+    train_models = cfg.get("train_models")
+    if not isinstance(train_models, list) or not train_models or not all(
+        isinstance(m, str) and m.strip() for m in train_models
+    ):
+        raise ValueError("screen.train_models requires a nonempty list of model names")
+    cfg["codex_reasoning"] = exp.get("codex_reasoning", "drop")
+    if cfg["codex_reasoning"] not in ("drop", "summary"):
+        raise ValueError("invalid export.codex_reasoning")
+    allow_masked = cfg["train_on_what"] == "loss_mask"
     tokenizer = ctx.path(exp["tokenizer"])
-    if cfg.get("hint_mode", "exclude") not in ("exclude", "strip"):
+    if cfg.get("hint_mode", "exclude") != "exclude":
         raise ValueError("invalid hint_mode")
 
     def build():
@@ -277,7 +316,7 @@ def screen(ctx):
                     fatal.add("timeout")
             elif not trial["clean_end"]:
                 fatal.add("unclean_end")
-            if trial["hint"] and cfg.get("hint_mode", "exclude") == "exclude":
+            if trial["hint"]:
                 fatal.add("hint_run")
             if len(trial["sessions"]) != 1:
                 fatal.add("session_missing_or_ambiguous")
@@ -295,24 +334,18 @@ def screen(ctx):
                     stripped.extend(sorted(removed))
                     profile = profiles.get(trial["harness"])
                     records, models, details = CONVERTERS[trial["harness"]](native, {**cfg, "profile": profile}, trial)
-                    details["wire_context_hash"] = digest([profile, cfg["train_on_what"]])
-                    expected = cfg.get("models", {}).get(trial["harness"], trial["model"])
+                    details["wire_context_hash"] = digest([profile, cfg["train_on_what"], cfg["codex_reasoning"]])
                     observed = set(models) | set(trial["response_models"])
                     if trial["reported_model"]:
                         observed.add(trial["reported_model"])
                     details["observed_models"] = sorted(str(m) for m in observed)
-                    if not expected or not models or any(m != expected for m in observed):
-                        fatal.add("model_mismatch")
+                    if not models or not observed.issubset(train_models):
+                        fatal.add("model_not_trainable")
                     has_tagged_hint = any(
                         b.get("hint") for rec in records for m in rec["messages"] for b in m["content"]
                     )
-                    if has_tagged_hint and cfg.get("hint_mode", "exclude") == "exclude":
+                    if has_tagged_hint or details.get("hint_run"):
                         fatal.add("hint_run")
-                    if (has_tagged_hint or trial["hint"]) and cfg.get("hint_mode") == "strip":
-                        removed = sum(remove_hints(record, cfg) for record in records)
-                        if not removed:
-                            raise ValueError("hint_block_not_found")
-                        details["removed_hint_blocks"] = removed
                     for record in records:
                         # Validate before and after editing so removing a call cannot mask corruption.
                         fatal.update(check(render(record, {}), allow_masked=allow_masked))
@@ -363,21 +396,3 @@ def screen(ctx):
         [ctx.dependency("filter-tasks"), cfg, digest(profiles), file_hash(tokenizer), exp.get("max_length", 194560)],
         build,
     )
-
-
-def remove_hints(record, cfg):
-    # An operator supplies exact blocks. Any reference surviving in model text fails closed.
-    markers = cfg.get("hint_texts", [])
-    if not markers or not all(isinstance(v, str) and v for v in markers):
-        raise ValueError("hint_texts_required")
-    removed = 0
-    for m in record["messages"]:
-        for b in m["content"]:
-            if m["role"] == "user" and b["type"] == "text":
-                for hint in markers:
-                    removed += b["text"].count(hint)
-                    b["text"] = b["text"].replace(hint, "")
-            if any(h in str(b) for h in markers):
-                raise ValueError("hint_residue")
-
-    return removed
