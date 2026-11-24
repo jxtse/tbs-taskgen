@@ -62,7 +62,15 @@ def declared_outputs(spec, statement):
         if line.lstrip().startswith("#"):
             in_outputs = bool(re.search(r"\b(?:outputs?|deliverables?)\b", line, re.I))
         list_end = None
+        input_clause = False
+        prev_end = 0
         for match in FILE_TOKEN.finditer(line):
+            for cue in re.finditer(r"\b(from|using|given|write|produce|submit|save)\b|[.;]", line[prev_end:match.start()], re.I):
+                input_clause = cue[0].lower() in ("from", "using", "given")
+            prev_end = match.end()
+            if input_clause:
+                list_end = None
+                continue
             path = match[0]
             explicit_path = path.startswith(("/app/output/", "<output_dir>/", "output/"))
             relative = not path.startswith(("/", "data/"))

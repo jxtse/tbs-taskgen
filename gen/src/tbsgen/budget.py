@@ -26,6 +26,7 @@ import time
 from pathlib import Path
 
 CN = dt.timezone(dt.timedelta(hours=8))
+EXCLUDE_MIGRATION_CANCELLATIONS = "COALESCE(cost_kind,'') != 'probe_migration_cancelled'"
 # hardening round of the item being stepped (Pipeline.step sets it while state.harden_active; 0 = not a hardening
 # round).  Every reservation is tagged with it (calls.harden), so budget.item_harden_usd_cap can keep a hardening
 # round's authoring spend (S5G, S6A, S6M, S6C, S7, S8 ...) apart from the first version's budget.item_usd_cap.
@@ -205,7 +206,7 @@ class Ledger:
             cap_r = (b.get("run_calls_per_model") or {}).get(model)
             # call-count caps count calls that were made: a reservation the model relay refused at its preflight
             # (cost_kind relay_refused, calib.relay_preflight_refused: no Harbor job, no model call) is no call
-            made = "AND COALESCE(cost_kind,'') NOT IN ('relay_refused', 'diversity_parked')"
+            made = f"AND COALESCE(cost_kind,'') NOT IN ('relay_refused', 'diversity_parked') AND {EXCLUDE_MIGRATION_CANCELLATIONS}"
             if cap_r is not None:
                 n = db.execute(f"SELECT count(*) FROM calls WHERE model=? AND real=1 {made}", (model,)).fetchone()[0]
                 if n >= int(cap_r):
@@ -334,9 +335,10 @@ class Ledger:
 
     def summary(self, day: str | None = None) -> dict:
         q = ("SELECT model, stage, real, count(*), SUM(status='error'), SUM(in_tok), SUM(out_tok), SUM(cache_read), "
-             "SUM(COALESCE(usd,est_usd,0)) FROM calls {} GROUP BY model, stage, real ORDER BY model, stage")  # in-flight = reserved est
+             f"SUM(COALESCE(usd,est_usd,0)) FROM calls WHERE {EXCLUDE_MIGRATION_CANCELLATIONS} {{}} GROUP BY model, stage, real "
+             "ORDER BY model, stage")
         with self._db() as db:
-            rows = db.execute(q.format("WHERE day=?" if day else ""), (day,) if day else ()).fetchall()
+            rows = db.execute(q.format("AND day=?" if day else ""), (day,) if day else ()).fetchall()
             br = db.execute("SELECT model, open, reason FROM breaker WHERE open=1").fetchall()
         out = [dict(model=r[0], stage=r[1], real=bool(r[2]), calls=r[3], errors=r[4] or 0, in_tok=r[5] or 0,
                     out_tok=r[6] or 0, cache_read=r[7] or 0, usd=round(r[8] or 0, 4)) for r in rows]

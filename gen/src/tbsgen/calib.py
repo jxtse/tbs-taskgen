@@ -754,6 +754,8 @@ def run_summary(runs: list[dict]) -> list[dict]:
     keys = ("who", "n", "model", "job_name", "outcome", "result_type", "minutes", "cost_usd", "cost_kind")
     out = []
     for r in runs:
+        if r.get("obsolete_probe_job"):
+            continue
         t = r.get("trial") or {}
         d = {k: r.get(k, t.get(k)) for k in keys}
         if d["result_type"] is None and r.get("outcome") == "infra":

@@ -1196,7 +1196,7 @@ def test_ans_control_in_s7_and_review_bundle(tmp_path, monkeypatch, wired_gates,
     assert detail["inconclusive"] and detail["reference"]["verifier_rc"] == rc and detail["reference"]["reward"] == reward
     write_json(tmp_path / "gates/attempt-1.json", report)
     (tmp_path / "pkg").mkdir()
-    review.write_bundle(tmp_path, tmp_path / "bundle", {})
+    review.write_bundle(tmp_path, tmp_path / "bundle", {"gates_attempt": 1})
     bundled = json.loads((tmp_path / "bundle/records/s7_gates/attempt-1.json").read_text())
     assert bundled["details"]["coverage"] == detail
 
@@ -1304,3 +1304,39 @@ def test_dynamic_reassignment_reports_unknown():
     for change in ("t //= factor()", "t = choose()", "if maybe: t = 60"):
         assert package.run_solution_timeouts(f"t=1200\n{change}\nrun_solution(t)", 780) == [
             "line 3: run_solution timeout unknown"]
+
+
+@pytest.mark.parametrize("cue", ["from", "using", "given"])
+def test_deliverables_section_excludes_input_clause(cue):
+    from tbsgen.statement import declared_outputs
+    text = f"## Deliverables\nWrite a.csv and b.csv {cue} input.csv and lookup.tsv. Submit c.csv."
+    assert declared_outputs({}, text) == {"a.csv", "b.csv", "c.csv"}
+
+
+def test_timeout_branch_uses_value_at_call():
+    src = ("def check(flag):\n    t=900\n    if flag:\n        run_solution(t)\n        t=10\n"
+           "        run_solution(t)\n    else:\n        run_solution(t)\n    run_solution(t)")
+    unknown = []
+    assert package.run_solution_timeouts(src, 780, warnings=unknown) == [
+        f"line {n}: run_solution timeout 900s >= verifier budget 780s" for n in (4, 8)]
+    assert unknown == ["line 9: run_solution timeout unknown"]
+
+
+def test_audit_and_pkg_warn_on_unknown_timeout(tmp_path):
+    share = tmp_path / "share"
+    pkg = share / "1-hard/demo"
+    (pkg / "tests").mkdir(parents=True)
+    (share / "INDEX.csv").write_text("task_id,tbsgen_run\ndemo,\n")
+    (pkg / "task.toml").write_text('[task]\ndescription="Demo"\n[verifier]\ntimeout_sec=900\n'
+                                   'network_mode="no-network"\n[agent]\nnetwork_mode="allowlist"\n'
+                                   '[environment]\nnetwork_mode="no-network"')
+    (pkg / "instruction.md").write_text("Demo")
+    (pkg / "tests/test_outputs.py").write_text("run_solution(dynamic_limit())")
+    report = package.validate_pkg(pkg)
+    assert report["warnings"] == ["test_outputs.py: line 1: run_solution timeout unknown"]
+    assert not report["errors"]
+    script = Path(__file__).resolve().parents[1] / "scripts/audit_share.py"
+    result = subprocess.run([sys.executable, script, pkg.parent], check=True, capture_output=True, text=True)
+    headers, row, summary = result.stdout.splitlines()
+    assert dict(zip(headers.split("\t"), row.split("\t")))["run_solution_timeout"] == "WARN"
+    assert json.loads(summary)["flagged"]["run_solution_timeout"] == 0

@@ -316,6 +316,14 @@ def run_solution_timeouts(src: str, budget: float, *, warnings: list[str] | None
                     visit(stmt, current, later, current)
                     bind(stmt, current)
             return
+        if isinstance(node, ast.If):
+            visit(node.test, visible, deferred, class_parent)
+            for branch in (node.body, node.orelse):
+                bindings = dict(visible)
+                for stmt in branch:
+                    visit(stmt, bindings, deferred, bindings if class_parent is visible else class_parent)
+                    bind(stmt, bindings)
+            return
         if isinstance(node, ast.Call):
             name = getattr(node.func, "id", None)
             if name in names or getattr(node.func, "attr", None) == "run_solution":

@@ -15,7 +15,7 @@ import traceback
 from pathlib import Path
 
 from . import blocklist, intake, screen_jev, stages_a as A, stages_b as B
-from .budget import BudgetStop, Ledger, harden_scope, today, variant_scope
+from .budget import EXCLUDE_MIGRATION_CANCELLATIONS, BudgetStop, Ledger, harden_scope, today, variant_scope
 from .config import resolve_role
 from .models import ModelError, get_client
 from .state import STAGES, Store, read_json, write_json
@@ -110,7 +110,8 @@ class Pipeline:
 
     def item_cost(self, item_id: str) -> dict:
         with self.ledger._db() as db:
-            r = db.execute("SELECT count(*), SUM(COALESCE(usd,0)), SUM(in_tok), SUM(out_tok) FROM calls WHERE item=?",
+            r = db.execute("SELECT count(*), SUM(COALESCE(usd,0)), SUM(in_tok), SUM(out_tok) FROM calls "
+                           f"WHERE item=? AND {EXCLUDE_MIGRATION_CANCELLATIONS}",
                            (item_id,)).fetchone()
         return dict(calls=r[0], usd=round(r[1] or 0, 4), in_tok=r[2] or 0, out_tok=r[3] or 0)
 

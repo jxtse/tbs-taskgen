@@ -51,7 +51,7 @@ def _pkg_item(tmp_path, monkeypatch, old_ins, new_ins, rescore=True, pre_sha=Non
     (d / "thresholds.json").write_text(json.dumps(dict(thresholds={})))
     (d / "pkg" / "instruction.md").write_text(old_ins)
     (d / "calib" / "runs.json").write_text(json.dumps([dict(job_name="j1", who="glm", outcome="fail")]))
-    state = dict(stage="PKG", status="active", calib_label="hard", calib_epoch=0, history=[])
+    state = dict(stage="PKG", status="active", calib_label="hard", calib_epoch=0, history=[], gates_attempt=1)
     if rescore:
         state["rescore_pending"] = dict(reason="regate")
     if pre_sha:
@@ -71,7 +71,7 @@ def _pkg_item(tmp_path, monkeypatch, old_ins, new_ins, rescore=True, pre_sha=Non
     monkeypatch.setattr(prerelease, "signals", lambda *a, **k: dict(repos=[]))
     events = []
     P = SimpleNamespace(cfg=load_config(None), item_cost=lambda i: 0.0,
-                        store=SimpleNamespace(event=lambda *a, **k: events.append((a, k))))
+                        store=SimpleNamespace(root=it.root, event=lambda *a, **k: events.append((a, k))))
     stages_b.pkg(P, it)
     return Item(tmp_path / "run", "doi-x").load(), events
 

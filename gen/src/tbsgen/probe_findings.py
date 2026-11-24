@@ -5,7 +5,9 @@ import re
 import shlex
 
 
-CURRENT_CONTRACT = "s9r-v4"
+CURRENT_CONTRACT = "s9r-v5"
+_NEVER_EXECUTED = re.compile(r"\b(?:(?:never|(?:did\s+)?not|didn['’]t)\s+(?:run|executed?)|"
+                             r"(?:was|were)\s+never\s+(?:run|executed))\b", re.I)
 _NOT_RUN = re.compile(r"\b(?:(?:did\s+)?not\s+run|didn['’]t\s+run|was\s+not\s+executed|"
                       r"could(?:\s+not|n['’]t)\s+run|unable\s+to\s+run|skipped\s+running|no\s+run)\b", re.I)
 _V3_NOT_RUN = re.compile(r"\b(?:not\s+run|didn['’]t\s+run|could(?:\s+not|n['’]t)\s+run|"
@@ -42,7 +44,7 @@ def has_evidence(ev) -> bool:
 def finding_errors(verdict, suspected_scopes, contract=CURRENT_CONTRACT):
     if contract == "s9r-v1":
         return []
-    if contract not in ("s9r-v2", "s9r-v3", CURRENT_CONTRACT):
+    if contract not in ("s9r-v2", "s9r-v3", "s9r-v4", CURRENT_CONTRACT):
         return ["unknown review contract"]
     findings = verdict.get("probe_findings", {})
     if not isinstance(findings, dict):
@@ -71,7 +73,8 @@ def finding_errors(verdict, suspected_scopes, contract=CURRENT_CONTRACT):
             for field, minimum in (("command", 1), ("observation", 20)):
                 value = finding.get(field)
                 if (not isinstance(value, str) or len(value.strip()) < minimum or negation.search(value)
-                        or field == "command" and contract == CURRENT_CONTRACT and not _looks_like_command(value)):
+                        or contract == CURRENT_CONTRACT and _NEVER_EXECUTED.search(value)
+                        or field == "command" and contract != "s9r-v3" and not _looks_like_command(value)):
                     errors.append(f"{scope}: expected {field} from a completed run")
         if not isinstance(finding.get("reason"), str) or not finding["reason"].strip():
             errors.append(f"{scope}: missing reason")

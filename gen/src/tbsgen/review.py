@@ -43,7 +43,7 @@ from pathlib import Path
 from . import calib
 from .gates import current_probe_report
 from .probe_findings import CURRENT_CONTRACT, finding_errors, has_evidence
-from .state import gate_attempts, read_json
+from .state import passed_gate_attempt, passed_gate_report, read_json, write_json
 
 VERDICTS = ("pass", "revise", "drop")
 ALLOWED_HUMAN = ("human",)          # accepted only behind review.allow_human (legacy verdicts stay readable)
@@ -238,7 +238,8 @@ def _tail(p: Path, n: int) -> str:
 # ------------------------------------------------------------------ bundle / review task
 def _calib_records(item_dir: Path) -> list[dict]:
     try:
-        return json.loads((item_dir / "calib" / "runs.json").read_text())
+        return [r for r in json.loads((item_dir / "calib" / "runs.json").read_text())
+                if not r.get("obsolete_probe_job")]
     except (OSError, ValueError):
         return []
 
@@ -319,15 +320,13 @@ def write_bundle(item_dir: Path, dest: Path, state: dict, digest_kb: int = 150) 
         if prev_task.is_dir() and (item_dir / "task").is_dir():
             from .difficulty import version_diff
             (rec / "hardening" / f"{h.parent.name}-diff.patch").write_text(version_diff(prev_task, item_dir / "task"))
-    gates = gate_attempts(item_dir / "gates")
+    report = passed_gate_report(item_dir / "gates", state)
     probes, suspected = {}, []
-    if gates:
+    if current_probe_report(report):
         (rec / "s7_gates").mkdir()
-        for g in gates:
-            shutil.copy2(g, rec / "s7_gates" / g.name)
-        # Older attempts describe earlier graders. Only the last S7 attempt binds the current verdict.
-        report = read_json(gates[-1], {})
-        details = report.get("details", {}) if current_probe_report(report) else {}
+        g = item_dir / "gates" / f"attempt-{passed_gate_attempt(state)}.json"
+        shutil.copy2(g, rec / "s7_gates" / g.name)
+        details = report.get("details", {})
         probes = {arm: details[gate] for gate, arm in PROBE_ARMS.items() if gate in details}
         suspected = suspected_scopes(report)
     (rec / "output_probes.json").write_text(json.dumps(dict(probes=probes, suspected_scopes=suspected), indent=2))
@@ -428,6 +427,8 @@ def build_task(cfg: dict, item_dir: Path, state: dict, rnd: int, out: Path | Non
     (out / "instruction.md").write_text(instruction(cfg, item_dir, state, rnd, info))
     (out / "tests").mkdir()
     verdicts = list(VERDICTS) + (list(ALLOWED_HUMAN) if (cfg.get("review") or {}).get("allow_human") else [])
+    write_json(out / "tests/review_contract.json", dict(review_contract_version=CURRENT_CONTRACT,
+               allowed_verdicts=verdicts, suspected_scopes=info["suspected_scopes"]))
     shutil.copy2(Path(__file__).with_name("probe_findings.py"), out / "tests")
     (out / "tests" / "s9r_validate.py").write_text(VALIDATOR.replace("{problems}", repr(sorted(PROBLEM_CLASSES)))
                                                    .replace("{verdicts}", repr(verdicts))
@@ -721,7 +722,7 @@ def job_contract(job):
 
 
 def normalize(raw: dict | None, reward: float | None = None, allow_human: bool = False, suspected_scopes=(),
-              contract=CURRENT_CONTRACT) -> dict:
+              contract=CURRENT_CONTRACT, allowed_verdicts=None) -> dict:
     """Apply the contract to a raw verdict: returns {verdict, raw_verdict, issues, blocking, minor, downgraded,
     label_assessment, checklist, problems}.  verdict None = invalid (structural problem: unknown verdict or
     severity, non-object issue, blocking issue without a fix_kind, verifier reward != 1 when known) — the caller
@@ -791,14 +792,16 @@ def normalize(raw: dict | None, reward: float | None = None, allow_human: bool =
         problems.append(f"review verifier reward {reward} (verdict.json failed the structure check)")
         hard.append("reward")
     blocking = [i for i in issues if i["severity"] == "blocking"]
-    if rv not in VERDICTS and not (allow_human and rv in ALLOWED_HUMAN):
-        problems.append(f"verdict {rv!r} not one of {VERDICTS}")
+    if allowed_verdicts is None:
+        allowed_verdicts = VERDICTS + (ALLOWED_HUMAN if allow_human else ())
+    if rv not in allowed_verdicts:
+        problems.append(f"verdict {rv!r} not one of {allowed_verdicts}")
         v = None
     elif rv == "drop" and blocking:
         v = "drop"
     elif hard:
         v = None
-    elif allow_human and rv in ALLOWED_HUMAN:
+    elif rv in ALLOWED_HUMAN:
         v = "human"
     elif rv in ("revise", "drop") and not blocking:
         # the reviewer judged a defect but no blocking issue survives the contract (none, or all without
@@ -841,7 +844,7 @@ def read_verdict(trial: Path) -> dict | None:
 
 
 def classify(job_dir: Path, model: str | None, prices: dict, allow_human: bool = False, suspected_scopes=(),
-              contract=CURRENT_CONTRACT) -> dict:
+              contract=CURRENT_CONTRACT, allowed_verdicts=None) -> dict:
     """A finished review job: outcome "done" (a verdict file came back; verdict may still be None = invalid,
     retried by routing) or "infra"; cost as for calibration."""
     trials = calib.collect(job_dir, model, prices)
@@ -858,7 +861,8 @@ def classify(job_dir: Path, model: str | None, prices: dict, allow_human: bool =
         reward = rw.get("reward")
         reward = float(reward) if isinstance(reward, (int, float)) else 0.0
     return dict(outcome="done" if raw is not None else "infra", verdict_raw=raw, verifier_reward=reward,
-                verdict=normalize(raw, reward, allow_human, suspected_scopes, contract) if raw is not None else None,
+                verdict=normalize(raw, reward, allow_human, suspected_scopes, contract, allowed_verdicts)
+                if raw is not None else None,
                 trial=dict(last, job_dir=str(Path(job_dir).resolve()),
                            verdict_trial=trial.name if trial else None),
                 minutes=last.get("minutes"), cost_usd=usd, cost_kind=kind, usage=usage, n_trials=len(trials))
@@ -897,9 +901,8 @@ def prepare(cfg: dict, item_dir: Path, task: Path, rnd: int, attempt: int, epoch
                config=str(p), command=command, state="intent", submitted=False, ts=time.time(),
                job_dir=str(Path(c["jobs_dir"]) / name), task=str(task.resolve()), outcome=None,
                ledger_stage="S9R", pkg_sha=calib.pkg_sha(item_dir / "pkg"), calib_epoch=epoch)
-    evidence = read_json(task / "environment/review/records/output_probes.json", {})
-    rec.update(review_prompt_version=REVIEW_PROMPT_VERSION, review_contract_version=CURRENT_CONTRACT,
-               suspected_scopes=evidence.get("suspected_scopes", []))
+    contract = json.loads((task / "tests/review_contract.json").read_text())
+    rec.update(review_prompt_version=REVIEW_PROMPT_VERSION, **contract)
     why = calib.network_problem(rc, task, conf) or route_problem(cfg)
     if why:
         rec["blocked" if c.get("allow_submit") else "warning"] = why

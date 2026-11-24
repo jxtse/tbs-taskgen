@@ -12,7 +12,7 @@ from . import calib, difficulty, gates, package, repair, review
 from .models import parse_files
 from .prompts import METRICS_API, S6C_TESTS, S8_EXPLOIT, S8_REPAIR, S8_REVIEW, SYSTEM
 from .stages_a import _write_files, chat_files, save_raw
-from .state import gate_attempts, latest_gate_report, read_json, write_json
+from .state import gate_attempts, latest_gate_report, passed_gate_attempt, passed_gate_report, read_json, write_json
 
 
 def s6c(P, it):
@@ -80,10 +80,15 @@ def s7(P, it):
                         it.save()
                     return None
                 return it.finish("dropped", "difficulty_design_unproven")
+    attempts = gate_attempts(it.p("gates"))
+    if attempts:
+        counters = it.state.setdefault("attempts", {})
+        counters["S7"] = max(counters.get("S7", 0), int(attempts[-1].stem[8:]))
     n = it.bump("S7")
     rep = gates.run_gates(P.cfg, it.dir, spec, th, n)
     write_json(it.p("gates", f"attempt-{n}.json"), rep)
     if rep["ok"]:
+        it.state["gates_attempt"] = n
         return it.advance("S7", "PKG", attempt=n)
     if rep["blocking"]:
         it.state["repair_from"] = "gates:" + ",".join(rep["blocking"])
@@ -155,11 +160,18 @@ _POST_PROBE_STAGES = ("S8", "PKG", "S9", "S9R", "S10")
 def legacy_report_id(it):
     if it.state.get("stage") not in _POST_PROBE_STAGES or it.state.get("status") in ("done", "dropped"):
         return None
-    reports = gate_attempts(it.p("gates"))
-    if not reports or gates.current_probe_report(read_json(reports[-1])):
+    attempt = passed_gate_attempt(it.state)
+    if attempt is not None and it.state["stage"] != "S8":
+        report = it.p("gates", f"attempt-{attempt}.json")
+    else:
+        reports = gate_attempts(it.p("gates"))
+        if not reports:
+            return None
+        report = reports[-1]
+    if gates.current_probe_report(read_json(report)) and (attempt is not None or it.state["stage"] == "S8"):
         return None
     # An attempt number can be reused by another hardening round.
-    report_id = f"{reports[-1].stem}:{_sha_file(reports[-1])}"
+    report_id = f"{report.stem}:{_sha_file(report) if report.exists() else 'missing'}"
     if not any(r.get("probe_report_id") == report_id for r in it.state.get("regates", [])):
         return report_id
     return None
@@ -184,17 +196,23 @@ def migrate_probe_report(P, it):
                     _route_review(P, it, rec, rec["n"])
                     return True
                 if rec.get("outcome") is None:
-                    if rec.get("state") == "launched" or calib.job_started(rec):
+                    if rec.get("state") == "launched" or rec.get("launch_attempted") or calib.job_started(rec):
                         # Keep the original job identity and slot until its result and spend are settled.
                         rec["state"] = "launched"
                         save(it, rec)
                         it.state["probe_migration_job_stage"] = stage
                     else:
-                        if rec.get("ledger_call"):
-                            P.ledger.settle(rec["ledger_call"], 0.0, status="error", kind="not_launched")
-                        save(it, dict(rec, outcome="infra", result_type="infra", obsolete_probe_job=True))
+                        _cancel_probe_job(P, it, rec, save)
         _regate(P, it, "probe_policy_migration", False, report_id)
         return True
+
+
+def _cancel_probe_job(P, it, rec, save):
+    if rec.get("ledger_call"):
+        P.ledger.settle(rec["ledger_call"], 0.0, status="error", kind="probe_migration_cancelled")
+    rec.update(outcome="infra", result_type="infra", obsolete_probe_job=True,
+               cost_usd=0.0, cost_kind="probe_migration_cancelled")
+    save(it, rec)
 
 
 def _received_drop(it, rec):
@@ -204,7 +222,7 @@ def _received_drop(it, rec):
     v = _bound_verdict(it, rec, rec["n"])
     if v and (v.get("verdict") == "drop" or v["_normalized"].get("verdict") == "drop"):
         return (rec.get("pkg_sha") == calib.pkg_sha(it.p("pkg"))
-                and _job_judgment(v, rec, allow_human=False)["verdict"] == "drop")
+                and _job_judgment(v, rec)["verdict"] == "drop")
     return False
 
 
@@ -242,7 +260,7 @@ def _regate(P, it, reason, recalibrate, report_id=None):
         rec["probe_report_id"] = report_id
         st.pop("repair_from", None)
         st.pop("regen_6c", None)
-        st.pop("post_revision", None)
+        st["gates_attempt"] = None
     st.setdefault("regates", []).append(rec)
     if not st.get("thresholds_locked") or not st.get("revision_data_hash"):
         st["revision_data_hash"] = review.pkg_data_hash(it.p("pkg")) if packaged else None
@@ -361,8 +379,11 @@ def _slim(g):
 
 def pkg(P, it):
     spec = read_json(it.p("_spec", "spec.json"))
-    gate = latest_gate_report(it.p("gates"))
-    gen0 = it.p("runs", f"s7-{gate['attempt']}", "detA")
+    attempt = passed_gate_attempt(it.state)
+    gate = passed_gate_report(it.p("gates"), it.state)
+    if attempt is None or gate.get("attempt") != attempt:
+        raise ValueError("PKG needs the report of the passing S7 attempt")
+    gen0 = it.p("runs", f"s7-{attempt}", "detA")
     from . import prerelease
     cand = read_json(it.p("S1_candidate.json"), {})
     prov = dict(read_json(it.p("_spec", "provenance.json"), {}), item_id=it.item_id,
@@ -380,6 +401,12 @@ def pkg(P, it):
         except OSError:
             pass
     old_sha = it.state.get("pkg_statement_sha")
+    if "legacy_release_sha" not in it.state:
+        previous = _live_release(P, it.item_id)
+        if previous and "pkg_sha" not in previous and previous.get("pkg"):
+            previous_pkg = Path(previous["pkg"])
+            it.state["legacy_release_sha"] = calib.pkg_sha(previous_pkg) if previous_pkg.is_dir() else None
+            it.save()  # Keep the original hash even if PKG is interrupted and retried.
     out = package.package(P.cfg, it.dir, gen0, spec, prov)
     v = package.validate_pkg(out, P.cfg)
     new_sha = hashlib.sha256((out / "instruction.md").read_bytes()).hexdigest()
@@ -810,12 +837,12 @@ def _ingest(P, it, job_dir: str | None = None) -> dict:
 
 def _oracle_gate_ok(it) -> bool:
     """The last S7 gate report of the current version passed the oracle (reference) gate."""
-    g = latest_gate_report(it.p("gates")).get("gates", {})
+    g = passed_gate_report(it.p("gates"), it.state).get("gates", {})
     return g.get("oracle") is True
 
 
 def _probe_scopes(it):
-    return review.suspected_scopes(latest_gate_report(it.p("gates")))
+    return review.suspected_scopes(passed_gate_report(it.p("gates"), it.state))
 
 
 def _park_unreviewed(it, scopes):
@@ -842,10 +869,12 @@ def review_gate(P, it, scopes=None) -> str | None:
         if (job.get("outcome") != "done" or job.get("n") != v.get("round") or job.get("pkg_sha") != v.get("pkg_sha")
                 or job.get("calib_epoch", 0) != v.get("calib_epoch", 0)):
             return "probe verdict of another review job"
-        if _job_judgment(v, job, allow_human=False)["verdict"] != "pass":
+        if _job_judgment(v, job)["verdict"] != "pass":
             return "invalid verdict for the submitted review contract"
-        if not P.cfg["review"]["enabled"] and review.job_contract(job) != review.CURRENT_CONTRACT:
-            return "current review contract required"
+        # v4 also required command, observed reward and observation. Recheck its
+        # evidence below with the current rules when a fresh review is unavailable.
+        if not P.cfg["review"]["enabled"] and review.job_contract(job) not in ("s9r-v4", review.CURRENT_CONTRACT):
+            return "review contract with execution evidence required"
         scopes = set(scopes) | set(job.get("suspected_scopes", []))
     if (scopes or v.get("probe_findings")) and review.normalize(v, suspected_scopes=scopes)["verdict"] != "pass":
         return "probe findings require a new review"
@@ -911,13 +940,16 @@ def _release_reviewed(P, it, previous, scopes):
                   pkg_sha=sha, calib_epoch=epoch, review=rev, difficulty=_difficulty_summary(it))
     if previous and "pkg_sha" not in previous and previous.get("pkg"):
         previous_pkg = Path(previous["pkg"])
-        if previous_pkg.is_dir():
+        if "legacy_release_sha" in it.state:
+            previous = dict(previous, pkg_sha=it.state["legacy_release_sha"])
+        elif previous_pkg.is_dir():
             previous = dict(previous, pkg_sha=calib.pkg_sha(previous_pkg))
     if previous and all(previous.get(k) == v for k, v in record.items()):
         return it.advance("S10", None, status="done")
     rel = P.store.root / "release"
     rel.mkdir(exist_ok=True)
     _append_manifest(rel / "manifest.jsonl", dict(record, ts=time.time()))
+    it.state.pop("legacy_release_sha", None)
     it.advance("S10", None, status="done")
 
 
@@ -1007,7 +1039,13 @@ def watch_tick(P, only: list[str] | None = None, max_steps: int = 50) -> dict:
                 if kind is None:
                     continue
                 if it.state.get("probe_migration_job_stage"):
-                    _settle_dead_job(P, it, cur, save=_save_run if stage == "S9" else _save_review)
+                    save = _save_run if stage == "S9" else _save_review
+                    job_dir = Path(cur["job_dir"])
+                    if ((job_dir / "config.json").exists() or (job_dir / "result.json").exists()
+                            or any(job_dir.glob("*/result.json"))):
+                        _settle_dead_job(P, it, cur, save=save)
+                    else:
+                        _cancel_probe_job(P, it, cur, save)
                     _after_ingest(P, it, cur, stage)
                 else:
                     it.state["status"] = "active"       # s9() / s9r() reconcile the dead launch
@@ -1144,7 +1182,7 @@ def _s9r(P, it):
         if rec.get("outcome") == "invalid" and review.job_contract(rec) != review.CURRENT_CONTRACT:
             v = _bound_verdict(it, rec, rnd)
             if v:
-                norm = _job_judgment(v, rec, bool(rv.get("allow_human")))
+                norm = _job_judgment(v, rec)
                 if norm["verdict"]:
                     rec.update(outcome="done", verdict=norm["verdict"])
                     if _needs_new_review(rec, dict(v, _normalized=norm), scopes):
@@ -1226,7 +1264,7 @@ def _ingest_review(P, it, job_dir: str | None = None) -> dict:
     scopes = _probe_scopes(it)
     assigned = rec.get("suspected_scopes", [])
     res = review.classify(jd, rec.get("model"), P.cfg["models"].get("prices", {}),
-                          allow_human=bool((P.cfg.get("review") or {}).get("allow_human")),
+                          allowed_verdicts=rec.get("allowed_verdicts"), allow_human=True,
                           suspected_scopes=assigned, contract=review.job_contract(rec))
     rec.update(outcome="invalid" if (res["outcome"] == "done" and (res["verdict"] or {}).get("verdict") is None)
                else res["outcome"],
@@ -1321,7 +1359,7 @@ def _bound_verdict(it, rec, rnd):
     return None
 
 
-def _job_judgment(v, rec, allow_human):
+def _job_judgment(v, rec):
     reward = v.get("verifier_reward")
     if reward is None and v["_normalized"].get("verdict") is None:
         # Older records did not persist the verifier reward separately. Only reconsider a rejected
@@ -1329,8 +1367,11 @@ def _job_judgment(v, rec, allow_human):
         trial = rec.get("trial") or {}
         matched = trial.get("trial") and trial["trial"] == trial.get("verdict_trial")
         reward = trial.get("reward") if matched and trial.get("reward") is not None else 0
-    return review.normalize(v, reward=reward, allow_human=allow_human, suspected_scopes=rec.get("suspected_scopes", []),
-                            contract=review.job_contract(rec))
+    # For older jobs the bundled verifier already checked membership. A reward of one
+    # (or its persisted human verdict) is evidence of opt-in under that job's contract.
+    legacy_human = reward == 1 or v["_normalized"].get("verdict") == "human"
+    return review.normalize(v, reward=reward, allow_human=legacy_human, allowed_verdicts=rec.get("allowed_verdicts"),
+                            suspected_scopes=rec.get("suspected_scopes", []), contract=review.job_contract(rec))
 
 
 def _needs_new_review(rec, verdict, scopes):
@@ -1354,7 +1395,7 @@ def _route_review(P, it, rec: dict, rnd: int):
     if not v:
         return _review_invalid(P, it, rnd, rec, f"verdict of job {rec.get('job_name')} missing or bound to "
                                                  f"another job / package / epoch")
-    norm = _job_judgment(v, rec, bool(rv.get("allow_human")))
+    norm = _job_judgment(v, rec)
     if _needs_new_review(rec, dict(v, _normalized=norm), _probe_scopes(it)):
         _save_review(it, dict(rec, outcome="infra", obsolete_probe_review=True))
         return it.goto("S9R", "review contract changed; re-running")
@@ -1646,6 +1687,7 @@ def start_hardening(P, it, operator: str | None = None, kind: str = "harden"):
             prev_review_round=int(st.get("review_round") or 0),    # reviews above this round belong to the new build
             prev_task_sha=difficulty.task_sha(it.p("task")), prev_science_sha=difficulty.science_sha(it.p("task")),
             prev_pkg_sha=calib.pkg_sha(it.p("pkg")) if it.p("pkg").exists() else None,
+            prev_gates_attempt=passed_gate_attempt(st),
             prev_label=st.get("calib_label"), archived_epoch=pend["epoch"],
             prev_runs=[{x: r.get(x) for x in ("job_name", "who", "outcome", "minutes", "cost_usd")} for r in runs],
             started=time.time())
@@ -1665,6 +1707,7 @@ def start_hardening(P, it, operator: str | None = None, kind: str = "harden"):
                 "post_regate", "difficulty_reauthored", "harden_built", "harden_pending"):
         st.pop(key, None)
     st.setdefault("attempts", {}).pop("S7", None)
+    st["gates_attempt"] = None
     st["regen_6c"] = True
     st["harden_round"] = k
     st["harden_kind"] = kind
@@ -1751,6 +1794,11 @@ def harden_revert(P, it, locked: bool = False) -> bool:
     k = int(pend["round"])
     rd = it.p("harden", f"round-{k}")
     difficulty.restore_version(it, rd / "prev", rd / "failed")
+    record = read_json(rd / "record.json", {})
+    if "prev_gates_attempt" in record:
+        st["gates_attempt"] = record["prev_gates_attempt"]
+    else:
+        st.pop("gates_attempt", None)  # An older snapshot uses its passing history entry.
     if not pend.get("failed_archived"):
         if int(st.get("calib_epoch", 0)) == pend["failed_epoch"]:
             _archive_calibration(it)                    # the failed version's own records (normally none)
