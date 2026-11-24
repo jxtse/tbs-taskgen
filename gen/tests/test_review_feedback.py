@@ -1,5 +1,6 @@
 """Offline regressions for generation and review."""
 import csv
+import hashlib
 import json
 from pathlib import Path
 import os
@@ -1283,6 +1284,8 @@ def test_side_file_only_suspicion_identifies_transformed_path(tmp_path, monkeypa
 
 
 @pytest.mark.parametrize("directive,expected", [
+    ("## Deliverables\nRead input.csv and write a.csv.", {"a.csv"}),
+    ("## Deliverables\nFrom input.csv, generate /app/output/a.csv.", {"a.csv"}),
     ("Write a.csv and b.csv from input.csv.", {"a.csv", "b.csv"}),
     ("Submit a.csv, b.csv, or c.csv.", {"a.csv", "b.csv", "c.csv"}),
     ("Save `a.csv`, `dir/b.csv` and `c.csv` using `raw.csv`.", {"a.csv", "dir/b.csv", "c.csv"}),
@@ -1322,7 +1325,8 @@ def test_timeout_branch_uses_value_at_call():
     assert unknown == ["line 9: run_solution timeout unknown"]
 
 
-def test_audit_and_pkg_warn_on_unknown_timeout(tmp_path):
+@pytest.mark.parametrize("custom_overhead", [False, True])
+def test_audit_and_pkg_use_same_timeout_budget(tmp_path, custom_overhead):
     share = tmp_path / "share"
     pkg = share / "1-hard/demo"
     (pkg / "tests").mkdir(parents=True)
@@ -1332,11 +1336,36 @@ def test_audit_and_pkg_warn_on_unknown_timeout(tmp_path):
                                    '[environment]\nnetwork_mode="no-network"')
     (pkg / "instruction.md").write_text("Demo")
     (pkg / "tests/test_outputs.py").write_text("run_solution(dynamic_limit())")
-    report = package.validate_pkg(pkg)
-    assert report["warnings"] == ["test_outputs.py: line 1: run_solution timeout unknown"]
-    assert not report["errors"]
+    if custom_overhead:
+        (pkg / "tests/test_outputs.py").write_text("run_solution(700)")
+        write_json(pkg / "provenance.json", dict(verifier_overhead_sec=240))
+        report = package.validate_pkg(pkg, load_config(overrides={"package": {"verifier_overhead_sec": 240}}))
+        assert any("700s >= verifier budget 660s" in err for err in report["errors"])
+    else:
+        report = package.validate_pkg(pkg)
+        assert report["warnings"] == ["test_outputs.py: line 1: run_solution timeout unknown"]
+        assert not report["errors"]
     script = Path(__file__).resolve().parents[1] / "scripts/audit_share.py"
     result = subprocess.run([sys.executable, script, pkg.parent], check=True, capture_output=True, text=True)
     headers, row, summary = result.stdout.splitlines()
-    assert dict(zip(headers.split("\t"), row.split("\t")))["run_solution_timeout"] == "WARN"
-    assert json.loads(summary)["flagged"]["run_solution_timeout"] == 0
+    assert dict(zip(headers.split("\t"), row.split("\t")))["run_solution_timeout"] == ("FAIL" if custom_overhead else "WARN")
+    assert json.loads(summary)["flagged"]["run_solution_timeout"] == int(custom_overhead)
+
+
+@pytest.mark.parametrize("attempt", [3, 4, 5])
+def test_s7_revision_rechecks_fixed_statement(tmp_path, wired_gates, attempt):
+    cfg, spec, _, task = wired_gates
+    store = Store(tmp_path / "store")
+    it = store.item("revision")
+    it.save()
+    task.rename(it.p("task"))
+    write_json(it.p("_spec/spec.json"), spec)
+    write_json(it.p("thresholds.json"), {"thresholds": {"score": {"threshold": 0.9, "direction": ">="}}})
+    (tmp_path / "S6A_measure.json").rename(it.p("S6A_measure.json"))
+    it.state.update(stage="S7", post_revision=True, thresholds_locked=True, attempts={"S7": attempt - 1})
+    P = SimpleNamespace(store=store, cfg=cfg)
+    stages_b.s7(P, it)
+    assert it.load().state["status"] == "active" and it.state["stage"] == "S7"
+    assert it.state["autofix_done_for"] == hashlib.sha256(it.p("task/instruction.md").read_bytes()).hexdigest()
+    stages_b.s7(P, it)
+    assert it.state["stage"] == "PKG" and it.state["gates_attempt"] == attempt + 1

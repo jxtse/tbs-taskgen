@@ -1,6 +1,7 @@
 """S9R review stage: routing after S9 labels, review job lifecycle (prepare / launch / ingest), verdict contract
 (normalize), the S8 review revision (thresholds locked, only allowed files, calibration archived and restarted
 from GLM), the second-review rule, manifest notes and withdrawal.  No Docker, no network, no real jobs."""
+import hashlib
 import json
 import subprocess
 import sys
@@ -82,7 +83,11 @@ def _runs(P, iid, sub="calib"):
     return read_json(P.store.item(iid).p(sub, "runs.json"), [])
 
 
-def _finish(jobs, job_name, reward=None, cost=5.0, verdict=None, name="trial__a"):
+def _receipt(scope, key, reward=1):
+    return dict(repro_id=key, scope_id=scope, reward=reward, exit_code=0, output_sha256="a" * 64)
+
+
+def _finish(jobs, job_name, reward=None, cost=5.0, verdict=None, name="trial__a", repros=()):
     if reward is None:
         reward = 1.0 if verdict is not None else 0.0     # a review job with a well-formed verdict has reward 1
     jd = jobs / job_name
@@ -97,6 +102,8 @@ def _finish(jobs, job_name, reward=None, cost=5.0, verdict=None, name="trial__a"
         json.dumps({"type": "assistant", "message": {"id": "m1", "content": [
             {"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "ls /app/data"}}]}}) + "\n" +
         json.dumps({"type": "result", "subtype": "success", "result": "done"}) + "\n")
+    if repros:
+        (t / "verifier/repro.jsonl").write_text("".join(json.dumps(row) + "\n" for row in repros))
     if verdict is not None:
         (t / "verifier" / "verdict.json").write_text(json.dumps(verdict))
     (jd / "result.json").write_text(json.dumps({"finished_at": "2026-11-09T01:31:00Z"}))
@@ -1012,56 +1019,46 @@ def test_suspected_scopes_bind_bundle_validator_and_ingest(tmp_path):
     prompt = (task / "instruction.md").read_text()
     assert all(s in prompt for s in (first, second, review.REVIEW_PROMPT_VERSION, "reproduce"))
     artifact = dict(classification="probe_artefact", command="python check.py", observed_reward="1",
-                    observation="The grader accepted the transformed table.",
-                    reason="Only the diagnostic file changed.")
-    verdict = dict(V("pass"), probe_findings={first: artifact})
+                    observation="The optional plotting branch was never executed.",
+                    reason="Only the diagnostic file changed.", repro_id="first-run")
+    other = dict(artifact, repro_id="second-run")
+    verdict = dict(V("pass"), probe_findings={first: artifact, second: other})
+    journal = tmp_path / "repro.jsonl"
+    rows = [_receipt(first, "first-run"), _receipt(second, "second-run"), _receipt("extra/public", "extra-run")]
+    journal.write_text("".join(json.dumps(row) + "\n" for row in rows))
 
-    def validate():
+    def check(expected):
         src = tmp_path / "verdict.json"
         write_json(src, verdict)
-        return subprocess.run([sys.executable, task / "tests/s9r_validate.py", src, tmp_path / "parsed.json"],
-                              capture_output=True, text=True)
+        validation = subprocess.run([sys.executable, task / "tests/s9r_validate.py", src, tmp_path / "parsed.json",
+                                     journal], capture_output=True, text=True)
+        assert validation.returncode == (1 if expected is None else 0), validation.stdout
+        assert review.normalize(verdict, suspected_scopes=[first, second],
+                                repros=review.read_repros(journal))["verdict"] == expected
 
-    partial = validate()
-    assert partial.returncode == 1 and second in partial.stdout
-    _finish(jobs, rec["job_name"], reward=1, verdict=verdict)
+    check("pass")
+    del verdict["probe_findings"][second]
+    check(None)
+    verdict["probe_findings"][second] = other
+    # A verdict file cannot supply its own receipts. With no trial log this attempt is invalid.
+    _finish(jobs, rec["job_name"], verdict=dict(verdict, repros=review.read_repros(journal)))
     watch_tick(P, only=[iid])
     invalid, retry = _runs(P, iid, "review")
     assert invalid["outcome"] == "invalid" and retry["suspected_scopes"] == [first, second]
-    verdict["probe_findings"][second] = dict(classification="grader_gap", issue_id="I1",
-                                            command="python check.py", observed_reward=1,
-                                            observation="The grader accepted incorrect results.", reason="missing check")
-    assert validate().returncode == 1
-    for problem, routed in (("test_gap", "revise"), ("core_invalid", "drop")):
-        verdict["issues"] = [dict(BLOCK, problem=problem)]
-        assert validate().returncode == 0
-        assert review.normalize(verdict, suspected_scopes=[first, second])["verdict"] == routed
-    verdict.update(issues=[], probe_findings={first: artifact, second: artifact})
-    artifact["observation"] = "5 passed, 1 skipped in 0.3s"
-    assert validate().returncode == 0
-    # The bundled verifier and host enforce the same contract on required and additional gaps.
-    for scope in (first, "extra/public"):
-        good = dict(artifact, classification="grader_gap", issue_id="I1")
-        verdict["issues"] = [BLOCK]
-        verdict["probe_findings"][scope] = good
-        assert validate().returncode == 0
-        assert review.normalize(verdict, suspected_scopes=[first, second])["verdict"] == "revise"
-        for field, value in (("command", "  "), ("command", "x"), ("command", "all checks passed"),
-                             ("command", "NOT RUN"), ("observation", "short"),
-                             ("observation", "I never executed the grader for this scope."),
-                             ("observation", "I did not run the grader for this scope."),
-                             ("observation", "The verifier was never run for this scope."),
-                             ("observation", "Did not run the verifier on this table."),
-                             ("command", "unable to run"), ("observation", "Skipped running the verifier for this table."),
-                             ("observed_reward", True), ("observed_reward", "unknown"), ("issue_id", "absent")):
-            verdict["probe_findings"][scope] = dict(good, **{field: value})
-            assert validate().returncode == 1
-            assert review.normalize(verdict, suspected_scopes=[first, second])["verdict"] is None
-        verdict["probe_findings"][scope] = {k: v for k, v in good.items() if k != "observed_reward"}
-        assert validate().returncode == 1
-        assert review.normalize(verdict, suspected_scopes=[first, second])["verdict"] is None
-        verdict.update(issues=[], probe_findings={first: artifact, second: artifact})
-    _finish(jobs, retry["job_name"], verdict=verdict)
+    for scope, key in ((first, "first-run"), ("extra/public", "extra-run")):
+        gap = dict(artifact, repro_id=key, classification="grader_gap", issue_id="I1")
+        verdict["probe_findings"][scope] = gap
+        check(None)
+        for problem, routed in (("test_gap", "revise"), ("core_invalid", "drop")):
+            verdict["issues"] = [dict(BLOCK, problem=problem)]
+            check(routed)
+        for change in ({"repro_id": "absent"}, {"repro_id": "second-run"}, {"observed_reward": True},
+                       {"observed_reward": 0.5}, {"observation": "short"}, {"issue_id": "absent"},
+                       {"repro_id": "", "observation": "I have not attempted to execute the grader on this scope."}):
+            verdict["probe_findings"][scope] = dict(gap, **change)
+            check(None)
+        verdict.update(issues=[], probe_findings={first: artifact, second: other})
+    _finish(jobs, retry["job_name"], verdict=verdict, repros=rows)
     watch_tick(P, only=[iid])
     assert P.store.item(iid).state["status"] == "done"
 
@@ -1135,8 +1132,8 @@ def test_disabled_review_parks_and_resumes(tmp_path):
     [rec] = _runs(P, iid, "review")
     assert rec["suspected_scopes"] == [scope]
     finding = dict(classification="probe_artefact", command="python verify.py", observation="Only the notes changed.",
-                   observed_reward="1", reason="The declared table is identical.")
-    _finish(jobs, rec["job_name"], verdict=dict(V("pass"), probe_findings={scope: finding}))
+                   observed_reward="1", reason="The declared table is identical.", repro_id="run")
+    _finish(jobs, rec["job_name"], verdict=dict(V("pass"), probe_findings={scope: finding}), repros=[_receipt(scope, "run")])
     watch_tick(P, only=[iid])
     assert P.store.item(iid).state["status"] == "done" and stages_b._released(P, iid)
 
@@ -1256,7 +1253,7 @@ def test_received_drop_survives_contract_and_regate(tmp_path, old, legacy_report
     from tbsgen.stages_b import running_jobs
     P, iid, jobs = _env(tmp_path)
     it = P.store.item(iid)
-    _current_probe(it)
+    scope = _current_probe(it)
     _to_label(P, iid, jobs)
     rec, = _runs(P, iid, "review")
     if old:
@@ -1267,7 +1264,11 @@ def test_received_drop_survives_contract_and_regate(tmp_path, old, legacy_report
         from tbsgen.cli import _running
         assert it.load().state["stage"] == "S6A_run" and running_jobs(P) == [rec["job_name"]]
         assert _running(P, iid)
-    _finish(jobs, rec["job_name"], reward=0, verdict=V("drop", [BLOCK]))
+    verdict = V("drop", [BLOCK])
+    if not old:
+        verdict["probe_findings"] = {scope: dict(classification="grader_gap", issue_id="I1", reason="Mismatch",
+            command="pytest", observed_reward=1, repro_id="run", observation="The synthetic grader reported success.")}
+    _finish(jobs, rec["job_name"], reward=0, verdict=verdict, repros=[_receipt(scope, "run")])
     watch_tick(P, only=[iid])
     assert it.load().state["status"] == "dropped" and it.state["reason"].startswith("review:drop")
     assert _runs(P, iid, "review")[0]["outcome"] == "done" and running_jobs(P) == []
@@ -1281,9 +1282,9 @@ def test_s10_review_disabled_checks_bound_findings(tmp_path, change):
     scope = _current_probe(it)
     _to_label(P, iid, jobs)
     rec, = _runs(P, iid, "review")
-    finding = dict(classification="probe_artefact", command="pytest", observed_reward="1",
+    finding = dict(classification="probe_artefact", command="pytest", observed_reward="1", repro_id="run",
                    observation="5 passed, 1 skipped in 0.3s", reason="Only diagnostic output changed.")
-    _finish(jobs, rec["job_name"], verdict=dict(V("pass"), probe_findings={scope: finding}))
+    _finish(jobs, rec["job_name"], verdict=dict(V("pass"), probe_findings={scope: finding}), repros=[_receipt(scope, "run")])
     ingest(P, it)
     P.run(only=[iid], max_steps=1)
     assert it.load().state["stage"] == "S10"
@@ -1317,13 +1318,13 @@ def test_s10_review_disabled_checks_bound_findings(tmp_path, change):
 @pytest.mark.parametrize("phrase", ["not run", "did not run", "didn't run", "was not executed", "could not run",
                                     "unable to run", "skipped running", "no run"])
 @pytest.mark.parametrize("field", ["observation", "command"])
-def test_reproduction_rejects_explicit_negations(phrase, field):
+def test_legacy_v5_reproduction_rejects_explicit_negations(phrase, field):
     finding = dict(classification="probe_artefact", command="pytest", observed_reward=0.5,
                    observation="5 passed, 1 skipped in 0.3s", reason="Only diagnostic output changed.")
     verdict = dict(V("pass"), probe_findings={"scope": finding})
-    assert not review.finding_errors(verdict, ["scope"])
+    assert not review.finding_errors(verdict, ["scope"], "s9r-v5")
     finding[field] = f"pytest ./checks.py ({phrase} in this environment)"
-    assert review.finding_errors(verdict, ["scope"])
+    assert review.finding_errors(verdict, ["scope"], "s9r-v5")
 
 
 @pytest.mark.parametrize("started", [True, False])
@@ -1517,18 +1518,206 @@ def test_legacy_manifest_hash_survives_in_place_pkg_retry(tmp_path, monkeypatch)
     assert {k: v for k, v in new.items() if k not in ("pkg_sha", "ts")} == {k: v for k, v in old.items() if k != "ts"}
 
 
-def test_v4_nonexecution_finding_gets_free_review(tmp_path):
+@pytest.mark.parametrize("contract,observation", [
+    ("s9r-v4", "I never executed the grader for this scope."),
+    ("s9r-v5", "Synthetic grader reported a passing score."),
+])
+def test_old_probe_contract_gets_free_review(tmp_path, contract, observation):
     P, iid, jobs = _env(tmp_path, review_kw={"infra_retries": 0})
     it = P.store.item(iid)
     scope = _current_probe(it)
     _to_label(P, iid, jobs)
     rec, = _runs(P, iid, "review")
     rec.pop("allowed_verdicts")
-    write_json(it.p("review/runs.json"), [dict(rec, review_contract_version="s9r-v4")])
+    write_json(it.p("review/runs.json"), [dict(rec, review_contract_version=contract)])
     finding = dict(classification="probe_artefact", command="bash /tests/test.sh", observed_reward=1,
-                   observation="I never executed the grader for this scope.", reason="Inspected the table.")
+                   observation=observation, reason="Inspected the table.")
     _finish(jobs, rec["job_name"], verdict=dict(V("pass"), probe_findings={scope: finding}))
     watch_tick(P, only=[iid])
     old, fresh = _runs(P, iid, "review")
     assert old["obsolete_probe_review"] and old["outcome"] == "infra"
     assert fresh["review_contract_version"] == review.CURRENT_CONTRACT and fresh["outcome"] is None
+
+
+def test_s7_autofix_once_per_statement(tmp_path, monkeypatch):
+    from tbsgen import stages_b
+    P, iid, _ = _env(tmp_path)
+    it = P.store.item(iid)
+    monkeypatch.setattr(gates, "run_gates", lambda *args: dict(ok=False, blocking=[], nonblocking=["thresholds_stated"]))
+    ins = it.p("task/instruction.md")
+    for version in ("Original", "Updated"):
+        ins.write_text(version)
+        it.goto("S7", "review revision")
+        stages_b.s7(P, it)
+        fixed = ins.read_bytes()
+        assert it.load().state["status"] == "active" and it.state["autofix_done_for"] == hashlib.sha256(fixed).hexdigest()
+        stages_b.s7(P, it)
+        assert it.state["reason"] == "nonblocking_unfixable:thresholds_stated" and ins.read_bytes() == fixed
+
+
+@pytest.mark.parametrize("stage", ["S9", "S9R"])
+def test_migration_adopts_manual_intent_once(tmp_path, monkeypatch, stage):
+    from tbsgen import stages_b
+    P, iid, jobs = _env(tmp_path, allow_submit=False, review_kw={"est_usd_per_run": 12})
+    it = P.store.item(iid)
+    it.state.update(stage=stage, status="active", review_round=1)
+    it.save()
+    P.run(only=[iid])
+    sub = "calib" if stage == "S9" else "review"
+    rec, = _runs(P, iid, sub)
+    assert rec["state"] == "intent"
+    write_json(jobs / rec["job_name"] / "config.json", read_json(Path(rec["config"])))
+    _finish(jobs, rec["job_name"], cost=7, verdict=V("pass") if stage == "S9R" else None)
+    write_json(it.p("gates/attempt-1.json"), {})
+    # Lose the run-record write immediately after committing the ledger reservation.
+    def interrupted(*args):
+        raise InterruptedError
+
+    with monkeypatch.context() as m:
+        m.setattr(stages_b, "_save_run" if stage == "S9" else "_save_review", interrupted)
+        with pytest.raises(InterruptedError):
+            stages_b.migrate_probe_report(P, it.load())
+    assert stages_b.migrate_probe_report(P, it.load())
+    adopted, = _runs(P, iid, sub)
+    with P.ledger._db() as db:
+        assert db.execute("SELECT stage, est_usd, reservation_key FROM calls").fetchall() == [
+            (stage, 30 if stage == "S9" else 12, "harbor-adopt:" + rec["job_name"])]
+    assert adopted["recovered"] and adopted["state"] == "launched"
+    watch_tick(P, only=[iid], max_steps=0)
+    assert it.load().state["stage"] == "S6A_run" and it.state["status"] == "active"
+    assert P.item_cost(iid)["usd"] == 7 and P.item_cost(iid)["calls"] == 1
+
+
+@pytest.mark.parametrize("upgrade", [False, True])
+def test_unstarted_review_releases_budget_and_slot(tmp_path, upgrade):
+    from tbsgen import stages_b
+    P, iid, _ = _env(tmp_path, allow_submit=False, max_concurrent_jobs=1)
+    it = P.store.item(iid)
+    _current_probe(it)
+    it.state.update(stage="S9R", review_round=1)
+    it.save()
+    P.run(only=[iid])
+    rec, = _runs(P, iid, "review")
+    P.cfg["budget"]["run_calls_per_model"] = {rec["model"]: 1}
+    call = P.ledger.reserve(rec["model"], "S9R", iid, True, est_usd=30)
+    if upgrade:
+        rec["review_contract_version"] = "s9r-v5"
+    write_json(it.p("review/runs.json"), [dict(rec, state="reserved", ledger_call=call)])
+    P.cfg["review"]["enabled"] = upgrade
+    it.goto("S9R", "restart")
+    assert stages_b.running_jobs(P) == [rec["job_name"]]
+    stages_b.s9r(P, it)
+    cancelled = _runs(P, iid, "review")[0]
+    assert cancelled["state"] == "cancelled_unstarted" and cancelled["cost_usd"] == 0
+    assert P.item_cost(iid)["calls"] == 0 and stages_b._slots_full(P) is None
+    assert P.ledger.reserve(rec["model"], "S9R", "another-item", True, est_usd=30) != call
+    if upgrade:
+        assert _runs(P, iid, "review")[1]["review_contract_version"] == "s9r-v6"
+    else:
+        assert it.state["reason"] == "parked:probe_unreviewed"
+
+
+def test_packaged_repro_records_fresh_reward_and_verifier_exports_it(tmp_path):
+    P, iid, _ = _env(tmp_path)
+    it = P.store.item(iid)
+    scope = _current_probe(it)
+    task = review.build_task(P.cfg, it.dir, it.state, 1)
+    logs = tmp_path / "logs"
+    verifier = logs / "verifier"
+    verifier.mkdir(parents=True)
+    reward = verifier / "reward.txt"
+    reward.write_text("1")
+    # Map the generated image's absolute paths to an isolated directory.
+    helper = task / "environment/tbs-repro"
+    helper.write_text(helper.read_text().replace('Path("/logs")', f"Path({str(logs)!r})"))
+    def run(code):
+        result = subprocess.run([helper, scope, "--", sys.executable, "-c", code], capture_output=True, check=False)
+        row = json.loads(result.stdout)
+        assert row["exit_code"] == result.returncode and row["scope_id"] == scope
+        assert row["output_sha256"] == hashlib.sha256(result.stderr).hexdigest()
+        return row
+
+    first = run("import sys; sys.exit(4)")
+    assert first["reward"] is None and first["exit_code"] == 4
+    second = run(f"import sys; print('out', flush=True); print('err', file=sys.stderr); open({str(reward)!r}, 'w').write('0.5')")
+    assert second["reward"] == 0.5 and second["repro_id"] != first["repro_id"]
+    assert [json.loads(line) for line in (logs / "review/repro.jsonl").read_text().splitlines()] == [first, second]
+
+    output = tmp_path / "review_out"
+    finding = dict(repro_id=second["repro_id"], classification="probe_artefact", reason="Synthetic smoke test.",
+                   command="python", observed_reward=0.5, observation="The optional branch was never executed.")
+    write_json(output / "verdict.json", dict(V("pass"), probe_findings={scope: finding}))
+    script = (task / "tests/test.sh").read_text().replace("/tests/", str(task / "tests") + "/")
+    script = script.replace("/logs/", str(logs) + "/").replace("/app/review_out/", str(output) + "/")
+    subprocess.run(["bash", "-c", script], check=True)
+    assert reward.read_text().strip() == "1"
+    assert (verifier / "repro.jsonl").read_bytes() == (logs / "review/repro.jsonl").read_bytes()
+    assert review.normalize(review.read_verdict(logs), suspected_scopes=[scope],
+                            repros=review.read_repros(verifier / "repro.jsonl"))["verdict"] == "pass"
+
+
+def test_received_drop_without_bound_gate_report(tmp_path):
+    from tbsgen import stages_b
+    P, iid, jobs = _env(tmp_path)
+    it = P.store.item(iid)
+    _current_probe(it)
+    _to_label(P, iid, jobs)
+    rec, = _runs(P, iid, "review")
+    _v2_job(it, rec)
+    _finish(jobs, rec["job_name"], verdict=V("drop", [BLOCK]))
+    ingest(P, it)
+    it.p("gates/attempt-1.json").unlink()
+    assert stages_b.migrate_probe_report(P, it.load())
+    assert it.state["status"] == "dropped" and it.state["reason"].startswith("review:drop")
+
+
+def test_old_harden_revert_selects_original_report(tmp_path):
+    from tbsgen import stages_b
+    P, iid, _ = _env(tmp_path)
+    it = P.store.item(iid)
+    scope = _current_probe(it)
+    it.p("gates/attempt-1.json").rename(it.p("gates/attempt-2.json"))
+    write_json(it.p("gates/attempt-1.json"), dict(ok=False, probe_policy_version=gates.PROBE_POLICY_VERSION))
+    del it.state["gates_attempt"]
+    it.state["history"] = [dict(stage="S7", result="ok", attempt=2),
+                           dict(stage="S9", result="harden", round=1, to="S5G"),
+                           dict(stage="S7", result="ok", attempt=1),
+                           dict(stage="PKG", result="harden_revert", to="S9")]
+    assert stages_b._probe_scopes(it) == [scope]
+
+
+@pytest.mark.parametrize("stage", ["S4c", "S5G", "S9", "S9R"])
+def test_crash_parking_releases_only_unstarted_jobs(tmp_path, monkeypatch, stage):
+    from tbsgen import pipeline, stages_b
+    P, iid, jobs = _env(tmp_path, allow_submit=False)
+    it = P.store.item(iid)
+    it.state.update(stage=stage, review_round=1)
+    it.save()
+    sub = "calib" if stage == "S9" else "review"
+    records = []
+    for name in ("reserved", "starting"):
+        call = P.ledger.reserve("model", stage, iid, True, est_usd=12)
+        records.append(dict(state="reserved", job_dir=str(jobs / name), launch_attempted=name == "starting",
+                            job_name=name, outcome=None, ledger_call=call))
+    agent_stage = stage in ("S4c", "S5G")
+    if agent_stage:
+        write_json(it.p(stage, "run.json"), records[0])
+        write_json(it.p(sub, "runs.json"), records[1:])
+    else:
+        write_json(it.p(sub, "runs.json"), records)
+
+    def fail(*args):
+        raise ValueError("synthetic failure")
+
+    monkeypatch.setitem(pipeline.HANDLERS, stage, fail)
+    for _ in range(2):
+        P.step(it)
+    assert it.state["status"] == "parked"
+    if agent_stage:
+        cancelled = read_json(it.p(stage, "run.json"))
+        starting, = _runs(P, iid, sub)
+    else:
+        assert stages_b.running_jobs(P) == ["starting"]
+        cancelled, starting = _runs(P, iid, sub)
+    assert cancelled["state"] == "cancelled_unstarted" and starting == records[1]
+    assert P.item_cost(iid)["calls"] == 1

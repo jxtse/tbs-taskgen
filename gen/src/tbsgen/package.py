@@ -20,6 +20,7 @@ from pathlib import Path
 
 from . import sandbox
 from .spec import valid_pins
+from .state import read_json
 from .runner import TEST_SH, metrics_helper_text, timing_budget
 
 TASK_TOML = """schema_version = "1.0"
@@ -149,7 +150,9 @@ def package(cfg: dict, item_dir: Path, gen0: Path, spec: dict, provenance: dict)
         domain=_q(spec.get("domain", "")), field=_q(spec.get("field", "")), form=_q(spec.get("form", "")),
         expert_h=float(spec.get("expert_time_hours", 2.0)), verifier_sec=float(pk["verifier_timeout"]) + timing_budget(cfg, spec),
         agent_sec=float(pk["agent_hours"] * 3600), cpus=TASK_CPUS, **network_policy(cfg)))
-    (out / "provenance.json").write_text(json.dumps(dict(provenance, extra_pip=spec.get("extra_pip", [])), indent=1, ensure_ascii=False, default=str))
+    provenance = dict(provenance, extra_pip=spec.get("extra_pip", []),
+                      verifier_overhead_sec=pk.get("verifier_overhead_sec", 120))
+    (out / "provenance.json").write_text(json.dumps(provenance, indent=1, ensure_ascii=False, default=str))
     for p in (out / "tests" / "test.sh", out / "solution" / "solve.sh"):
         p.chmod(0o755)
     return out
@@ -383,6 +386,7 @@ def sandbox_pin_errors(cfg: dict, pins: list) -> list[str]:
 
 
 def validate_pkg(pkg: Path, cfg: dict | None = None) -> dict:
+    provenance = read_json(pkg / "provenance.json", {})
     missing = [r for r in REQUIRED if not (pkg / r).exists()]
     errs, warnings = [], []
     try:
@@ -395,7 +399,7 @@ def validate_pkg(pkg: Path, cfg: dict | None = None) -> dict:
         policy = ((cfg or {}).get("package", {}).get("network") or {}).get("mode", "agent-allowlist")
         network, warnings = network_errors(t, policy)
         errs.extend(network)
-        overhead = float((cfg or {}).get("package", {}).get("verifier_overhead_sec", 120))
+        overhead = float((cfg or {}).get("package", {}).get("verifier_overhead_sec", provenance.get("verifier_overhead_sec", 120)))
         budget = float(t["verifier"]["timeout_sec"]) - overhead
         for name in ("measure.py", "test_outputs.py"):
             path = pkg / "tests" / name
@@ -406,8 +410,7 @@ def validate_pkg(pkg: Path, cfg: dict | None = None) -> dict:
     except Exception as e:  # noqa: BLE001
         errs.append(f"task.toml: {e}")
     if cfg is not None and not missing:
-        from .state import read_json
-        pins = read_json(pkg / "provenance.json", {}).get("extra_pip", [])
+        pins = provenance.get("extra_pip", [])
         errs.extend(sandbox_pin_errors(cfg, pins))
         errs += verifier_time_errors(pkg, float((cfg.get("package") or {}).get("verifier_overhead_sec", 120)))
     leaked = [str(p.relative_to(pkg)) for p in (pkg / "environment").rglob("*")

@@ -538,7 +538,7 @@ def _agent_stage(P, it, kind: str, instruction: str, need: list[str], timeout_s:
             rec.get("harden_round", 0) != rnd["round"]:
         rec["retry"] = True                     # a finished job of another version never counts for this round
         write_json(recp, rec)
-    if rec is not None and rec.get("state") == "launch_failed":
+    if rec is not None and rec.get("state") in ("launch_failed", "cancelled_unstarted"):
         rec["retry"] = True                     # infrastructure: a resumed item launches a fresh job
         rec["state"] = "finished"
         if rec.get("not_started"):
@@ -904,7 +904,8 @@ def _s5g(P, it):
         ht, hu = d.get("harden_authoring_timeout_s"), d.get("harden_authoring_max_usd")
         base = it.state.get("harden_base") or {}
         if base.get("round") != hround:
-            return it.finish("parked", f"harden:no_round_base:{hround}")
+            from .stages_b import finish_job_stage
+            return finish_job_stage(P, it, "parked", f"harden:no_round_base:{hround}")
         rnd = dict(round=hround, base=base, timeout_s=float(tmo if ht is None else ht),
                    max_usd=c.get("authoring_max_usd", 20.0) if hu is None else hu)
     rec = _agent_stage(P, it, "S5G", instruction, need, tmo, c.get("authoring_max_usd", 20.0),

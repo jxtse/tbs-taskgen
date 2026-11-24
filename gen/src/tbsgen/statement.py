@@ -65,8 +65,8 @@ def declared_outputs(spec, statement):
         input_clause = False
         prev_end = 0
         for match in FILE_TOKEN.finditer(line):
-            for cue in re.finditer(r"\b(from|using|given|write|produce|submit|save)\b|[.;]", line[prev_end:match.start()], re.I):
-                input_clause = cue[0].lower() in ("from", "using", "given")
+            for cue in re.finditer(r"\b(from|using|given|read|write|generate|produce|submit|save)\b|[.;]", line[prev_end:match.start()], re.I):
+                input_clause = cue[0].lower() in ("from", "using", "given", "read")
             prev_end = match.end()
             if input_clause:
                 list_end = None
@@ -74,7 +74,7 @@ def declared_outputs(spec, statement):
             path = match[0]
             explicit_path = path.startswith(("/app/output/", "<output_dir>/", "output/"))
             relative = not path.startswith(("/", "data/"))
-            declaration = re.search(r"\b(?:write|produce|submit|save|deliverables?:|outputs?:)\s+[`*]*$",
+            declaration = re.search(r"\b(?:write|generate|produce|submit|save|deliverables?:|outputs?:)\s+[`*]*$",
                                     line[:match.start()], re.I)
             continuation = list_end is not None and re.fullmatch(
                 r"[`*]*\s*(?:,\s*(?:(?:and|or)\s+)?|(?:and|or)\s+)[`*]*", line[list_end:match.start()], re.I)

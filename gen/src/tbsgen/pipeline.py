@@ -15,7 +15,7 @@ import traceback
 from pathlib import Path
 
 from . import blocklist, intake, screen_jev, stages_a as A, stages_b as B
-from .budget import EXCLUDE_MIGRATION_CANCELLATIONS, BudgetStop, Ledger, harden_scope, today, variant_scope
+from .budget import EXCLUDE_UNSTARTED_JOBS, BudgetStop, Ledger, harden_scope, today, variant_scope
 from .config import resolve_role
 from .models import ModelError, get_client
 from .state import STAGES, Store, read_json, write_json
@@ -111,7 +111,7 @@ class Pipeline:
     def item_cost(self, item_id: str) -> dict:
         with self.ledger._db() as db:
             r = db.execute("SELECT count(*), SUM(COALESCE(usd,0)), SUM(in_tok), SUM(out_tok) FROM calls "
-                           f"WHERE item=? AND {EXCLUDE_MIGRATION_CANCELLATIONS}",
+                           f"WHERE item=? AND {EXCLUDE_UNSTARTED_JOBS}",
                            (item_id,)).fetchone()
         return dict(calls=r[0], usd=round(r[1] or 0, 4), in_tok=r[2] or 0, out_tok=r[3] or 0)
 
@@ -146,6 +146,16 @@ class Pipeline:
         with harden_scope(hk), variant_scope(vk):
             return self._step(it)
 
+    def _finish_failed_stage(self, it, stage, status, reason, **info):
+        if stage in ("S4c", "S5G", "S9", "S9R"):
+            previous_status = it.state["status"]
+            with B.item_lock(it):
+                it.load()
+                if it.state["stage"] == stage and it.state["status"] == previous_status:
+                    B.finish_job_stage(self, it, status, reason, **info)
+        else:
+            it.finish(status, reason, **info)
+
     def _step(self, it) -> str:
         if B.migrate_probe_report(self, it):
             return "ok"
@@ -170,7 +180,7 @@ class Pipeline:
                 # this paper's authoring allowance (budget.item_usd_cap, item_harden_usd_cap in a hardening round,
                 # item_variant_usd_cap in an S9b variant round) is used up: final for the paper / the round, and
                 # the model stays available for the others
-                it.finish("dropped", e.reason + "_cap", detail=e.detail)
+                self._finish_failed_stage(it, st, "dropped", e.reason + "_cap", detail=e.detail)
                 if B.harden_needs_step(it):
                     B.harden_step(self, it)     # a hardened version: back to the previous one
                 self.store.event("budget_stop", item=it.item_id, stage=st, reason=e.reason, detail=e.detail)
@@ -187,14 +197,14 @@ class Pipeline:
                 self.stopped_models.add(alias if role else st)
                 return "paused"
             if n >= 2:
-                it.finish("parked", f"model_error:{st}:{e.cls}")
+                self._finish_failed_stage(it, st, "parked", f"model_error:{st}:{e.cls}")
             return "error"
         except Exception as e:  # noqa: BLE001  (bug or unexpected data: park the item, keep the run going)
             self.store.event("stage_crash", item=it.item_id, stage=st, err=f"{type(e).__name__}: {e}",
                              tb=traceback.format_exc()[-1500:])
             n = it.bump(f"crash:{st}")
             if n >= 2:
-                it.finish("parked", f"crash:{st}:{type(e).__name__}")
+                self._finish_failed_stage(it, st, "parked", f"crash:{st}:{type(e).__name__}")
             return "crash"
         self.store.event("stage_end", item=it.item_id, stage=st, to=it.state["stage"], status=it.state["status"],
                          sec=round(time.time() - t0, 2))

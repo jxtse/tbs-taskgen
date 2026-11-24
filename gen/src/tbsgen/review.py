@@ -10,7 +10,7 @@ teacher).  Its network is that of the teacher: the model endpoint during the age
 The agent writes /app/review_out/verdict.json:
     {"verdict": "pass" | "revise" | "drop",
      "checklist": {"a_consistency": {"status": "ok"|"issue"|"na", "note": ...}, ... "g_calibration": {...}},
-     "probe_findings": {"<arm>/<scope>": {"classification", "command", "observed_reward", "observation", "reason", ...}},
+     "probe_findings": {"<arm>/<scope>": {"classification", "repro_id", "command", "observed_reward", "observation", "reason", ...}},
      "issues": [{"id", "category", "severity": "blocking"|"minor", "fix_kind": "local"|"fundamental", "title",
                  "evidence": [...], "fix"}],
      "label_assessment": {"label": ..., "trustworthy": true|false|null, "reason": ...},
@@ -42,7 +42,7 @@ from pathlib import Path
 
 from . import calib
 from .gates import current_probe_report
-from .probe_findings import CURRENT_CONTRACT, finding_errors, has_evidence
+from .probe_findings import CURRENT_CONTRACT, finding_errors, has_evidence, read_repros
 from .state import passed_gate_attempt, passed_gate_report, read_json, write_json
 
 VERDICTS = ("pass", "revise", "drop")
@@ -409,8 +409,12 @@ def build_task(cfg: dict, item_dir: Path, state: dict, rnd: int, out: Path | Non
     for p in env_src.iterdir():
         (shutil.copytree if p.is_dir() else shutil.copy2)(p, out / "environment" / p.name)
     info = write_bundle(item_dir, out / "environment" / "review", state, int(r.get("trace_digest_kb") or 150))
+    helper = out / "environment/tbs-repro"
+    shutil.copyfile(Path(__file__).with_name("repro.py"), helper)
+    helper.chmod(0o755)
     df = (out / "environment" / "Dockerfile")
     df.write_text(df.read_text().rstrip() + "\n# S9R review bundle (tbsgen review.build_task)\nCOPY review /review\n"
+                  "COPY tbs-repro /usr/local/bin/tbs-repro\n"
                   "RUN mkdir -p /tests /solution /app/review_out /logs/verifier && cp -r /review/pkg/tests/. /tests/ && "
                   "cp -r /review/pkg/solution/. /solution/\n")
     t = tomllib.loads((pkg / "task.toml").read_text())
@@ -436,10 +440,7 @@ def build_task(cfg: dict, item_dir: Path, state: dict, rnd: int, out: Path | Non
     (out / "tests" / "test.sh").write_text(TEST_SH)
     (out / "tests" / "test.sh").chmod(0o755)
     (out / "solution").mkdir()
-    smoke_finding = dict(classification="probe_artefact", reason="synthetic harness smoke test",
-                         command="python -m pytest", observed_reward=1, observation="Synthetic verifier smoke test.")
-    smoke_findings = {scope: smoke_finding for scope in info["suspected_scopes"]}
-    (out / "solution" / "solve.sh").write_text(ORACLE_SH.replace("{findings}", json.dumps(smoke_findings)))
+    (out / "solution" / "solve.sh").write_text(ORACLE_SH.replace("{scopes}", repr(info["suspected_scopes"])))
     (out / "solution" / "solve.sh").chmod(0o755)
     return out
 
@@ -448,9 +449,15 @@ TEST_SH = """#!/bin/bash
 # S9R review task verifier: keep the reviewer's verdict and check its structure (reward 1 = a well-formed verdict;
 # it says nothing about the task under review).
 mkdir -p /logs/verifier
+echo 0 > /logs/verifier/reward.txt
 cp -f /app/review_out/verdict.json /logs/verifier/verdict.raw.json 2>/dev/null || true
 cp -f /app/review_out/report.md /logs/verifier/report.md 2>/dev/null || true
-if python3 /tests/s9r_validate.py /app/review_out/verdict.json /logs/verifier/verdict.json; then
+if [ -f /logs/review/repro.jsonl ]; then
+  cp /logs/review/repro.jsonl /logs/verifier/repro.jsonl || exit 1
+else
+  rm -f /logs/verifier/repro.jsonl
+fi
+if python3 /tests/s9r_validate.py /app/review_out/verdict.json /logs/verifier/verdict.json /logs/verifier/repro.jsonl; then
   echo 1 > /logs/verifier/reward.txt
 else
   echo 0 > /logs/verifier/reward.txt
@@ -460,15 +467,25 @@ fi
 ORACLE_SH = """#!/bin/bash
 # oracle of the review task (harness smoke test only): a well-formed "pass" verdict
 mkdir -p /app/review_out
-cat > /app/review_out/verdict.json <<'EOF'
-{"verdict": "pass", "probe_findings": {findings}, "issues": [], "checklist": {}, "label_assessment": {"label": null, "trustworthy": null,
- "reason": "oracle smoke test"}, "summary": "oracle smoke test of the S9R harness"}
-EOF
+python3 - <<'PYTHON'
+import json, subprocess
+from pathlib import Path
+findings = {}
+for scope in {scopes}:
+    run = subprocess.run(["tbs-repro", scope, "--", "bash", "/review/pkg/tests/test.sh"],
+                         stdout=subprocess.PIPE, text=True)
+    row = json.loads(run.stdout)
+    findings[scope] = dict(classification="probe_artefact", reason="Synthetic review harness smoke test.",
+                           command="bash /review/pkg/tests/test.sh", repro_id=row["repro_id"],
+                           observed_reward=row["reward"], observation="Packaged grader completed the smoke test.")
+Path("/app/review_out/verdict.json").write_text(json.dumps(dict(verdict="pass", probe_findings=findings,
+    issues=[], checklist={}, label_assessment={}, summary="Synthetic review harness smoke test.")))
+PYTHON
 """
 
 VALIDATOR = r'''"Structure check of /app/review_out/verdict.json (S9R).  Writes the parsed verdict to argv[2]."""
 import json, sys
-from probe_findings import finding_errors
+from probe_findings import finding_errors, read_repros
 src, dst = sys.argv[1], sys.argv[2]
 try:
     v = json.load(open(src))
@@ -488,7 +505,7 @@ for i, it in enumerate(v.get("issues") or [] if isinstance(v.get("issues", []), 
         errs.append(f"issues[{i}].severity must be blocking|minor")
     elif it.get("severity") == "blocking" and it.get("problem") not in PROBLEMS:
         errs.append(f"issues[{i}].problem must be one of {sorted(PROBLEMS)} on a blocking issue")
-errs.extend(finding_errors(v, {suspected}))
+errs.extend(finding_errors(v, {suspected}, repros=read_repros(sys.argv[3] if len(sys.argv) > 3 else "/logs/review/repro.jsonl")))
 json.dump(v, open(dst, "w"), indent=1)
 print("\n".join(errs) or "ok")
 sys.exit(1 if errs else 0)
@@ -610,7 +627,8 @@ e. **Shortcuts and leaks.**  Can the task be passed without doing the work (hard
    For EACH ID, reproduce the scoped run with the packaged grader. The exact transformations and CLI wrapper are in
    `records/probe_outputs.py` when probes are present. Change only the named public or hidden scope and check
    which changed values the statement requires and the grader scores. In `probe_findings`, record the exact ID,
-   the executable command line you ran in `command`, its `observed_reward` ("0", "1", or a number), and an `observation` of at least
+   the `repro_id` printed by `tbs-repro <scope_id> -- <command...>`, the wrapped command line in `command`,
+   its `observed_reward` ("0", "1", or a number), and an `observation` of at least
    20 characters describing the grader output. An optional `reproduction` note may add context.
    Classify a real grader gap as `grader_gap` and link an evidenced blocking issue by `issue_id`. This applies
    to additional grader gaps you find too. For a `probe_artefact`, explain why the changed files or values do
@@ -697,7 +715,7 @@ Write `{verdict_path}` (JSON, exactly these keys) and optionally `/app/review_ou
     "h_timing_gate": {{"status": "...", "note": "..."}}
   }},
   "probe_findings": {{"<required scope ID>": {{"classification": "grader_gap | probe_artefact",
-    "command": "exact command run", "observed_reward": 1, "observation": "describe the actual grader output",
+    "repro_id": "ID printed by tbs-repro", "command": "exact command run", "observed_reward": 1, "observation": "describe the actual grader output",
     "reason": "why", "issue_id": "required for grader_gap"}}}},
   "issues": [
     {{"id": "I1", "category": "a|b|c|d|e|f|g|h|i|j", "severity": "blocking | minor",
@@ -722,7 +740,7 @@ def job_contract(job):
 
 
 def normalize(raw: dict | None, reward: float | None = None, allow_human: bool = False, suspected_scopes=(),
-              contract=CURRENT_CONTRACT, allowed_verdicts=None) -> dict:
+              contract=CURRENT_CONTRACT, allowed_verdicts=None, repros=None) -> dict:
     """Apply the contract to a raw verdict: returns {verdict, raw_verdict, issues, blocking, minor, downgraded,
     label_assessment, checklist, problems}.  verdict None = invalid (structural problem: unknown verdict or
     severity, non-object issue, blocking issue without a fix_kind, verifier reward != 1 when known) — the caller
@@ -785,7 +803,7 @@ def normalize(raw: dict | None, reward: float | None = None, allow_human: bool =
                 problems.append(f"{it['id']}: blocking issue without a problem class (or fix_kind)")
                 hard.append(it["id"])
         issues.append(it)
-    errors = finding_errors(raw, suspected_scopes, contract)
+    errors = finding_errors(raw, suspected_scopes, contract, repros)
     hard.extend(errors)
     problems.extend(errors)
     if reward is not None and reward != 1:
@@ -796,6 +814,8 @@ def normalize(raw: dict | None, reward: float | None = None, allow_human: bool =
         allowed_verdicts = VERDICTS + (ALLOWED_HUMAN if allow_human else ())
     if rv not in allowed_verdicts:
         problems.append(f"verdict {rv!r} not one of {allowed_verdicts}")
+        v = None
+    elif contract == CURRENT_CONTRACT and errors:
         v = None
     elif rv == "drop" and blocking:
         v = "drop"
@@ -860,8 +880,9 @@ def classify(job_dir: Path, model: str | None, prices: dict, allow_human: bool =
         rw = ((json.loads((trial / "result.json").read_text()).get("verifier_result") or {}).get("rewards") or {})
         reward = rw.get("reward")
         reward = float(reward) if isinstance(reward, (int, float)) else 0.0
-    return dict(outcome="done" if raw is not None else "infra", verdict_raw=raw, verifier_reward=reward,
-                verdict=normalize(raw, reward, allow_human, suspected_scopes, contract, allowed_verdicts)
+    repros = read_repros(trial / "verifier/repro.jsonl") if trial and contract == CURRENT_CONTRACT else {}
+    return dict(outcome="done" if raw is not None else "infra", verdict_raw=raw, verifier_reward=reward, repros=repros,
+                verdict=normalize(raw, reward, allow_human, suspected_scopes, contract, allowed_verdicts, repros)
                 if raw is not None else None,
                 trial=dict(last, job_dir=str(Path(job_dir).resolve()),
                            verdict_trial=trial.name if trial else None),

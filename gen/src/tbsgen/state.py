@@ -59,13 +59,15 @@ def passed_gate_attempt(state: dict) -> int | None:
     if "gates_attempt" in state:
         return state["gates_attempt"]
     # Before the explicit binding, Item.advance recorded the passing attempt in history.
-    reverted = None
+    revert = None
     for h in reversed(state.get("history", [])):
-        if reverted is not None:
-            if h.get("round") == reverted and h.get("to") == "S5G":
-                reverted = None
+        if revert is not None:
+            if (h.get("to") == "S5G" and h.get("result") in ("harden", "variant")
+                    and revert.get("round") in (None, h.get("round"))):
+                revert = None
         elif h.get("result") == "harden_revert":
-            reverted = h.get("round")
+            # Older revert entries omitted the round. Its start is the preceding harden/variant transition.
+            revert = h
         elif h.get("stage") == "S7" and h.get("result") == "ok":
             return h.get("attempt")
     return None

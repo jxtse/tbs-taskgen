@@ -363,7 +363,8 @@ def launch(cfg: dict, rec: dict, ledger, save) -> dict:
         # its printed command was already run (by hand): take the job over as it is (task, config, identity
         # unchanged); no preparation, path rewrite or pre-submit check applies to a job that exists
         rec["ledger_call"] = ledger.reserve(rec["model"], rec.get("ledger_stage", "S9"), rec["item"], True,
-                                            est_usd=float(c["est_usd_per_run"])) if ledger is not None else None
+                                            est_usd=float(c["est_usd_per_run"]),
+                                            reservation_key=f"harbor-adopt:{rec['job_name']}") if ledger is not None else None
         rec.update(state="launched", submitted=True, recovered=True)
         save(rec)
         return rec

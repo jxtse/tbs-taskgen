@@ -14,7 +14,7 @@ from tbsgen.state import read_json
 from tbsgen.statement import statement_clean, threshold_format
 
 
-def audit(root, runs_root):
+def audit(root, runs_root, verifier_overhead_sec=120):
     with (root.parent / "INDEX.csv").open(newline="") as f:
         index = {r["task_id"]: r for r in csv.DictReader(f)}
     rows, records = [], []
@@ -34,7 +34,7 @@ def audit(root, runs_root):
                         competencies=meta["task"].get("keywords", []), metrics=[{"name": n} for n in thresholds])
         records.append(diversity.template(item, {**metadata, **spec}, prov))
         text = (pkg / "instruction.md").read_text()
-        budget = meta["verifier"]["timeout_sec"] - 120
+        budget = meta["verifier"]["timeout_sec"] - prov.get("verifier_overhead_sec", verifier_overhead_sec)
         time_errors, time_warnings = [], []
         for name in ("measure.py", "test_outputs.py"):
             path = pkg / "tests" / name
@@ -52,8 +52,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("hard_dir", type=Path, help="share's 1-hard directory")
     parser.add_argument("--runs-root", type=Path, help="read the full specs for pipeline-authored packages")
+    parser.add_argument("--verifier-overhead-sec", type=float, default=120,
+                        help="verifier overhead for packages without it in provenance.json")
     args = parser.parse_args()
-    rows, report = audit(args.hard_dir, args.runs_root)
+    rows, report = audit(args.hard_dir, args.runs_root, args.verifier_overhead_sec)
     keys = ("statement_clean", "threshold_format", "run_solution_timeout", "network_explicit", "hidden_duplicates")
     print("\t".join(("item", *keys)))
     for row in rows:

@@ -26,7 +26,7 @@ import time
 from pathlib import Path
 
 CN = dt.timezone(dt.timedelta(hours=8))
-EXCLUDE_MIGRATION_CANCELLATIONS = "COALESCE(cost_kind,'') != 'probe_migration_cancelled'"
+EXCLUDE_UNSTARTED_JOBS = "COALESCE(cost_kind,'') NOT IN ('probe_migration_cancelled','cancelled_unstarted')"
 # hardening round of the item being stepped (Pipeline.step sets it while state.harden_active; 0 = not a hardening
 # round).  Every reservation is tagged with it (calls.harden), so budget.item_harden_usd_cap can keep a hardening
 # round's authoring spend (S5G, S6A, S6M, S6C, S7, S8 ...) apart from the first version's budget.item_usd_cap.
@@ -206,7 +206,7 @@ class Ledger:
             cap_r = (b.get("run_calls_per_model") or {}).get(model)
             # call-count caps count calls that were made: a reservation the model relay refused at its preflight
             # (cost_kind relay_refused, calib.relay_preflight_refused: no Harbor job, no model call) is no call
-            made = f"AND COALESCE(cost_kind,'') NOT IN ('relay_refused', 'diversity_parked') AND {EXCLUDE_MIGRATION_CANCELLATIONS}"
+            made = f"AND COALESCE(cost_kind,'') NOT IN ('relay_refused', 'diversity_parked') AND {EXCLUDE_UNSTARTED_JOBS}"
             if cap_r is not None:
                 n = db.execute(f"SELECT count(*) FROM calls WHERE model=? AND real=1 {made}", (model,)).fetchone()[0]
                 if n >= int(cap_r):
@@ -335,7 +335,7 @@ class Ledger:
 
     def summary(self, day: str | None = None) -> dict:
         q = ("SELECT model, stage, real, count(*), SUM(status='error'), SUM(in_tok), SUM(out_tok), SUM(cache_read), "
-             f"SUM(COALESCE(usd,est_usd,0)) FROM calls WHERE {EXCLUDE_MIGRATION_CANCELLATIONS} {{}} GROUP BY model, stage, real "
+             f"SUM(COALESCE(usd,est_usd,0)) FROM calls WHERE {EXCLUDE_UNSTARTED_JOBS} {{}} GROUP BY model, stage, real "
              "ORDER BY model, stage")
         with self._db() as db:
             rows = db.execute(q.format("AND day=?" if day else ""), (day,) if day else ()).fetchall()

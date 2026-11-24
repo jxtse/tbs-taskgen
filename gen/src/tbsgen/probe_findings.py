@@ -1,34 +1,12 @@
 """Shared by the review-task verifier and the host when ingesting a verdict."""
 
+import json
 import math
+from pathlib import Path
 import re
-import shlex
 
 
-CURRENT_CONTRACT = "s9r-v5"
-_NEVER_EXECUTED = re.compile(r"\b(?:(?:never|(?:did\s+)?not|didn['’]t)\s+(?:run|executed?)|"
-                             r"(?:was|were)\s+never\s+(?:run|executed))\b", re.I)
-_NOT_RUN = re.compile(r"\b(?:(?:did\s+)?not\s+run|didn['’]t\s+run|was\s+not\s+executed|"
-                      r"could(?:\s+not|n['’]t)\s+run|unable\s+to\s+run|skipped\s+running|no\s+run)\b", re.I)
-_V3_NOT_RUN = re.compile(r"\b(?:not\s+run|didn['’]t\s+run|could(?:\s+not|n['’]t)\s+run|"
-                         r"unable\s+to\s+run|skipped)\b", re.I)
-
-
-def _looks_like_command(value):
-    if len(value.strip()) < 4:
-        return False
-    try:
-        tokens = shlex.split(value)
-    except ValueError:
-        return False
-    if not tokens:
-        return False
-    # Paths, conventional executable names, and custom tools invoked with options.
-    return any("/" in t and t.rsplit("/", 1)[-1] for t in tokens) or bool(
-        re.fullmatch(r"(?:python[0-9.]*|pytest|bash|sh|env|make|ctest|just|uv|node|npm|cargo|go|ruby|Rscript|"
-                     r"echo|cat|grep|awk|sed|diff|cmp|test|true|false|"
-                     r"[a-zA-Z][\w.-]*[-_.][\w.-]+)", tokens[0])
-        or re.fullmatch(r"[a-zA-Z][\w.-]*", tokens[0]) and any(t.startswith("-") for t in tokens[1:]))
+CURRENT_CONTRACT = "s9r-v6"
 
 
 def has_evidence(ev) -> bool:
@@ -41,10 +19,40 @@ def has_evidence(ev) -> bool:
     return False
 
 
-def finding_errors(verdict, suspected_scopes, contract=CURRENT_CONTRACT):
+def read_repros(path):
+    """Index the trial's helper records. A duplicate identifier cannot identify a run."""
+    records = {}
+    try:
+        with Path(path).open() as journal:
+            for line in journal:
+                row = json.loads(line)
+                if not isinstance(row, dict) or not isinstance(row.get("repro_id"), str):
+                    continue
+                key = row["repro_id"]
+                records[key] = None if key in records else row
+    except (FileNotFoundError, ValueError):
+        return {}
+    return records
+
+
+def _matches_run(finding, scope, records):
+    key = finding.get("repro_id")
+    row = records.get(key) if isinstance(key, str) and key else None
+    reward = finding["observed_reward"]
+    if isinstance(reward, str):
+        reward = int(reward)  # only the legacy spellings "0" and "1" are accepted
+    return (isinstance(row, dict) and row.get("scope_id") == scope
+            and type(row.get("exit_code")) is int
+            and isinstance(row.get("output_sha256"), str)
+            and re.fullmatch("[0-9a-f]{64}", row["output_sha256"])
+            and type(row.get("reward")) in (int, float)
+            and row["reward"] == reward)
+
+
+def finding_errors(verdict, suspected_scopes, contract=CURRENT_CONTRACT, repros=None):
     if contract == "s9r-v1":
         return []
-    if contract not in ("s9r-v2", "s9r-v3", "s9r-v4", CURRENT_CONTRACT):
+    if contract not in ("s9r-v2", "s9r-v3", "s9r-v4", "s9r-v5", CURRENT_CONTRACT):
         return ["unknown review contract"]
     findings = verdict.get("probe_findings", {})
     if not isinstance(findings, dict):
@@ -69,13 +77,16 @@ def finding_errors(verdict, suspected_scopes, contract=CURRENT_CONTRACT):
             reward = finding.get("observed_reward")
             if not (reward in ("0", "1") or type(reward) is int or type(reward) is float and math.isfinite(reward)):
                 errors.append(f"{scope}: invalid or missing observed_reward")
-            negation = _V3_NOT_RUN if contract == "s9r-v3" else _NOT_RUN
-            for field, minimum in (("command", 1), ("observation", 20)):
-                value = finding.get(field)
-                if (not isinstance(value, str) or len(value.strip()) < minimum or negation.search(value)
-                        or contract == CURRENT_CONTRACT and _NEVER_EXECUTED.search(value)
-                        or field == "command" and contract != "s9r-v3" and not _looks_like_command(value)):
-                    errors.append(f"{scope}: expected {field} from a completed run")
+            elif contract == CURRENT_CONTRACT and not _matches_run(finding, scope, repros or {}):
+                errors.append(f"{scope}: no matching repro_id, scope and reward")
+            if contract == CURRENT_CONTRACT:
+                for field, minimum in (("command", 1), ("observation", 20)):
+                    value = finding.get(field)
+                    if not isinstance(value, str) or len(value.strip()) < minimum:
+                        errors.append(f"{scope}: missing or short {field}")
+            else:
+                from .legacy_probe_findings import legacy_execution_errors
+                errors.extend(legacy_execution_errors(scope, finding, contract))
         if not isinstance(finding.get("reason"), str) or not finding["reason"].strip():
             errors.append(f"{scope}: missing reason")
         if finding.get("classification") == "grader_gap":
