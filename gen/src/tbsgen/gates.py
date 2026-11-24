@@ -214,7 +214,7 @@ def hidden_duplicates(pub: Path, hid: Path, shared_inputs=(), copied_share_max: 
     same_sets = [[a, b] for i, a in enumerate(sets) for b in sets[i+1:] if trees[a] == trees[b]]
     same_public = [name for name, tree in {".": hidden, **trees}.items() if tree and tree == public]
     # A copied file is fine on its own (a shared training table, a common time grid: 7 of the 21 tbsgen tasks in the
-    # 2026-11-23 share do this).  What tests nothing is a hidden set made mostly of public bytes.
+    # released tasks do this).  What tests nothing is a hidden set made mostly of public bytes.
     mostly = {}
     for name, tree in ({".": hidden} if not sets else trees).items():
         total = sum(size for size, _ in tree.values())
@@ -344,7 +344,8 @@ def run_gates(cfg: dict, item_dir: Path, spec: dict, thresholds: dict, attempt: 
             t = runner.test(cfg, task, gen, Path(sv["outdir"]), work, f"{tag}{s}")
             od = Path(sv["outdir"])
             sd[tag] = dict(solve_rc=sv["rc"], solve_sec=sv["sec"], solve_err=sv["err"][-300:], passed=t["passed"],
-                           reward=t.get("reward"), n_checks=t["n_checks"], n_failed=t["n_failed"], failed=t["failed"],
+                           verifier_rc=t["rc"], reward=t.get("reward"), n_checks=t["n_checks"], n_failed=t["n_failed"],
+                           failed=t["failed"],
                            out_files=sum(1 for p in od.rglob("*") if p.is_file()) if od.exists() else 0,
                            metrics=[{k: m.get(k) for k in ("name", "value", "threshold", "direction", "passed", "aux",
                                                             "rc", "wall_times", "gated", "threshold_effective",
@@ -389,8 +390,8 @@ def run_gates(cfg: dict, item_dir: Path, spec: dict, thresholds: dict, attempt: 
             parity = hidden_parity(ref["metrics"], spec, runner.hidden_set_names(gen) if per_set else ())
             det["hidden_parity"][s] = parity
             # only public checks missing on the hidden sets block (the reviewer's finding); a hidden-only metric
-            # measures the shift itself and is normal (14 of 18 prod-code tasks have one).  Specs written before
-            # the prompts asked for it (no public_only declarations: 6 of 25 released prod-code tasks have a
+            # measures the shift itself and is normal (most released tasks have one).  Specs written before
+            # the prompts asked for it (no public_only declarations: about a quarter of released tasks have a
             # public-only metric) are recorded for S9R, not blocked.
             parity["enforced"] = review_rules
             if review_rules:
@@ -400,16 +401,21 @@ def run_gates(cfg: dict, item_dir: Path, spec: dict, thresholds: dict, attempt: 
     seed0 = next((s for s in seeds if str(s) == "0"), None)
     if seed0 is None:
         gen = work / "probe-gen0"
-        reference_ok = runner.generate(cfg, task, 0, gen)["rc"] == 0
         ref_out = work / "out-probe-ref0"
-        if reference_ok:
+        reference = {"generate_rc": runner.generate(cfg, task, 0, gen)["rc"]}
+        if reference["generate_rc"] == 0:
             sv = runner.solve(cfg, task, gen, "solution/solve.py", work, "probe-ref0")
-            reference_ok = sv["rc"] == 0 and runner.test(cfg, task, gen, ref_out, work, "probe-ref0")["passed"]
+            reference["solve_rc"] = sv["rc"]
+            if sv["rc"] == 0:
+                t = runner.test(cfg, task, gen, ref_out, work, "probe-ref0")
+                reference.update(verifier_rc=t["rc"], reward=t.get("reward"))
     else:
         gen = work / ("detA" if seed0 == seeds[0] else "gen0")
         ref_out = work / "out-ref0"
-        reference = det["seeds"][seed0].get("ref", {})
-        reference_ok = reference.get("solve_rc") == 0 and reference.get("passed")
+        scored = det["seeds"][seed0].get("ref", {})
+        reference = {k: scored.get(k) for k in ("solve_rc", "verifier_rc", "reward")}
+    reference_ok = (reference.get("solve_rc") == 0 and reference.get("verifier_rc") == 0
+                    and reference.get("reward") == "1")
     prog = spec.get("form") == "PROG"
     arms = [("coverage", "one_confident")]
     if prog:
@@ -420,8 +426,8 @@ def run_gates(cfg: dict, item_dir: Path, spec: dict, thresholds: dict, attempt: 
     isolated = g.get("truth_isolation", True) is not False      # never run the reference wrapper with truth readable
     for gate, arm in arms:
         result = (runner.output_probe(cfg, task, gen, ref_out, work, arm, prog) if reference_ok and isolated
-                  else dict(ok=False, error="seed 0 reference failed" if not reference_ok
-                            else "not run: truth isolation failed"))
+                  else dict(ok=True, inconclusive=True, reference=reference,
+                            error="seed 0 reference failed" if not reference_ok else "not run: truth isolation failed"))
         det["seeds"].setdefault(0 if seed0 is None else seed0, {})[f"exploit__{arm}"] = result
         g[gate] = result["ok"]
         det[gate] = "na" if result.get("na") else result

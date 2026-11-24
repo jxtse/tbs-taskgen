@@ -3,7 +3,7 @@ S8 local repair).  Outputs are machine-parsed: S5 -> one JSON object; S6A/S6C/S8
 "=== FILE: <rel path> ===" ... "=== END ===".  Kept short on purpose: the contract (file layout + rules)
 matters more than prose.  Version strings go into provenance so prompt changes are traceable.
 """
-PROMPT_VERSION = "v2.9-2026-11-24"
+PROMPT_VERSION = "v2.10-2026-11-25"
 
 METRICS_API = """Verifier helper module `_metrics` (provided, importable from tests/; exact signatures):
   check(name: str, value: float, threshold: float, direction: "<=" | ">=") -> None   # records + asserts

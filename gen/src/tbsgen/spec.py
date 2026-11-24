@@ -34,7 +34,7 @@ def _requires_assumptions(version) -> bool:
 
 
 def requires_hidden_provenance(version) -> bool:
-    return _prompt_at_least(version, (2, 9), (5, 0))
+    return _prompt_at_least(version, (2, 10), (6, 0))
 
 
 PIN = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?==[0-9][A-Za-z0-9.!+_-]*")
@@ -269,8 +269,8 @@ def set_thresholds(spec: dict, measure: dict, cfg: dict) -> dict:
             thr = _round_sig(exact, tc["sig_digits"] + 2, d, toward_loose=False)
         if naive_capped and not _worse(d, n_best, exact):
             # the cap fell back to the reference-margin floor and the naive baseline clears even the exact value:
-            # this metric does not reject naive at any precision, so extra digits buy nothing (prod-code
-            # doi-7f1e4ce020185a83 printed `>= 0.8665767420502813` this way).  Keep the readable rounding.
+            # this metric does not reject naive at any precision, so extra digits buy nothing (a released
+            # task once printed `>= 0.8665767420502813` this way).  Keep the readable rounding.
             naive_capped = False
         if naive_capped and not _worse(d, n_best, thr):  # nor the naive baseline (review #9)
             for extra in (1, 2, 3):

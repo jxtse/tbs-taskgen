@@ -797,8 +797,7 @@ def _release_reviewed(P, it, previous):
         return it.advance("S10", None, status="done")
     rel = P.store.root / "release"
     rel.mkdir(exist_ok=True)
-    with (rel / "manifest.jsonl").open("a") as f:
-        f.write(json.dumps(dict(record, ts=time.time())) + "\n")
+    _append_manifest(rel / "manifest.jsonl", dict(record, ts=time.time()))
     it.advance("S10", None, status="done")
 
 
@@ -1097,6 +1096,16 @@ def _ingest_review(P, it, job_dir: str | None = None) -> dict:
     return dict(outcome=res["outcome"], verdict=rec.get("verdict"), job_name=rec["job_name"])
 
 
+def _append_manifest(path: Path, record: dict) -> None:
+    with path.open("a+b") as f:
+        prefix = b""
+        if f.tell():
+            f.seek(-1, 2)
+            if f.read(1) != b"\n":
+                prefix = b"\n"
+        f.write(prefix + json.dumps(record).encode() + b"\n")
+
+
 def _live_release(P, item_id: str) -> dict | None:
     m = P.store.root / "release" / "manifest.jsonl"
     if not m.exists():
@@ -1120,8 +1129,8 @@ def withdraw(P, item_id: str, reason: str) -> bool:
     """Append a withdrawal line for a released item (the manifest is append-only; the last line per item wins)."""
     if not _released(P, item_id):
         return False
-    with (P.store.root / "release" / "manifest.jsonl").open("a") as f:
-        f.write(json.dumps(dict(item_id=item_id, withdrawn=True, reason=reason, ts=time.time())) + "\n")
+    _append_manifest(P.store.root / "release" / "manifest.jsonl",
+                     dict(item_id=item_id, withdrawn=True, reason=reason, ts=time.time()))
     P.store.event("release_withdrawn", item=item_id, reason=reason)
     return True
 

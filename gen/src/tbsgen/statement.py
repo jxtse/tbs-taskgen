@@ -6,7 +6,7 @@ from .package import strip_time_note
 from .spec import assumption_quote
 
 # Scientific homonyms stay allowed: "patch" (sky patch, tissue patch), "internal standard", "baseline-free" (structural
-# health monitoring) all occur in real statements of the 2026-11-23 share; only their process senses are flagged.
+# health monitoring) all occur in real task statements; only their process senses are flagged.
 # Bare "gate" (gate voltage, logic gate), "hardening" (strain hardening), "lever" (lever arm), "audit" (convergence
 # audit) and "revision" (data revision) are science too: only their editorial / pipeline phrasings are flagged.
 PROCESS_WORDS = (r"audit\s+(?:copy|revision|note|round|fix|finding)s?", r"(?:task|statement|audit|review)\s+revision",

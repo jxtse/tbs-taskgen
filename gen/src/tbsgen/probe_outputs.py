@@ -5,11 +5,11 @@ Each probe verifier run targets ONE scope: the public deliverables, or a single 
 the reference's answer values, so a rejection can only come from the targeted scope (a verifier that stops at
 its first failed check is fine, and a verifier that scores set A but silently skips set B is caught on B).
 
-hidden_garbage: rotate table answers across rows, preserving unique, named row identifiers. JSON and arrays get numbers zeroed and labels replaced by mode.
+hidden_garbage: rotate table answers across rows, preserving the detected row identifier. JSON and arrays get numbers zeroed and labels replaced by mode.
 one_confident: CSV tables with > 5 data rows keep only the most confident row (score/confidence/prob column, else
   the first row).
 Files the probe cannot transform (images, FITS, HDF5, ...) are left untouched; a scope where nothing was
-transformed reports count 0 (= no evidence, n/a for that scope)."""
+transformed reports count 0. Uncertain table keys are reported separately."""
 import csv
 import json
 import math
@@ -28,8 +28,16 @@ class Unsupported(ValueError):
     """An output this probe cannot transform."""
 
 
+class UncertainTable(ValueError):
+    """The probe cannot establish a unique row-to-answer mapping."""
+
+
 def _number(value):
     try:
+        if isinstance(value, int) or (isinstance(value, str) and re.fullmatch(r"[+-]?\d+", value.strip())):
+            return int(value)
+        if isinstance(value, bytes):
+            return _number(value.decode("ascii"))
         return float(value)
     except (ValueError, TypeError):
         return None
@@ -40,19 +48,26 @@ def _mode(values):
     return counts.most_common(1)[0][0] if counts else ""
 
 
-_KEY_NAME = re.compile(r"(?:(?:sample|item|row|cell|case|record|subject|obs|site|trial)_)?"
-                       r"(?:ids?|keys?|identifiers?|index|idx)", re.I)
+_KEY_NAME = re.compile(r"(?:.*_)?(?:ids?|keys?|identifiers?|index|idx)|name|sample", re.I)
 
 
-def _is_key(name, values):
-    if not _KEY_NAME.fullmatch(name.strip()):
-        return False
+def _unique(values):
     seen = set()
     for value in values:
-        if value in seen:
+        if value is None or isinstance(value, (dict, list)) or isinstance(value, str) and not value.strip():
+            return False
+        if value != value or value in seen:
             return False
         seen.add(value)
     return bool(seen)
+
+
+def _key_column(columns):
+    candidates = [i for i, (name, values) in enumerate(columns)
+                  if (i == 0 or _KEY_NAME.fullmatch(name.strip())) and _unique(values)]
+    if len(candidates) != 1:
+        raise UncertainTable("ambiguous keys" if candidates else "no unique key")
+    return candidates[0]
 
 
 def _same_values(a, b):
@@ -64,24 +79,32 @@ def _same_values(a, b):
     if a == b:
         return True
     x, y = _number(a), _number(b)
-    return x is not None and y is not None and (x == y or (math.isnan(x) and math.isnan(y)))
+    return x is not None and y is not None and (x == y or (x != x and y != y))
 
 
-def _rotate_rows(rows, header=()):
-    if not rows:
-        return rows
+def _row_key(rows, header):
     width = len(rows[0])
-    if any(len(row) != width for row in rows):
-        raise Unsupported("ragged output table")
-    keys = {i for i, name in enumerate(header) if i < width and _is_key(name, (r[i] for r in rows))}
+    if not width or (header and len(header) != width) or any(len(row) != width for row in rows):
+        raise UncertainTable("ragged output table")
+    return _key_column((header[i] if header else "", (row[i] for row in rows)) for i in range(width))
+
+
+def _mapping_changed(original, changed, key):
+    before = {row[key]: row for row in original}
+    after = {row[key]: row for row in changed}
+    return before.keys() != after.keys() or any(not _same_values(row, after[k]) for k, row in before.items())
+
+
+def _rotate_rows(rows, key):
+    width = len(rows[0])
     out = [row.copy() for row in rows]
     if len(rows) == 1:
         for i, cell in enumerate(rows[0]):
-            if i not in keys and _number(cell) is not None:
+            if i != key and _number(cell) is not None:
                 out[0][i] = "0"
         return out
     for i in range(width):
-        if i not in keys:
+        if i != key:
             offset = (len(rows) // 2 + max(i - 1, 0)) % len(rows) or 1
             for r, row in enumerate(out):
                 row[i] = rows[(r + offset) % len(rows)][i]
@@ -94,9 +117,10 @@ def _table(path, arm, delimiter, identity):
     if not rows:
         return False
     header, data = rows[0], [row for row in rows[1:] if row]
+    if not data or (arm == "one_confident" and len(data) <= 5):
+        return False
+    key = _row_key(data, header)
     if arm == "one_confident":
-        if len(data) <= 5:
-            return False
         score_names = {"score", "confidence", "prob", "probability", "p"}
         names = [s.strip().lower() for s in header]
         column = next((i for i, name in enumerate(names) if name in score_names), None)
@@ -106,48 +130,50 @@ def _table(path, arm, delimiter, identity):
 
         def confidence(row):
             val = _number(row[column]) if column is not None and column < len(row) else None
-            return val if val is not None and math.isfinite(val) else -math.inf
+            return val if isinstance(val, int) or (val is not None and math.isfinite(val)) else -math.inf
         changed = [max(data, key=confidence)]
     else:
-        changed = _rotate_rows(data, header)
-        if _same_values(data, changed):
-            return False
+        changed = _rotate_rows(data, key)
+    if not _mapping_changed(data, changed, key):
+        return False
     with path.open("w", newline="") as stream:
         csv.writer(stream, delimiter=delimiter).writerows([header, *(data if identity else changed)])
     return True
 
 
 def _json_garbage(value):
-    # Group leaves by key path (ignoring array indices), so labels in each column use their own mode.
-    columns = {}
-    key_columns = {}
+    # Reduce labels within each answer column. Preserve row order and the selected key verbatim.
+    def column(values):
+        mode = _mode(values)
+        return [transform(v, mode) for v in values]
 
-    def visit(v, key, replace):
+    def records(rows, names):
+        key = _row_key(rows, names)
+        columns = [vs if i == key else column(vs) for i, vs in enumerate(zip(*rows))]
+        return list(zip(*columns))
+
+    def transform(v, mode=None):
         if isinstance(v, dict):
-            return {k: visit(x, key + (k,), replace) for k, x in v.items()}
+            if len(v) > 1 and all(isinstance(xs, list) and xs for xs in v.values()):
+                if len({len(xs) for xs in v.values()}) == 1:
+                    rows = records(list(zip(*v.values())), list(v))
+                    return dict(zip(v, map(list, zip(*rows))))
+            return {k: x if _KEY_NAME.fullmatch(k) else transform(x) for k, x in v.items()}
         if isinstance(v, list):
+            if v and all(isinstance(row, dict) for row in v):
+                names = list(v[0])
+                if any(row.keys() != v[0].keys() for row in v):
+                    raise UncertainTable("ragged output table")
+                rows = records([[row[k] for k in names] for row in v], names)
+                return [dict(zip(names, row)) for row in rows]
             if v and all(isinstance(row, list) for row in v):
-                return [[visit(cell, key + (i,), replace) for i, cell in enumerate(row)] for row in v]
-            return [visit(x, key, replace) for x in v]
-        if key and isinstance(key[-1], str) and _KEY_NAME.fullmatch(key[-1].strip()):
-            if not replace:
-                key_columns.setdefault(key, []).append(v)
-            elif key in keys:
-                return v
+                return list(map(list, records(v, [])))
+            return column(v)
         if _number(v) is not None:
             return "0" if isinstance(v, str) else 0
-        if isinstance(v, str):
-            if replace:
-                return columns[key].most_common(1)[0][0]
-            columns.setdefault(key, Counter())[v] += 1
-        return v
-    visit(value, (), False)
-    keys = {k for k, vs in key_columns.items() if _is_key(k[-1], vs)}
-    return visit(value, (), True)
+        return mode if isinstance(v, str) and mode is not None else v
 
-
-def _array_key(name, a):
-    return a.ndim == 1 and not a.dtype.names and _is_key(name, a)
+    return transform(value)
 
 
 def _same_array(a, b):
@@ -163,8 +189,15 @@ def _array_garbage(a):
     import numpy as np
     out = np.zeros_like(a)
     if a.dtype.names:
-        for name in a.dtype.names:
-            out[name] = a[name] if _array_key(name, a[name]) else _array_garbage(a[name])
+        if a.ndim != 1:
+            raise UncertainTable("expected one-dimensional record array")
+        key = _key_column((name, a[name] if a[name].ndim == 1 else ()) for name in a.dtype.names)
+        for i, name in enumerate(a.dtype.names):
+            out[name] = a[name] if i == key else _array_garbage(a[name])
+    elif a.ndim == 2 and a.size:
+        key = _key_column(("", col) for col in a.T)
+        for i in range(a.shape[1]):
+            out[:, i] = a[:, i] if i == key else _array_garbage(a[:, i])
     elif a.dtype.kind in "SU" and a.size:
         for index in np.ndindex(a.shape[1:]):
             col = (slice(None),) + index if a.ndim else ()
@@ -199,11 +232,17 @@ def _mutate_file(path, arm, identity):
                 np.save(stream, a if identity else changed)
         else:
             with np.load(path, allow_pickle=False) as data:
+                original = {name: data[name] for name in data.files}
+                key_column = None
+                vectors = {name: a for name, a in original.items() if a.ndim == 1 and not a.dtype.names}
+                if len(original) > 1 and vectors and all(a.ndim for a in original.values()):
+                    if len({len(a) for a in original.values()}) == 1:
+                        key_column = _key_column((name, vectors.get(name, ())) for name in original)
                 arrays = {}
                 changed = False
-                for key in data.files:
-                    a = data[key]
-                    candidate = a if _array_key(key, a) else _array_garbage(a)
+                for i, (key, a) in enumerate(original.items()):
+                    named_key = key in vectors and _KEY_NAME.fullmatch(key) and _unique(a)
+                    candidate = a if i == key_column or named_key else _array_garbage(a)
                     changed |= not _same_array(a, candidate)
                     arrays[key] = a if identity else candidate
             if not changed:
@@ -220,8 +259,9 @@ def _mutate_file(path, arm, identity):
             raise Unsupported(f"cannot identify table in {path.name}")
         rows = [line.split() for line in lines[start:]]
         header = lines[start - 1].lstrip("#").split() if start else []
-        changed = _rotate_rows(rows, header)
-        if _same_values(rows, changed):
+        key = _row_key(rows, header)
+        changed = _rotate_rows(rows, key)
+        if not _mapping_changed(rows, changed, key):
             return 0
         replaced = [" ".join(row) for row in (rows if identity else changed)]
         path.write_text("\n".join(lines[:start] + replaced) + "\n")
@@ -229,7 +269,7 @@ def _mutate_file(path, arm, identity):
     raise Unsupported(f"unsupported output format: {path.name}")
 
 
-def mutate(root, arm, skipped=None, *, identity=False):
+def mutate(root, arm, skipped=None, *, identity=False, uncertain=None):
     """Transform every supported file under root; unsupported files stay as they are (listed in `skipped`).
     An identity control computes the same candidate and serializes the original values for each applicable file.
     Returns the number of applicable files."""
@@ -241,10 +281,19 @@ def mutate(root, arm, skipped=None, *, identity=False):
             continue
         try:
             count += _mutate_file(path, arm, identity)
+        except UncertainTable as e:
+            if uncertain is not None:
+                uncertain.append(f"{path.name}: {e}")
         except Unsupported as e:
             if skipped is not None:
                 skipped.append(str(e))
     return count
+
+
+def mutation_report(root, arm, identity=False):
+    uncertain = []
+    count = mutate(root, arm, identity=identity, uncertain=uncertain)
+    return count, [reason[:120] for reason in uncertain[:2]]
 
 
 def hidden_main(arm, target, identity=False):
@@ -258,8 +307,7 @@ def hidden_main(arm, target, identity=False):
     with tempfile.TemporaryDirectory() as tmp:
         subprocess.run([sys.executable, str(Path(__file__).with_name("_probe_reference.py")), input_dir, tmp],
                        check=True)
-        skipped = []
         # The timer includes this wrapper on every set. Do the same work on non-target sets as the shared control.
-        count = mutate(Path(tmp), arm, skipped, identity=identity or name != target)
+        count, uncertain = mutation_report(Path(tmp), arm, identity=identity or name != target)
         shutil.copytree(tmp, dest, dirs_exist_ok=True)
-    print("TBSGEN_PROBE " + json.dumps([name, count, identity or name == target, skipped[:3]]), file=sys.stderr)
+    print("TBSGEN_PROBE " + json.dumps([name, count, identity or name == target, uncertain]), file=sys.stderr)

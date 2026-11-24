@@ -22,7 +22,8 @@ from tbsgen.state import Store, write_json
 from tbsgen.statement import assumptions_stated, statement_clean, threshold_format
 
 
-def test_statement_hygiene_real_statements():
+def test_statement_hygiene_clean_statements():
+    # synthetic statements shaped like released tasks (no real task text in this public repository)
     fixture = json.loads((Path(__file__).parent / "fixtures/review_statements.json").read_text())
     assert len(fixture) == 3
     for name, text in fixture.items():
@@ -37,7 +38,7 @@ def test_hygiene_forms_and_exceptions():
                  "round-12", "difficulty lever", "naive baseline", "mid-baseline", "# exploit", "<!-- private -->"):
         assert statement_clean(word), word
     assert not statement_clean("Investigate, navigate and aggregate the hidden outputs.\nFit the baseline level.")
-    # scientific homonyms from real statements of the 2026-11-23 share stay clean
+    # scientific homonyms stay clean
     for line in ("# CMB polarization amplitude behind Galactic foregrounds, patch by patch",
                  "- more spurious and more missed H&E detections, including a contiguous patch where H&E nuclei",
                  "# Locating damage on a CFRP plate from a single guided-wave scan (no baseline)",
@@ -53,10 +54,10 @@ def test_threshold_literals_and_unreadable_separation():
     assert threshold_format("≥ 0.8665767420502813") == ["0.8665767420502813"]
     assert threshold_format("value 0.8031095863545515 here") == ["0.8031095863545515"]   # float repr anywhere
     assert not threshold_format("At most 0.123456 or 1e-9. Catalogue ID 12345678.", thresholds)
-    # physical constants and small exact cutoffs in real statements stay allowed (st-batch2-023, doi-47f3c851...)
+    # physical constants and small exact cutoffs stay allowed
     assert not threshold_format("- GM = 398600.4418 km^3/s^2, equatorial radius = 6378.137 km, J2 = 1.08262668e-3.")
     assert not threshold_format("fitted slope **≥ −0.0000000001**, difference **≤ 0.000000001**")
-    # prod-code doi-7f1e4ce020185a83: naive capped at the ref-margin floor and naive (0.912) clears even the exact
+    # a released item: naive capped at the ref-margin floor and naive (0.912) clears even the exact
     # floor 0.8666: the old code printed `>= 0.8665767420502813`; now a readable 2-digit threshold
     ms = {w: {"0": {"p": a}, "1": {"p": b}} for w, a, b in (("ref", .9628630467225348, .9667504236545317),
                                                           ("mid", .9628630467225348, .9667504236545317),
@@ -181,7 +182,7 @@ def test_pkg_checks_and_sandbox_inventory(tmp_path, monkeypatch):
 
 
 def test_array_json_and_small_csv(tmp_path):
-    (tmp_path / "small.csv").write_text("label,count\nb,1\na,2\nb,3\n")
+    (tmp_path / "small.csv").write_text("label,count\nb,1\na,2\nc,3\n")
     np.save(tmp_path / "a.npy", np.arange(4))
     np.savez(tmp_path / "b.npz", score=np.arange(6), labels=np.array(["a", "a", "b"]))
     (tmp_path / "c.json").write_text('[{"x":1,"color":"red"},{"x":2,"color":"blue"},{"x":8,"color":"red"}]')
@@ -191,8 +192,8 @@ def test_array_json_and_small_csv(tmp_path):
     assert not np.load(tmp_path / "a.npy").any()
     with np.load(tmp_path / "b.npz") as data:
         assert not data["score"].any() and data["labels"].tolist() == ["a"] * 3
-    assert json.loads((tmp_path / "c.json").read_text()) == [{"x": 0, "color": "red"}] * 3
-    assert (tmp_path / "d.txt").read_text() == "x value\n3 4\n0 1.2\n"
+    assert json.loads((tmp_path / "c.json").read_text()) == [{"x": x, "color": "red"} for x in (1, 2, 8)]
+    assert (tmp_path / "d.txt").read_text() == "x value\n0 4\n3 1.2\n"
 
 
 @pytest.fixture
@@ -217,7 +218,7 @@ def wired_gates(tmp_path, monkeypatch):
         value = .93 if ref else 2 if tag.startswith("nop") else 1.5
         rows = [dict(name=m["name"], value=value, direction="<=", threshold=1, passed=ref) for m in spec["metrics"]]
         rows.append(dict(name="_solution_cli_run", rc=0, aux=True))
-        return dict(metrics=rows, passed=ref, n_checks=4, n_failed=0 if ref else 4,
+        return dict(metrics=rows, rc=0, reward="1" if ref else "0", passed=ref, n_checks=4, n_failed=0 if ref else 4,
                     failed=[] if ref else [r["name"] for r in rows[:-1]])
     monkeypatch.setattr(runner, "generate", generate)
     monkeypatch.setattr(runner, "solve", solve)
@@ -401,7 +402,7 @@ def _probe_fixture(tmp_path, monkeypatch, sets=("A", "B")):
         (d / "data").write_text(table)
     def prepare(cfg, mounts, cmd, timeout, name):
         arm = "one_confident" if "one_confident" in cmd else "hidden_garbage"
-        return dict(rc=0, out=str(probe_outputs.mutate(mounts[0][0], arm, identity="identity=True" in cmd)), err="")
+        return dict(rc=0, out=json.dumps(probe_outputs.mutation_report(mounts[0][0], arm, identity="identity=True" in cmd)), err="")
     monkeypatch.setattr(runner.sandbox, "run", prepare)
     return cfg, ref, gen, table
 
@@ -434,6 +435,7 @@ def _verifier(tmp_path, gen, table, score_sets=("A", "B"), stop_early=False, pub
                 failed.append(f"hidden_{name}")
                 if stop_early:
                     break
+        metrics.extend(dict(name=name, passed=False) for name in failed)
         return dict(metrics=metrics, rc=0, passed=not failed, reward="0" if failed else "1", failed=failed)
     return verify
 
@@ -445,7 +447,7 @@ def test_probe_early_stopping_verifier_is_not_a_failure(tmp_path, monkeypatch):
     for arm in ("hidden_garbage", "one_confident"):
         (tmp_path / arm).mkdir()
         r = runner.output_probe(cfg, tmp_path, gen, ref, tmp_path / arm, arm, True)
-        assert r["ok"] and not r["accepted_scopes"], r
+        assert r["ok"] and not r["inconclusive"] and not r["accepted_scopes"], r
 
 
 def test_probe_catches_an_unscored_hidden_set(tmp_path, monkeypatch):
@@ -477,7 +479,6 @@ def test_probe_side_files_do_not_skip_the_check(tmp_path, monkeypatch):
 
 def test_probe_requires_every_hidden_set_to_be_run(tmp_path, monkeypatch):
     cfg, ref, gen, table = _probe_fixture(tmp_path, monkeypatch)
-    inner = _verifier(tmp_path, gen, table)
     def skip_b(cfg_, task, g, out, work, tag):
         (gen / "tests/hidden/B").rename(gen / "tests/hidden_B")
         try:
@@ -486,13 +487,13 @@ def test_probe_requires_every_hidden_set_to_be_run(tmp_path, monkeypatch):
             (gen / "tests/hidden_B").rename(gen / "tests/hidden/B")
     monkeypatch.setattr(runner, "test", skip_b)
     r = runner.output_probe(cfg, tmp_path, gen, ref, tmp_path, "hidden_garbage", True)
-    assert not r["ok"] and r["error"] == "hidden set not run by the verifier"
+    assert r["ok"] and r["inconclusive"] and r["scopes"]["hidden:B"]["error"] == "hidden set not run by the verifier"
 
 
 def test_probe_ids_stay_valid_while_answers_move():
     # finding 10: an id-only verifier must not reject the garbage table; ids keep their values, answers rotate
     rows = [[str(i), f"lab{i}", str(i / 10)] for i in range(6)]
-    out = probe_outputs._rotate_rows(rows, ["id", "label", "score"])
+    out = probe_outputs._rotate_rows(rows, 0)
     assert [r[0] for r in out] == [r[0] for r in rows]
     assert sorted(r[1] for r in out) == sorted(r[1] for r in rows)
     assert all(o[1] != r[1] and o[2] != r[2] for o, r in zip(out, rows))
@@ -598,7 +599,7 @@ def test_orphan_reservation_settled_before_relaunch(tmp_path, monkeypatch):
 
 
 def test_parity_matches_renamed_hidden_metrics():
-    # released prod-code names: public_rr10 vs hidden_rr10_set_a, public_rel_rmse vs hidden_large_rel_rmse_max
+    # released-task metric names: public_rr10 vs hidden_rr10_set_a, public_rel_rmse vs hidden_large_rel_rmse_max
     rows = [{"name": n} for n in ("public_rr10", "hidden_rr10_set_a", "public_rel_rmse", "hidden_large_rel_rmse_max",
                                   "public_mean_clean_error", "hidden_max_clean_error", "public_host_accuracy")]
     assert gates.hidden_parity(rows, {"metrics": []})["missing_hidden"] == ["host_accuracy"]
@@ -632,7 +633,7 @@ def test_public_probe_command_survives_the_shell(tmp_path, monkeypatch):
     for arm in ("one_confident", "hidden_garbage"):
         (tmp_path / arm).mkdir()
         runner.output_probe(cfg, tmp_path, gen, ref, tmp_path / arm, arm, True)
-    public = [s for s in seen if "probe_outputs import mutate" in s[0]]
+    public = [s for s in seen if "probe_outputs import mutation_report" in s[0]]
     assert public and all(rc == 0 for _, rc, _ in public), public
 
 
@@ -645,8 +646,8 @@ def test_wrapper_requires_dropped_privileges(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("version,enforced,per_set", [
-    ("v2.7", False, False), ("v2.8", True, False), (PROMPT_VERSION, True, True),
-    ("cg-v3", False, False), ("cg-v4", True, False), (CODE_PROMPT_VERSION, True, True),
+    ("v2.7", False, False), ("v2.8", True, False), ("v2.9", True, False), (PROMPT_VERSION, True, True),
+    ("cg-v3", False, False), ("cg-v4", True, False), ("cg-v5", True, False), (CODE_PROMPT_VERSION, True, True),
 ])
 @pytest.mark.parametrize("has_bias", [True, False])
 def test_runtime_parity_by_hidden_set(tmp_path, monkeypatch, wired_gates, version, enforced, per_set, has_bias):
@@ -704,17 +705,18 @@ def test_garbage_preserves_keys_and_counts_changes(tmp_path, rows, expected_coun
         assert path.read_bytes() == original
 
 
-def test_failed_identity_control_is_inconclusive(tmp_path, monkeypatch):
+@pytest.mark.parametrize("trial_reward", ["0", "1"])
+def test_failed_identity_control_is_inconclusive(tmp_path, monkeypatch, trial_reward):
     cfg, ref, gen, table = _probe_fixture(tmp_path, monkeypatch, sets=("A",))
     verify = _verifier(tmp_path, gen, table, score_sets=("A",))
     calls = []
     def wrapper_fails(cfg, task, gen, out, work, tag):
         result = verify(cfg, task, gen, out, work, tag)
         calls.append(result["reward"])
-        return dict(result, reward="0", passed=False, failed=["runtime"])
+        return dict(result, reward="0" if tag.endswith("__control") else trial_reward, failed=["runtime"])
     monkeypatch.setattr(runner, "test", wrapper_fails)
     result = runner.output_probe(cfg, tmp_path, gen, ref, tmp_path, "hidden_garbage", True)
-    assert not result["ok"] and result["inconclusive"]
+    assert result["ok"] and result["inconclusive"]
     assert calls.count("1") == 1 and len(calls) <= 2
 
 
@@ -727,7 +729,7 @@ def test_zero_changes_still_requires_verifier_result(tmp_path, monkeypatch, rc, 
         return dict(verify(*args), rc=rc, reward=reward)
     monkeypatch.setattr(runner, "test", timeout)
     result = runner.output_probe(cfg, tmp_path, gen, ref, tmp_path, "hidden_garbage", True)
-    assert not result["ok"] and not result.get("na")
+    assert result["ok"] and result["inconclusive"] and not result["na"]
 
 
 def test_hidden_scope_named_public(tmp_path, monkeypatch):
@@ -834,7 +836,7 @@ def test_hidden_measurements_reach_check_record(tmp_path, monkeypatch):
 
 def test_constant_answer_scope_is_na(tmp_path, monkeypatch):
     cfg, ref, gen, _ = _probe_fixture(tmp_path, monkeypatch, sets=("A",))
-    table = "value,case_id,trial_key\n7,1,a\n7,2,b\n7,3,c\n"
+    table = "value,case_id\n7,1\n7,2\n7,3\n"
     (gen / "tests/hidden/A/data").write_text(table)
     monkeypatch.setattr(runner, "test", _verifier(tmp_path, gen, table, score_sets=("A",), public_count=False))
     result = runner.output_probe(cfg, tmp_path, gen, ref, tmp_path, "hidden_garbage", True)
@@ -865,14 +867,15 @@ def test_single_set_requires_provenance(tmp_path, wired_gates):
 @pytest.mark.parametrize("ext", ["csv", "txt"])
 def test_rotation_compares_numeric_values(tmp_path, values, ext):
     path = tmp_path / ("out." + ext)
-    original = "value\n" + "\n".join(values) + "\n"
+    sep = "," if ext == "csv" else " "
+    original = f"id{sep}value\n" + "".join(f"{i}{sep}{v}\n" for i, v in enumerate(values))
     path.write_text(original)
     assert probe_outputs.mutate(tmp_path, "hidden_garbage") == 0
     assert path.read_text() == original
 
 
 @pytest.mark.parametrize("answer,values", [
-    ("predicted_class_id", ["7", "8", "7"]), ("predicted_class_id", ["7", "8"]),
+    ("predicted_class_id", ["7", "8", "7"]),
     ("site_id", ["7", "8", "7"]),
 ])
 def test_id_like_answer_is_rotated(tmp_path, answer, values):
@@ -915,11 +918,11 @@ def test_ans_uses_scored_reference_as_control(tmp_path, monkeypatch):
 
     def verify(cfg, task, gen, out, work, tag):
         calls.append(tag)
-        return dict(rc=0, reward="0", failed=["count"], metrics=[])
+        return dict(rc=0, reward="0", failed=["count"], metrics=[dict(name="count", passed=False)])
 
     monkeypatch.setattr(runner, "test", verify)
     result = runner.output_probe(cfg, tmp_path, gen, ref, tmp_path, "one_confident", False)
-    assert len(calls) == 1 and result["ok"]
+    assert len(calls) == 1 and result["ok"] and not result["inconclusive"]
 
 
 @pytest.mark.parametrize("version", ["cg-v3", "v2.7"])
@@ -1045,15 +1048,21 @@ def test_numeric_zero_format_is_unchanged(tmp_path, ext):
 
 
 @pytest.mark.parametrize("ext", ["json", "npy", "npz"])
-def test_key_uniqueness_across_formats(tmp_path, ext):
+@pytest.mark.parametrize("ambiguous", [False, True])
+def test_key_uniqueness_across_formats(tmp_path, ext, ambiguous):
     path = tmp_path / ("scores." + ext)
-    fields = dict(id=[1, 2, 3], site_id=[7, 8, 7], predicted_class_id=[7, 8, 9])
+    fields = dict(id=[1, 2, 3], site_id=[7, 8, 9] if ambiguous else [7, 8, 7], predicted_class_id=[7, 8, 7])
     if ext == "json":
         path.write_text(json.dumps([dict(zip(fields, row)) for row in zip(*fields.values())]))
     elif ext == "npy":
         np.save(path, np.array(list(zip(*fields.values())), dtype=[(k, int) for k in fields]))
     else:
         np.savez(path, **fields)
+    if ambiguous:
+        original = path.read_bytes()
+        assert probe_outputs.mutation_report(tmp_path, "hidden_garbage") == (0, [f"{path.name}: ambiguous keys"])
+        assert path.read_bytes() == original
+        return
     assert probe_outputs.mutate(tmp_path, "hidden_garbage") == 1
     if ext == "json":
         rows = json.loads(path.read_text())
@@ -1067,8 +1076,143 @@ def test_key_uniqueness_across_formats(tmp_path, ext):
     assert result == dict(id=[1, 2, 3], site_id=[0, 0, 0], predicted_class_id=[0, 0, 0])
 
 
-def test_headerless_first_column_is_not_an_identifier(tmp_path):
+def test_headerless_unique_first_column_preserves_mapping(tmp_path):
     path = tmp_path / "answers.txt"
     path.write_text("1 7\n2 7\n")
+    assert probe_outputs.mutate(tmp_path, "hidden_garbage") == 0
+    assert path.read_text() == "1 7\n2 7\n"
+
+
+@pytest.mark.parametrize("header", ["patient_id,prediction", "case,prediction", "prediction,name", "prediction,sample"])
+def test_table_keys_preserve_answer_associations(tmp_path, header):
+    path = tmp_path / "out.csv"
+    if header.startswith("prediction"):
+        original = [["7", "p1"], ["7", "p2"], ["8", "p3"]]
+        key = 1
+    else:
+        original = [["p1", "7"], ["p2", "8"]]
+        key = 0
+    path.write_text(header + "\n" + "".join(",".join(row) + "\n" for row in original))
     assert probe_outputs.mutate(tmp_path, "hidden_garbage") == 1
-    assert path.read_text() == "2 7\n1 7\n"
+    changed = list(csv.reader(path.read_text().splitlines()))[1:]
+    assert [r[key] for r in changed] == [r[key] for r in original]
+    assert probe_outputs._mapping_changed(original, changed, key)
+    assert not probe_outputs._mapping_changed(original, original[::-1], key)
+
+
+@pytest.mark.parametrize("arm", ["one_confident", "hidden_garbage"])
+def test_ambiguous_keys_are_inconclusive_per_scope(tmp_path, monkeypatch, arm):
+    cfg, ref, gen, table = _probe_fixture(tmp_path, monkeypatch)
+    ambiguous = table.replace("confidence", "site_id")
+    (gen / "tests/hidden/A/data").write_text(ambiguous)
+    (ref / "public.csv").write_text(ambiguous)
+    monkeypatch.setattr(runner, "test", _verifier(tmp_path, gen, table, score_sets=(), public_count=False))
+    result = runner.output_probe(cfg, tmp_path, gen, ref, tmp_path, arm, True)
+    assert result["accepted_scopes"] == ["hidden:B"] and not result["ok"]
+    for scope in (["public", "hidden:A"] if arm == "one_confident" else ["hidden:A"]):
+        detail = result["scopes"][scope]
+        assert detail["inconclusive"] and detail["count"] == 0 and "ambiguous keys" in detail["uncertain"][0]
+    files = list(tmp_path.glob("res-*-A/A.csv"))
+    assert files and all(p.read_bytes() == ambiguous.encode() for p in files)
+
+
+@pytest.mark.parametrize("ext", ["csv", "txt"])
+def test_integer_answers_beyond_float_precision(tmp_path, ext):
+    sep = "," if ext == "csv" else " "
+    path = tmp_path / f"out.{ext}"
+    a, b = 2**53, 2**53 + 1
+    path.write_text(f"id{sep}answer\np1{sep}{a}\np2{sep}{b}\n")
+    assert probe_outputs.mutate(tmp_path, "hidden_garbage") == 1
+    assert path.read_text().splitlines()[1:] == [f"p1{sep}{b}", f"p2{sep}{a}"]
+
+
+@pytest.mark.parametrize("rows,conclusive", [
+    ([], False),
+    ([dict(name="hidden_runtime")], False),
+    ([dict(name="allocation", threshold_effective=10)], False),
+    ([dict(name="custom_cpu")], False),
+    ([dict(name="helper", aux=True), dict(name="recorded", gated=False)], False),
+    ([dict(name="custom_cpu"), dict(name="accuracy")], True),
+])
+def test_rejection_requires_failed_non_resource_metric(tmp_path, monkeypatch, rows, conclusive):
+    cfg, ref, gen, _ = _probe_fixture(tmp_path, monkeypatch)
+    task = tmp_path / "task"
+    write_json(tmp_path / "_spec/spec.json", {"metrics": [dict(name="custom_cpu", kind="resource")]})
+    metrics = [dict(row, passed=False) for row in rows]
+    monkeypatch.setattr(runner, "test", lambda *a: dict(rc=0, reward="0", metrics=metrics,
+                                                        failed=[r["name"] for r in metrics if not r.get("aux") and r.get("gated", True)]))
+    result = runner.output_probe(cfg, task, gen, ref, tmp_path, "one_confident", False)
+    assert result["ok"] and not result["na"] and result["inconclusive"] != conclusive
+    assert result["scopes"]["public"]["failed_non_resource"] == (["accuracy"] if conclusive else [])
+
+
+@pytest.mark.parametrize("seeds", [[0], [7]])
+@pytest.mark.parametrize("rc,reward", [(124, "1"), (0, "0"), (0, None)])
+def test_ans_control_in_s7_and_review_bundle(tmp_path, monkeypatch, wired_gates, seeds, rc, reward):
+    cfg, spec, arms, _ = wired_gates
+    spec["form"] = "ANS"
+    cfg["gen"]["seeds"] = seeds
+    verify = runner.test
+
+    def score(*args):
+        result = verify(*args)
+        if args[-1] in ("ref0", "probe-ref0"):
+            result.update(rc=rc, reward=reward, passed=reward == "1")
+        return result
+
+    monkeypatch.setattr(runner, "test", score)
+    report = gates.run_gates(cfg, tmp_path, spec, {}, 1)
+    assert not arms and report["gates"]["coverage"] and "coverage" not in report["blocking"]
+    detail = report["details"]["coverage"]
+    assert detail["inconclusive"] and detail["reference"]["verifier_rc"] == rc and detail["reference"]["reward"] == reward
+    write_json(tmp_path / "gates/attempt-1.json", report)
+    (tmp_path / "pkg").mkdir()
+    review.write_bundle(tmp_path, tmp_path / "bundle", {})
+    bundled = json.loads((tmp_path / "bundle/records/s7_gates/attempt-1.json").read_text())
+    assert bundled["details"]["coverage"] == detail
+
+
+def test_manifest_append_after_torn_line(tmp_path):
+    P = SimpleNamespace(cfg=load_config(), store=Store(tmp_path))
+    P.cfg["review"]["enabled"] = False
+    it = P.store.item("x")
+    manifest = tmp_path / "release/manifest.jsonl"
+    manifest.parent.mkdir()
+    manifest.write_bytes(b'{"item_id":')
+    stages_b.s10(P, it)
+    stages_b.s10(P, it)
+    assert stages_b._released(P, "x") and diversity.released_ids(tmp_path) == {"x"}
+    with manifest.open("ab") as f:
+        f.write(b'{"withdrawn":')
+    assert stages_b.withdraw(P, "x", "review")
+    assert not stages_b._released(P, "x") and not diversity.released_ids(tmp_path)
+    a, release, b, withdrawal = manifest.read_text().splitlines()
+    assert (a, b) == ('{"item_id":', '{"withdrawn":')
+    assert json.loads(release)["item_id"] == "x" and json.loads(withdrawal)["withdrawn"]
+
+
+@pytest.mark.parametrize("legacy,current", [("v2.9", PROMPT_VERSION), ("cg-v5", CODE_PROMPT_VERSION)])
+@pytest.mark.parametrize("operation,builtin", [("max", max), ("sum", sum)])
+def test_legacy_builtin_and_versioned_hidden_aggregate(tmp_path, monkeypatch, wired_gates, legacy, current, operation, builtin):
+    cfg, spec, _, _ = wired_gates
+    cfg["gen"]["seeds"] = [0]
+    spec["metrics"] = [{"name": "public_error"}, {"name": "hidden_error"}]
+    verify = runner.test
+    def scores(*args):
+        result = verify(*args)
+        if args[-1] == "ref0":
+            gen, work = args[2], args[4]
+            (gen / "tests/hidden/other").mkdir()
+            log = work / "metrics.jsonl"
+            monkeypatch.setattr(templates_metrics, "_PATH", str(log))
+            values = [templates_metrics.hidden_value(name, "hidden_error", .2) for name in ("d", "other")]
+            combined = builtin(values) if use_builtin else templates_metrics.hidden_aggregate(operation, values)
+            templates_metrics.check("public_error", .5, 1, "<=")
+            templates_metrics.check("hidden_error", combined, 1, "<=")
+            result["metrics"] = [json.loads(line) for line in log.read_text().splitlines()]
+        return result
+    monkeypatch.setattr(runner, "test", scores)
+    for attempt, (version, use_builtin, expected) in enumerate([(legacy, True, True), (current, True, False),
+                                                                 (current, False, True)]):
+        spec["prompt_version"] = version
+        assert gates.run_gates(cfg, tmp_path, spec, {}, attempt)["gates"]["hidden_parity"] == expected

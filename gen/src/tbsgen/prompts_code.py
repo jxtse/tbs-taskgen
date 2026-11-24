@@ -2,7 +2,7 @@
 
 from .prompts import ASSUMPTION_RULES, GRADING_RULES
 
-CODE_PROMPT_VERSION = "cg-v5-2026-11-24"
+CODE_PROMPT_VERSION = "cg-v6-2026-11-25"
 
 S4C_RUNNABILITY = """# Runnability check of a paper's published code ({item})
 
