@@ -190,6 +190,22 @@ def legacy_report_id(it):
     return None
 
 
+def _job_runs(cfg, it, stage):
+    """Read active runs, recovering the route of records written before remote_route existed."""
+    directory = "review" if stage == "S9R" else "calib"
+    runs = read_json(it.p(directory, "runs.json"), [])
+    for rec in runs:
+        if rec.get("outcome") is None and "remote_route" not in rec:
+            c = cfg["calib"]
+            launcher = rec.get("launcher_script")
+            if not launcher and stage == "S9R":
+                launcher = cfg["review"].get("launcher") or c.get("teacher_launcher")
+            elif not launcher:
+                launcher = c.get("student_launcher" if rec.get("who") == "glm" else "teacher_launcher")
+            rec["remote_route"] = calib.is_remote_launcher(c, launcher)
+    return runs
+
+
 def migrate_probe_report(P, it):
     if not legacy_report_id(it):
         return False
@@ -202,7 +218,7 @@ def migrate_probe_report(P, it):
         if stage == "S8" and it.state.get("review_revision_pending"):
             _finish_revision(P, it, it.state["review_revision_pending"])
         if stage in ("S9", "S9R"):
-            records = read_json(it.p("review" if stage == "S9R" else "calib", "runs.json"), [])
+            records = _job_runs(P.cfg, it, stage)
             save = _save_review if stage == "S9R" else _save_run
             for rec in records:
                 if stage == "S9R" and _received_drop(it, rec):
@@ -210,8 +226,7 @@ def migrate_probe_report(P, it):
                     return True
                 if rec.get("outcome") is None:
                     if calib.remote_job(rec):
-                        if _reconcile_remote(P, it, rec, save) == "remote_unknown":
-                            return True
+                        _reconcile_remote(P, it, rec, save)
                     elif not (rec.get("state") == "launched" or rec.get("launch_attempted") or calib.job_started(rec)):
                         _cancel_probe_job(P, it, rec, save)
                     elif rec.get("state") == "intent" and calib.job_started(rec):
@@ -221,13 +236,17 @@ def migrate_probe_report(P, it):
                     else:
                         rec["state"] = "launched"
                         save(it, rec)
+                    if rec.get("state") == "remote_unknown":
+                        return True
                     if rec.get("outcome") is None:
                         it.state["probe_migration_job_stage"] = stage
         _regate(P, it, "probe_policy_migration", False, report_id)
         return True
 
 
-def _settle_not_launched(P, it, rec, save, why):
+def _settle_not_launched(P, it, rec, save, why, *, confirmed=False):
+    if not confirmed and calib.remote_job(rec):
+        return _reconcile_remote(P, it, rec, save)
     stage = rec.get("ledger_stage") or ("S9R" if save is _save_review else "S9")
     rec["ledger_call"] = P.ledger.cancel_unstarted_job(
         it.item_id, stage, calib.reservation_key(rec, it.item_id, stage), rec.get("ledger_call"), "not_launched")
@@ -280,16 +299,15 @@ def finish_job_stage(P, it, status, reason, **info):
                 agent["ledger_call"] = call
             agent.update(state="cancelled_unstarted", not_started=True, cost_usd=0.0, cost_kind="cancelled_unstarted")
             write_json(path, agent)
-    for directory, save in (("review", _save_review), ("calib", _save_run)):
-        for rec in read_json(it.p(directory, "runs.json"), []):
+    for job_stage_name, save in (("S9R", _save_review), ("S9", _save_run)):
+        for rec in _job_runs(P.cfg, it, job_stage_name):
+            if _unstarted(rec):
+                _cancel_probe_job(P, it, rec, save, kind="cancelled_unstarted")
             if rec.get("outcome") is None and calib.remote_job(rec):
-                it.state["pending_job_finish"] = dict(stage="S9R" if save is _save_review else "S9",
-                                                      status=status, reason=reason, info=info)
+                it.state["pending_job_finish"] = dict(stage=job_stage_name, status=status, reason=reason, info=info)
                 if _reconcile_remote(P, it, rec, save) == "remote_unknown":
                     return
                 return it.finish("waiting", f"awaiting remote job {rec['job_name']}")
-            if _unstarted(rec):
-                _cancel_probe_job(P, it, rec, save, kind="cancelled_unstarted")
     return it.finish(status, reason, **info)
 
 
@@ -321,13 +339,16 @@ def regate(P, it, reason: str, recalibrate: bool = False) -> dict:
 
 def _regate(P, it, reason, recalibrate, report_id=None):
     st = it.state
+    if not report_id:
+        for directory in ("calib", "review"):
+            for run in read_json(it.p(directory, "runs.json"), []) or []:
+                if run.get("outcome") is None:
+                    raise ValueError(f"regate: {directory} run {run.get('job_name')} is still pending ({run.get('state')})")
     if not report_id and st.get("stage") not in ("S9", "S9R", "S10") and st.get("status") not in ("done", "parked"):
         raise ValueError(f"regate: item at {st.get('stage')}/{st.get('status')} is not packaged")
     packaged = it.p("pkg").is_dir()
     if (not report_id and not packaged) or not it.p("thresholds.json").exists():
         raise ValueError("regate: no pkg/ or thresholds.json")
-    if not report_id and any(r.get("outcome") is None for r in read_json(it.p("calib", "runs.json"), []) or []):
-        raise ValueError("regate: a calibration run is still pending")
     old_sha = calib.pkg_sha(it.p("pkg")) if packaged else None
     # withdraw first (idempotent): the package must be out of the manifest before the item can run again
     # and overwrite pkg/; a crash after this line leaves a withdrawn, still finished item -> regate again
@@ -726,9 +747,9 @@ def _s9(P, it):
     if it.state.get("rescore_pending"):
         if _rescore_pending(P, it) is not None:
             return None                     # waiting (sandbox trouble) or sent back to S9 to recalibrate
-    runs = read_json(it.p("calib", "runs.json"), [])
+    runs = _job_runs(P.cfg, it, "S9")
     for rec in runs:                                         # reconcile interrupted submissions
-        if rec.get("outcome") is None and calib.remote_job(rec):
+        if rec.get("outcome") is None and calib.remote_submission(rec):
             if _reconcile_remote(P, it, rec, _save_run) == "remote_unknown":
                 return
             continue
@@ -740,6 +761,8 @@ def _s9(P, it):
                 # same gate as a new run: settled spend reached the run total -> do not start it; a held
                 # reservation is released and the record goes back to intent (reserved again on resume)
                 if rec["state"] == "reserved" and rec.get("ledger_call"):
+                    if calib.remote_job(rec):
+                        return _reconcile_remote(P, it, rec, _save_run)
                     P.ledger.settle(rec["ledger_call"], 0.0, status="error", kind="not_launched",
                                     note="not launched: run_usd_total reached")
                     rec.update(state="intent", ledger_call=None)
@@ -772,6 +795,8 @@ def _s9(P, it):
                 _settle_not_launched(P, it, rec, _save_run, why)
             elif calib.launcher_died(rec, c):
                 _settle_dead_job(P, it, rec)
+        if rec.get("state") == "remote_unknown":
+            return it.finish("parked", f"remote_unknown: {rec['job_name']}")
     runs = read_json(it.p("calib", "runs.json"), [])
     pending = [r for r in runs if r.get("outcome") is None]
     if pending:
@@ -851,6 +876,8 @@ def _s9(P, it):
         return it.finish("waiting", f"calib {what} run {n} queued: {full}")
     P.store.event("calib_submitted" if rec.get("submitted") else "calib_launch_failed", item=it.item_id, who=what,
                   config=rec["config"], state=rec["state"])
+    if rec.get("state") == "remote_unknown":
+        return it.finish("parked", f"remote_unknown: {rec['job_name']}")
     if rec.get("submitted"):
         return it.finish("waiting", f"submitted {what} run {n}: {rec['job_name']}")
     return it.goto("S9", f"launch failed: {rec.get('error', '')[:120]}")
@@ -863,8 +890,7 @@ def ingest(P, it, job_dir: str | None = None) -> dict:
     with item_lock(it):
         it.load()
         stage = "S9R" if job_stage(it) == "S9R" else "S9"
-        directory = "review" if stage == "S9R" else "calib"
-        runs = read_json(it.p(directory, "runs.json"), [])
+        runs = _job_runs(P.cfg, it, stage)
         rec = next((r for r in runs if calib.pending_launcher(r)), None)
         if rec is None:
             if runs and runs[-1].get("outcome") is not None and it.state.get("status") == "waiting":
@@ -880,7 +906,7 @@ def ingest(P, it, job_dir: str | None = None) -> dict:
         return _ingest_run(P, it, rec, stage, Path(job_dir or rec["job_dir"]))
 
 
-def resolve_remote(P, it, job, *, synced):
+def resolve_remote(P, it, job, *, synced, died=False, remote_task=None):
     """Resolve one named parked run under the same lock as the watcher."""
     if not it.p("state.json").is_file():
         raise ValueError(f"unknown item: {it.item_id}")
@@ -889,8 +915,7 @@ def resolve_remote(P, it, job, *, synced):
         stage = job_stage(it)
         if stage not in ("S9", "S9R"):
             raise ValueError("no pending remote run for this item")
-        directory = "review" if stage == "S9R" else "calib"
-        runs = read_json(it.p(directory, "runs.json"), [])
+        runs = _job_runs(P.cfg, it, stage)
         rec = next((r for r in runs if r.get("job_name") == job), None)
         if (rec and rec.get("outcome") is not None and _remote_parked(it)
                 and it.state["reason"] == f"remote_unknown: {job}"):
@@ -900,14 +925,24 @@ def resolve_remote(P, it, job, *, synced):
         if not rec or rec.get("state") != "remote_unknown" or rec.get("outcome") is not None:
             raise ValueError(f"no remote_unknown run named {job} for this item")
         jd = Path(rec["job_dir"])
-        if synced:
-            return _ingest_run(P, it, rec, stage, jd)
-        if (jd / "config.json").exists() or any(jd.glob("*/result.json")):
-            raise ValueError("cannot confirm not-started with a job config or trial results")
         save = _save_review if stage == "S9R" else _save_run
-        _settle_not_launched(P, it, rec, save, "operator confirmed remote job did not start")
+        if synced or died:
+            finished = (read_json(jd / "result.json", {}) or {}).get("finished_at")
+            if synced and not finished:
+                raise ValueError("missing finished_at: use --died if the remote job ended")
+            if died and finished:
+                raise ValueError("job has finished_at: sync the full job and use --synced")
+            calib.restore_remote_marker(jd, rec, remote_task, review=stage == "S9R", partial=died)
+            if synced:
+                return _ingest_run(P, it, rec, stage, jd)
+            calib.check_job_identity(jd, rec, review=stage == "S9R", partial=True)
+            _settle_dead_job(P, it, rec, save, confirmed=True)
+        else:
+            if (jd / "config.json").exists() or (jd / "result.json").exists() or any(jd.glob("*/result.json")):
+                raise ValueError("cannot confirm not-started with a job config, top-level result or trial results")
+            _settle_not_launched(P, it, rec, save, "operator confirmed remote job did not start", confirmed=True)
         _after_ingest(P, it, rec, stage)
-        return dict(job_name=job, cost_usd=0.0, cost_kind=rec["cost_kind"])
+        return dict(job_name=job, cost_usd=rec["cost_usd"], cost_kind=rec["cost_kind"])
 
 
 def _after_ingest(P, it, rec, stage):
@@ -926,7 +961,7 @@ def _after_ingest(P, it, rec, stage):
 
 
 def _ingest_run(P, it, rec, stage, jd):
-    if calib.remote_job(rec) and not calib.complete_remote_trials(jd):
+    if calib.remote_job(rec) and not calib.complete_remote_trials(jd, review=stage == "S9R"):
         raise ValueError(f"incomplete remote trial set: {jd}")
     jr = read_json(jd / "result.json", {})
     if not jr.get("finished_at"):
@@ -1081,20 +1116,28 @@ def _release_reviewed(P, it, previous, scopes):
     it.advance("S10", None, status="done")
 
 
-def _settle_dead_job(P, it, rec: dict, save=_save_run) -> None:
+def _settle_dead_job(P, it, rec: dict, save=_save_run, *, confirmed=False):
     """The Harbor job of a launched run ended without finished_at (crash / kill): an infra run.  Its cost is what
     the trials written so far show (tokens), else unknown (reservation kept, not counted as actual spend)."""
+    if not confirmed and calib.remote_job(rec):
+        return _reconcile_remote(P, it, rec, save)
     jd = Path(rec["job_dir"])
-    try:
-        trials = calib.collect(jd, rec.get("model"), P.cfg["models"].get("prices", {}))
-    except (OSError, ValueError):
-        trials = []
-    usd, kind, usage = calib.job_cost(trials) if trials else (None, "reservation", None)
+    costs = []
+    for trial in sorted(jd.glob("*/")):
+        if not confirmed and not (trial / "result.json").is_file():
+            continue
+        try:
+            cost = calib.trial_cost(trial, rec.get("model"), P.cfg["models"].get("prices", {}))
+        except (OSError, ValueError, TypeError, AttributeError):
+            cost = {}
+        if cost.get("cost_usd") is not None or not confirmed:
+            costs.append(cost)
+    usd, kind, usage = calib.job_cost(costs)
     if rec.get("ledger_call"):
         P.ledger.settle(rec["ledger_call"], usd, status="error", kind=kind, usage=usage,
                         note="harbor job ended without finished_at")
     exf = Path(rec.get("log", "") + ".exit")
-    ex = exf.read_text().strip() if exf.exists() else "none (session gone)"
+    ex = exf.read_text().strip() if exf.exists() else "none recorded"
     rec.update(state="died", outcome="infra", result_type="infra", cost_usd=usd, cost_kind=kind,
                error=f"launcher exit {ex}; harbor job has no finished_at")
     save(it, rec)
@@ -1125,7 +1168,7 @@ def reschedulable(cfg: dict, it) -> bool:
     disabled = stage == "S9R" and not cfg["review"]["enabled"]
     if not disabled and not cfg["calib"].get("allow_submit"):
         return False
-    runs = read_json(it.p("calib" if stage == "S9" else "review", "runs.json"), [])
+    runs = _job_runs(cfg, it, stage)
     if not disabled and runs and calib.preflight_wait(cfg, runs[-1]):
         return False
     return not any(calib.pending_launcher(r) for r in runs)
@@ -1140,22 +1183,27 @@ def watch_tick(P, only: list[str] | None = None, max_steps: int = 50) -> dict:
         if only and it.item_id not in only:
             continue
         stage = job_stage(it)
-        if stage not in ("S9", "S9R") or it.state.get("status") != "waiting":
+        if stage not in ("S9", "S9R") or not (it.state.get("status") == "waiting" or _remote_parked(it)):
             continue
-        rf = ("calib" if stage == "S9" else "review", "runs.json")
-        runs = read_json(it.p(*rf), [])
+        runs = _job_runs(P.cfg, it, stage)
         pend = [r for r in runs if calib.pending_launcher(r)]
         if not pend:
-            if it.state.get("probe_migration_job_stage") or it.state.get("pending_job_finish"):
+            if it.state.get("status") == "waiting" and (it.state.get("probe_migration_job_stage") or
+                                                        it.state.get("pending_job_finish")):
                 ingest(P, it)  # recover a crash after saving runs.json
             continue
         rec = pend[0]
         with item_lock(it):
             it.load()                   # re-check under the lock: another watcher / run may have moved it
-            runs = read_json(it.p(*rf), [])
+            runs = _job_runs(P.cfg, it, stage)
             cur = next((r for r in runs if r.get("job_name") == rec["job_name"]), {})
-            if job_stage(it) != stage or it.state.get("status") != "waiting" or \
-                    not cur or not calib.pending_launcher(cur):
+            if job_stage(it) != stage or not cur or not calib.pending_launcher(cur):
+                continue
+            if _remote_parked(it):
+                if cur.get("state") == "remote_unknown" and calib.remember_remote_marker(cur):
+                    (_save_run if stage == "S9" else _save_review)(it, cur)
+                continue
+            if it.state.get("status") != "waiting":
                 continue
             if calib.remote_job(cur):
                 save = _save_run if stage == "S9" else _save_review
@@ -1247,7 +1295,7 @@ def _s9r(P, it):
     rv = P.cfg.get("review") or {}
     rnd = int(it.state.get("review_round") or 1)
     save = lambda r: _save_review(it, r)  # noqa: E731
-    runs = [r for r in read_json(it.p("review", "runs.json"), []) if r.get("n") == rnd]
+    runs = [r for r in _job_runs(P.cfg, it, "S9R") if r.get("n") == rnd]
     sha, epoch = calib.pkg_sha(it.p("pkg")), int(it.state.get("calib_epoch", 0))
     for rec in runs:
         if _received_drop(it, rec):
@@ -1255,7 +1303,7 @@ def _s9r(P, it):
     scopes = _probe_scopes(it)
     review_disabled = not rv.get("enabled")
     for rec in runs:                                     # reconcile interrupted submissions / dead launches
-        if rec.get("outcome") is None and calib.remote_job(rec):
+        if rec.get("outcome") is None and calib.remote_submission(rec):
             if _reconcile_remote(P, it, rec, _save_review) == "remote_unknown":
                 return
             continue
@@ -1265,6 +1313,8 @@ def _s9r(P, it):
                 if (review_disabled or review.job_contract(rec) != review.CURRENT_CONTRACT
                         or set(scopes) - set(rec.get("suspected_scopes", []))):
                     _cancel_probe_job(P, it, rec, _save_review, kind="cancelled_unstarted")
+                    if rec.get("state") == "remote_unknown":
+                        return
                     continue
             elif review_disabled:
                 # A manual job needs adoption. An uncertain launcher must be drained without resubmitting it.
@@ -1282,6 +1332,8 @@ def _s9r(P, it):
             cap = None if calib.job_started(rec) else _cap_reached(P)
             if cap is not None:
                 if rec["state"] == "reserved" and rec.get("ledger_call"):
+                    if calib.remote_job(rec):
+                        return _reconcile_remote(P, it, rec, _save_review)
                     P.ledger.settle(rec["ledger_call"], 0.0, status="error", kind="not_launched",
                                     note="not launched: run_usd_total reached")
                     rec.update(state="intent", ledger_call=None)
@@ -1302,17 +1354,9 @@ def _s9r(P, it):
             if why:
                 _settle_not_launched(P, it, rec, _save_review, why)
             elif calib.launcher_died(rec, c):
-                try:
-                    trials = calib.collect(Path(rec["job_dir"]), rec.get("model"), P.cfg["models"].get("prices", {}))
-                except (OSError, ValueError):
-                    trials = []
-                usd, kind, usage = calib.job_cost(trials) if trials else (None, "reservation", None)
-                rec.update(state="died", outcome="infra", cost_usd=usd, cost_kind=kind,
-                           error="review job ended without finished_at")
-                if rec.get("ledger_call"):
-                    P.ledger.settle(rec["ledger_call"], usd, status="error", kind=kind, usage=usage,
-                                    note="review job ended without finished_at")
-                save(rec)
+                _settle_dead_job(P, it, rec, _save_review)
+        if rec.get("state") == "remote_unknown":
+            return it.finish("parked", f"remote_unknown: {rec['job_name']}")
     all_rnd = [r for r in read_json(it.p("review", "runs.json"), []) if r.get("n") == rnd]
     pending = [r for r in all_rnd if r.get("outcome") is None]
     if pending:
@@ -1384,6 +1428,8 @@ def _s9r(P, it):
         return it.finish("waiting", f"review round {rnd} queued: {full}")
     P.store.event("review_submitted" if rec.get("submitted") else "review_launch_failed", item=it.item_id,
                   round=rnd, state=rec["state"])
+    if rec.get("state") == "remote_unknown":
+        return it.finish("parked", f"remote_unknown: {rec['job_name']}")
     if rec.get("submitted"):
         return it.finish("waiting", f"submitted review round {rnd}: {rec['job_name']}")
     return it.goto("S9R", f"review launch failed: {rec.get('error', '')[:120]}")

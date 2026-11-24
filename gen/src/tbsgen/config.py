@@ -298,6 +298,7 @@ DEFAULTS: dict[str, Any] = {
     # S1 -> S2a (code signal, no download quota) -> S2 -> S3 (full text) -> S3b (own code confirmed on its host)
     # -> S4.  A paper without the authors' code is dropped (no exception route).  Licences are recorded only.
     # See codegate.py for the drop reasons.  grounded=false keeps the paper-only pipeline unchanged.
+    "agent": {"remote_launchers": None},  # S4c / S5G launcher classification (same default as calib)
     "code": {
         "grounded": False,
         "prescreen": True,                  # S2a on (needs grounded)
@@ -459,6 +460,7 @@ DEFAULTS: dict[str, Any] = {
         # printed command is a plain `harbor run --config ...`, and allow_submit=true refuses to launch.
         "harbor_root": HARBOR_ROOT,
         "jobs_dir": str(REPO_ROOT / "gen" / "state" / "harbor-jobs"),
+        "remote_launchers": None,           # explicit script basenames, default: all wrappers except harbor
         "student_launcher": None,
         "teacher_launcher": None,
         "allow_submit": False,              # must be flipped explicitly; True = reserve in ledger + tmux launch

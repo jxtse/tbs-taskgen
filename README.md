@@ -196,10 +196,23 @@ default; routed like the teacher unless set) are in §4–§5b there.
 
 For S9 and S9R, `tbsgen status` and `tbsgen report` count unresolved `remote_unknown` runs. The item reason
 `remote_unknown: NAME` identifies the job. Its budget reservation and concurrency slot stay held until an
-operator resolves it. After syncing the complete remote job directory to its recorded local location, run
-`tbsgen calib resolve-remote --run RUN --config CFG --item ID --job NAME --synced` to ingest the trials,
-settle their cost and process the verdict. If you have verified that the remote job never started, use
-`--not-started` to release the reservation at zero. A local job config or trial result blocks that option.
+operator resolves it. The controller records the route before submission. By default, plain Harbor runs locally
+and custom launcher scripts are treated as remote. Set `calib.remote_launchers` (S9 and S9R) or
+`agent.remote_launchers` (S4c and S5G) to an explicit list of remote script basenames. An empty list
+classifies all configured scripts as local. A launcher's remote marker also identifies a remote run.
+
+Use `tbsgen calib resolve-remote --run RUN --config CFG --item ID --job NAME` with one of these outcomes.
+
+- `--synced` ingests a finished job after its full directory has been copied back. Every trial needs a result,
+  and each S9R trial also needs its verifier verdict.
+- `--died` confirms that the remote job ended without `finished_at`. Sync the available trials first. The
+  controller charges their readable costs, or the reservation when none is available, then applies the infra retry policy.
+- `--not-started` releases the reservation at zero after the operator verifies that the remote job never started.
+  A job config, top-level result, or trial result blocks this outcome.
+
+Directory replacement can remove the local `tbsgen-remote.json`. Resolution restores the saved marker.
+If the controller never captured the mapping, supply the original remote task path with `--remote-task PATH`.
+`regate` requires all calibration and review runs for the item to be closed.
 
 ### Running unattended
 

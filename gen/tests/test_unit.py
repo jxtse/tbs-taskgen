@@ -456,7 +456,7 @@ def _s9_env(tmp_path, monkeypatch=None, launcher_rc=0, make_job=True, **calib_kw
           % (jobs, jobs)) if make_job else "true"
     (hr / "launch.sh").write_text("#!/bin/bash\n%s\nexit %d\n" % (mk, launcher_rc))
     (hr / "launch.sh").chmod(0o755)
-    cal = dict(allow_submit=True, harbor_root=str(hr), jobs_dir=str(jobs), student_launcher="launch.sh",
+    cal = dict(allow_submit=True, remote_launchers=[], harbor_root=str(hr), jobs_dir=str(jobs), student_launcher="launch.sh",
                agent_allowed_hosts=["models.example.com"],
                tmux_bin=str(tmux), est_usd_per_run=10.0)
     cal.update(calib_kw)

@@ -409,12 +409,15 @@ def recover_legacy_agent_call(it, kind, rec, conf, ledger):
 def launch_agent(cfg: dict, it, kind: str, conf: dict, ledger, est_usd: float, extra: dict | None = None) -> dict:
     """intent -> reserved -> launched, persisted in <item>/<kind>/run.json (one job per stage attempt).  extra:
     fields stored with the intent (e.g. budget, harden_round) so a resumed job keeps them."""
+    from .calib import is_remote_launcher
+    launcher = _c(cfg).get("agent_launcher") or cfg["calib"].get("teacher_launcher")
+    remote_route = is_remote_launcher(cfg.get("agent", {}), launcher)
     d = it.p(kind)
     d.mkdir(parents=True, exist_ok=True)
     recp = d / "run.json"
     rec = read_json(recp, None) or {}
     if rec.get("job_name") != conf["job_name"]:
-        rec = dict(job_name=conf["job_name"], state="intent", ts=time.time(), kind=kind,
+        rec = dict(job_name=conf["job_name"], state="intent", ts=time.time(), kind=kind, remote_route=remote_route,
                    job_dir=str(Path(conf["jobs_dir"]) / conf["job_name"]), config=str((d / "job.json").resolve()),
                    **(extra or {}))
         (d / "job.json").write_text(json.dumps(conf, indent=1))
@@ -442,7 +445,6 @@ def launch_agent(cfg: dict, it, kind: str, conf: dict, ledger, est_usd: float, e
             write_json(recp, rec)
             return rec
         root = _c(cfg).get("agent_harbor_root") or cfg["calib"].get("teacher_harbor_root")
-        launcher = _c(cfg).get("agent_launcher") or cfg["calib"].get("teacher_launcher")
         if not (root and launcher):
             rec.update(state="launch_failed", error="code.agent_harbor_root / agent_launcher not set")
             if ledger is not None and rec.get("ledger_call"):
@@ -467,7 +469,7 @@ def launch_agent(cfg: dict, it, kind: str, conf: dict, ledger, est_usd: float, e
                 return rec                      # cannot tell: keep the reservation, try again on the next step
         inner = (f"cd {shlex.quote(root)} && env -u PYTHONPATH -u VIRTUAL_ENV ./{launcher} run "
                  f"{shlex.quote(rec['config'])} > {shlex.quote(str(log))} 2>&1; echo $? > {shlex.quote(str(log))}.exit")
-        rec.update(launch_attempted=time.time(), log=str(log), tmux=conf["job_name"][-60:])
+        rec.update(launch_attempted=time.time(), log=str(log), tmux=conf["job_name"][-60:], remote_route=remote_route)
         write_json(recp, rec)
         r = subprocess.run([tmux_bin, "new-session", "-d", "-s", rec["tmux"], "bash", "-lc",
                             inner], capture_output=True, text=True, timeout=60)

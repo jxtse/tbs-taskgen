@@ -122,6 +122,15 @@ def _agent_item(tmp_path, monkeypatch, files, stage="S4c", **code):
     return P, it, fl
 
 
+@pytest.mark.parametrize("stage", ["S4c", "S5G"])
+@pytest.mark.parametrize("names,remote", [(None, True), (["x.sh"], True), ([], False)])
+def test_agent_records_remote_route_at_launch(tmp_path, monkeypatch, stage, names, remote):
+    P, it, _ = _agent_item(tmp_path, monkeypatch, {}, stage=stage)
+    P.cfg["agent"]["remote_launchers"] = names
+    P.run(max_steps=1, only=[it.item_id])
+    assert read_json(it.p(stage, "run.json"))["remote_route"] is remote
+
+
 def test_s4c_runnable_then_s5g(tmp_path, monkeypatch):
     P, it, fl = _agent_item(tmp_path, monkeypatch, {
         "runnability.json": json.dumps({"runnable": True, "reason": "ok", "language": "Python", "seconds": 3,

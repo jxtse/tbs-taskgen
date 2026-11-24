@@ -311,8 +311,11 @@ uv run tbsgen ping --run state/ping --calls 1 --budget-usd 1        # Opus 连�
 
 **人工处理远端校准或审核作业**。条目以 `remote_unknown: NAME` 暂存时，原预算预留和并发槽位继续占用。`tbsgen status` 和 `tbsgen report` 会显示待处理的作业数。
 
-- 已将完整作业同步到记录的本地目录时，运行 `tbsgen calib resolve-remote --run runs/R --config config.toml --item ID --job NAME --synced`。命令核对作业身份、结束标记、配置要求的试次数和各试次的 `result.json`，再结算费用并处理裁决。
-- 确认远端从未启动该作业时，将同一命令的 `--synced` 换为 `--not-started`，按零费用结算。本地已有作业 `config.json` 或试次结果时，命令会拒绝零费用结算。
+- 已将完整作业同步到记录的本地目录时，运行 `tbsgen calib resolve-remote --run runs/R --config config.toml --item ID --job NAME --synced`。命令核对作业身份、结束标记、配置要求的试次数和各试次的 `result.json`。审核作业还要求每个试次都有 verifier 裁决，齐全后才结算并处理裁决。
+- 已确认远端作业死亡、缺少 `finished_at` 时，先同步现存文件，再用 `--died`。命令合计可读试次费用，没有可读费用时按预留额结算，然后释放槽位并按 infra 策略重试。
+- 确认远端从未启动该作业时，将同一命令的 `--synced` 换为 `--not-started`，按零费用结算。本地已有作业 `config.json`、顶层或试次 `result.json` 时，命令会拒绝零费用结算。
+
+替换目录导致本机 `tbsgen-remote.json` 丢失时，命令会从运行记录恢复它。若从未取得映射，使用 `--remote-task PATH` 提供远端任务路径。对尚有校准或审核作业未结算的条目，`regate` 会报告待处理作业。
 
 `config.toml` 示例（只需写要覆盖的项）：
 
@@ -372,6 +375,7 @@ allow_submit = false
 | `calib.variant_depth` | 0 | S9b 更难变体（**待定**，MVP 关闭） |
 | `calib.infra_retries` | 2 | API/沙箱异常不计入校准次数 |
 | `calib.allow_submit` | **False** | True 时：账本预留 → tmux 后台运行启动脚本；预留超总额则拒绝；没配 `harbor_root` 和启动脚本时拒绝提交 |
+| `calib.remote_launchers`（S9/S9R）、`agent.remote_launchers`（S4c/S5G） | None | 启动前按脚本文件名记录路由。默认直接调用 `harbor` 为本地，自定义启动脚本为远端。显式列表只将列出的脚本标记为远端，空列表表示所有脚本均为本地。远端 marker 也可独立识别远端作业。 |
 | `calib.harbor_root / student_launcher / teacher_launcher` | None | 启动脚本目录与脚本名（`./<launcher> run <作业配置>`）；未设置时只打印 `harbor run --config ...` |
 | `calib.student_agent / teacher_agent / environment` | None | Harbor 自定义 agent/环境的 `module:Class`；未设置用内置 `claude-code` agent 和 `docker` 环境 |
 | `calib.est_usd_per_run` | 20 | 每次校准作业的预留额，`calib-ingest` 冲销：Harbor 报了 `cost_usd` 用实报（`reported`）；没报（如超时）用 trial 的 token 用量 × `models.prices[模型]` 估算（`tokens`，来源依次为 agent_result、trajectory.json、Claude Code stream-json）；都没有则保留预留额并标 `reservation`——它仍占用预留额度，但不算进 `run_usd_total` 的实际花费门。`tbsgen ledger` 的 `usd_by_cost_kind` 分开列出 |

@@ -71,6 +71,7 @@ CATEGORIES = {"a": "consistency", "b": "missing_conditions", "c": "thresholds", 
               "i": "author_code", "j": "genuine_difficulty"}
 REVIEW_PROMPT_VERSION = CURRENT_CONTRACT
 VERDICT_PATH = "/app/review_out/verdict.json"
+VERIFIED_VERDICT = Path("verifier/verdict.json")
 # files a review revision (S8) may change: the statement, the data format notes (written by the generator), the
 # test / scoring scripts, and the exploit baselines.  Never the reference solution, the baselines' mid / naive,
 # _spec/ or thresholds.json.
@@ -854,15 +855,15 @@ def _obj(v) -> dict:
 
 
 def read_verdict(trial: Path) -> dict | None:
-    for name in ("verdict.json", "verdict.raw.json"):
-        p = trial / "verifier" / name
+    paths = (trial / VERIFIED_VERDICT, trial / "verifier/verdict.raw.json")
+    for p in paths:
         if p.exists():
             try:
                 v = json.loads(p.read_text())
             except (ValueError, UnicodeDecodeError, OSError):
                 continue
             return v if v is not None else {"_corrupt": "verdict file holds JSON null"}
-    if any((trial / "verifier" / n).exists() for n in ("verdict.json", "verdict.raw.json")):
+    if any(p.is_file() for p in paths):
         # a verdict file was written but cannot be parsed: a (broken) judgment, not missing infrastructure ->
         # normalize() makes it invalid and the review is re-run, then dropped
         return {"_corrupt": "verdict file is not valid JSON"}
@@ -925,7 +926,8 @@ def prepare(cfg: dict, item_dir: Path, task: Path, rnd: int, attempt: int, epoch
     root, launcher = c.get("teacher_harbor_root"), c.get("teacher_launcher")
     command = f"cd {root} && ./{launcher} run {p}" if launcher and root else f"harbor run --config {p} --yes"
     rec = dict(who="review", n=rnd, attempt=attempt, item=item_dir.name, model=c["teacher_model"], job_name=name,
-               config=str(p), command=command, state="intent", submitted=False, ts=time.time(),
+               config=str(p), command=command, state="intent", remote_route=calib.is_remote_launcher(c, launcher),
+               submitted=False, ts=time.time(),
                job_dir=str(Path(c["jobs_dir"]) / name), task=str(task.resolve()), outcome=None,
                ledger_stage="S9R", pkg_sha=calib.pkg_sha(item_dir / "pkg"), calib_epoch=epoch)
     contract = json.loads((task / "tests/review_contract.json").read_text())
