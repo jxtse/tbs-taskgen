@@ -1,0 +1,84 @@
+out = "../state/trainpipe"
+
+[ingest]
+runs = ["../runs/example"]
+jobs = []
+
+[difficulty]
+# Omit model names to infer them from calibration roles.
+hard_max = 0.3333333333333333
+medium_max = 0.6666666666666666
+
+[filter]
+review_allow = ["pass"]
+exclude = []
+
+[screen]
+train_models = ["student-model"]
+hint_mode = "exclude"
+allow_timeout = false
+
+[judge]
+base_url = "https://llm.example/v1"
+model = "judge-model"
+api_key_env = "JUDGE_API_KEY"
+concurrency = 64
+timeout = 180
+retries = 4
+window_chars = 64000
+input_tokens_per_million = 0.0
+output_tokens_per_million = 0.0
+
+[select]
+# easy_cap: every admitted medium/hard trajectory, plus the best easy ones up to easy_max of the mix.
+# shares: an exact tier mix (the largest cohort that fits `shares`).
+mode = "easy_cap"
+easy_max = 0.15
+shares = { hard = 0.45, medium = 0.40, easy = 0.15 }
+per_task = 2
+max_token_share = 0.02
+token_share_floor = 1.5   # x the even share 1/n_tasks; only matters for small sets
+easy_quality = 4
+seed = 0
+
+[export]
+images = "drop_row"
+codex_reasoning = "drop"
+tokenizer = "../state/tokenizer.json"
+train_on_what = "all_assistant_messages"
+max_length = 194560
+
+[export.wire.claude-code]
+dir = "../state/wire/claude-code"
+
+[submit]
+cli = "mint-recursive"
+cli_env = "MINT_RECURSIVE_CLI"
+config_file = "../state/training.toml"
+base_model = "student-model"
+timeout = "30m"
+note = "Scientific trajectories"
+
+[rollout]
+job_name = "science-rollout"
+jobs_dir = "../runs/rollout-jobs"
+harness = "claude-code"
+model = "student-model"
+attempts = 3
+concurrency = 8
+
+[rollout.environment]
+import_path = "example.environment:Environment"
+
+[rollout.agents.claude-code]
+import_path = "example.agents:ClaudeCode"
+kwargs = {}
+
+[rollout.agents.codex]
+import_path = "example.agents:Codex"
+kwargs = {}
+
+[rollout.agents.pi]
+import_path = "example.agents:Pi"
+kwargs = {}
+
