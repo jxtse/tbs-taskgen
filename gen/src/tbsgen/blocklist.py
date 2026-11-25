@@ -16,11 +16,15 @@ match.
 from __future__ import annotations
 
 import datetime
+import fcntl
+import functools
 import json
 import re
 import time
 import urllib.parse
 from pathlib import Path
+
+from .state import write_json
 
 _PII_YEAR = re.compile(r"\((\d{2})\)")
 _YEAR = re.compile(r"^\s*(\d{4})(?:[-/]\d{1,2}(?:[-/]\d{1,2})?)?\s*$")   # 1997, 1997-03, 1997-03-01
@@ -89,7 +93,16 @@ def load_state(store) -> dict:
 
 
 def save_state(store, st: dict) -> None:
-    state_path(store).write_text(json.dumps(st, indent=1, sort_keys=True))
+    write_json(state_path(store), st)
+
+
+def _serialized(fn):
+    @functools.wraps(fn)
+    def locked(store, *args, **kwargs):
+        with (store.root / ".blocklist.lock").open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            return fn(store, *args, **kwargs)
+    return locked
 
 
 # per-process cache of target shares, per run directory; dropped whenever the run's item count changes (new
@@ -116,7 +129,7 @@ def target_share(store, c: dict, rules: list[dict], rule: dict, lifted: set[str]
     tgt = str(c.get("_target") or c.get("target") or "")
     if not tgt:
         return None
-    key = (tgt, rule.get("name") or rule.get("doi_prefix"), rule.get("before_year"))
+    key = (tgt, rule.get("name") or rule.get("doi_prefix"), rule.get("before_year"), frozenset(lifted))
     if key in cache:
         return cache[key]
     n = m = 0
@@ -133,17 +146,19 @@ def target_share(store, c: dict, rules: list[dict], rule: dict, lifted: set[str]
     return share
 
 
+@_serialized
 def decide(store, cfg: dict, c: dict, rules: list[dict], rule: dict, event) -> dict:
-    """Called from S2 with a matching rule: {action: block | trial}.  A trial goes through the normal path; the
+    """Called from S2 with a matching rule: {action: block | trial | allow (lifted meanwhile)}.  A trial goes through the normal path; the
     paper's fetch outcome is recorded (resolve) and once enough trials decided, a lift decision is made."""
     rc = (cfg.get("screen") or {}).get("blocklist_recheck") or {}
-    name = rule.get("name") or rule.get("doi_prefix")
     st = load_state(store)
+    rule = match(c, rules, lifted_rules(st))
+    if rule is None:
+        return dict(action="allow", lifted=True)
+    name = rule.get("name") or rule.get("doi_prefix")
     r = st.setdefault("rules", {}).setdefault(name, dict(trials=[], lifted=False))
-    if r.get("lifted"):
-        return dict(action="block", lifted=True)          # caller should not have matched it; block is stale
     if c.get("item_id") and any(t.get("item") == c.get("item_id") for t in r.get("trials") or []):
-        return dict(action="trial", repeat=True)          # S2 re-run of a trial paper: no second quota slot
+        return dict(action="trial", rule=rule, repeat=True)          # S2 re-run of a trial paper: no second quota slot
     quota = int(rc.get("weekly_quota", 5))
     week = _iso_week()
     r.setdefault("weeks", {})
@@ -156,11 +171,28 @@ def decide(store, cfg: dict, c: dict, rules: list[dict], rule: dict, event) -> d
         save_state(store, st)
         event("blocklist_trial", rule=name, item=c.get("item_id"), doi=_norm_doi(c.get("doi")),
               share=round(share, 4) if share is not None else None, week=week)
-        return dict(action="trial", share=share)
+        return dict(action="trial", rule=rule, share=share)
     save_state(store, st)
-    return dict(action="block", share=share)
+    return dict(action="block", rule=rule, share=share)
 
 
+def _revive(it, name, result, **details):
+    # The blocklist lock is held. A worker may hold the step lock while deciding a
+    # trial, so skip a busy item and reconsider it on the next pass.
+    with it.step_lock() as held:
+        if not held:
+            return False
+        state = it.load().state
+        if (state["stage"], state["status"], state.get("reason")) != ("S2", "dropped", f"blocklist:{name}"):
+            return False
+        state["history"].append(dict(stage="S2", result=result, rule=name, ts=time.time(), **details))
+        state.update(status="active")
+        state.pop("reason", None)
+        it.save()
+        return True
+
+
+@_serialized
 def revive_for_trials(store, cfg: dict, event) -> list[str]:
     """Weekly re-scheduling: papers S2 dropped by a rule (reason "blocklist:<rule>") in an earlier week are the
     trial pool.  For every rule that is not lifted and still has quota this ISO week, put up to the remaining quota
@@ -183,11 +215,8 @@ def revive_for_trials(store, cfg: dict, event) -> list[str]:
             for it in items:
                 if it.state.get("status") == "dropped" and it.state.get("stage") == "S2" and \
                         it.state.get("reason") == f"blocklist:{name}" and it.item_id not in out:
-                    it.state.setdefault("history", []).append(dict(stage="S2", result="blocklist_lifted", rule=name,
-                                                                   ts=time.time()))
-                    it.state.update(status="active")
-                    it.state.pop("reason", None)
-                    it.save()
+                    if not _revive(it, name, "blocklist_lifted"):
+                        continue
                     out.append(it.item_id)
                     event("blocklist_revived", rule=name, item=it.item_id, lifted=True)
             continue
@@ -210,16 +239,14 @@ def revive_for_trials(store, cfg: dict, event) -> list[str]:
             if sh is not None and sh > float(rc.get("min_share", 0.10)):
                 ok_share.append(it)
         for it in ok_share:
-            it.state.setdefault("history", []).append(dict(stage="S2", result="blocklist_recheck", rule=name,
-                                                           week=week, ts=time.time()))
-            it.state.update(status="active")
-            it.state.pop("reason", None)
-            it.save()
+            if not _revive(it, name, "blocklist_recheck", week=week):
+                continue
             out.append(it.item_id)
             event("blocklist_revived", rule=name, item=it.item_id, week=week)
     return out
 
 
+@_serialized
 def resolve(store, item, void: str | None = None) -> None:
     """Settle this item's pending trial: ok when its full text exists (S3 delivered), fail when S3 parked it
     fulltext_unavailable (a later delivery by the fetch queue upgrades it to ok in reevaluate()); `void`: the paper
@@ -244,6 +271,7 @@ def resolve(store, item, void: str | None = None) -> None:
         save_state(store, st)
 
 
+@_serialized
 def reevaluate(store, cfg: dict, event) -> dict:
     """Lift / keep decisions for every rule with enough decided trials; an {rule: decision} report.  A trial that
     failed at S3 but whose paper was delivered later by the fetch queue is upgraded to ok first."""
@@ -259,6 +287,9 @@ def reevaluate(store, cfg: dict, event) -> dict:
                 it = store.item(t["item"])
                 if it.p("fulltext.txt").exists():
                     t["outcome"], t["settled"] = "ok", time.time()
+                    upgraded = True
+                elif t.get("outcome") == "pending" and it.state.get("reason") == "fulltext_unavailable":
+                    t["outcome"], t["settled"] = "fail", time.time()
                     upgraded = True
             except Exception:
                 pass

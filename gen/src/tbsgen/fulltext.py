@@ -51,7 +51,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass, field
+from dataclasses import InitVar, dataclass, field
 from pathlib import Path
 from typing import Callable
 
@@ -213,12 +213,17 @@ def _alt_key(stem: str, ident: str) -> str:
 
 
 @contextlib.contextmanager
-def _dir_lock(d: Path):
+def _dir_lock(d: Path, deadline=None):
     """Exclusive lock for choosing + publishing a cache file name (writes are rare; reads need no lock because a
     file name is only ever published for one identity)."""
     import fcntl
     with open(d / ".write.lock", "a+") as fh:
-        fcntl.flock(fh, fcntl.LOCK_EX)
+        if deadline is None:
+            fcntl.flock(fh, fcntl.LOCK_EX)
+        else:
+            from .state import _try_lock
+            if not _try_lock(fh, deadline):
+                raise TimeoutError("timed out waiting for the fetch cache")
         try:
             yield
         finally:
@@ -407,6 +412,38 @@ def publisher_of_host(host: str) -> tuple[list[str], list[str]]:
     return [], []
 
 
+def cached_text(c: dict, dirs, min_chars: int) -> tuple[str, dict] | None:
+    """Cached text for this paper.  A file whose provenance names another DOI (doi_key collision) is
+    skipped; the collision-safe `<stem>-<sha8>` name is tried too.  Files without provenance (the earlier
+    pipeline's cache always has one; hand-made caches may not) are accepted by name."""
+    key, ident, doi = paper_key(c), paper_ident(c), norm_doi(c.get("doi"))
+    if not key:
+        return None
+    for d in dirs:
+        for stem in (key, _alt_key(key, ident)):
+            p = Path(d) / f"{stem}.txt"
+            if not p.exists():
+                continue
+            prov: dict = {}
+            with contextlib.suppress(OSError, ValueError):
+                j = json.loads(p.with_suffix(".json").read_text())
+                prov = j if isinstance(j, dict) else {}
+            if doi and prov.get("doi") and norm_doi(prov["doi"]) != doi:
+                continue
+            txt = p.read_text(errors="replace")
+            if len(txt) >= min_chars:
+                return txt, dict(source="cache", path=str(p), cached_channel=prov.get("channel"),
+                                 cached_licence=prov.get("licence") or licence_of(prov.get("channel")),
+                                 cached_fetched_at=prov.get("fetched_at"))
+    return None
+
+
+def browser_eligible(c, queue, dirs, min_chars):
+    # Queue updates use atomic replacement. Read the current file inside the ledger grant transaction.
+    ident = paper_ident(c)
+    return (queue is None or any(paper_ident(e) == ident for e in read_queue(queue))) and not cached_text(c, dirs, min_chars)
+
+
 # ------------------------------------------------------------------------------------------- fetcher
 @dataclass
 class Outcome:
@@ -421,14 +458,16 @@ class Fetcher:
     transport: Transport | None = None
     browser_runner: Callable | None = None          # tests inject; default browser_ego.run_one
     secrets: dict = field(default_factory=dict)       # overrides env lookups (tests / in-memory injection)
+    settle_on_export: bool = False                    # job cache and reservations are reconciled on collect
+    init_deadline: InitVar[float | None] = None
 
-    def __post_init__(self):
+    def __post_init__(self, init_deadline):
         ft = self.ft
         if self.transport is None:
             self.transport = make_transport(bool(ft.get("use_env_proxy")), ft.get("ca_file"))
         if self.ledger is None:
             self.ledger = DownloadLedger(ledger_path(self.cfg), ft.get("limits"), ft.get("global_limits"),
-                                         ft.get("host_caps"))
+                                         ft.get("host_caps"), init_deadline=init_deadline)
         self._egress: dict | None = None
         self._egress_browser: dict | None = None
         self._egress_lock = threading.Lock()
@@ -485,33 +524,14 @@ class Fetcher:
     def write_dir(self) -> Path | None:
         return write_cache_dir(self.cfg)
 
-    def cached(self, c: dict) -> tuple[str, dict] | None:
-        """Cached text for this paper.  A file whose provenance names another DOI (doi_key collision) is
-        skipped; the collision-safe `<stem>-<sha8>` name is tried too.  Files without provenance (the earlier
-        pipeline's cache always has one; hand-made caches may not) are accepted by name."""
-        key, ident, doi = paper_key(c), paper_ident(c), norm_doi(c.get("doi"))
-        if not key:
-            return None
-        dirs = [Path(d) for d in self.ft.get("cache_dirs") or []]
-        if (w := self.write_dir()):
+    def cache_dirs(self):
+        dirs = list(self.ft.get("cache_dirs") or [])
+        if w := self.write_dir():
             dirs.append(w)
-        for d in dirs:
-            for stem in (key, _alt_key(key, ident)):
-                p = d / f"{stem}.txt"
-                if not p.exists():
-                    continue
-                prov: dict = {}
-                with contextlib.suppress(OSError, ValueError):
-                    j = json.loads((d / f"{stem}.json").read_text())
-                    prov = j if isinstance(j, dict) else {}
-                if doi and prov.get("doi") and norm_doi(prov["doi"]) != doi:
-                    continue
-                txt = p.read_text(errors="replace")
-                if len(txt) >= self.ft["min_chars"]:
-                    return txt, dict(source="cache", path=str(p), cached_channel=prov.get("channel"),
-                                     cached_licence=prov.get("licence") or licence_of(prov.get("channel")),
-                                     cached_fetched_at=prov.get("fetched_at"))
-        return None
+        return dirs
+
+    def cached(self, c: dict) -> tuple[str, dict] | None:
+        return cached_text(c, self.cache_dirs(), self.ft["min_chars"])
 
     def _ua(self) -> str:
         m = self.ft.get("mailto")
@@ -602,18 +622,18 @@ class Fetcher:
                     **extra)
         if (w := self.write_dir()) and key:
             w.mkdir(parents=True, exist_ok=True)
-            with _dir_lock(w):
+            with _dir_lock(w, getattr(self._tl, "cache_deadline", None)):
                 return self._save_locked(w, key, ident, prov, body, txt, kind)
         return prov
 
-    def save_imported(self, c: dict, prov: dict, txt: str, raw: bytes | None) -> dict:
+    def save_imported(self, c: dict, prov: dict, txt: str, raw: bytes | None, *, deadline=None) -> dict:
         """Write a text fetched elsewhere (remote mode) to the write cache, with the same collision-safe naming."""
         key, ident = paper_key(c), paper_ident(c)
         prov = dict(prov, ident=ident)
         prov.setdefault("licence", licence_of(prov.get("channel")))
         if (w := self.write_dir()) and key:
             w.mkdir(parents=True, exist_ok=True)
-            with _dir_lock(w):
+            with _dir_lock(w, deadline):
                 return self._save_locked(w, key, ident, prov, raw or b"", txt, prov.get("kind") or "bin")
         return prov
 
@@ -732,8 +752,13 @@ class Fetcher:
                 note = note[len(channel) + 2:]          # ledger note starts with "not_entitled" (breaker ignores it)
             elif not ok and r.status == 0 and r.error.startswith("redirect target "):
                 note = "cancelled: " + note             # our own limit on the redirect target: no breaker count
-            self.ledger.record(channel, host, doi or key, "ok" if ok else "fail", r.status, len(r.body),
-                               note[:300], reservation=rid)
+            try:
+                self.ledger.record(channel, host, doi or key, "ok" if ok else "fail", r.status, len(r.body),
+                                   note[:300], reservation=rid)
+            except Exception as exc:
+                if not self.settle_on_export or not ok or not rec["provenance"].get("path"):
+                    raise
+                rec["errors"].append(self._r(f"{channel}: saved body awaiting ledger settlement: {exc}"))
             self._server_error_streak(channel, host, r.status)
         return txt
 
@@ -885,7 +910,7 @@ class Fetcher:
                     return None
         return None
 
-    def ch_browser(self, c: dict, key: str, doi: str, title: str, rec: dict, slot: int = 0) -> str | None:
+    def ch_browser(self, c: dict, key: str, doi: str, title: str, rec: dict, slot: int = 0, queued=False) -> str | None:
         from . import browser_ego
         b = self.ft["browser"]
         _, keys, web_hosts = publisher_of(doi)
@@ -895,7 +920,9 @@ class Fetcher:
             raise LimitReached("no download ledger configured (fulltext.ledger_path)", "cap")
         if not self._space_held and not self._try_space_lock():
             raise LimitReached("browser TaskSpace is in use by another process (e.g. `tbsgen fetch`)", "cap", "host")
-        rid = self.ledger.acquire("browser", lkey, doi, related=tuple(web_hosts), group=aliases)
+        rid = self.ledger.acquire("browser", lkey, doi, related=tuple(web_hosts), group=aliases,
+                                  eligible=lambda: browser_eligible(c, queue_path(self.cfg) if queued else None,
+                                                                    self.cache_dirs(), self.ft["min_chars"]))
         rec["tried"].append(f"browser:{lkey}")
         res: dict = {}
         ok = False
@@ -961,7 +988,7 @@ class Fetcher:
         return True
 
     def fetch(self, c: dict, *, browser: bool | None = None, channels: list[str] | None = None,
-              slot: int = 0) -> Outcome:
+              slot: int = 0, queued: bool = False) -> Outcome:
         doi = norm_doi(c.get("doi"))
         key = paper_key(c)
         self._tl.c = c
@@ -1021,7 +1048,7 @@ class Fetcher:
                 else:
                     self._egress_ok_browser()
                 fn = getattr(self, f"ch_{ch}")
-                txt = fn(c, key, doi, title, rec, slot) if ch == "browser" else fn(c, key, doi, title, rec)
+                txt = fn(c, key, doi, title, rec, slot, queued) if ch == "browser" else fn(c, key, doi, title, rec)
             except LimitReached as e:
                 rec["skipped"].append(self._r(f"{ch}: {e}"))
                 self._limited(e, rec, ch)
@@ -1166,11 +1193,16 @@ def queue_path(cfg: dict) -> Path:
 
 
 @contextlib.contextmanager
-def queue_lock(path: Path):
+def queue_lock(path: Path, deadline=None):
     import fcntl
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path.with_name(path.name + ".lock"), "a+") as fh:
-        fcntl.flock(fh, fcntl.LOCK_EX)
+        if deadline is None:
+            fcntl.flock(fh, fcntl.LOCK_EX)
+        else:
+            from .state import _try_lock
+            if not _try_lock(fh, deadline):
+                raise TimeoutError("timed out waiting for the fetch queue")
         try:
             yield
         finally:
@@ -1213,7 +1245,7 @@ def queue_entry(c: dict, **extra) -> dict:
     return e
 
 
-def enqueue(path: Path, entry: dict) -> bool:
+def enqueue(path: Path, entry: dict, *, deadline=None) -> bool:
     """Idempotent (by paper identity).  For a paper already queued: new subscribers are added, retrieval fields
     that were missing or changed (a new OA link, a PMCID) are merged, and if anything changed the entry becomes
     due again (its backoff is reset)."""
@@ -1221,7 +1253,7 @@ def enqueue(path: Path, entry: dict) -> bool:
     entry.pop("key", None)
     if not entry["ident"]:
         return False
-    with queue_lock(path):
+    with queue_lock(path, deadline):
         q = read_queue(path)
         for e in q:
             if _entry_key(e) == entry["ident"]:
@@ -1249,7 +1281,7 @@ def enqueue(path: Path, entry: dict) -> bool:
         return True
 
 
-def reconcile(store, path: Path) -> int:
+def reconcile(store, path: Path, *, deadline=None) -> int:
     """Re-queue items parked with fulltext_unavailable whose queue write never happened (crash between parking
     and enqueueing, or a failed write).  Idempotent.  Returns the number of entries (re)added or updated."""
     from .state import read_json
@@ -1262,7 +1294,7 @@ def reconcile(store, path: Path) -> int:
                 e = {k: v for k, v in q.items() if k in (*QUEUE_FIELDS, "ident", "subscribers", "failed_channels",
                                                          "queued_at")}
                 e.setdefault("subscribers", [[str(store.root), it.item_id]])
-                n += bool(enqueue(path, e))
+                n += bool(enqueue(path, e, deadline=deadline))
     return n
 
 
@@ -1376,7 +1408,7 @@ def _chan_skip(e: dict, now: float) -> list[str]:
 
 def drain_queue(fetcher: Fetcher, *, max_papers: int = 10, channels: list[str] | None = None,
                 browser: bool = True, dry_run: bool = False, on_success=None, log=print,
-                now: float | None = None, only: list[str] | None = None) -> dict:
+                now: float | None = None, only: list[str] | None = None, poll_once: bool = False, max_wait_s: float | None = None) -> dict:
     """`tbsgen fetch`: try queued papers again (cache first, then the cascade incl. the browser channel).
 
     Order: entries whose `next_try` has passed, least recently tried first.  Only a real failure (requests made,
@@ -1392,40 +1424,52 @@ def drain_queue(fetcher: Fetcher, *, max_papers: int = 10, channels: list[str] |
     """
     import fcntl
     from collections import defaultdict
+    from . import browser_ego, remote
 
-    from . import browser_ego
-    now = time.time() if now is None else now
     qp = queue_path(fetcher.cfg)
     qp.parent.mkdir(parents=True, exist_ok=True)
-    # one drain at a time per queue (and so per browser TaskSpace / Page set); others return immediately
-    drain_fh = open(qp.with_name(qp.name + ".drain.lock"), "a+")
-    try:
-        fcntl.flock(drain_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        drain_fh.close()
-        return dict(busy=True, note="another `tbsgen fetch` is draining this queue")
-    try:
-        return _drain_locked(fetcher, qp, now, max_papers, channels, browser, dry_run, on_success, log,
-                             defaultdict, browser_ego, only)
-    finally:
-        fcntl.flock(drain_fh, fcntl.LOCK_UN)
-        drain_fh.close()
+    deadline = (remote.poll_deadline(fetcher.ft["remote"], max_wait_s, fetcher.ledger.clock())
+                if fetcher.remote_mode() else None)
+
+    if deadline is None and max_wait_s is not None:
+        deadline = time.monotonic() + max_wait_s
+    with qp.with_name(qp.name + ".drain.lock").open("a+") as drain:
+        try:
+            fcntl.flock(drain, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return dict(busy=True, note="another controller is draining this queue")
+        return _drain_locked(fetcher, qp, time.time() if now is None else now, max_papers, channels,
+                             browser, dry_run, on_success, log, defaultdict, browser_ego, only, poll_once, deadline)
 
 
 def _drain_locked(fetcher, qp, now, max_papers, channels, browser, dry_run, on_success, log, defaultdict,
-                  browser_ego, only=None) -> dict:
-    with queue_lock(qp):
+                  browser_ego, only, poll_once, deadline) -> dict:
+    with queue_lock(qp, deadline):
         queue = read_queue(qp)
     if only:
-        due = [e for e in queue if match_only(e, only)]
+        due = [e for e in queue if match_only(e, only) and (not poll_once or float(e.get("next_try") or 0) <= now)]
     else:
         due = sorted((e for e in queue if float(e.get("next_try") or 0) <= now),
                      key=lambda e: (max(float(e.get("last_try") or 0), float(e.get("last_limited") or 0)),
                                     queue.index(e)))
+    if fetcher.remote_mode() and not dry_run:
+        held = fetcher.ledger.leased_papers()
+        due = [e for e in due if paper_ident(e) not in held]
+    if poll_once and (fetcher.remote_mode() or channels):
+        # Apply eligibility before the batch limit. Otherwise a capped channel or a partial round
+        # still backing off would keep the same papers at the head of every pass.
+        from .remote import available_channels
+        scope = channels or fetcher.ft.get("cascade") or CHANNELS
+        ready = available_channels(fetcher.ledger, [ch for ch in scope if ch in fetcher.ledger.limits])
+        if not browser or (fetcher.ft.get("browser") or {}).get("batch_only"):
+            ready = [ch for ch in ready if ch != "browser"]
+        due = [e for e in due if any(ch not in _chan_skip(e, now) and
+               fetcher.channel_applies(ch, norm_doi(e.get("doi"))) for ch in ready)
+               or (fetcher.remote_mode() and e.get("remote_failure"))
+               or (("cache" in scope or fetcher.remote_mode()) and fetcher.cached(e))]
     todo = due[:max_papers] if max_papers else due
-    vers = {_entry_key(e): int(e.get("ver") or 0) for e in todo}
     # per-channel backoff travels with the work copy (also to the remote worker); never written back as such
-    todo = [dict(e, skip_channels=sk) if (sk := _chan_skip(e, now)) and not only else e for e in todo]
+    todo = [dict(e, skip_channels=sk) if (sk := _chan_skip(e, now)) and (not only or poll_once) else e for e in todo]
     stats = dict(queued=len(queue), due=len(due), considered=len(todo), ok=0, failed=0, limited=0, deferred=0,
                  by_channel={}, errors=[])
     if only:
@@ -1437,6 +1481,52 @@ def _drain_locked(fetcher, qp, now, max_papers, channels, browser, dry_run, on_s
                                         if ch == "cache" or fetcher.channel_applies(ch, e.get("doi") or "")])
                          for e in todo]
         return stats
+
+    def deliver(entries, job=None):
+        return _deliver_round(fetcher, qp, now, entries, channels, browser, on_success, log, defaultdict,
+                              browser_ego, deadline, stats, job)
+
+    if not fetcher.remote_mode():
+        return deliver(todo)
+    from . import remote
+    want = [ch for ch in (channels or fetcher.ft.get("cascade") or CHANNELS) if ch in remote.HTTP_CHANNELS]
+    collected = remote.collected_papers(fetcher.cfg)
+    cached_results = {}
+    for e in queue:
+        ident = paper_ident(e)
+        if ident in collected and (hit := fetcher.cached(e)):
+            text, rec = hit
+            cached_results[ident] = dict(ok=True, text=text, rec=rec)
+
+    ready = {paper_ident(e) for e in todo if paper_ident(e) in cached_results or
+             (want and e.get("remote_failure")) or fetcher.cached(e)}
+    if ready or cached_results:
+        # _deliver_round acknowledges results outside the batch against the current subscribers.
+        deliver([e for e in todo if paper_ident(e) in ready], {"results": cached_results})
+        todo = [e for e in todo if paper_ident(e) not in ready]
+        if stats.get("undelivered"):
+            return stats
+    if not want and not poll_once:
+        return deliver(todo)
+
+    while True:
+        candidates = [dict(e, partial=bool(channels)) for e in todo] if want else []
+        job = remote.run_job(fetcher, candidates, want, log=log, max_poll_s=0 if poll_once else None,
+                             deadline=deadline, sleep=time.sleep)
+        if not job.pop("collected_prior", False):
+            return deliver(todo, job)
+        # Commit every subscriber acknowledgement and backoff before the next submit or poll.
+        results = job["results"]
+        ready = {paper_ident(e) for e in todo if paper_ident(e) in results or fetcher.cached(e)}
+        deliver([e for e in todo if paper_ident(e) in ready], job)
+        todo = [e for e in todo if paper_ident(e) not in ready]
+        if not todo or stats.get("remote_error") or stats.get("undelivered"):
+            return stats
+
+
+def _deliver_round(fetcher, qp, now, todo, channels, browser, on_success, log, defaultdict,
+                   browser_ego, deadline, stats, rjob):
+    vers = {_entry_key(e): int(e.get("ver") or 0) for e in todo}
     bconf = fetcher.ft.get("browser") or {}
     # browser.batch_only: the browser runs only in egress-gated batches (`tbsgen fetch --browser`)
     use_browser = browser and bool(bconf.get("enabled")) and not bconf.get("batch_only")
@@ -1444,10 +1534,13 @@ def _drain_locked(fetcher, qp, now, max_papers, channels, browser, dry_run, on_s
     lock = threading.Lock()
     results: dict[str, tuple[bool, list]] = {}     # key -> (fetched, acknowledged subscribers)
     deferred: set[str] = set()                     # not tried (remote job not collected yet): stays due
-    limited: dict[str, float | None] = {}          # refused by the ledger / egress: due again at `until`
-    chan_failed: dict[str, set[str]] = {}          # channels that made a request and got nothing
-    backoff_only: set[str] = set()                 # nothing refused, every applicable channel still backing off
-    skipped_bo: dict[str, set[str]] = {}           # channels each entry's round skipped for their backoff
+    retries = {}  # scheduling inputs for _requeue, applied to the latest entry under its queue lock
+
+    def retry_state(rec):
+        verdict, until, failed, _ = classify(Outcome(None, rec), now)
+        return verdict, dict(was_limited=verdict == "limited", until=until, failed_ch=failed,
+                             backoff_only=verdict == "limited" and not (rec.get("limited") or rec.get("egress_refused")),
+                             skipped_backoff=rec.get("backing_off") or ())
     # A round is PARTIAL for an entry when it did not cover every channel that applies to it: any explicit
     # `--channels`, or a remote result collected from a job whose channel scope was narrower than the entry's
     # applicable HTTP channels (e.g. an older `--channels elsevier` job collected now; unknown scope counts as
@@ -1463,23 +1556,53 @@ def _drain_locked(fetcher, qp, now, max_papers, channels, browser, dry_run, on_s
         doi = norm_doi(e.get("doi"))
         need = {ch for ch in (fetcher.ft.get("cascade") or CHANNELS)
                 if ch in HTTP_CHANNELS and fetcher.channel_applies(ch, doi)}
-        return r.get("channels") is None or not need <= set(r["channels"])
+        return r.get("partial") or r.get("channels") is None or not need <= set(r["channels"])
+
+    def acknowledge(e, outcome):
+        if not on_success:
+            return _subs(e)
+        acked = []
+        for sub in _subs(e):
+            try:
+                if on_success(e, outcome, sub):
+                    acked.append(sub)
+            except Exception as exc:
+                with lock:
+                    stats["errors"].append(dict(key=_entry_key(e), error=fetcher._r(f"reactivate {sub[1]}: {exc}")))
+        if len(acked) < len(_subs(e)):
+            with lock:
+                stats["undelivered"] = stats.get("undelivered", 0) + len(_subs(e)) - len(acked)
+        return acked
+
     if fetcher.remote_mode():
-        # the HTTP channels of every due paper run as one job on the remote host; results feed the cascade
         from . import remote
-        want = [ch for ch in (channels or fetcher.ft.get("cascade") or CHANNELS) if ch in remote.HTTP_CHANNELS]
-        rjob = remote.run_job(fetcher, [e for e in todo if not fetcher.cached(e)], want or None,
-                              log=lambda m: log(m)) if want else dict(results={}, jobs=[])
-        round_results = rjob.get("results") or {}
+        want = any(ch in remote.HTTP_CHANNELS for ch in (channels or fetcher.ft.get("cascade") or CHANNELS))
+        rjob = rjob or {}
+        held = fetcher.ledger.leased_papers()
+        leased = {paper_ident(e) for e in todo} & held
+        stats["deferred"] += len(leased)
+        queue = read_queue(qp)
+        current = {paper_ident(e): e for e in queue}
+        todo = [dict(e, subscribers=_subs(current[k])) for e in todo if (k := paper_ident(e)) in current and k not in held]
+        round_results = {k: e["remote_failure"] for k, e in current.items() if e.get("remote_failure") and want}
+        round_results.update(rjob.get("results") or {})
         fetcher.remote_results.clear()             # a reused Fetcher must not consume an earlier round's results
         fetcher.remote_results.update(round_results)
+        # A completed job may be outside this pass's due slice. Deliver its failures/backoffs as well as texts.
+        included = {paper_ident(e) for e in todo}
+        todo.extend(e for e in queue if paper_ident(e) in round_results and paper_ident(e) not in included)
         for ident, r in round_results.items():
             # a result of an older job (collected now) was fetched for the entry version of that time
-            if "entry_ver" in r and ident in vers:
+            if "entry_ver" in r:
                 vers[ident] = int(r["entry_ver"])
-        stats["remote"] = {k: v for k, v in rjob.items() if k != "results"}
-        for j in stats["remote"].get("jobs") or []:
-            j.pop("results", None)
+        remote_stats = stats.setdefault("remote", dict(jobs=[], progress=False))
+        remote_stats["progress"] |= rjob.get("progress", False)
+        remote_stats.update({k: v for k, v in rjob.items() if k not in ("results", "jobs", "progress")})
+        remote_stats["jobs"].extend({k: v for k, v in job.items() if k != "results"} for job in rjob.get("jobs", []))
+        if rjob.get("retry_after"):
+            remaining = [e for e in todo if paper_ident(e) in round_results or fetcher.cached(e)]
+            stats["deferred"] += len(todo) - len(remaining)
+            todo = remaining
         # a job the remote side refused (code fingerprint, bad spec) or that could not be collected: report it
         # loudly (the CLI exits non-zero); its papers were not tried and stay due
         errs = [f"{j.get('job')}: {j['error']}" for j in stats["remote"].get("jobs") or [] if j.get("error")]
@@ -1498,17 +1621,23 @@ def _drain_locked(fetcher, qp, now, max_papers, channels, browser, dry_run, on_s
         t0 = time.time()
         acked: list = []
         try:
-            out = fetcher.fetch(e, browser=use_browser, channels=channels, slot=slot)
-            if out.text is not None and on_success:
-                for s in _subs(e):
-                    try:
-                        if on_success(e, out, s):
-                            acked.append(s)
-                    except Exception as ex:  # noqa: BLE001
-                        with lock:
-                            stats["errors"].append(dict(key=k, error=fetcher._r(f"reactivate {s[1]}: {ex}")))
-            elif out.text is not None:
-                acked = _subs(e)
+            order = channels or fetcher.ft.get("cascade") or CHANNELS
+            if fetcher.remote_mode() and k not in fetcher.remote_results and "cache" not in order:
+                order = ["cache", *order]  # imported text awaiting subscriber delivery
+            imported = fetcher.remote_results.get(k) if fetcher.remote_mode() else None
+            if imported and imported["ok"]:
+                out = Outcome(imported["text"], imported["rec"])
+            elif imported and not use_browser:
+                hit = fetcher.cached(e)
+                out = Outcome(*hit) if hit else Outcome(None, imported["rec"])
+            else:
+                fetcher._tl.cache_deadline = deadline
+                try:
+                    out = fetcher.fetch(e, browser=use_browser, channels=order, slot=slot, queued=True)
+                finally:
+                    fetcher._tl.cache_deadline = None
+            if out.text is not None:
+                acked = acknowledge(e, out)
         except Exception as ex:  # noqa: BLE001
             out = Outcome(None, dict(errors=[fetcher._r(f"{type(ex).__name__}: {ex}")], skipped=[], source=None))
         dt = round(time.time() - t0, 1)
@@ -1523,22 +1652,19 @@ def _drain_locked(fetcher, qp, now, max_papers, channels, browser, dry_run, on_s
                 deferred.add(k)
                 stats["deferred"] += 1
             else:
-                verdict, until, failed_ch, _ = classify(out, now)
-                chan_failed[k] = failed_ch
-                skipped_bo[k] = set(out.rec.get("backing_off") or [])
-                if verdict == "limited":
-                    limited[k] = until
-                    if not out.rec.get("limited") and not out.rec.get("egress_refused"):
-                        backoff_only.add(k)
-                    stats["limited"] += 1
-                else:
-                    stats["failed"] += 1
+                verdict, retries[k] = retry_state(out.rec)
+                stats[verdict] += 1
                 stats["errors"].append(dict(key=k, errors=out.rec.get("errors", [])[-3:],
                                             skipped=out.rec.get("skipped", [])[-3:]))
             log(json.dumps(dict(key=k, ok=out.text is not None, source=src, seconds=dt,
                                 errors=out.rec.get("errors", [])[-2:], skipped=out.rec.get("skipped", [])[-2:]),
                            ensure_ascii=False))
 
+    if not todo:
+        stats["progress"] = bool(stats.get("progress") or stats.get("remote", {}).get("progress"))
+        with queue_lock(qp, deadline):
+            stats["remaining"] = len(read_queue(qp))
+        return stats
     space_fh = None
     if use_browser and not fetcher._space_held:
         # one user of a browser TaskSpace at a time, across processes (fetch, inline S3): they share its Pages
@@ -1561,26 +1687,32 @@ def _drain_locked(fetcher, qp, now, max_papers, channels, browser, dry_run, on_s
             fcntl.flock(space_fh, fcntl.LOCK_UN)
             space_fh.close()
     partial = {_entry_key(e) for e in todo if is_partial(e)}
-    with queue_lock(qp):
+    with queue_lock(qp, deadline):
         q = read_queue(qp)
         keep = []
+        queue_progress = False
         for e in q:
             k = _entry_key(e)
             if k in results and k not in deferred:
+                if k in fetcher.remote_results:
+                    e.pop("remote_failure", None)
                 fetched, acked = results[k]
                 rest = [s for s in _subs(e) if s not in acked]
                 if fetched and not rest:
+                    queue_progress = True
                     continue                                   # all subscribers re-activated: done
                 if fetched:
+                    queue_progress |= len(rest) < len(_subs(e))
                     e["subscribers"] = rest                    # new / unacknowledged subscribers stay
                     e["next_try"] = 0
                     e.pop("chan_backoff", None)
                 else:
-                    _requeue(e, now, backoff, k in limited, limited.get(k), chan_failed.get(k) or set(),
-                             same_version=int(e.get("ver") or 0) == vers.get(k, 0), backoff_only=k in backoff_only,
-                             partial=k in partial, skipped_backoff=skipped_bo.get(k, set()))
+                    _requeue(e, now, backoff, **retries[k], same_version=int(e.get("ver") or 0) == vers.get(k, 0),
+                             partial=k in partial)
+                    queue_progress |= float(e.get("next_try") or 0) > now or bool(retries[k]["failed_ch"])
             keep.append(e)
         write_queue(qp, keep)
+        stats["progress"] = queue_progress or bool(stats.get("progress") or stats.get("remote", {}).get("progress"))
         stats["remaining"] = len(keep)
     return stats
 

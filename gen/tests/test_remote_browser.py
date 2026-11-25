@@ -46,6 +46,15 @@ class FakeSSH:
     def __call__(self, cmd: str, stdin: bytes = b"", timeout: float = 300):
         import shlex
         argv = shlex.split(cmd)
+        if argv[1] == "-":  # legacy proof also runs before the new worker package is deployed
+            import subprocess
+            import sys
+            assert argv[2] == str(self.rdir)
+            self.calls.append("legacy-release")
+            if self.down:
+                return 255, b"", b"ssh: connect failed"
+            p = subprocess.run([sys.executable, *argv[1:]], input=stdin, capture_output=True, timeout=timeout)
+            return p.returncode, p.stdout, p.stderr
         assert argv[1:3] == ["-m", "tbsgen.remote"]
         sub, wd, job = argv[3:6]
         self.calls.append(sub)
@@ -311,11 +320,11 @@ def test_remote_reclaimed_narrow_job_does_not_postpone_untried_oa(tmp_path, monk
     f, net, _, led, rdir, _ = mk_remote(tmp_path, {"api.elsevier.com": Resp(500, {}, b"", "u"),
                                                     "repo.example": FAKE_PDF})
     queue(f, p)
-    real_collect = remote.collect
-    monkeypatch.setattr(remote, "collect", lambda fetcher, job, run, **kw: dict(job=job, stage="submitted",
+    real_collect = remote._collect_once
+    monkeypatch.setattr(remote, "_collect_once", lambda fetcher, job, run, **kw: dict(job=job, stage="submitted",
                                                                                note="still running"))
-    drain(f, FakeSSH(rdir, net), channels=["elsevier"])               # submitted, not collected this round
-    monkeypatch.setattr(remote, "collect", real_collect)
+    drain(f, FakeSSH(rdir, net), channels=["elsevier"], poll_once=True)  # submitted, not collected this round
+    monkeypatch.setattr(remote, "_collect_once", real_collect)
     [job] = remote.outstanding_jobs(f.cfg)
     assert job["channels"] == ["elsevier"]
     st = drain(f, FakeSSH(rdir, net))                                  # default round reclaims the narrow job
@@ -335,12 +344,12 @@ def test_remote_result_skipped_for_a_since_expired_backoff_keeps_the_entry_due(t
     [e] = fulltext.read_queue(qp)
     e["chan_backoff"] = {"elsevier": dict(tries=1, next_try=time.time() + 30)}
     fulltext.write_queue(qp, [e])
-    real_collect = remote.collect
-    monkeypatch.setattr(remote, "collect", lambda fetcher, job, run, **kw: dict(job=job, stage="submitted",
+    real_collect = remote._collect_once
+    monkeypatch.setattr(remote, "_collect_once", lambda fetcher, job, run, **kw: dict(job=job, stage="submitted",
                                                                                note="still running"))
     real_run = remote.run_job
-    drain(f, FakeSSH(rdir, net))                     # submitted while elsevier backs off (entry itself is due)
-    monkeypatch.setattr(remote, "collect", real_collect)
+    drain(f, FakeSSH(rdir, net), poll_once=True)     # submitted while elsevier backs off (entry itself is due)
+    monkeypatch.setattr(remote, "_collect_once", real_collect)
     [e] = fulltext.read_queue(qp)
     e["chan_backoff"]["elsevier"]["next_try"] = time.time() - 1         # the backoff runs out meanwhile
     fulltext.write_queue(qp, [e])
@@ -354,6 +363,7 @@ def test_remote_result_skipped_for_a_since_expired_backoff_keeps_the_entry_due(t
 
 def test_remote_dead_worker_partial_results_are_kept_and_rest_stays_queued(tmp_path):
     f, net, _, led, rdir, _ = mk_remote(tmp_path, {"api.elsevier.com": ELS_XML, "api.wiley.com": FAKE_PDF})
+    f.ft["remote"]["stale_after_s"] = 0
     queue(f, ELS, WIL)
     ssh = FakeSSH(rdir, net, worker_stop_after=1)
     real = ssh.__call__
@@ -421,6 +431,7 @@ def test_second_remote_job_waits_for_the_first_lease(tmp_path):
 
 def test_worker_crash_after_save_before_result_is_recovered(tmp_path):
     f, net, _, led, rdir, _ = mk_remote(tmp_path, {"api.elsevier.com": ELS_XML})
+    f.ft["remote"]["stale_after_s"] = 0
     queue(f, ELS)
     ssh = FakeSSH(rdir, net)
     real = ssh.__call__
@@ -1037,6 +1048,7 @@ def test_recovered_text_is_booked_as_success(tmp_path):
     """Worker died after saving the text but before booking it: the recovered result and the ledger agree."""
     f, net, _, led, rdir, _ = mk_remote(tmp_path, {"api.elsevier.com": ELS_XML},
                                         limits={"elsevier": {"daily_ok": 1, "gap_s": 0.0, "jitter_s": 0.0}})
+    f.ft["remote"]["stale_after_s"] = 0
     queue(f, ELS)
     ssh = FakeSSH(rdir, net)
     real = ssh.__call__

@@ -211,8 +211,11 @@ def _batch(tmp_path, monkeypatch, papers, **st_over):
     bd = tmp_path / "batch"
     (bd / "papers").mkdir(parents=True)
     (bd / "files").mkdir()
+    queue_path = tmp_path / "queue.jsonl"
+    fulltext.write_queue(queue_path, [fulltext.queue_entry({"doi": doi}) for doi in papers])
     st = dict(space="t-sp", papers={str(i): dict(doi=d, title="T", ident=d, allow=["pub.example", "sso.example"])
                                     for i, d in enumerate(papers, 1)},
+              queue_path=str(queue_path), cache_dirs=[str(tmp_path)], min_chars=100,
               deadline=time.time() + 600, ledger_path=str(led.path), limits=led.limits, global_limits=led.g,
               host_caps=led.host_caps, ego_binary=str(ego), gate_max_wait_s=150, max_calls_per_paper=25,
               call_timeout_s=20, challenge_cooldown_s=3600, challenge_wait_ms=1000, max_navigations_per_paper=12,
@@ -221,6 +224,22 @@ def _batch(tmp_path, monkeypatch, papers, **st_over):
     st.update(st_over)
     (bd / "batch.json").write_text(json.dumps(st))
     return bd, led
+
+
+@pytest.mark.parametrize("change", ["removed", "cached", "old_batch"])
+def test_wrapper_rechecks_paper_before_first_grant(tmp_path, monkeypatch, change):
+    doi = "10.1080/stale"
+    bd, ledger = _batch(tmp_path, monkeypatch, [doi])
+    st = json.loads((bd / "batch.json").read_text())
+    if change == "removed":
+        fulltext.write_queue(Path(st["queue_path"]), [])
+    elif change == "cached":
+        (tmp_path / (fulltext.paper_key({"doi": doi}) + ".txt")).write_text(BODY)
+    else:
+        st.pop("queue_path")
+        (bd / "batch.json").write_text(json.dumps(st))
+    assert browser_agent.wrapper_main(str(bd), ["1", "look"]) == 2
+    assert ledger.db.execute("select count(*) from attempts").fetchone() == (0,)
 
 
 def _call(bd, *argv, env=None):

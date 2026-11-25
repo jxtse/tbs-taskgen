@@ -16,6 +16,7 @@ from pathlib import Path
 
 from . import blocklist, intake, screen_jev, stages_a as A, stages_b as B
 from .budget import EXCLUDE_UNSTARTED_JOBS, BudgetStop, Ledger, harden_scope, today, variant_scope
+from .calib import migrate_manual_commands
 from .config import resolve_role
 from .models import ModelError, get_client
 from .state import STAGES, Store, read_json, write_json
@@ -31,6 +32,29 @@ _STOP = {"a", "an", "the", "of", "for", "and", "in", "on", "with", "by", "to", "
          "new", "novel", "fast", "efficient", "method", "methods", "approach", "algorithm", "data", "analysis"}
 
 
+STAGE_GROUPS = {
+    "intake": {"S1", "S2a", "S2", "S3", "S4"},
+    "code": {"S3b", "S3c"},
+    "agent": set(AGENT_STAGES),
+    "build": {"S6I"} & HANDLERS.keys(),
+    "sandbox": {"S6A_run", "S6B", "S6C", "S7", "S8", "PKG"},
+    "calib": {"S9", "S9R", "S10"},
+    "harden": {"harden"},
+}
+
+
+def parse_stages(value: str) -> set[str]:
+    selected = set()
+    for name in map(str.strip, value.split(",")):
+        if name in STAGE_GROUPS:
+            selected.update(STAGE_GROUPS[name])
+        elif name in HANDLERS:
+            selected.add(name)
+        else:
+            raise ValueError(f"unknown worker stage or group: {name!r}")
+    return selected
+
+
 def _stage_pos(stage: str) -> float:
     s, off = _SUBSTAGE.get(stage, (stage, 0.0))
     return STAGES.index(s) + off if s in STAGES else float(len(STAGES))
@@ -42,13 +66,14 @@ def _title_words(title: str) -> frozenset:
 
 
 class Pipeline:
-    def __init__(self, cfg: dict, clients: dict | None = None, fetcher=None):
+    def __init__(self, cfg: dict, clients: dict | None = None, fetcher=None, *, init_deadline=None):
         root = cfg["run"]["root"]
         if not root:
             raise ValueError("cfg.run.root is required")
         self.cfg = cfg
         self.store = Store(root)
-        self.ledger = Ledger(Path(root) / "ledger.sqlite", cfg)
+        self.ledger = Ledger(Path(root) / "ledger.sqlite", cfg, init_deadline=init_deadline)
+        migrate_manual_commands(self.store, cfg.get("config_path"), deadline=init_deadline)
         self._clients = dict(clients or {})
         self.fetcher = fetcher
         self._tbs = None
@@ -69,12 +94,12 @@ class Pipeline:
         self._clients[role] = c
         return c
 
-    def fulltext_fetcher(self):
+    def fulltext_fetcher(self, *, deadline=None):
         """The S3 Fetcher (one per pipeline: one ledger connection, one egress check).  A test-injected
         fulltext.Fetcher takes precedence."""
         from .fulltext import Fetcher
         if self.fetcher is None:
-            self.fetcher = Fetcher(self.cfg)
+            self.fetcher = Fetcher(self.cfg, init_deadline=deadline)
         return self.fetcher
 
     def jev_client(self) -> screen_jev.JevClient:
@@ -121,15 +146,36 @@ class Pipeline:
         for c in candidates:
             iid = intake.item_id_for(c)
             it = self.store.item(iid)
-            if not it.p("S1_candidate.json").exists():
-                write_json(it.p("S1_candidate.json"), c)
-                it.save()
-                self.store.event("ingest", item=iid, doi=c.get("doi"))
+            if not it.p("S1_candidate.json").exists() or not it.p("state.json").exists():
+                with it.operator_lock():
+                    if not it.p("S1_candidate.json").exists():
+                        write_json(it.p("S1_candidate.json"), c)
+                    if not it.p("state.json").exists():
+                        it.load().save()
+                        self.store.event("ingest", item=iid, doi=c.get("doi"))
             ids.append(iid)
         return ids
 
     # ------------------------------------------------------------------ run loop
     def step(self, it) -> str:
+        expected = it.state
+        with it.step_lock() as held:
+            if not held or it.load().state != expected:
+                return "skipped"
+            if B.legacy_report_id(it):
+                return self._step_with_budget(it)
+            if it.state["status"] not in ("active", "waiting") and not B.harden_needs_step(it):
+                return "skipped"
+            if (it.state["status"] == "waiting" and B.job_stage(it) in ("S9", "S9R")
+                    and not B.harden_needs_step(it)):
+                action = B.poll_calibration(self, it)
+                if action:
+                    return "skipped" if action["action"] == "ingest_error" else "ok"
+                if not B.rewake(self.cfg, it):
+                    return "skipped"
+            return self._step_with_budget(it)
+
+    def _step_with_budget(self, it) -> str:
         # a hardening round's reservations are tagged with the round (budget.item_harden_usd_cap); evaluated at each
         # reservation from it.state, which handlers re-load under the item lock (another run / watch may have moved it)
         def hk():
@@ -190,7 +236,7 @@ class Pipeline:
                 if B.harden_needs_step(it):
                     B.harden_step(self, it)     # a hardened version that failed to build: back to the old one
         except BudgetStop as e:
-            if e.reason in ("item_usd", "item_harden_usd", "item_variant_usd"):
+            if not e.cancelled_unstarted and e.reason in ("item_usd", "item_harden_usd", "item_variant_usd"):
                 # this paper's authoring allowance (budget.item_usd_cap, item_harden_usd_cap in a hardening round,
                 # item_variant_usd_cap in an S9b variant round) is used up: final for the paper / the round, and
                 # the model stays available for the others
@@ -199,7 +245,7 @@ class Pipeline:
                     B.harden_step(self, it)     # a hardened version: back to the previous one
                 self.store.event("budget_stop", item=it.item_id, stage=st, reason=e.reason, detail=e.detail)
                 return "ok"
-            it.finish("paused", f"budget:{e.reason}", detail=e.detail, paused_stage=st)
+            it.finish("paused", f"budget:{e.reason}", detail=e.detail, paused_stage=st, **e.reservation)
             self.stopped_models.add(alias if role else st)
             self.store.event("budget_stop", item=it.item_id, stage=st, reason=e.reason, detail=e.detail)
             return "paused"
@@ -268,26 +314,36 @@ class Pipeline:
             k += 1
         return out
 
-    def run(self, max_steps: int = 10000, only: list[str] | None = None, until: str | None = None) -> dict:
+    def run(self, max_steps: int = 10000, only: list[str] | None = None, until: str | None = None,
+            stages: set[str] | None = None, stopping=None, poll_calib=False) -> dict:
         """until: last stage to run (e.g. "S4"); items that reach a later stage are left active there, untouched."""
         if until is not None and until not in STAGES:
             raise ValueError(f"unknown stage {until!r}")
+        poll_calib = poll_calib or stages is not None
         last = _stage_pos(until) if until else None
         steps = 0
         progress = True
-        if last is None or last >= _stage_pos("S2"):    # the S2 Jev prefetch is S2 work
+        made_progress = False
+        screen_worker = (stages is None or "S2" in stages) and (last is None or last >= _stage_pos("S2"))
+        if screen_worker:    # the S2 Jev prefetch is S2 work
             if self.cfg["screen"].get("blocklist"):
                 # trial papers the fetch queue delivered since S3 parked them count as successes now; then this
                 # week's trial quota picks papers an earlier week's S2 dropped by a rule
                 blocklist.reevaluate(self.store, self.cfg, self.store.event)
                 if not only:
-                    blocklist.revive_for_trials(self.store, self.cfg, self.store.event)
-            self.prefetch_screen(only)
+                    made_progress |= bool(blocklist.revive_for_trials(self.store, self.cfg, self.store.event))
+            made_progress |= bool(self.prefetch_screen(only))
 
+        skipped: set[str] = set()
         rewoken: set[str] = set()
         polled: set[str] = set()
 
         def runnable(it) -> bool:
+            if it.item_id in skipped:
+                return False
+            if stages is not None and it.state["stage"] not in stages and not (
+                    "harden" in stages and B._in_hardening(it)):
+                return False
             if only and it.item_id not in only:
                 return False
             if last is not None and _stage_pos(it.state["stage"]) > last:
@@ -301,12 +357,21 @@ class Pipeline:
             if it.state["status"] == "waiting" and it.state["stage"] in AGENT_STAGES:
                 return it.item_id not in polled and not A.relay_waiting(self.cfg, it)
             # S9 waiting with nothing running (prepared while allow_submit was off, or blocked): once per run
-            return it.item_id not in rewoken and B.reschedulable(self.cfg, it)
+            return it.item_id not in rewoken and (B.reschedulable(self.cfg, it) or
+                    (poll_calib and B.job_stage(it) in ("S9", "S9R") and it.state["status"] == "waiting"))
 
         while progress and steps < max_steps:
             progress = False
             # filter first, then order: skipped items must not take a round-robin slot (review)
-            for it in self.order([i for i in self.store.items() if runnable(i)]):
+            ordered = self.order([i for i in self.store.items() if runnable(i)])
+            if stopping and not steps:
+                # A bounded loop must eventually poll past the first N waiting jobs.
+                cursor = getattr(self, "_loop_cursor", None)
+                offset = next((i + 1 for i, it in enumerate(ordered) if it.item_id == cursor), 0)
+                ordered = ordered[offset:] + ordered[:offset]
+            for it in ordered:
+                if stopping and stopping():
+                    break
                 if not runnable(it):            # its status may have changed since the snapshot
                     continue
                 if B.harden_needs_step(it):
@@ -315,14 +380,23 @@ class Pipeline:
                     polled.add(it.item_id)
                 elif it.state["status"] == "waiting" and not B.legacy_report_id(it):
                     rewoken.add(it.item_id)
-                    if not B.rewake(self.cfg, it):      # re-checked under the item lock
-                        continue
+                before = (it.state["stage"], it.state["status"], it.state.get("reason"))
                 r = self.step(it)
+                if r == "skipped":
+                    skipped.add(it.item_id)
+                    continue
+                after = (it.state["stage"], it.state["status"], it.state.get("reason"))
+                made_progress |= before != after or it.state["status"] == "active"
                 steps += 1
                 progress |= r in ("ok", "error", "crash")
                 if steps >= max_steps:
+                    if stopping:
+                        self._loop_cursor = it.item_id
                     break
+        if screen_worker and steps and self.cfg["screen"].get("blocklist"):
+            blocklist.reevaluate(self.store, self.cfg, self.store.event)
         out = self.status()
+        out["progress"] = made_progress
         if until:
             out["until"] = until
         return out
@@ -335,21 +409,29 @@ class Pipeline:
         for it in self.store.items():
             if only and it.item_id not in only:
                 continue
-            hist = it.state.get("history") or [{}]
-            if stages and hist[-1].get("paused_stage", it.state["stage"]) not in stages:
+            if it.state["status"] not in ("paused", "parked") and not B.legacy_report_id(it):
                 continue
-            migrated = self._migrate_probe_report(it)
-            if migrated:
-                if migrated == "ok":
+            with it.step_lock(timeout=60):
+                it.load()
+                hist = it.state.get("history") or [{}]
+                if stages and hist[-1].get("paused_stage", it.state["stage"]) not in stages:
+                    continue
+                migrated = self._migrate_probe_report(it)
+                if migrated:
+                    if migrated == "ok":
+                        out.append(it.item_id)
+                    continue
+                probe_park = (it.state["status"] == "parked" and it.state.get("reason") == "parked:probe_unreviewed"
+                              and (self.cfg.get("review") or {}).get("enabled"))
+                if (it.state["status"] == "paused" or probe_park) and str(it.state.get("reason", "")).startswith(reasons_prefix):
+                    if not self.ledger.window_allows(hist[-1]):
+                        continue
+                    it.state["stage"] = hist[-1].get("paused_stage", it.state["stage"])
+                    it.state.setdefault("history", []).append(dict(stage=it.state["stage"], result="resume", ts=time.time()))
+                    it.state.pop("reason", None)
+                    it.state["status"] = "active"
+                    it.save()
                     out.append(it.item_id)
-                continue
-            probe_park = (it.state["status"] == "parked" and it.state.get("reason") == "parked:probe_unreviewed"
-                          and (self.cfg.get("review") or {}).get("enabled"))
-            if (it.state["status"] == "paused" or probe_park) and str(it.state.get("reason", "")).startswith(reasons_prefix):
-                it.state["stage"] = hist[-1].get("paused_stage", it.state["stage"])
-                it.state["status"] = "active"
-                it.save()
-                out.append(it.item_id)
         self.stopped_models.clear()
         return out
 
@@ -361,5 +443,7 @@ class Pipeline:
                     reasons=dict(Counter(i.state.get("reason") for i in items if i.state.get("reason"))),
                     remote_unknown=sum(r.get("state") == "remote_unknown" and r.get("outcome") is None
                                        for i in items for directory in ("calib", "review")
-                                       for r in read_json(i.p(directory, "runs.json"), [])),
-                    ledger_today=self.ledger.summary(today()))
+                                       for r in read_json(i.p(directory, "runs.json"), []))
+                                   + sum(read_json(i.p(stage, "run.json"), {}).get("state") == "remote_unknown"
+                                         for i in items for stage in AGENT_STAGES),
+                    ledger_today=self.ledger.summary(today()), window_caps=self.ledger.window_usage())

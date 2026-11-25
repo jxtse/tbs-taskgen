@@ -308,6 +308,8 @@ def test_diversity_inventory_and_both_admissions(tmp_path, capsys):
     assert stages_a._admission_status(why) == "parked"
     P.cfg["diversity"]["max_area_share"] = 1
     assert stages_a._agent_admission(P, candidate, "S5G") == "diversity:template_full:a"
+    candidate.state["stage"] = "S10"
+    candidate.save()
     stages_b.s10(P, candidate)
     assert candidate.state["status"] == "parked" and candidate.state["reason"] == "diversity:template_full:a"
     assert diversity.released_ids(run) == {a.item_id, b.item_id}
@@ -577,6 +579,8 @@ def test_s10_keeps_an_existing_release(tmp_path, monkeypatch):
     # finding 6: manifest already holds the item (crash before "done"): no re-decision, no withdrawal
     store = Store(tmp_path)
     it = store.item("x")
+    it.state["stage"] = "S10"
+    it.save()
     (tmp_path / "release").mkdir()
     (tmp_path / "release/manifest.jsonl").write_text('{"item_id":"x"}\n')
     P = SimpleNamespace(store=store, cfg=load_config())
@@ -832,6 +836,7 @@ def test_release_retry_after_append_is_idempotent(tmp_path, monkeypatch):
     stages_b.s10(P, it)
     assert it.state["status"] == "done" and len(manifest.read_text().splitlines()) == 1
     it.state["calib_epoch"] += 1
+    it.save()
     stages_b.s10(P, it)
     write_json(it.p("pkg", "data.json"), 2)
     stages_b.s10(P, it)
@@ -958,7 +963,9 @@ def test_legacy_explicit_assumption_passes_both_stages(tmp_path, wired_gates, ve
     assert not gates.run_gates(cfg, tmp_path, spec, {}, 2)["gates"]["assumptions_stated"]
 
 
-def test_resume_b88e514_reservation(tmp_path, monkeypatch):
+@pytest.mark.parametrize("resume_day", ["2026-11-24", "2026-11-25"])
+def test_resume_b88e514_reservation(tmp_path, monkeypatch, resume_day):
+    monkeypatch.setattr(budget, "today", lambda: resume_day)
     cfg = load_config()
     cfg["budget"].update(daily_usd_total=10, run_calls_per_model={"model": 1})
     it = Store(tmp_path).item("x")
@@ -1004,15 +1011,22 @@ def test_resume_b88e514_reservation(tmp_path, monkeypatch):
     step()
     assert len(launches) == 1 and job in launches[0]
     resumed = json.loads(it.p("S5G", "run.json").read_text())
-    assert resumed["state"] == "launched" and resumed["ledger_call"] == old
+    assert resumed["state"] == "launched"
     with ledger._db() as db:
-        assert db.execute("SELECT id,reservation_key FROM calls").fetchall() == [(old, resumed["reservation_key"])]
+        rows = db.execute("SELECT id,day,status,usd FROM calls WHERE reservation_key=? ORDER BY id",
+                          (resumed["reservation_key"],)).fetchall()
+    if resume_day == "2026-11-24":
+        assert rows == [(old, resume_day, "sent", None)]
+    else:
+        assert rows == [(old, "2026-11-24", "cancelled", 0), (resumed["ledger_call"], resume_day, "sent", None)]
+    assert resumed["ledger_call"] == rows[-1][0]
 
 
 def test_resume_b88e514_manifest(tmp_path, monkeypatch):
     store = Store(tmp_path)
     it = store.item("x")
     it.state.update(stage="S10", calib_epoch=2, calib_label="hard")
+    it.save()
     cfg = load_config()
     cfg["review"]["enabled"] = False
     manifest = tmp_path / "release/manifest.jsonl"
@@ -1045,16 +1059,19 @@ def test_release_records_changed_review_and_label(tmp_path):
     store = Store(tmp_path)
     it = store.item("x")
     it.state.update(stage="S10", calib_epoch=2, calib_label="hard")
+    it.save()
     P = SimpleNamespace(cfg=load_config(), store=store)
     P.cfg["review"]["enabled"] = False
     stages_b.s10(P, it)
     P.cfg["review"]["enabled"] = True
     it.state["review_round"] = 1
+    it.save()
     write_json(it.p("review/verdict.json"), dict(_normalized=dict(verdict="pass"), round=1,
                calib_epoch=2, pkg_sha=stages_b.calib.pkg_sha(it.p("pkg"))))
     stages_b.s10(P, it)
     stages_b.s10(P, it)
     it.state["calib_label"] = "medium"
+    it.save()
     stages_b.s10(P, it)
     records = [json.loads(line) for line in (tmp_path / "release/manifest.jsonl").read_text().splitlines()]
     assert [(r["label"], (r["review"] or {}).get("verdict")) for r in records] == [
@@ -1212,6 +1229,8 @@ def test_manifest_append_after_torn_line(tmp_path):
     P = SimpleNamespace(cfg=load_config(), store=Store(tmp_path))
     P.cfg["review"]["enabled"] = False
     it = P.store.item("x")
+    it.state["stage"] = "S10"
+    it.save()
     manifest = tmp_path / "release/manifest.jsonl"
     manifest.parent.mkdir()
     manifest.write_bytes(b'{"item_id":')

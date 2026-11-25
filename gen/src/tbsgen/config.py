@@ -29,6 +29,7 @@ DEFAULTS: dict[str, Any] = {
     "budget": {
         # USD per UTC+8 day.  None = not configured -> real model calls refuse to start.
         "daily_usd_total": None,
+        "window_caps": [],
         "daily_usd_per_model": {},          # e.g. {"claude-opus-5-5": 50.0}
         "daily_usd_per_stage": {},          # e.g. {"S6A": 20.0}
         "daily_calls_per_model": {},        # hard call caps, e.g. {"claude-opus-5-5": 6}
@@ -258,6 +259,9 @@ DEFAULTS: dict[str, Any] = {
             # a remote job starts no new paper after this; it also bounds how stale the job's copy of the ledger
             # state (cooldowns set meanwhile by the local browser) can get
             "max_job_s": 1800,
+            "submit_grace_s": 600,  # release leases with no submitted marker after this interval
+            "unreachable_after_s": 1800,  # stop waiting after continuous SSH failure; retain the lease
+            "stale_after_s": 7200,  # observe a missing or dead job this long before reclaiming its lease
             "batch_max": 50,
             # Command printing a JSON object of secrets on stdout; it gets the wanted names (JSON list) on stdin.
             # None -> read them from this process's environment.  Secrets go to the remote worker on ssh stdin.
@@ -457,7 +461,7 @@ DEFAULTS: dict[str, Any] = {
         "teacher_agent": None,
         "environment": None,
         # Launchers: scripts under harbor_root called as `./<launcher> run <job-config.json>`.  Unset -> the
-        # printed command is a plain `harbor run --config ...`, and allow_submit=true refuses to launch.
+        # manual launch uses Harbor directly, and allow_submit=true refuses to launch.
         "harbor_root": HARBOR_ROOT,
         "jobs_dir": str(REPO_ROOT / "gen" / "state" / "harbor-jobs"),
         "remote_launchers": None,           # explicit script basenames, default: all wrappers except harbor
@@ -491,6 +495,7 @@ DEFAULTS: dict[str, Any] = {
         # job waits (status waiting, "queued: slots full") and is stepped again by the next run / calib watch.
         # None = no limit.
         "max_concurrent_jobs": None,
+        "max_concurrent_jobs_by_who": {},
         # Hosts the agent may reach while it works when the task's agent phase is an allowlist
         # (package.network.mode = "agent-allowlist"): the model endpoint(s).  Written to the job config as
         # agents[].extra_allowed_hosts (= harbor run --allow-agent-host).  Empty with an allowlisted task: S9 does
@@ -508,6 +513,7 @@ DEFAULTS: dict[str, Any] = {
         # A job the model relay refused at its preflight (launcher log "relay preflight http=<non-200>", exit 3, no
         # Harbor job) ran nothing: S4c / S5G / S9 / S9R wait this long and launch again, without using up
         # infra_retries / code infra retries / review.infra_retries (calib.relay_preflight_refused).
+        "launch_grace_s": 60,  # grace period for legacy launches without permits
         "preflight_retry_s": 600,
         "variant_depth": 0,                 # S9b: per-item S9b variant rounds (a task the student labels easy is
                                             # re-authored harder, then re-calibrated); 0 = off
@@ -601,8 +607,13 @@ def load_config(path: str | Path | None = None, overrides: dict | None = None) -
         p = Path(path)
         if p.exists():
             cfg = _merge(cfg, tomllib.loads(p.read_text()))
+            cfg["config_path"] = str(p.resolve())
     if overrides:
         cfg = _merge(cfg, overrides)
+    if remote := cfg.get("fetch", {}).get("remote"):
+        cfg["fulltext"]["remote"] = _merge(cfg["fulltext"]["remote"], remote)
+    if "hosts" in cfg["fulltext"]["remote"]:
+        raise ValueError("fetch.remote.hosts is unsupported: configure a single remote host with remote.host")
     return cfg
 
 

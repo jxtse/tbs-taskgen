@@ -135,7 +135,7 @@ reference / mid / naive 实测中成立（`difficulty.preferred_problem`），�
   `harden_authoring_max_usd` 与加难剩余额度的较小值。
 - `code.daily_new_runnability` / `code.daily_new_authoring`：每天（北京时间）首次进入 S4c / S5G 的论文数上限，
   记在 run 目录 `s4c-admissions.jsonl` / `s5g-admissions.jsonl`（同一篇的重出题、加难轮次不重复计数）；
-  超出时条目暂停 `budget:daily_s5g_papers`，次日 `tbsgen resume --reason budget:daily` 恢复（驱动跨日时执行）。只有作业真正启动才计入当天名额；
+  超出时条目暂停 `budget:daily_s5g_papers`，次日 `tbsgen resume --reason budget:daily` 恢复（驱动跨日时执行）。持久化启动意图时计入当天名额；确认首次作业未启动时退回名额。
   设了单篇上限时，作业在账本里按整份额度预留（成本未知时不会少算），恢复时沿用同一预留额。准入检查、预留和启动在 run 级锁
   `.agent-slots.lock` 下完成。
 - `code.max_concurrent_agent_jobs`：同时运行的 S4c + S5G 作业上限；满时条目 waiting（`queued: agent slots full`），
@@ -268,6 +268,8 @@ items/<item_id>/
 
 ## 3. 怎么跑
 
+多 worker 部署、抓取主机列表、停止文件和预算窗口的完整示例见[根目录运行说明](../README.md#多进程运行)。
+
 ```bash
 cd gen
 uv sync
@@ -278,7 +280,7 @@ uv run python -m tbsgen.backtest --out eval/leak_backtest_X         # 泄漏门�
 
 # 真实运行（必须先在 config.toml 里设预算；不设则真实模型调用全部拒绝）
 uv run tbsgen ingest --run runs/R --candidates <tbsretr 输出.json> [--top N] --config config.toml
-uv run tbsgen run    --run runs/R --config config.toml [--max-steps N] [--only ID]
+uv run tbsgen run    --run runs/R --config config.toml [--max-steps N] [--only ID] [--stages intake,code] [--loop 10]
 uv run tbsgen status --run runs/R ; uv run tbsgen report --run runs/R ; uv run tbsgen ledger --run runs/R
 uv run tbsgen resume --run runs/R --config config.toml              # 恢复因预算/熔断暂停的条目
 uv run tbsgen resume --run runs/R --only ID1,ID2 [--stage S9] [--reason budget:]  # 只恢复指定条目/阶段/原因前缀
@@ -309,11 +311,11 @@ uv run tbsgen reset  --run runs/R --item ID --stage S6B [--regen]    # 管线修
 uv run tbsgen ping --run state/ping --calls 1 --budget-usd 1        # Opus 连通性（真实调用）
 ```
 
-**人工处理远端校准或审核作业**。条目以 `remote_unknown: NAME` 暂存时，原预算预留和并发槽位继续占用。`tbsgen status` 和 `tbsgen report` 会显示待处理的作业数。
+**人工处理 S4c、S5G、S9 或 S9R 的远端作业**。条目以 `remote_unknown: NAME` 暂存时，原预算预留和并发槽位继续占用。`tbsgen status` 和 `tbsgen report` 会显示待处理的作业数。
 
-- 已将完整作业同步到记录的本地目录时，运行 `tbsgen calib resolve-remote --run runs/R --config config.toml --item ID --job NAME --synced`。命令核对作业身份、配置要求的试次数和各试次的 `result.json`。S9 每个试次还需 `verifier/metrics.jsonl`，S9R 则需要正式裁决及该审核版本读取的复现日志。即使 Harbor 未写入作业级 `finished_at`，完整试次仍可接收。
+- 已将完整作业同步到记录的本地目录时，运行 `tbsgen calib resolve-remote --run runs/R --config config.toml --item ID --job NAME --synced`。命令核对作业身份、配置要求的试次数和各试次的 `result.json`。S9 每个试次还需 `verifier/metrics.jsonl`，S9R 则需要正式裁决及该审核版本读取的复现日志。这两个阶段即使缺少作业级 `finished_at` 也能接收完整试次。S4c 和 S5G 需要作业完成摘要，以及各试次 `verifier/out` 下的阶段交付文件。
 - 确认远端作业已结束且目录已完整同步时，使用 `--ended-without-result`（别名 `--died`）接收其中已完成的试次。若没有完整试次，命令合计可读试次费用，没有可读费用时按预留额结算，然后按 infra 策略重试。
-- 确认远端从未启动该作业且本地 launcher 已退出时，使用 `--not-started` 按零费用结算。tmux 无法确定会话状态时，独立核实 launcher 已退出后可加 `--force-local-gone`。本地已有作业配置、顶层或试次结果时，命令会拒绝零费用结算。
+- 确认远端从未启动该作业且本地 launcher 已退出时，使用 `--not-started` 按零费用结算。tmux 无法确定会话状态时，独立核实 launcher 已退出后可加 `--force-local-gone`。结算前会原子撤销本次启动许可。许可已被领取，或本地已有作业配置、顶层或试次结果时，命令会拒绝零费用结算。
 
 替换目录导致本机 `tbsgen-remote.json` 丢失时，命令会从运行记录恢复它。若从未取得映射，使用 `--synced --remote-task PATH` 提供原远端任务路径。watcher 报作业身份不匹配且条目仍在等待时，也可用此命令。对尚有校准或审核作业未结算的条目，`regate` 会报告待处理作业。
 
@@ -376,7 +378,7 @@ allow_submit = false
 | `calib.infra_retries` | 2 | API/沙箱异常不计入校准次数 |
 | `calib.allow_submit` | **False** | True 时：账本预留 → tmux 后台运行启动脚本；预留超总额则拒绝；没配 `harbor_root` 和启动脚本时拒绝提交 |
 | `calib.remote_launchers`（S9/S9R）、`agent.remote_launchers`（S4c/S5G） | None | 启动前按脚本文件名记录路由。默认直接调用 `harbor` 为本地，自定义启动脚本为远端。显式列表只将列出的脚本标记为远端，空列表表示所有脚本均为本地。远端 marker 也可独立识别远端作业。 |
-| `calib.harbor_root / student_launcher / teacher_launcher` | None | 启动脚本目录与脚本名（`./<launcher> run <作业配置>`）；未设置时只打印 `harbor run --config ...` |
+| `calib.harbor_root / student_launcher / teacher_launcher` | None | 启动脚本目录与脚本名（`./<launcher> run <作业配置>`）；人工提交统一通过 `tbsgen calib launch` 领取本次启动许可，未设脚本时由该命令调用 Harbor |
 | `calib.student_agent / teacher_agent / environment` | None | Harbor 自定义 agent/环境的 `module:Class`；未设置用内置 `claude-code` agent 和 `docker` 环境 |
 | `calib.est_usd_per_run` | 20 | 每次校准作业的预留额，`calib-ingest` 冲销：Harbor 报了 `cost_usd` 用实报（`reported`）；没报（如超时）用 trial 的 token 用量 × `models.prices[模型]` 估算（`tokens`，来源依次为 agent_result、trajectory.json、Claude Code stream-json）；都没有则保留预留额并标 `reservation`——它仍占用预留额度，但不算进 `run_usd_total` 的实际花费门。`tbsgen ledger` 的 `usd_by_cost_kind` 分开列出 |
 | `calib.teacher_available` | True | False：GLM 首次失败直接记 `parked:teacher_unavailable` |

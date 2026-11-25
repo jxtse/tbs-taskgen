@@ -1719,6 +1719,7 @@ def test_obsolete_calibration_excluded_from_manifest(tmp_path):
             dict(job_name="completed", who="teacher", outcome="pass", result_type="pass")]
     write_json(it.p("calib/runs.json"), runs)
     it.state.update(stage="S10", calib_label="hard")
+    it.save()
     stages_b.s10(P, it)
     record = stages_b._live_release(P, iid)
     assert record["calib_runs"] == calib.run_summary(runs[1:])
@@ -1730,6 +1731,7 @@ def test_legacy_manifest_hash_survives_in_place_pkg_retry(tmp_path, monkeypatch)
     P, iid, _ = _env(tmp_path, review_kw={"enabled": False})
     it = P.store.item(iid)
     it.state.update(stage="S10", calib_label="hard", gates_attempt=1)
+    it.save()
     write_json(it.p("gates/attempt-1.json"), dict(attempt=1, gates={}, probe_policy_version=gates.PROBE_POLICY_VERSION))
     stages_b.s10(P, it)
     previous = stages_b._live_release(P, iid)
@@ -2103,15 +2105,15 @@ exit 5
     command = ["calib", "resolve-remote", "--run", str(P.store.root), "--item", iid, "--job", name]
     monkeypatch.setattr("tbsgen.calib.session_alive", lambda c, r: False)
     if evidence == "marker":
-        assert main(command + ["--not-started"]) == 0
-        assert _runs(P, iid, "review")[0]["cost_kind"] == "not_launched"
+        with pytest.raises(SystemExit, match="permit already claimed"):
+            main(command + ["--not-started"])
     else:
         with pytest.raises(SystemExit, match="cannot confirm not-started"):
             main(command + ["--not-started"])
         assert _runs(P, iid, "review") == [held]
     with P.ledger._db() as db:
         row = db.execute("SELECT status,usd FROM calls WHERE id=?", (rec["ledger_call"],)).fetchone()
-        assert row == (("error", 0) if evidence == "marker" else ("reserved", None))
+        assert row == ("sent", None)
 
 
 @pytest.mark.parametrize("stage", ["S9", "S9R"])
@@ -2262,7 +2264,7 @@ def test_late_repro_journal_parks_then_honors_drop(tmp_path, monkeypatch, during
     assert held["state"] == "remote_unknown" and held["outcome"] is None
     assert stages_b.running_jobs(P) == [jd.name]
     with P.ledger._db() as db:
-        assert db.execute("SELECT status,usd FROM calls WHERE id=?", (rec["ledger_call"],)).fetchone() == ("reserved", None)
+        assert db.execute("SELECT status,usd FROM calls WHERE id=?", (rec["ledger_call"],)).fetchone() == ("sent", None)
     with pytest.raises(SystemExit, match="incomplete remote trial set"):
         main(cmd + ["--synced"])
     journal.write_text(json.dumps(receipt) + "\n")
@@ -2370,7 +2372,7 @@ def test_remote_route_precedes_marker_and_exit_143(tmp_path, monkeypatch, stage)
         P.ledger.reserve(rec["model"], stage, "next", True, est_usd=12)
     with P.ledger._db() as db:
         assert db.execute("SELECT status,usd FROM calls WHERE id=?", (rec["ledger_call"],)).fetchone() == (
-            "reserved", None)
+            "sent", None)
 
 
 @pytest.mark.parametrize("observed", ["live", "parked", "never"])
@@ -2527,7 +2529,11 @@ def test_remote_agent_default_and_registered_completeness(tmp_path, monkeypatch,
     log = tmp_path / "launcher.log"
     Path(str(log) + ".exit").write_text("0")
     rec = dict(job_name=jd.name, job_dir=str(jd), log=str(log), ledger_stage=stage, state="launched", ledger_call=1)
-    assert calib.reconcile_remote({}, rec, None, lambda r: None) == "awaiting_ingest"
+    # The generic rule needs only a readable trial result and no delivery metrics ...
+    assert calib.remote_trial_set(jd, stage) == ([trial], True)
+    # ... but agent recovery also requires the stage's own deliverables and a finished job, so a launcher that
+    # exited without them parks the run instead of failing the item.
+    assert calib.reconcile_remote({}, rec, None, lambda r: None) == "remote_unknown"
 
     def has_deliverable(trial_dir, result, contract):
         return (trial_dir / "verifier/out/answer.txt").is_file()

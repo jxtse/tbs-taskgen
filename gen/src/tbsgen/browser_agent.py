@@ -593,7 +593,12 @@ def _paper_call(bd: Path, st: dict, n: str, action: str, arg: str, say) -> int:
                            f"{slot - time.time():.0f}s. Work on another paper, or `sleep` and retry.", 4)
             if slot > float(st["deadline"]):
                 return say("tbsgen: the batch deadline comes before this publisher's next slot; skip it.", 4)
-            rid = led.acquire("browser", lkey, p["doi"], related=tuple(web_hosts), group=aliases)
+            from .fulltext import browser_eligible
+            if "queue_path" not in st:
+                return say("tbsgen: start a fresh browser batch to recheck the queue before downloading", 2)
+            rid = led.acquire("browser", lkey, p["doi"], related=tuple(web_hosts), group=aliases,
+                              eligible=lambda: browser_eligible(p, Path(st["queue_path"]), st["cache_dirs"],
+                                                                st["min_chars"]))
         except LimitReached as e:
             ps["closed"] = f"ledger: {e}"
             _atomic(sp, json.dumps(ps))
@@ -1261,7 +1266,7 @@ def agent_space(b: dict) -> str:
 
 
 def _due(fetcher, bb: dict) -> list[dict]:
-    from .fulltext import queue_lock, queue_path, read_queue
+    from .fulltext import paper_ident, queue_lock, queue_path, read_queue
     qp = queue_path(fetcher.cfg)
     with queue_lock(qp):
         queue = read_queue(qp)
@@ -1269,7 +1274,8 @@ def _due(fetcher, bb: dict) -> list[dict]:
     # the browser has its own backoff (browser_next_try): a failed HTTP attempt must not hide a paper from the
     # browser, and by default only papers the HTTP cascade already tried are taken (the browser quota is small)
     http_first = bool(bb.get("require_http_first", True))
-    due = [e for e in queue if float(e.get("browser_next_try") or 0) <= t_now and e.get("doi")
+    leased = fetcher.ledger.leased_papers()
+    due = [e for e in queue if paper_ident(e) not in leased and float(e.get("browser_next_try") or 0) <= t_now and e.get("doi")
            and fetcher.channel_applies("browser", e["doi"])
            and (not http_first or e.get("failed_channels") or e.get("tries") or e.get("last_try"))]
     due.sort(key=lambda e: float(e.get("browser_last_try") or 0))
@@ -1425,7 +1431,7 @@ def _script_phase(fetcher, plan, results, stats, bb, wd, stop, deadline, clock, 
                 break
             fetcher._egress_browser = dict(ok=True, ip=(wd.prober.last_ok or {}).get("ip"), ts=time.time())
             t0 = clock()
-            out = fetcher.fetch(e, browser=True, channels=["cache", "browser"])
+            out = fetcher.fetch(e, browser=True, channels=["cache", "browser"], queued=True)
             if stop.is_set() and out.text is None:
                 results[k] = dict(status="deferred", phase="script", errors=["batch stopped"])
                 _uncount_cancelled(fetcher, e)
@@ -1643,7 +1649,7 @@ def _hermes_home(bd: Path, ag: dict, hook_cmd: str) -> Path:
 
 def _agent_phase(fetcher, todo: list[dict], deadline: float, bd: Path, wd: Watchdog, stop: threading.Event,
                  hermes_runner, log) -> dict:
-    from .fulltext import Outcome, paper_ident
+    from .fulltext import Outcome, paper_ident, queue_path
     ft = fetcher.ft
     b = ft["browser"]
     ag = b.get("agent") or {}
@@ -1662,6 +1668,9 @@ def _agent_phase(fetcher, todo: list[dict], deadline: float, bd: Path, wd: Watch
         return dict(usage=dict(skipped="not enough time left in the egress window"),
                     papers={v["ident"]: dict(status="deferred") for v in papers.values()})
     st = dict(space=agent_space(b), papers=papers, deadline=deadline,
+              queue_path=str(queue_path(fetcher.cfg).resolve()),
+              cache_dirs=[str(Path(d).resolve()) for d in fetcher.cache_dirs()],
+              min_chars=ft["min_chars"],
               ledger_path=str(led.path), limits=led.limits, global_limits=led.g, host_caps=led.host_caps,
               ego_binary=browser_ego.binary(b), gate_max_wait_s=float(ag.get("gate_max_wait_s", 150)),
               max_calls_per_paper=int(ag.get("max_calls_per_paper", 25)),

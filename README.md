@@ -194,7 +194,7 @@ default; routed like the teacher unless set) are in §4–§5b there.
 
 ### Resolving a parked remote job
 
-For S9 and S9R, `tbsgen status` and `tbsgen report` count unresolved `remote_unknown` runs. The item reason
+For S4c, S5G, S9 and S9R, `tbsgen status` and `tbsgen report` count unresolved `remote_unknown` runs. The item reason
 `remote_unknown: NAME` identifies the job. Its budget reservation and concurrency slot stay held until an
 operator resolves it. The controller records the route before submission. By default, plain Harbor runs locally
 and custom launcher scripts are treated as remote. Set `calib.remote_launchers` (S9 and S9R) or
@@ -203,50 +203,82 @@ classifies all configured scripts as local. A launcher's remote marker also iden
 
 Use `tbsgen calib resolve-remote --run RUN --config CFG --item ID --job NAME` with one of these outcomes.
 
-- `--synced` ingests every expected trial once its files are present, even if Harbor never wrote the job's
+- For S9 and S9R, `--synced` ingests every expected trial once its files are present, even if Harbor never wrote the job's
   `finished_at`. Each trial needs its `result.json`. S9 also requires `verifier/metrics.jsonl`. S9R requires
   the formal verifier verdict and the reproduction journal if the review contract reads one.
+  S4c and S5G require a finished job summary and their stage outputs under each trial's `verifier/out`.
 - `--ended-without-result` (alias `--died`) confirms that the remote job has ended and its directory is fully
-  synced. The controller ingests the complete trials. If none is complete, it applies the infra retry policy
+  synced. For S9 and S9R the controller ingests the complete trials. If none is complete, it applies the infra retry policy
   and charges the readable trial costs, or the reservation when none is available.
 - `--not-started` settles at zero after the operator verifies that the remote job never started and the local
   launcher is gone. If tmux cannot determine the session state, independently confirm it is gone and add
-  `--force-local-gone`. A job config, top-level result, or trial result blocks this outcome.
+  `--force-local-gone`. The controller atomically revokes the attempt's launch permit before settling. A claimed permit,
+  job config, top-level result, or trial result blocks this outcome.
 
 Directory replacement can remove the local `tbsgen-remote.json`. Ingest uses the saved mapping and resolution restores the marker.
 If the controller never captured the mapping, `--synced --remote-task PATH` restores it using the original remote
 task path. This also works when the item is still waiting after the watcher reported a job identity mismatch.
 `regate` requires all calibration and review runs for the item to be closed.
 
-### Running unattended
+### 多进程运行
 
-A long-running deployment uses a small driver script, written for the deployment; the repository has no such
-script. The script repeats one serial loop:
-1. `tbsgen calib watch --run RUN --config CFG --once`: collect finished calibration / review jobs and start the next
-   ones.
-2. `tbsgen run --run RUN --config CFG --max-steps N`.
-3. Sleep a few minutes.
+在同一控制机上，让所有 worker 使用相同的 run 目录和配置。以下示例在已安装 `tbsgen` 的环境中运行：
 
-Run only one such loop per run directory, because both commands advance items. At each day change the script also
-runs `tbsgen resume --run RUN --config CFG --reason budget:daily`. When few papers are left in the front of the
-pipeline, it tops up candidates: `tbsretr run --targets T.json --out DIR`, filter, then
-`tbsgen ingest --run RUN --candidates C.json`. Every cap is enforced inside tbsgen, so the loop never needs to relax
-one:
-- `budget.daily_usd_per_model`;
-- `budget.item_usd_cap` for a paper's first version;
-- `budget.item_harden_usd_cap` for all of its hardening rounds together;
-- `code.daily_new_authoring` papers per day into S5G;
-- agent / calibration concurrency.
+```sh
+run_dir=runs/example
+cfg=config.toml
+tbsgen fetch --run "$run_dir" --config "$cfg" --loop 2 &
+tbsgen run --run "$run_dir" --config "$cfg" --stages intake,code --loop 10 &
+tbsgen run --run "$run_dir" --config "$cfg" --stages agent --loop 10 &
+tbsgen run --run "$run_dir" --config "$cfg" --stages sandbox,build,S5,S6A,S6M --loop 5 &
+tbsgen run --run "$run_dir" --config "$cfg" --stages sandbox,build,S5,S6A,S6M --loop 5 &
+tbsgen run --run "$run_dir" --config "$cfg" --stages calib --loop 10 &
+wait
+```
 
-Job states are persisted, so the loop can be killed and restarted at any point.
+`intake` 负责 S1、S2a、S2、S3 和 S4，`code` 负责 S3b、S3c。
+`agent` 提交并轮询 S4c、S5G。两个 `sandbox` worker 分担 S6A_run、S6B、S6C、S7、S8、PKG；
+示例同时覆盖单次调用的 S5、S6A、S6M，`build` 在有 S6I 的版本中处理该阶段。
+`calib` 收取并推进 S9、S9R、S10。`harden` 可单独推进正在加难或生成变体的条目。
 
-Keep the loop alive with something that can read the run directory:
-- On Linux, a systemd user service.
-- On macOS, a `tmux` session plus a periodic watchdog. The watchdog is a cron job or scheduler entry that restarts
-  the session when the loop's pid is gone and no stop file is present; stop the loop by creating that file, not by
-  killing it. launchd agents may be denied access to external volumes (TCC), so check that before you rely on one.
-- Start the loop from a directory that will not be deleted: `uv` refuses to run when the inherited working directory
-  no longer exists.
+`--stages` 接受逗号分隔的组名和阶段名。`--max-steps` 按遍计数，有进展即开始下一遍，空闲时才等待
+`--loop` 指定的秒数。在另一终端运行 `touch "$run_dir/driver.stop"`，或向指定 worker 发送 SIGTERM，
+当前操作结束后停止。重新启动前移走停止文件。每日额度刷新后可运行
+`tbsgen resume --run "$run_dir" --config "$cfg" --reason budget:daily`。
+
+```toml
+[code]
+max_concurrent_agent_jobs = 2
+agent_memory_mb = 8192
+
+[calib]
+max_concurrent_jobs = 4
+max_concurrent_jobs_by_who = { glm = 3, teacher = 1, review = 1 }
+
+[budget]
+daily_usd_total = 20
+window_caps = [
+  { name = "project", model = "*", usd = 100, since = "2026-01-01" },
+  { name = "teacher-week", model = "my-teacher-model", usd = 30, since = "2026-01-01", days = 7 },
+]
+
+[fetch.remote]
+enabled = true
+host = "fetch-host"
+code_dir = "~/code"
+workdir = "~/fetch"
+python = "python3"
+```
+
+Agent 并发数乘以 `agent_memory_mb` 应在构建机可用内存以内，另给同机教师、审核作业及系统留出内存。
+校准同时受总上限和角色上限约束。按云沙箱容量设置 `glm`，按构建机剩余容量设置 `teacher` 和 `review`。
+
+单台抓取主机每次运行一个批次。`tbsgen fetch --loop` 收回结果后立即提交下一批，作业结算前由本地账本保留额度。
+
+预算窗口从指定的北京时间日期起累计实际支出和未结算预留。`days = 7` 只计含当天的最近七个日历日。
+`tbsgen status --run "$run_dir" --config "$cfg"` 显示窗口用量；额度充足时用 `resume --reason budget:window:`
+恢复相应条目。`tbsgen report --run "$run_dir" --throughput --days 7` 从条目历史统计近七天各阶段按原因
+累计的等待小时、按运行中状态持续时间估算的平均并发数、每日发布数和到达各阶段的去重条目数。省略 `--days` 可查看整个 run。
 
 ## Configuration
 
@@ -456,12 +488,31 @@ publisher request.
 - Secrets (`ELSEVIER_API_KEY`, `WILEY_TDM_TOKEN`) are read locally (environment, or the command in
   `fulltext.remote.secrets_cmd`, which gets the wanted names on stdin and prints a JSON object) and sent on the
   ssh connection's stdin. The remote worker keeps them in memory; they are never in a command line, file or log.
-- One ledger: the local `ledger_path` stays the only authority, and one remote job at a time uses it. Before a job, the local ledger books one lease row
+- In single-host mode, the local `ledger_path` stays the only authority. Before a job, the local ledger books one lease row
   per paper (counts against the global daily cap, so the browser cannot use the same quota) and sends a snapshot of
   today's usage, live cooldowns and pacing state; the remote job works on a copy seeded from it, so channel caps,
   breakers and cooldowns include the local usage. Afterwards the remote job's new rows are merged into the local
   ledger exactly once and the lease is dropped (a lease holds its quota until then, however long that takes).
   Cooldowns set locally while a job runs reach the remote side with the next job (`max_job_s` bounds the delay).
+- One-shot fetch polls until the job deadline plus 600 seconds by default. `--max-wait` bounds the round,
+  including run and download ledger initialization, lease acquisition, the secrets command, remote calls, cache import,
+  ledger merge and subscriber delivery. In loop mode a startup lock timeout retries on the next tick. A batch needs
+  at least ten minutes before its job deadline, or half of `max_job_s` for job limits under twenty minutes. Near local midnight, papers stay due and the loop retries after rollover.
+  Each fetch delivers cached papers from collected receipts to waiting subscribers before submitting or polling
+  the next batch, including papers outside the current batch limit.
+- Each queue has a `<queue>.drain.lock` held for the whole drain. Controllers sharing a ledger take
+  `<ledger>.remote.lock` across submission, polling and collection. Queue edits and SQLite transactions take
+  shorter locks. Receipts belong to the queue that created them. An unsubmitted lease expires after
+  `submit_grace_s` (default 600 seconds). After `unreachable_after_s` of SSH failure (default 1800 seconds),
+  fetch reports the host and retains the lease. Successful downloads count on the local settlement day.
+- At startup, fetch lists unfinished legacy receipts in the configured queue. For every legacy receipt,
+  confirm that no legacy fetch worker process is running on the original host, regardless of receipt age.
+  Use the original host, workdir and queue configuration with
+  `tbsgen fetch --run DIR --config FILE --release-stale JOB_ID --legacy-worker-stopped`. The command checks
+  that the worker lock is free and the job directory is absent. For a legacy collected receipt it can clean up
+  the finished job before confirming absence. It prints the action and records it in the receipt. Use normal
+  fetch recovery for current receipts. A missing submitted job keeps its lease until the worker fences a late
+  submit and confirms absence with export status 44.
 - Interruptions: the remote worker is detached, so an ssh drop does not stop it. The local job file
   (`<queue>.remote/<job>.json`) records the stage; the next `tbsgen fetch` first collects unfinished jobs. Results
   are written per paper (a text saved just before a crash is recovered from its provenance), so a worker that dies
@@ -678,7 +729,7 @@ obfuscated, or fetched at run time some other way; calibration and human review 
 | `TYPESAFE_API_KEY` | gen (S2) | TypeSafe key for the Jev screen (`models.roles.screen = "jev"`). The variable name is `screen.jev.key_env`. Unset: S2 falls back to the rules screen (or parks, see `screen.jev.on_unavailable`). |
 | `ELSEVIER_API_KEY`, `ELSEVIER_INSTTOKEN` | gen (S3) | Elsevier TDM channel (`fulltext.elsevier.key_env` / `insttoken_env`). Unset: the channel is skipped. |
 | `WILEY_TDM_TOKEN` | gen (S3) | Wiley TDM channel (`fulltext.wiley.token_env`). Unset: the channel is skipped. |
-| `TBS_HARBOR_ROOT` | gen (S9) | Directory with your Harbor job launch scripts for calibration (`calib.harbor_root`). Unset: S9 prints a plain `harbor run --config ...` command. |
+| `TBS_HARBOR_ROOT` | gen (S9) | Directory with your Harbor job launch scripts for calibration (`calib.harbor_root`). Without a launcher, manual submission through `tbsgen calib launch` uses Harbor directly. |
 | `TBS_HARBOR_BIN` | gen | Path to the `harbor` binary for `tbsgen harbor-local` (otherwise looked up on `PATH`). |
 | `TBS_SEARCH_POOL_URL` | retrieval | Search-pool service for Exa (`sources.exa.backend = "pool"`, the default). No default: unset means Exa is skipped. Or set `backend = "direct"` and use `EXA_API_KEY_SECONDARY`. |
 | `OPENALEX_API_KEY` | retrieval | Optional; OpenAlex also works without a key, at lower rate limits. |
@@ -697,7 +748,7 @@ the teacher URL (real model stages pause until it is set), the Exa search pool (
 texts for deduplication; none: no deduplication), `leak_refs` in the retrieval config (papers TB-Science tasks
 were built from, excluded from retrieval; none: no exclusion), and the S9 launcher
 settings under `[calib]` (`harbor_root`, `student_launcher`, `teacher_launcher`). Without launchers,
-S9 writes the job config and prints a plain `harbor run --config <file> --yes` command, and
+S9 writes the job config and prints a single-use `tbsgen calib launch` command for the current attempt, and
 `allow_submit = true` refuses to launch. Calibration jobs use Harbor's built-in `claude-code` agent
 and `docker` environment unless `student_agent`, `teacher_agent` or `environment` name a custom
 `module:Class`. None of this affects the tests or the dry run.

@@ -94,11 +94,11 @@ def test_reservation_is_the_job_allowance_and_admission_only_on_launch(tmp_path,
     P.cfg["code"]["daily_new_authoring"] = 1
     from tbsgen import codeagent
     import subprocess as sp
-    monkeypatch.setattr(codeagent.subprocess, "run", lambda args, **kw: sp.CompletedProcess(args, 1, "", "no tmux"))
-    P.run(max_steps=1, until="S5G")                              # tmux fails: never started
+    monkeypatch.setattr(codeagent.subprocess, "run", lambda args, **kw: sp.CompletedProcess(args, 1, "", "no server running"))
+    P.run(max_steps=1, until="S5G")
     st = P.store.item(it.item_id).state
     assert st["status"] == "paused" and st["reason"] == "code:S5G:launch_failed"
-    assert not (P.store.root / "s5g-admissions.jsonl").exists()  # not admitted: nothing started
+    assert not (P.store.root / "s5g-admissions.jsonl").read_text().strip()  # tmux failed: admission withdrawn
     with P.ledger._db() as db:
         rows = db.execute("SELECT est_usd, usd, status FROM calls WHERE item=? AND stage='S5G'", (it.item_id,)).fetchall()
     assert rows == [(10.0, 0.0, "error")]                        # reserved at the allowance, released at 0
@@ -347,7 +347,7 @@ def test_tmux_failure_then_refusal_gives_the_daily_slot_back(tmp_path, monkeypat
     P, it, fl = _agent_item(tmp_path, monkeypatch, _S4C_OK, stage="S4c")
     P.cfg["code"]["daily_new_runnability"] = 1
     P.cfg["calib"]["preflight_retry_s"] = 3600
-    monkeypatch.setattr(codeagent.subprocess, "run", lambda args, **kw: sp.CompletedProcess(args, 1, "", "no server"))
+    monkeypatch.setattr(codeagent.subprocess, "run", lambda args, **kw: sp.CompletedProcess(args, 1, "", "no server running"))
     P.run(max_steps=1, until="S4c")
     assert read_json(it.p("S4c", "run.json"))["state"] == "launch_failed"
     from tbsgen.cli import main

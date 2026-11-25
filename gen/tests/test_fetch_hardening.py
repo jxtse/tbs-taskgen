@@ -456,7 +456,7 @@ def test_deploy_refuses_while_remote_job_outstanding(tmp_path):
     f, r = _rf(tmp_path), _repo(tmp_path)
     run = FakeRun()
     run_ls = lambda cmd, stdin=b"", timeout=300: (run.cmds.append(cmd), (0, b"job-1\n", b""))[1] \
-        if cmd.startswith("ls ") else run(cmd, stdin, timeout)
+        if cmd.startswith("for d in ") else run(cmd, stdin, timeout)
     out = remote.deploy(f, repo=r, ssh_runner=run_ls, scp_runner=lambda *a, **k: (0, b"", b""))
     assert not out["ok"] and "job directories" in out["error"]
 
@@ -682,3 +682,31 @@ def test_purge_reports_but_never_writes_readonly_caches(tmp_path):
     f, net, led, clock = mkfetcher(tmp_path, {}, SECRETS, cache_dirs=[str(ro)])
     out = fulltext.purge(f.cfg, ["elsevier"])
     assert out["readonly_matches"] == 1 and (ro / "10.1016_j.r.1.txt").exists()
+
+
+def test_deploy_skips_only_expired_job_dirs(tmp_path):
+    import io
+    import subprocess
+
+    wd = tmp_path / "work dir"
+    f, repo = _rf(tmp_path, workdir=str(wd)), _repo(tmp_path)
+    partial = wd / "jobs/late"
+    (partial / "results").mkdir(parents=True)
+    (partial / "ledger.sqlite").touch()
+    assert remote.cmd_export(str(wd), "late", io.BytesIO()) == remote.EXPORT_MISSING
+    guard = wd / "jobs/late/expired"
+    fake = FakeRun(info=dict(fingerprint=remote.code_fingerprint(), head=_git(repo, "rev-parse", "HEAD")))
+    def run(cmd, stdin=b"", timeout=120):
+        if cmd.startswith("for d in "):
+            p = subprocess.run(["sh", "-c", cmd], capture_output=True, timeout=timeout)
+            return p.returncode, p.stdout, p.stderr
+        return fake(cmd, stdin, timeout)
+    def deploy():
+        return remote.deploy(f, repo=repo, ssh_runner=run, scp_runner=lambda *a: (0, b"", b""))
+    assert deploy()["ok"] and guard.exists()
+    spec = dict(fingerprint=remote.code_fingerprint(), fulltext=dict(egress_check=dict(enabled=True, allow_cidrs=["x"])))
+    output = io.StringIO()
+    assert remote.cmd_submit(str(wd), "late", io.StringIO(json.dumps(spec) + "\n{}"), output, daemon=False) != 0
+    assert "expired" in output.getvalue()
+    (wd / "jobs/active").mkdir()
+    assert "job directories" in deploy()["error"] and guard.exists()

@@ -577,15 +577,15 @@ def test_job_config_builtin_agent_and_env_by_default(tmp_path):
     assert conf["environment"]["import_path"] == "my_ext:Env" and "type" not in conf["environment"]
 
 
-def test_prepare_without_launcher_prints_plain_harbor_command(tmp_path):
+def test_prepare_prints_guarded_command_with_or_without_launcher(tmp_path):
     item = tmp_path / "items" / "x"
     (item / "pkg").mkdir(parents=True)
     rec = calib.prepare(load_config(), item, "glm", 1)
-    assert rec["command"].startswith("harbor run --config ") and "blocked" not in rec
+    assert rec["command"].startswith("tbsgen calib launch --item x --job tbsgen-x-glm1 --attempt 1 ") and "blocked" not in rec
     rec = calib.prepare(load_config(None, {"calib": {"allow_submit": True}}), item, "glm", 1)
     assert "harbor_root" in rec["blocked"]
     rec = calib.prepare(load_config(None, {"calib": {"harbor_root": "/h", "student_launcher": "run.sh"}}), item, "glm", 1)
-    assert rec["command"].startswith("cd /h && ./run.sh run ")
+    assert rec["command"].startswith("tbsgen calib launch ") and "run.sh" not in rec["command"]
 
 
 def test_teacher_url_unset_is_a_config_error(tmp_path):
@@ -1193,3 +1193,47 @@ def test_timing_budget_written_and_added_to_verifier_timeout():
     assert "TIMING_BUDGET_SEC = 0.0  # tbsgen:timing_budget" in runner.metrics_helper_text(cfg, dict(metrics=[]))
     assert runner.timing_budget(cfg, res) == 120.0 and runner.timing_budget(cfg, dict(metrics=[])) == 0.0
 
+
+
+@pytest.mark.parametrize("cap", ["calls", "usd", "allow"])
+def test_retry_after_response_settles_estimate_and_rechecks_caps(tmp_path, monkeypatch, cap):
+    from tbsgen.models import _sha
+    client, ledger, sent = _teacher(tmp_path, monkeypatch, [_sse("ok", "end_turn", 10), _sse("retry", "end_turn", 10)])
+    ledger.cfg["budget"].update(est_usd_per_call=1, daily_usd_total=1 if cap == "usd" else 2,
+                                daily_calls_per_model={client.name: 1 if cap == "calls" else 2})
+    cid = ledger.reserve(client.name, "S6A", "paper", True, _sha("system", "user"))
+    def crash(call, usage, **kwargs):
+        assert call == cid and usage["output_tokens"] == 10
+        with ledger._db() as db:
+            assert db.execute("select status from calls where id=?", (cid,)).fetchone() == ("sent",)
+        raise SystemExit("after response")
+    with monkeypatch.context() as patch:
+        patch.setattr(ledger, "finish", crash)
+        with pytest.raises(SystemExit, match="after response"):
+            client.chat("system", "user", stage="S6A", item="paper")
+    if cap == "allow":
+        assert client.chat("system", "user", stage="S6A", item="paper").call_id != cid
+        assert len(sent) == 2
+    else:
+        with pytest.raises(BudgetStop) as exc:
+            client.chat("system", "user", stage="S6A", item="paper")
+        assert exc.value.reason == ("daily_total" if cap == "usd" else "daily_calls")
+        assert len(sent) == 1
+    with ledger._db() as db:
+        assert db.execute("select usd,cost_kind,status from calls where id=?", (cid,)).fetchone() == (
+            1, "reservation", "error")
+
+
+def test_legacy_teacher_reservation_may_have_been_sent(tmp_path, monkeypatch):
+    from tbsgen.models import _sha
+
+    client, ledger, sent = _teacher(tmp_path, monkeypatch, [_sse("ok", "end_turn", 10)])
+    ledger.cfg["budget"].update(est_usd_per_call=1, daily_usd_total=1)
+    cid = ledger.reserve(client.name, "S6A", "paper", True, _sha("system", "user"))
+    client.ledger = Ledger(ledger.path, ledger.cfg)
+    with pytest.raises(BudgetStop, match="daily_total"):
+        client.chat("system", "user", stage="S6A", item="paper")
+    assert not sent
+    with ledger._db() as db:
+        assert db.execute("select usd, cost_kind, status from calls where id=?", (cid,)).fetchone() == (
+            1, "reservation", "error")

@@ -470,6 +470,9 @@ def test_agent_jobs_have_their_own_launch_log_and_resume_never_starts_twice(tmp_
 
     def fake(args, **kw):
         calls.append(args)
+        if args[1] == "new-session":
+            preamble = args[-1].split("\n", 1)[0]
+            assert codeagent.subprocess.Popen(["bash", "-c", preamble]).wait() == 0
         rc = 1 if args[1] == "has-session" else 0
         return __import__("subprocess").CompletedProcess(args, rc, "", "")
     monkeypatch.setattr(codeagent.subprocess, "run", fake)     # the new job starts but writes nothing yet
@@ -481,15 +484,16 @@ def test_agent_jobs_have_their_own_launch_log_and_resume_never_starts_twice(tmp_
     it = P.store.item(it.item_id)
     rec = read_json(it.p("S5G", "run.json"))
     assert rec["job_name"].endswith("-s5g2") and rec["state"] == "launched" and it.state["status"] == "waiting"
-    assert [a[1] for a in calls] == ["new-session"]
-    # crash after the tmux start, before "launched" was saved: the session is alive -> adopted, not restarted
+    assert [a[1] for a in calls] == ["new-session", "has-session"]
+    # A pre-permit record still consults its session and honors the grace period.
+    rec.pop("launch_permit")
     rec["state"] = "reserved"
     write_json(it.p("S5G", "run.json"), rec)
     monkeypatch.setattr(codeagent.subprocess, "run", lambda args, **kw: calls.append(args) or
                         __import__("subprocess").CompletedProcess(args, 0, "", ""))
     conf = json.loads(Path(rec["config"]).read_text())
     out = codeagent.launch_agent(P.cfg, it, "S5G", conf, None, 1.0)
-    assert out["state"] == "launched" and [a[1] for a in calls] == ["new-session", "has-session"]
+    assert out["state"] == "launched" and [a[1] for a in calls] == ["new-session", "has-session", "has-session"]
     # tmux cannot tell (e.g. socket permission error): the reservation is kept, nothing is started
     rec["state"] = "reserved"
     write_json(it.p("S5G", "run.json"), rec)
@@ -497,7 +501,7 @@ def test_agent_jobs_have_their_own_launch_log_and_resume_never_starts_twice(tmp_
                         __import__("subprocess").CompletedProcess(args, 1, "", "permission denied"))
     out = codeagent.launch_agent(P.cfg, it, "S5G", conf, None, 1.0)
     assert out["state"] == "reserved" and [a[1] for a in calls][-1] == "has-session"
-    # a pre-fix record pointing at the shared launch.log: its .exit is not evidence; session gone -> start
+    # A shared exit file cannot confirm this launch. Keep waiting until the grace period expires.
     rec.update(state="reserved", log=str(it.p("S5G", "launch.log")))
     write_json(it.p("S5G", "run.json"), rec)
     (it.p("S5G", "launch.log.exit")).write_text("0")
@@ -505,8 +509,10 @@ def test_agent_jobs_have_their_own_launch_log_and_resume_never_starts_twice(tmp_
                         __import__("subprocess").CompletedProcess(args, 0 if args[1] == "new-session" else 1, "",
                                                               "can't find session"))
     out = codeagent.launch_agent(P.cfg, it, "S5G", conf, None, 1.0)
-    assert out["state"] == "launched" and [a[1] for a in calls][-2:] == ["has-session", "new-session"]
-    assert out["log"].endswith("-s5g2.launch.log")
+    assert out["state"] == "reserved" and calls[-1][1] == "has-session"
+    P.cfg["calib"]["launch_grace_s"] = 0
+    out = codeagent.launch_agent(P.cfg, it, "S5G", conf, None, 1.0)
+    assert out["not_started"] and [a[1] for a in calls].count("new-session") == 1
 
 
 def test_poll_does_not_trust_a_shared_logs_exit_while_the_session_lives(tmp_path, monkeypatch):
