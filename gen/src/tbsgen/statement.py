@@ -105,8 +105,11 @@ def threshold_format(text: str, thresholds: dict | None = None) -> list[str]:
         for m in _NUMBER.finditer(line):
             literal = m[0]
             mantissa = re.split("[eE]", literal)[0].lstrip("+-−").replace(",", "")
-            fraction = mantissa.partition(".")[2]
+            whole, dot, fraction = mantissa.partition(".")
             digits = mantissa.replace(".", "").lstrip("0") or fraction
+            if not dot and not re.search("[eE]", literal):
+                # Trailing zeros of an integer carry no precision: "n >= 1,000,000" is a round cutoff.
+                digits = whole.lstrip("0").rstrip("0") or "0"
             if len(digits) <= MAX_THRESHOLD_DIGITS:
                 continue
             value = abs(float(literal.replace(",", "").replace("−", "-")))
