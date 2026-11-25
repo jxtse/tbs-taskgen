@@ -493,10 +493,19 @@ def transient_agent_error(exc) -> bool:
 
 def _agent_trial_complete(trial, result, kind, required, image_outputs=False, final=False):
     """A trial counts when its stage deliverables are all present. After the final sync (launcher exit status or the
-    operator's --synced) a trial whose agent recorded an exception also counts: it will not deliver any more files."""
-    if final and result.get("exception_info"):
+    operator's --synced) a trial also counts when it cannot deliver more files: its agent recorded an exception, or
+    the verifier ran on the build host and reported the deliverables missing (the agent finished without them)."""
+    if final and (result.get("exception_info") or _verifier_reported_missing(trial)):
         return True
     return _trial_delivered(trial, kind, required, image_outputs)
+
+
+def _verifier_reported_missing(trial):
+    """The structure check ran on the build host (reward 0) and listed missing deliverables."""
+    reward = safe_read(trial / "verifier/reward.txt", root=trial)
+    check = safe_read(trial / "verifier/check.txt", root=trial)
+    return (reward is not None and reward.strip() == "0" and check is not None
+            and re.match(r"missing: \[.+\]", check.strip()) is not None)
 
 
 def _trial_delivered(trial, kind, required, image_outputs=False):

@@ -54,6 +54,12 @@ def test_threshold_literals_and_unreadable_separation():
     # physical constants and small exact cutoffs stay allowed
     assert not threshold_format("The toy rotor has inertia 87654.3219 in model units and damping 3.45678912e-4.")
     assert not threshold_format("fitted slope **≥ −0.0000000001**, difference **≤ 0.000000001**")
+    # Round integer cutoffs are not over-precise, with or without digit grouping.
+    assert not threshold_format("Use only records with `n >= 1000000`. At least 1,000,000 reads.")
+    assert not threshold_format("at least 250000000 bases", {"m": {"threshold": 250000000.0}})
+    # Integers with many significant digits after a cutoff, and long decimals, are still flagged.
+    assert threshold_format("at least 1234567 reads") == ["1234567"]
+    assert threshold_format("n >= 1000000.5") == ["1000000.5"]
     # The reference-margin floor still admits naive, so extra digits cannot separate it.
     ms = {w: {"0": {"p": a}, "1": {"p": b}} for w, a, b in (
         ("ref", .8723, .8812), ("mid", .8723, .8812), ("naive", .811, .824))}

@@ -262,6 +262,36 @@ def test_remote_agent_error_waits_for_final_sync(tmp_path, monkeypatch):
     assert run["outcome"] == "agent_error" and run["retry"]
 
 
+def test_remote_agent_without_deliverables_is_final_after_sync(tmp_path, monkeypatch):
+    """The agent ended normally but wrote nothing; the verifier on the build host said so. After the launcher's exit
+    status, the job is final: the stage handles it (no remote_unknown park holding the slot)."""
+    from tbsgen import calib, stages_a
+
+    P, it, _ = _agent_item(tmp_path, monkeypatch, {}, stage="S5G", max_concurrent_agent_jobs=1)
+    P.cfg["agent"]["remote_launchers"] = ["x.sh"]
+    P.step(it.load())
+    rec = read_json(it.p("S5G/run.json"))
+    trial = Path(rec["job_dir"]) / (rec["job_name"] + "__x")
+    result = read_json(trial / "result.json")
+    result["verifier_result"]["rewards"]["reward"] = 0
+    write_json(trial / "result.json", result)
+    (trial / "verifier").mkdir(exist_ok=True)
+    (trial / "verifier/reward.txt").write_text("0\n")
+    (trial / "verifier/check.txt").write_text("missing: ['task/instruction.md']\n")
+    monkeypatch.setattr(calib, "session_alive", lambda c, r: True)
+    P.step(it.load())                                  # no exit status yet: still waiting, slot held
+    assert read_json(it.p("S5G/run.json"))["state"] == "launched"
+    assert "slots full" in stages_a._agent_admission(P, P.store.item("another"), "S5G")
+    Path(rec["log"] + ".exit").write_text("0\n")
+    P.step(it.load())
+    st = it.load().state
+    assert st["status"] != "parked", st
+    assert read_json(it.p("S5G/run.json"))["state"] == "finished"
+    assert stages_a._agent_admission(P, P.store.item("another"), "S5G") is None
+    # A verifier receipt alone, without the launcher's final sync, never counts.
+    assert not codeagent._agent_trial_complete(trial, result, "S5G", ["task/instruction.md"])
+
+
 def test_multi_trial_agent_job_uses_delivered_trial(tmp_path, monkeypatch):
     """Two trials: the first lost its API connection, the second delivered a valid S4c verdict. No retry."""
     files = {"runnability.json": json.dumps({"runnable": True, "reason": "ok", "language": "Python", "seconds": 3,
