@@ -139,6 +139,180 @@ def test_agent_records_remote_route_at_launch(tmp_path, monkeypatch, stage, name
     assert read_json(it.p(stage, "run.json"))["remote_route"] is remote
 
 
+def _agent_failure(it, stage, exc):
+    rec = read_json(it.p(stage, "run.json"))
+    jd = Path(rec["job_dir"])
+    result = jd / (rec["job_name"] + "__x") / "result.json"
+    trial = read_json(result)
+    trial["exception_info"] = {"exception_type": exc}
+    trial["verifier_result"]["rewards"]["reward"] = 0
+    trial["agent_result"]["cost_usd"] = 0.60
+    trial["agent_execution"]["finished_at"] = trial["agent_execution"]["started_at"]
+    write_json(result, trial)
+    Path(rec["log"] + ".exit").write_text("0\n")
+    return rec
+
+
+@pytest.mark.parametrize("stage,reason", [("S5G", "s5g_missing_files"), ("S4c", "code_runnability_agent_failed")])
+@pytest.mark.parametrize("route", ["remote", "local"])
+def test_agent_error_retries_twice_then_drops(tmp_path, monkeypatch, stage, reason, route):
+    from tbsgen import stages_a
+
+    P, it, launcher = _agent_item(tmp_path, monkeypatch, {}, stage=stage, max_concurrent_agent_jobs=1)
+    P.cfg["agent"]["remote_launchers"] = ["x.sh"] if route == "remote" else []
+    P.cfg["taskimage"]["enabled"] = True
+    other = P.store.item("another")
+    names = set()
+    for attempt, exc in enumerate(("UnknownApiError", "AgentTimeoutError", "NonZeroAgentExitCodeError"), 1):
+        P.step(it.load())
+        rec = _agent_failure(it, stage, exc)
+        assert rec["remote_route"] == (route == "remote")
+        assert rec["job_name"] not in names
+        names.add(rec["job_name"])
+        assert "slots full" in stages_a._agent_admission(P, other, stage)
+        P.step(it.load())
+        finished = read_json(it.p(stage, "run.json"))
+        assert finished["state"] == "finished" and finished["exception"] == exc
+        assert finished["outcome"] == "agent_error" and finished["cost_usd"] == 0.60
+        assert stages_a._agent_admission(P, other, stage) is None
+        with P.ledger._db() as db:
+            assert db.execute("select status, usd from calls").fetchall() == [("error", 0.60)] * attempt
+        st = it.load().state
+        assert st["stage"] == stage and st["attempts"][f"{stage}:infra"] == attempt
+        if attempt < 3:
+            assert st["status"] == "active" and finished["retry"]
+        else:
+            assert st["status"] == "dropped" and st["reason"] == reason
+    assert len(launcher.calls) == 3
+
+
+@pytest.mark.parametrize("stage,reason", [("S5G", "s5g_missing_files"), ("S4c", "code_runnability_agent_failed")])
+def test_remote_agent_safety_refusal_drops(tmp_path, monkeypatch, stage, reason):
+    P, it, _ = _agent_item(tmp_path, monkeypatch, {}, stage=stage)
+    P.cfg["agent"]["remote_launchers"] = ["x.sh"]
+    P.step(it.load())
+    _agent_failure(it, stage, "AgentSafetyRefusalError")
+    P.step(it.load())
+    st = it.load().state
+    assert st["status"] == "dropped" and st["reason"] == reason
+    assert f"{stage}:infra" not in st["attempts"]
+
+
+def test_resolve_synced_agent_error_retries(tmp_path, monkeypatch):
+    from tbsgen import cli
+
+    P, it, _ = _agent_item(tmp_path, monkeypatch, {}, stage="S5G")
+    P.cfg["agent"]["remote_launchers"] = ["x.sh"]
+    P.step(it.load())
+    rec = _agent_failure(it, "S5G", "SyntheticApiError")
+    jd = Path(rec["job_dir"])
+    (jd / "result.json").unlink()
+    P.step(it.load())
+    assert it.load().state["reason"] == f"remote_unknown: {rec['job_name']}"
+    command = ["calib", "resolve-remote", "--run", str(P.store.root), "--item", it.item_id,
+               "--job", rec["job_name"], "--synced"]
+    with pytest.raises(SystemExit, match="incomplete remote trial set"):
+        cli.main(command)
+    write_json(jd / "result.json", {"finished_at": "complete"})
+    assert cli.main(command) == 0
+    assert read_json(it.p("S5G/run.json"))["outcome"] == "agent_error"
+    P.step(it.load())
+    assert read_json(it.p("S5G/run.json"))["retry"]
+    P.step(it.load())
+    new = read_json(it.p("S5G/run.json"))
+    assert new["job_name"] != rec["job_name"] and new["state"] == "launched"
+
+
+def test_agent_exception_requires_all_configured_trials(tmp_path):
+    jd = tmp_path / "job"
+    rec = dict(job_dir=str(jd), ledger_stage="S5G", task=str(tmp_path / "task"))
+    write_json(jd / "config.json", dict(n_attempts=2, agents=[{}], tasks=[{}]))
+    write_json(jd / "result.json", dict(finished_at="complete"))
+    failure = dict(exception_info=dict(exception_type="UnknownApiError"))
+    write_json(jd / "trial-1/result.json", failure)
+    assert not codeagent.complete_remote_agent({}, rec, final=True)
+    second = jd / "trial-2/result.json"
+    write_json(second, {})
+    assert not codeagent.complete_remote_agent({}, rec, final=True)
+    second.write_text("{")
+    assert not codeagent.complete_remote_agent({}, rec, final=True)
+    write_json(second, failure)
+    assert codeagent.complete_remote_agent({}, rec, final=True)
+    # Before the launcher's final sync, an exception trial without outputs may still be receiving files.
+    assert not codeagent.complete_remote_agent({}, rec)
+
+
+def test_remote_agent_error_waits_for_final_sync(tmp_path, monkeypatch):
+    """Summary and exception trial synced first, launcher still running: hold the slot, do not settle."""
+    from tbsgen import calib, stages_a
+
+    P, it, _ = _agent_item(tmp_path, monkeypatch, {}, stage="S5G", max_concurrent_agent_jobs=1)
+    P.cfg["agent"]["remote_launchers"] = ["x.sh"]
+    P.step(it.load())
+    rec = _agent_failure(it, "S5G", "UnknownApiError")
+    Path(rec["log"] + ".exit").unlink()
+    monkeypatch.setattr(calib, "session_alive", lambda c, r: True)
+    P.step(it.load())
+    run = read_json(it.p("S5G/run.json"))
+    assert run["state"] == "launched" and not run.get("retry") and "S5G:infra" not in it.load().state.get("attempts", {})
+    assert "slots full" in stages_a._agent_admission(P, P.store.item("another"), "S5G")
+    Path(rec["log"] + ".exit").write_text("0\n")
+    P.step(it.load())
+    run = read_json(it.p("S5G/run.json"))
+    assert run["outcome"] == "agent_error" and run["retry"]
+
+
+def test_multi_trial_agent_job_uses_delivered_trial(tmp_path, monkeypatch):
+    """Two trials: the first lost its API connection, the second delivered a valid S4c verdict. No retry."""
+    files = {"runnability.json": json.dumps({"runnable": True, "reason": "ok", "language": "Python", "seconds": 3,
+                                             "entry": "python -m fastsmoother"}),
+             "HOWTO.md": "pip install .", "runs/0.json": json.dumps({"cmd": "python -m fastsmoother", "rc": 0,
+                                                                      "seconds": 3, "log": "runs/0.log"}),
+             "runs/0.log": "ok"}
+    P, it, launcher = _agent_item(tmp_path, monkeypatch, files, stage="S4c")
+    P.step(it.load())
+    rec = read_json(it.p("S4c/run.json"))
+    jd = Path(rec["job_dir"])
+    good = jd / (rec["job_name"] + "__x")
+    bad = jd / (rec["job_name"] + "__a")
+    (bad / "verifier").mkdir(parents=True)
+    write_json(bad / "result.json", dict(read_json(good / "result.json"),
+                                         exception_info={"exception_type": "UnknownApiError"},
+                                         verifier_result={"rewards": {"reward": 0}}))
+    conf = read_json(jd / "config.json")
+    conf["n_attempts"] = 2
+    write_json(jd / "config.json", conf)
+    P.step(it.load())
+    st = it.load().state
+    assert st["stage"] == "S5G", st
+    run = read_json(it.p("S4c/run.json"))
+    assert run["trial"] == str(good) and run["cost_usd"] == 7.0
+    assert len(launcher.calls) == 1
+
+
+def test_s4c_unbacked_runnable_verdict_after_agent_error_retries(tmp_path, monkeypatch):
+    """The agent wrote runnable: true and then lost its API connection before the how-to and run receipts."""
+    P, it, launcher = _agent_item(tmp_path, monkeypatch, {
+        "runnability.json": json.dumps({"runnable": True, "reason": "ok", "entry": "python -m fastsmoother"})},
+        stage="S4c")
+    P.step(it.load())
+    _agent_failure(it, "S4c", "UnknownApiError")
+    P.step(it.load())
+    st = it.load().state
+    assert st["status"] == "active" and st["stage"] == "S4c" and st["attempts"]["S4c:infra"] == 1, st
+    assert read_json(it.p("S4c/run.json"))["retry"]
+
+
+def test_s4c_complete_negative_verdict_after_agent_error_is_kept(tmp_path, monkeypatch):
+    P, it, _ = _agent_item(tmp_path, monkeypatch, {
+        "runnability.json": json.dumps({"runnable": False, "reason": "needs_gpu"}), "HOWTO.md": "x"}, stage="S4c")
+    P.step(it.load())
+    _agent_failure(it, "S4c", "AgentTimeoutError")
+    P.step(it.load())
+    st = it.load().state
+    assert st["status"] == "dropped" and st["reason"] == "code_needs_gpu"
+
+
 def test_s4c_runnable_then_s5g(tmp_path, monkeypatch):
     P, it, fl = _agent_item(tmp_path, monkeypatch, {
         "runnability.json": json.dumps({"runnable": True, "reason": "ok", "language": "Python", "seconds": 3,
@@ -184,6 +358,26 @@ SPEC = {"generator_assumptions": [], "title": "t", "domain": "d", "field": "f", 
              "carrier": None}],
             "edges": [["a", "est"], ["b", "est"]], "mid_drop": ["a"], "naive_drop": ["a", "b"],
             "difficulty_knobs": {"derive_nodes": 3, "chain_len": 2, "files_crossed": 1, "nonstd_tool": False}}}
+
+
+def test_agent_error_after_complete_deliverables_is_used(tmp_path, monkeypatch):
+    """An agent that wrote every S5G deliverable and then lost its API connection keeps its work."""
+    files = {"_spec/spec.json": json.dumps(SPEC),
+             "_spec/author_code.json": json.dumps({"package_names": ["fastsmoother"], "main_functions": ["smooth_rts"]}),
+             "task/instruction.md": "Estimate the state.", "task/generator/generate.py": "print(1)",
+             "task/solution/solve.py": "print(1)", "task/tests/measure.py": "print(1)",
+             "task/baselines/mid.py": "print(1)", "task/baselines/naive.py": "print(1)",
+             "task/environment/requirements.txt": "fastsmoother\n", "report.md": "ok"}
+    P, it, launcher = _agent_item(tmp_path, monkeypatch, files, stage="S5G")
+    monkeypatch.setattr("tbsgen.stages_a.validate_spec", lambda s, c: [])
+    P.step(it.load())
+    _agent_failure(it, "S5G", "UnknownApiError")
+    P.step(it.load())
+    st = it.load().state
+    assert st["stage"] == "S6A_run", st
+    assert read_json(it.p("S5G/run.json"))["outcome"] == "agent_error"
+    assert "S5G:infra" not in st.get("attempts", {})
+    assert len(launcher.calls) == 1
 
 
 def test_s5g_writes_same_artifacts(tmp_path, monkeypatch):

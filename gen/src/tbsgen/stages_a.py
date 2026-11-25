@@ -883,6 +883,26 @@ def s4c(P, it):
         return _s4c(P, it)
 
 
+def _retry_agent_infra(it, stage, rec):
+    """Retry a stage job whose agent or launcher failed before it delivered: at most twice for transient agent errors
+    (API, timeout, non-zero exit), once for launcher_failed / no_result. A job that delivered complete outputs is used
+    as is even if the agent ended with an error."""
+    outcome = rec.get("outcome")
+    if outcome not in ("agent_error", "launcher_failed", "no_result"):
+        return False
+    counter = f"{stage}:infra"
+    # A resumed step can see the same finished job after the counter was saved.
+    if it.state.get("last_agent_infra_job") != rec["job_name"]:
+        it.state["last_agent_infra_job"] = rec["job_name"]
+        it.bump(counter)
+    limit = 2 if outcome == "agent_error" else 1
+    if it.state.get("attempts", {}).get(counter, 0) > limit:
+        return False
+    rec["retry"] = True
+    write_json(it.p(stage, "run.json"), rec)
+    return True
+
+
 def _s4c(P, it):
     """Runnability gate: a Claude Code agent installs and runs the authors' code once on the build host."""
     from . import codeagent
@@ -927,12 +947,12 @@ def _s4c(P, it):
     write_json(it.p("S4c_runnability.json"), dict(job=rec.get("job_name"), outcome=rec.get("outcome"),
                                                   exception=rec.get("exception"), cost_usd=rec.get("cost_usd"),
                                                   minutes=rec.get("minutes"), result=res))
-    if not isinstance(res, dict):
-        if rec.get("outcome") in ("launcher_failed", "no_result") and it.bump("S4c:infra") < 2:
-            rec["retry"] = True
-            write_json(it.p("S4c", "run.json"), rec)
+    if not isinstance(res, dict) or (rec.get("outcome") == "agent_error" and res.get("reason") == "invalid_result"):
+        # No verdict, or the agent failed (API error, timeout) before it could back its verdict with evidence.
+        if _retry_agent_infra(it, "S4c", rec):
             return it.goto("S4c", "runnability job infra failure: retry")
-        return it.finish("dropped", "code_runnability_agent_failed")
+        if not isinstance(res, dict):
+            return it.finish("dropped", "code_runnability_agent_failed")
     if res.get("runnable") is not True:
         why = str(res.get("reason") or "other")
         reason = {"needs_gpu": "code_needs_gpu", "needs_commercial_license": "code_needs_commercial_license",
@@ -1044,9 +1064,7 @@ def _s5g(P, it):
                                              difficulty_profile=difficulty.provenance(prof), harden_round=hround,
                                              harden_kind=hkind))
     if miss:
-        if rec.get("outcome") in ("launcher_failed", "no_result") and it.bump("S5G:infra") < 2:
-            rec["retry"] = True
-            write_json(it.p("S5G", "run.json"), rec)
+        if _retry_agent_infra(it, "S5G", rec):
             return it.goto("S5G", "authoring job infra failure: retry")
         return it.finish("dropped", "s5g_missing_files", missing=miss[:5])
     try:

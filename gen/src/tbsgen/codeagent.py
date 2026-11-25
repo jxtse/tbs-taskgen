@@ -483,7 +483,23 @@ def agent_output_files(kind, *, with_profile=False):
     return S5G_FILES + (["_spec/" + DESIGN_FILE] if with_profile else [])
 
 
-def _agent_outputs_present(trial, kind, required, image_outputs=False):
+TRANSIENT_AGENT_ERRORS = ("AgentTimeoutError", "NonZeroAgentExitCodeError")
+
+
+def transient_agent_error(exc) -> bool:
+    """API failures, timeouts and non-zero agent exits: worth a new job. Safety refusals are not."""
+    return isinstance(exc, str) and (exc.endswith("ApiError") or exc in TRANSIENT_AGENT_ERRORS)
+
+
+def _agent_trial_complete(trial, result, kind, required, image_outputs=False, final=False):
+    """A trial counts when its stage deliverables are all present. After the final sync (launcher exit status or the
+    operator's --synced) a trial whose agent recorded an exception also counts: it will not deliver any more files."""
+    if final and result.get("exception_info"):
+        return True
+    return _trial_delivered(trial, kind, required, image_outputs)
+
+
+def _trial_delivered(trial, kind, required, image_outputs=False):
     out = deliverable(dict(trial=trial))
     if not out or any(safe_read(out / name, root=trial) is None for name in required):
         return False
@@ -528,19 +544,24 @@ def run_receipts(out):
     return receipts
 
 
-def complete_remote_agent(cfg, rec):
+def _required_outputs(cfg, rec):
+    # The staged input preserves the original profile requirement when resolving without --config.
+    kind = rec["ledger_stage"]
+    has_profile = (cfg.get("difficulty", {}).get("profile_path")
+                   or (Path(rec["task"]) / "environment/work/weakness_profile.md").is_file())
+    return kind, agent_output_files(kind, with_profile=has_profile)
+
+
+def complete_remote_agent(cfg, rec, final=False):
+    """final: the launcher's final sync has finished (its exit status exists) or the operator confirmed the sync."""
     from .calib import configured_trial_set
     jd = Path(rec["job_dir"])
     summary = read_json(jd / "result.json")
     if not isinstance(summary, dict) or not summary.get("finished_at"):
         return False
-    # The staged input preserves the original profile requirement when resolving without --config.
-    kind = rec["ledger_stage"]
-    has_profile = (cfg.get("difficulty", {}).get("profile_path")
-                   or (Path(rec["task"]) / "environment/work/weakness_profile.md").is_file())
-    required = agent_output_files(kind, with_profile=has_profile)
-    _, complete = configured_trial_set(jd, lambda trial: _agent_outputs_present(
-        trial, kind, required, rec.get("image_outputs", False)))
+    kind, required = _required_outputs(cfg, rec)
+    _, complete = configured_trial_set(jd, lambda trial, result: _agent_trial_complete(
+        trial, result, kind, required, rec.get("image_outputs", False), final=final))
     return complete
 
 
@@ -714,12 +735,19 @@ def poll_agent(cfg: dict, it, kind: str, ledger) -> dict | None:
 def collect_agent(cfg, recp, rec, ledger):
     from .calib import archive_run_marker, job_cost, trial_cost
     jd = Path(rec["job_dir"])
-    trials = [t for t in jd.iterdir() if t.is_dir() and (t / "result.json").exists()]
+    trials = sorted(t for t in jd.iterdir() if t.is_dir() and (t / "result.json").exists())
     trial = trials[0] if trials else None
+    if len(trials) > 1 and rec.get("ledger_stage") in ("S4c", "S5G") and rec.get("task"):
+        # Several trials: use one that delivered the stage outputs before any that only recorded an error.
+        kind, required = _required_outputs(cfg, rec)
+        delivered = [t for t in trials if _trial_delivered(t, kind, required, rec.get("image_outputs", False))]
+        trial = delivered[0] if delivered else trial
     prices = cfg["models"].get("prices") or {}
     usd, kind, usage = job_cost([trial_cost(t, rec.get("model"), prices) for t in trials])
     tr = read_json(trial / "result.json", {}) if trial else {}
     exc = ((tr or {}).get("exception_info") or {}).get("exception_type")
+    if transient_agent_error(exc):
+        rec["outcome"] = "agent_error"
     rec.update(state="finished", finished_ts=time.time(), trial=str(trial) if trial else None, cost_usd=usd,
                cost_kind=kind, usage=usage, exception=exc,
                reward=(((tr or {}).get("verifier_result") or {}).get("rewards") or {}).get("reward"),

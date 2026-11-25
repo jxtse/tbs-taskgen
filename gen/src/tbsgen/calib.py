@@ -845,14 +845,14 @@ def remote_trial_set(jd: Path, stage: str, *, contract=None) -> tuple[list[Path]
     """Unregistered stages require only a readable trial result. All stages check the configured trial count."""
     rule = _COMPLETENESS_RULES.get(stage)
     return configured_trial_set(
-        jd, lambda trial: rule is None or rule(trial, _load(trial / "result.json"), contract))
+        jd, lambda trial, result: rule is None or rule(trial, result, contract))
 
 
 def configured_trial_set(jd, has_outputs):
     """Match readable trial results and their stage outputs to the configured number of trials."""
     trials = sorted(p for p in jd.glob("*") if p.is_dir())
-    complete = [p for p in trials if isinstance(_load(p / "result.json"), dict)
-                and has_outputs(p)]
+    complete = [p for p in trials if isinstance(result := _load(p / "result.json"), dict)
+                and has_outputs(p, result)]
     config = _load(jd / "config.json")
     if not isinstance(config, dict):
         return complete, False
@@ -870,11 +870,11 @@ def complete_remote_trials(jd: Path, stage: str, *, contract=None) -> bool:
     return complete
 
 
-def _remote_results_ready(cfg, rec):
+def _remote_results_ready(cfg, rec, final=False):
     stage = rec.get("ledger_stage")
     if stage in ("S4c", "S5G"):
         from .codeagent import complete_remote_agent
-        return complete_remote_agent(cfg, rec)
+        return complete_remote_agent(cfg, rec, final=final)
     from .review import job_contract
     return complete_remote_trials(Path(rec["job_dir"]), stage or "S9", contract=job_contract(rec))
 
@@ -896,7 +896,9 @@ def reconcile_remote(cfg, rec, ledger, save):
                 alive = False
         summary = _load(jd / "result.json")
         ended = alive is False or isinstance(summary, dict) and summary.get("finished_at")
-        if ended and _remote_results_ready(cfg, rec):
+        # The launcher writes its exit status after the final sync; only then is a trial without outputs final.
+        final_sync = bool(exit_file and exit_file.exists())
+        if ended and _remote_results_ready(cfg, rec, final=final_sync):
             action = "awaiting_ingest"
         else:
             action = "waiting" if alive is True else "remote_unknown"
