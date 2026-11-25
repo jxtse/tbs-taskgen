@@ -2484,7 +2484,7 @@ def test_complete_trials_without_finished_at(tmp_path, stage, resolution):
 
 
 @pytest.mark.parametrize("stage", ["S9", "S9R"])
-def test_ended_without_result_ingests_complete_subset(tmp_path, stage):
+def test_ended_without_result_ingests_complete_subset_and_settles_all_trials(tmp_path, stage):
     from tbsgen.cli import main
 
     P, it, directory, rec, jd, cmd = _remote_launch(tmp_path, stage)
@@ -2492,7 +2492,7 @@ def test_ended_without_result_ingests_complete_subset(tmp_path, stage):
     _finish(jd.parent, jd.name, name="complete", reward=1, cost=7, verdict=V("drop", [BLOCK]))
     # The incomplete result sorts first for S9 and last for S9R, where it could mask the completed trial.
     name = "a-partial" if stage == "S9" else "z-partial"
-    _finish(jd.parent, jd.name, name=name, reward=0, verdict=V("pass"))
+    _finish(jd.parent, jd.name, name=name, reward=0, cost=4, verdict=V("pass"))
     (jd / name / ("verifier/metrics.jsonl" if stage == "S9" else review.REPRO_JOURNAL)).unlink()
     (jd / "result.json").unlink()
     Path(rec["log"] + ".exit").write_text("143")
@@ -2501,11 +2501,60 @@ def test_ended_without_result_ingests_complete_subset(tmp_path, stage):
         main(cmd + ["--synced"])
     assert main(cmd + ["--ended-without-result"]) == 0
     settled, = _runs(P, it.item_id, directory)
-    assert settled["n_trials"] == 1 and settled["trial"]["trial"] == "complete" and settled["cost_usd"] == 7
+    assert settled["n_trials"] == 1 and settled["trial"]["trial"] == "complete"
+    assert settled["ledger_call"] == rec["ledger_call"]
+    assert settled["cost_usd"] == 11 and settled["cost_kind"] == "reported"
+    with P.ledger._db() as db:
+        assert db.execute("SELECT status,usd,cost_kind FROM calls WHERE id=?", (rec["ledger_call"],)).fetchone() == (
+            "ok", 11, "reported")
     if stage == "S9R":
         assert settled["verdict"] == "drop" and it.load().state["status"] == "dropped"
     else:
         assert settled["outcome"] == "pass"
+
+
+@pytest.mark.parametrize("stage", ["S4c", "S5G"])
+def test_remote_agent_default_and_registered_completeness(tmp_path, monkeypatch, stage):
+    from tbsgen import calib
+
+    jd = tmp_path / "agent-job"
+    trial = jd / "trial"
+    verifier = trial / "verifier"
+    (verifier / "out").mkdir(parents=True)
+    (verifier / "check.txt").write_text("ok")
+    write_json(trial / "result.json", {"verifier_result": {"rewards": {"reward": 1}}})
+    write_json(jd / "config.json", {"tasks": [{}], "agents": [{}]})
+    log = tmp_path / "launcher.log"
+    Path(str(log) + ".exit").write_text("0")
+    rec = dict(job_name=jd.name, job_dir=str(jd), log=str(log), ledger_stage=stage, state="launched", ledger_call=1)
+    assert calib.reconcile_remote({}, rec, None, lambda r: None) == "awaiting_ingest"
+
+    def has_deliverable(trial_dir, result, contract):
+        return (trial_dir / "verifier/out/answer.txt").is_file()
+
+    monkeypatch.setattr(calib, "_COMPLETENESS_RULES", calib._COMPLETENESS_RULES.copy())
+    calib.register_completeness(stage, has_deliverable)
+    assert calib.remote_trial_set(jd, stage) == ([], False)
+    (verifier / "out/answer.txt").write_text("answer")
+    assert calib.remote_trial_set(jd, stage) == ([trial], True)
+    (trial / "result.json").unlink()
+    assert calib.remote_trial_set(jd, stage) == ([], False)
+
+
+def test_remote_s9_exception_without_reward_ingests_as_infra(tmp_path):
+    P, it, directory, rec, jd, _ = _remote_launch(tmp_path, "S9")
+    write_json(jd / "config.json", read_json(Path(rec["config"])))
+    write_json(jd / "result.json", {"finished_at": "done"})
+    write_json(jd / "trial/result.json", {"exception_info": {"exception_type": "AddTestsDirError"},
+                                          "verifier_result": None, "agent_result": {"cost_usd": 3}})
+    Path(rec["log"] + ".exit").write_text("0")
+    watch_tick(P, max_steps=0)
+    settled, = _runs(P, it.item_id, directory)
+    assert settled["outcome"] == settled["result_type"] == "infra" and it.load().state["status"] == "active"
+    assert settled["ledger_call"] == rec["ledger_call"] and settled["cost_usd"] == P.item_cost(it.item_id)["usd"] == 3
+    P.run(only=[it.item_id], max_steps=1)
+    previous, retry = _runs(P, it.item_id, directory)
+    assert previous == settled and retry["who"] == "glm" and retry["state"] == "launched"
 
 
 @pytest.mark.parametrize("during_classification", [False, True])

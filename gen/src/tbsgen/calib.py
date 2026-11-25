@@ -26,6 +26,7 @@ import json
 import os
 import re
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 from .state import read_json, write_json
@@ -648,16 +649,43 @@ def preflight_wait(cfg: dict, rec: dict | None) -> str | None:
 DELIVERY_METRICS = "verifier/metrics.jsonl"
 
 
-def remote_trial_set(jd: Path, *, review=False, contract=None) -> tuple[list[Path], bool]:
-    """Return the complete trials in ingest order and whether the whole configured set is present."""
+def _trial_reward(result):
+    return ((result.get("verifier_result") or {}).get("rewards") or {}).get("reward")
+
+
+def _s9_requires_metrics(result):
+    return not result.get("exception_info") or _trial_reward(result) is not None
+
+
+def _s9_complete(trial, result, contract):
+    return not _s9_requires_metrics(result) or (trial / DELIVERY_METRICS).is_file()
+
+
+def _s9r_complete(trial, result, contract):
     from .review import CURRENT_CONTRACT, JOURNAL_CONTRACTS, REPRO_JOURNAL, VERIFIED_VERDICT
 
-    required = [VERIFIED_VERDICT] if review else [DELIVERY_METRICS]
-    if review and (contract or CURRENT_CONTRACT) in JOURNAL_CONTRACTS:
-        required.append(REPRO_JOURNAL)
+    return (trial / VERIFIED_VERDICT).is_file() and (
+        (contract or CURRENT_CONTRACT) not in JOURNAL_CONTRACTS or (trial / REPRO_JOURNAL).is_file())
+
+
+CompletenessRule = Callable[[Path, dict, str | None], bool]
+_COMPLETENESS_RULES: dict[str, CompletenessRule] = {"S9": _s9_complete, "S9R": _s9r_complete}
+
+
+def register_completeness(stage: str, fn: CompletenessRule) -> None:
+    """Register fn(trial_dir, result_json, contract) for this stage before reconciling jobs."""
+    _COMPLETENESS_RULES[stage] = fn
+
+
+def remote_trial_set(jd: Path, stage: str, *, contract=None) -> tuple[list[Path], bool]:
+    """Unregistered stages require only a readable trial result. All stages check the configured trial count."""
+    rule = _COMPLETENESS_RULES.get(stage)
     trials = sorted(p for p in jd.glob("*") if p.is_dir())
-    complete = [p for p in trials if isinstance(_load(p / "result.json"), dict)
-                and all((p / name).is_file() for name in required)]
+    complete = []
+    for trial in trials:
+        result = _load(trial / "result.json")
+        if isinstance(result, dict) and (rule is None or rule(trial, result, contract)):
+            complete.append(trial)
     config = _load(jd / "config.json")
     if not isinstance(config, dict):
         return complete, False
@@ -670,8 +698,8 @@ def remote_trial_set(jd: Path, *, review=False, contract=None) -> tuple[list[Pat
     return complete, len(complete) >= expected and len(complete) == len(trials)
 
 
-def complete_remote_trials(jd: Path, *, review=False, contract=None) -> bool:
-    _, complete = remote_trial_set(jd, review=review, contract=contract)
+def complete_remote_trials(jd: Path, stage: str, *, contract=None) -> bool:
+    _, complete = remote_trial_set(jd, stage, contract=contract)
     return complete
 
 
@@ -693,7 +721,7 @@ def reconcile_remote(cfg, rec, ledger, save):
                 alive = False
         summary = _load(jd / "result.json")
         ended = alive is False or isinstance(summary, dict) and summary.get("finished_at")
-        if ended and complete_remote_trials(jd, review=rec.get("ledger_stage") == "S9R", contract=job_contract(rec)):
+        if ended and complete_remote_trials(jd, rec.get("ledger_stage", "S9"), contract=job_contract(rec)):
             action = "awaiting_ingest"
         else:
             action = "waiting" if alive is True else "remote_unknown"
@@ -900,7 +928,7 @@ def classify_trial(trial: Path, model: str | None = None, prices: dict | None = 
     r = json.loads((trial / "result.json").read_text())
     ei = r.get("exception_info") or {}
     exc = ei.get("exception_type")
-    reward = ((r.get("verifier_result") or {}).get("rewards") or {}).get("reward")
+    reward = _trial_reward(r)
     status, msg = _api_status(trial)
     minutes = None
     try:
@@ -920,7 +948,7 @@ def classify_trial(trial: Path, model: str | None = None, prices: dict | None = 
     else:
         outcome = "fail"
     quota = bool(msg and re.search(r"额度|quota|429", msg))
-    deliv = delivered(trial, required=require_metrics)
+    deliv = delivered(trial, required=require_metrics and _s9_requires_metrics(r))
     c = trial_cost(trial, model, prices or {}, r)
     return dict(trial=trial.name, outcome=outcome, result_type=result_type(outcome, exc, deliv), delivered=deliv,
                 reward=reward, exception=exc, api_status=status, api_msg=msg, quota=quota, minutes=minutes,

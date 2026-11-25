@@ -942,13 +942,14 @@ def resolve_remote(P, it, job, *, synced, ended_without_result=False, remote_tas
                 raise ValueError("job identity mismatch: --remote-task must match the job's remote task path")
         save = _save_review if stage == "S9R" else _save_run
         if synced or ended_without_result:
-            trials, complete = calib.remote_trial_set(jd, review=stage == "S9R", contract=review.job_contract(rec))
+            trials, complete = calib.remote_trial_set(jd, stage, contract=review.job_contract(rec))
             if synced and not complete:
                 raise ValueError(f"incomplete remote trial set: {jd}; use --ended-without-result (--died) "
                                  "if fully synced and ended")
             calib.restore_remote_marker(jd, rec, remote_task, review=stage == "S9R", partial=not trials)
             if trials:
-                return _ingest_run(P, it, rec, stage, jd, trial_dirs=trials)
+                settlement = None if complete else _unfinished_job_cost(P, rec, jd, confirmed=True)
+                return _ingest_run(P, it, rec, stage, jd, trial_dirs=trials, settlement=settlement)
             calib.check_job_identity(jd, rec, review=stage == "S9R", partial=True)
             _settle_dead_job(P, it, rec, save, confirmed=True)
         else:
@@ -983,17 +984,17 @@ def _after_ingest(P, it, rec, stage):
     it.save()
 
 
-def _ingest_run(P, it, rec, stage, jd, *, trial_dirs=None):
+def _ingest_run(P, it, rec, stage, jd, *, trial_dirs=None, settlement=None):
     remote = calib.remote_job(rec, P.ledger)
     if remote and trial_dirs is None:
-        trial_dirs, complete = calib.remote_trial_set(jd, review=stage == "S9R", contract=review.job_contract(rec))
+        trial_dirs, complete = calib.remote_trial_set(jd, stage, contract=review.job_contract(rec))
         if not complete:
             raise ValueError(f"incomplete remote trial set: {jd}")
     if not remote and not (read_json(jd / "result.json", {}) or {}).get("finished_at"):
         raise ValueError(f"job not finished yet: {jd}")
     calib.check_job_identity(jd, rec, review=stage == "S9R")
     if stage == "S9R":
-        return _ingest_review(P, it, rec, jd, trial_dirs=trial_dirs)
+        return _ingest_review(P, it, rec, jd, trial_dirs=trial_dirs, settlement=settlement)
     runs = read_json(it.p("calib", "runs.json"), [])
     used = {r.get("trial", {}).get("job_dir") for r in runs if r.get("outcome") is not None}
     if str(jd.resolve()) in used:
@@ -1008,7 +1009,7 @@ def _ingest_run(P, it, rec, stage, jd, *, trial_dirs=None):
     if not trials:
         raise ValueError("no trial results in job dir")
     t = dict(trials[0], job_dir=str(jd.resolve()))
-    usd, kind, usage = calib.job_cost(trials)
+    usd, kind, usage = settlement or calib.job_cost(trials)
     rec.update(outcome=t["outcome"], result_type=t["result_type"], minutes=t["minutes"], trial=t,
                cost_usd=usd, cost_kind=kind, n_trials=len(trials))
     if remote:
@@ -1147,12 +1148,8 @@ def _release_reviewed(P, it, previous, scopes):
     it.advance("S10", None, status="done")
 
 
-def _settle_dead_job(P, it, rec: dict, save=_save_run, *, confirmed=False):
-    """The Harbor job of a launched run ended without a complete result: an infra run. Its cost is what
-    the trials written so far show (tokens), else unknown (reservation kept, not counted as actual spend)."""
-    if not confirmed and calib.remote_job(rec, P.ledger):
-        return _reconcile_remote(P, it, rec, save)
-    jd = Path(rec["job_dir"])
+def _unfinished_job_cost(P, rec, jd, *, confirmed):
+    """Recover costs from every trial, including trials missing their verdict artifacts."""
     costs = []
     for trial in sorted(jd.glob("*/")):
         if not confirmed and not (trial / "result.json").is_file():
@@ -1163,7 +1160,15 @@ def _settle_dead_job(P, it, rec: dict, save=_save_run, *, confirmed=False):
             cost = {}
         if cost.get("cost_usd") is not None or not confirmed:
             costs.append(cost)
-    usd, kind, usage = calib.job_cost(costs)
+    return calib.job_cost(costs)
+
+
+def _settle_dead_job(P, it, rec: dict, save=_save_run, *, confirmed=False):
+    """The Harbor job of a launched run ended without a complete result: an infra run. Its cost is what
+    the trials written so far show (tokens), else unknown (reservation kept, not counted as actual spend)."""
+    if not confirmed and calib.remote_job(rec, P.ledger):
+        return _reconcile_remote(P, it, rec, save)
+    usd, kind, usage = _unfinished_job_cost(P, rec, Path(rec["job_dir"]), confirmed=confirmed)
     if rec.get("ledger_call"):
         P.ledger.settle(rec["ledger_call"], usd, status="error", kind=kind, usage=usage,
                         note="harbor job ended without a complete result")
@@ -1477,7 +1482,7 @@ def _park_missing_trial(P, it, rec, save, error):
     raise ValueError(f"incomplete remote trial set: missing {error.filename}") from error
 
 
-def _ingest_review(P, it, rec, jd, *, trial_dirs=None):
+def _ingest_review(P, it, rec, jd, *, trial_dirs=None, settlement=None):
     assigned = rec.get("suspected_scopes", [])
     remote = calib.remote_job(rec, P.ledger)
     try:
@@ -1489,10 +1494,11 @@ def _ingest_review(P, it, rec, jd, *, trial_dirs=None):
         if not remote:
             raise
         _park_missing_trial(P, it, rec, _save_review, e)
+    usd, kind, usage = settlement or (res["cost_usd"], res["cost_kind"], res["usage"])
     rec.update(outcome="invalid" if (res["outcome"] == "done" and (res["verdict"] or {}).get("verdict") is None)
                else res["outcome"],
-               minutes=res["minutes"], cost_usd=res["cost_usd"], cost_kind=res["cost_kind"],
-               trial=res["trial"], n_trials=res["n_trials"], usage=res["usage"], repros=res["repros"])
+               minutes=res["minutes"], cost_usd=usd, cost_kind=kind,
+               trial=res["trial"], n_trials=res["n_trials"], usage=usage, repros=res["repros"])
     if res["verdict"] is not None:
         d = it.p("review", f"r{rec['n']}")
         d.mkdir(parents=True, exist_ok=True)
@@ -1513,7 +1519,7 @@ def _ingest_review(P, it, rec, jd, *, trial_dirs=None):
         calib.bind_started_call(review.review_cfg(P.cfg), rec, P.ledger)
         rec["state"] = "launched"
     if rec.get("ledger_call"):
-        P.ledger.settle(rec["ledger_call"], res["cost_usd"], kind=res["cost_kind"], usage=res["usage"],
+        P.ledger.settle(rec["ledger_call"], usd, kind=kind, usage=usage,
                         note=f"S9R review r{rec['n']} outcome={rec['outcome']} verdict={rec.get('verdict')}")
     _save_review(it, rec)
     _after_ingest(P, it, rec, "S9R")
