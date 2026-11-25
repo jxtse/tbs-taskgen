@@ -14,7 +14,8 @@ import shlex
 import shutil
 from pathlib import Path
 
-from . import sandbox
+from . import sandbox, taskimage
+from .state import read_json
 
 METRICS_HELPER = Path(__file__).with_name("templates_metrics.py")
 
@@ -28,6 +29,13 @@ METRICS_HELPER = Path(__file__).with_name("templates_metrics.py")
 VERIFIER_PRE = ("mkdir -p /app && cp -a /src/tests /tests && cp -a /src/output /app/output && "
                 "cp -a /src/data /app/data && chown -R -h root:root /tests /app/output /app/data && "
                 "chmod 700 /src && ")   # staging mounts stay in the container: make them root-only (review #2)
+TASK_VERIFIER_PRE = ("mkdir -p /app/output /app/data /tests && cp -a /src/tests/. /tests/ && cp -a /src/output/. /app/output/ && "
+                "cp -a /src/data/. /app/data/ && chown -R -h root:root /tests /app/output /app/data && "
+                "chmod 700 /src && ")   # staging mounts stay in the container: make them root-only (review #2)
+
+
+def verifier_pre(item_dir):
+    return TASK_VERIFIER_PRE if taskimage.is_task(read_json(item_dir / "state.json", {})) else VERIFIER_PRE
 
 
 def tree_hash(d: Path) -> str:
@@ -35,7 +43,8 @@ def tree_hash(d: Path) -> str:
     for p in sorted(Path(d).rglob("*")):
         if p.is_file():
             h.update(str(p.relative_to(d)).encode())
-            h.update(p.read_bytes())
+            with p.open("rb") as f:
+                hashlib.file_digest(f, lambda: h)
     return h.hexdigest()[:16]
 
 
@@ -45,11 +54,14 @@ def generate(cfg: dict, task: Path, seed: int, out: Path) -> dict:
     shutil.copytree(task / "generator", out / "generator")
     for d in ("environment/data", "tests/truth", "tests/hidden"):
         (out / d).mkdir(parents=True)
-    r = sandbox.run(cfg, [(out, "/task", "rw")], f"cd /task && python generator/generate.py {seed}",
+    r = taskimage.run(cfg, task.parent, [(out, "/task", "rw")], f"cd /task && python generator/generate.py {seed}",
                     cfg["gen"]["gen_timeout"], f"tbsgen-gen-{task.parent.name}-{seed}")
+    public_bytes = sum(p.stat().st_size for p in (out / "environment").rglob("*") if p.is_file())
+    if taskimage.is_task(read_json(task.parent / "state.json", {})) and public_bytes > cfg["gen"]["max_public_mb"] * 1_000_000:
+        r.update(rc=1, err=f"generated public data exceeds gen.max_public_mb ({public_bytes} bytes)")
     r["hash_env"] = tree_hash(out / "environment") if r["rc"] == 0 else None
     r["hash_tests"] = tree_hash(out / "tests") if r["rc"] == 0 else None
-    r["public_mb"] = round(sum(p.stat().st_size for p in (out / "environment").rglob("*") if p.is_file()) / 1e6, 3)
+    r["public_mb"] = round(public_bytes / 1e6, 3)
     return r
 
 
@@ -160,11 +172,23 @@ def resource_kind_of(name: str, declared: str | None = None) -> str:
         _re.search(r"wall_?time|cpu_?time|runtime", name, _re.I) else "memory"
 
 
+def metrics_template(task_image):
+    src = METRICS_HELPER.read_text()
+    if task_image:
+        # Authored images may install their verifier runtime under /app.
+        call = '_open_workspace("/app")'
+        if src.count(call) != 1:
+            raise RuntimeError("missing workspace setup in metrics template")
+        src = src.replace(call, '_open_workspace("/app/output")')
+    return src
+
+
 def metrics_helper_text(cfg: dict, spec: dict | None, item_dir: Path | None = None) -> str:
     """tests/_metrics.py as copied into a task: the template with TIMING_REPEATS, the machine-speed reference
     (thresholds.speed_bench_sec of this item, when thresholds exist) and the resource-metric gating flag set for
     this task."""
-    src = METRICS_HELPER.read_text()
+    state = read_json(item_dir / "state.json", {}) if item_dir else {}
+    src = metrics_template(taskimage.is_task(spec or {}) or taskimage.is_task(state))
     if REPEATS_LINE not in src:
         raise RuntimeError("templates_metrics.py: TIMING_REPEATS marker line missing")
     tb = "TIMING_BUDGET_SEC = 300.0  # tbsgen:timing_budget"
@@ -230,7 +254,7 @@ def solve(cfg: dict, task: Path, gen: Path, prog: str | None, work: Path, tag: s
         return dict(rc=0, out="", err="", sec=0.0, nop=True, outdir=str(outd))
     p = task / prog
     timeout = cfg["gen"]["solve_timeout"] if prog.startswith("solution") else cfg["gen"]["baseline_timeout"]
-    r = sandbox.run(cfg, [(gen / "environment" / "data", "/app/data", "ro"), (outd, "/app/output", "rw"),
+    r = taskimage.run(cfg, task.parent, [(gen / "environment" / "data", "/app/data", "ro"), (outd, "/app/output", "rw"),
                           (p.parent, "/sol", "ro")], f"cd /app && python /sol/{p.name}", timeout,
                     f"tbsgen-solve-{tag}")
     r["outdir"] = str(outd)
@@ -244,9 +268,9 @@ def measure(cfg: dict, task: Path, gen: Path, outd: Path, work: Path, tag: str) 
     logs = work / f"mlogs-{tag}"
     logs.mkdir(parents=True, exist_ok=True)
     logs.chmod(0o777)
-    r = sandbox.run(cfg, [(outd, "/src/output", "ro"), (tests, "/src/tests", "ro"), (logs, "/logs/verifier", "rw"),
+    r = taskimage.run(cfg, task.parent, [(outd, "/src/output", "ro"), (tests, "/src/tests", "ro"), (logs, "/logs/verifier", "rw"),
                           (gen / "environment" / "data", "/src/data", "ro")],
-                    VERIFIER_PRE + "cd /tests && python /tests/measure.py",
+                    verifier_pre(task.parent) + "cd /tests && python /tests/measure.py",
                     int(cfg["gen"]["test_timeout"] + timing_budget(cfg, task_spec(task))),
                     f"tbsgen-measure-{tag}", root=True)
     vals = {}
@@ -270,9 +294,9 @@ def speed_bench(cfg: dict, task: Path, gen: Path, work: Path, seed) -> float | N
     logs.chmod(0o777)
     out = work / f"mout-bench{seed}"                  # VERIFIER_PRE copies /src/output: an empty one
     out.mkdir(parents=True, exist_ok=True)
-    r = sandbox.run(cfg, [(out, "/src/output", "ro"), (tests, "/src/tests", "ro"), (logs, "/logs/verifier", "rw"),
+    r = taskimage.run(cfg, task.parent, [(out, "/src/output", "ro"), (tests, "/src/tests", "ro"), (logs, "/logs/verifier", "rw"),
                           (gen / "environment" / "data", "/src/data", "ro")],
-                    VERIFIER_PRE + "python /tests/_metrics.py --speed-bench", 300,
+                    verifier_pre(task.parent) + "python /tests/_metrics.py --speed-bench", 300,
                     f"tbsgen-bench-{seed}", root=True)
     try:
         d = json.loads(r["out"].strip().splitlines()[-1])
@@ -294,9 +318,9 @@ def test(cfg: dict, task: Path, gen: Path, outd: Path, work: Path, tag: str) -> 
     logs.chmod(0o777)
     settle = float(cfg["gen"].get("verifier_settle_sec", 1.0))
     probe_env = "TBSGEN_PROBE_REPORT=1 " if tag.startswith(("exploit__one_confident__", "exploit__hidden_garbage__")) else ""
-    r = sandbox.run(cfg, [(outd, "/src/output", "ro"), (tests, "/src/tests", "ro"), (logs, "/logs/verifier", "rw"),
+    r = taskimage.run(cfg, task.parent, [(outd, "/src/output", "ro"), (tests, "/src/tests", "ro"), (logs, "/logs/verifier", "rw"),
                           (gen / "environment" / "data", "/src/data", "ro")],
-                    VERIFIER_PRE + f"cd /tests && {probe_env}bash /tests/test.sh; rc=$?; sleep {settle:g}; exit $rc",
+                    verifier_pre(task.parent) + f"cd /tests && {probe_env}bash /tests/test.sh; rc=$?; sleep {settle:g}; exit $rc",
                     int(cfg["gen"]["test_timeout"] + timing_budget(cfg, task_spec(task))), f"tbsgen-test-{tag}", root=True)
     mf = logs / "metrics.jsonl"
     metrics = []
@@ -371,7 +395,7 @@ def hidden_set_names(gen):
     return sets or [hidden.name]
 
 
-def _prepare_public_probe(cfg, out, script, work, tag, arm, identity=False):
+def _prepare_public_probe(cfg, item_dir, out, script, work, tag, arm, identity=False):
     # shlex.quote: repr(arm) has single quotes, which must not end a single-quoted shell word
     command = "cd / && python -c " + shlex.quote(
         "import json; from pathlib import Path; from probe_outputs import mutation_report; "
@@ -389,7 +413,7 @@ def _prepare_public_probe(cfg, out, script, work, tag, arm, identity=False):
     info.mkdir(exist_ok=True)
     report = info / "report.json"
     report.unlink(missing_ok=True)
-    prep = sandbox.run(cfg, [(out, "/app/output", "rw"), (script, "/probe_outputs.py", "ro"), (info, "/probe-info", "rw")],
+    prep = taskimage.run(cfg, item_dir, [(out, "/app/output", "rw"), (script, "/probe_outputs.py", "ro"), (info, "/probe-info", "rw")],
                        command, cfg["gen"]["baseline_timeout"], f"tbsgen-prepare-{tag}")
     for p in keep:
         (stash / p.name).rename(p)
@@ -417,7 +441,7 @@ def _probe_run(cfg, task, gen, ref_out, work, tag, arm, prog, kind, name, *, ide
     trial = dict(files=files, uncertain=uncertain)
     if kind == "public" or (identity and arm == "one_confident"):
         try:
-            public_files, issues = _prepare_public_probe(cfg, out, script, work, tag, arm, identity)
+            public_files, issues = _prepare_public_probe(cfg, task.parent, out, script, work, tag, arm, identity)
             files.extend(public_files)
             uncertain.extend(issues)
         except ValueError as exc:

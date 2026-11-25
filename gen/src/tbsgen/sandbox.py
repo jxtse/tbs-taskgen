@@ -15,11 +15,12 @@ import uuid
 from pathlib import Path
 
 
-def sh(cmd: list[str], timeout: int, env=None, cwd=None) -> dict:
+def sh(cmd: list[str], timeout: int, env=None, cwd=None, output_limit=4000) -> dict:
     t0 = time.time()
     try:
         p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env, cwd=cwd)
-        return dict(rc=p.returncode, out=p.stdout[-4000:], err=p.stderr[-4000:], sec=round(time.time() - t0, 2))
+        out = p.stdout if output_limit is None else p.stdout[-output_limit:]
+        return dict(rc=p.returncode, out=out, err=p.stderr[-4000:], sec=round(time.time() - t0, 2))
     except subprocess.TimeoutExpired:
         return dict(rc=-9, out="", err=f"TIMEOUT after {timeout}s", sec=float(timeout))
 
@@ -32,20 +33,22 @@ def image_exists(image: str) -> bool:
     return sh(["docker", "image", "inspect", image], 30)["rc"] == 0
 
 
-def run(cfg: dict, mounts: list[tuple], cmd: str, timeout: int, name: str = "", root: bool = False) -> dict:
+def run(cfg: dict, mounts: list[tuple], cmd: str, timeout: int, name: str = "", root: bool = False, image: str | None = None) -> dict:
     sb = cfg["sandbox"]
     name = re.sub(r"[^a-zA-Z0-9_.-]", "-", (name or "tbsgen") + "-" + uuid.uuid4().hex[:6])[:120]
     if sb["backend"] == "ssh":
-        return run_remote(cfg, mounts, cmd, timeout, name, root)
+        return run_remote(cfg, mounts, cmd, timeout, name, root, image)
     if sb["backend"] != "docker":
         raise ValueError("sandbox.backend must be docker or ssh (task code hard-codes /app, /tests paths)")
     args = ["docker", "run", "--rm", "--name", name, "--network", "none", "--cpus", str(sb["cpus"]),
             "--memory", sb["memory"], "--memory-swap", sb["memory"], "--pids-limit", str(sb["pids"]),
             "--user", "0:0" if root else f"{os.getuid()}:{os.getgid()}", "-e", "HOME=/tmp", "-e", "OMP_NUM_THREADS=2",
             "-e", "OPENBLAS_NUM_THREADS=2", "-e", "MPLCONFIGDIR=/tmp"]
+    if image and image.startswith(("tbsgen-task:", "sha256:")):
+        args.append("--pull=never")
     for src, dst, mode in mounts:
         args += ["-v", f"{Path(src).resolve()}:{dst}:{mode}"]
-    args += [sb["image"], "bash", "-lc", cmd]
+    args += [image or sb["image"], "bash", "-lc", cmd]
     r = sh(args, timeout + 60)
     subprocess.run(["docker", "rm", "-f", name], capture_output=True)
     return r
@@ -59,7 +62,7 @@ def _ssh(host: str) -> list[str]:
     return ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=30", "-o", "ServerAliveInterval=30", host]
 
 
-def run_remote(cfg: dict, mounts: list[tuple], cmd: str, timeout: int, name: str, root: bool) -> dict:
+def run_remote(cfg: dict, mounts: list[tuple], cmd: str, timeout: int, name: str, root: bool, image: str | None = None) -> dict:
     import shlex
     sb = cfg["sandbox"]
     host, base = sb.get("host"), sb.get("remote_dir")
@@ -86,14 +89,16 @@ def run_remote(cfg: dict, mounts: list[tuple], cmd: str, timeout: int, name: str
     dargs = ["docker", "run", "--rm", "--name", name, "--network", "none", "--cpus", str(sb["cpus"]),
              "--memory", sb["memory"], "--memory-swap", sb["memory"], "--pids-limit", str(sb["pids"]),
              "-e", "HOME=/tmp", "-e", "OMP_NUM_THREADS=2", "-e", "OPENBLAS_NUM_THREADS=2", "-e", "MPLCONFIGDIR=/tmp"]
+    if image and image.startswith(("tbsgen-task:", "sha256:")):
+        dargs.append("--pull=never")
     line = (" ".join(shlex.quote(a) for a in dargs) + f" --user {user} " +
-            " ".join(shlex.quote(a) for a in margs) + f" {shlex.quote(sb['image'])} bash -lc {shlex.quote(cmd)}")
+            " ".join(shlex.quote(a) for a in margs) + f" {shlex.quote(image or sb['image'])} bash -lc {shlex.quote(cmd)}")
     # rw mounts are written by container users other than the ssh user: make them writable for everyone
     prep = " ".join(f"chmod -R a+rwX {shlex.quote(f'{rd}/m{i}')};" for i, (_, _, m) in enumerate(mounts) if m == "rw")
     env = f"DOCKER_CONFIG={shlex.quote(sb['docker_config'])} " if sb.get("docker_config") else ""
     r = sh(_ssh(host) + [f"{prep} {env}timeout -k 30 {int(timeout) + 30} {line}"], timeout + 120)
     sh(_ssh(host) + [f"docker rm -f {shlex.quote(name)} >/dev/null 2>&1; "
-                     f"docker run --rm -v {shlex.quote(rd)}:/x {shlex.quote(sb['image'])} chmod -R a+rwX /x "
+                     f"docker run --rm -v {shlex.quote(rd)}:/x {shlex.quote(sb.get('cleanup_image') or sb['image'])} chmod -R a+rwX /x "
                      ">/dev/null 2>&1 || true"], 120)
     for i, (src, dst, mode) in enumerate(mounts):
         if mode == "rw" and Path(src).is_dir():

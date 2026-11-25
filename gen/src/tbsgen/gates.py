@@ -283,7 +283,7 @@ def _core_tokens(name: str) -> set:
     return {t for t in _tokens(name) if t not in _AGG and not re.fullmatch(r"\d|set\w|h\d+", t)}
 
 
-def realism(spec, public, runs):
+def realism(spec, public, runs, inventory=None):
     times = [v["solve_sec"] for k, v in runs.items() if re.fullmatch(r"ref\d+", k) and
              v.get("solve_rc") == 0 and isinstance(v.get("solve_sec"), (int, float))]
     hours = next((spec[k] for k in ("expert_time_estimate_hours", "expert_hours", "expert_time_hours")
@@ -296,10 +296,17 @@ def realism(spec, public, runs):
     except (TypeError, ValueError):
         long_task = False
     effort = bool(str(spec.get("effort_note") or "").strip()) or not times or max(times) >= 30 or not long_task
-    data = bool(str(spec.get("data_realism_note") or "").strip()) or size >= 2_000_000 or bool(
+    names = {p["name"].lower() for p in inventory or ()}
+    reader_formats = {Path(p.name.lower().removesuffix(".gz")).suffix for p in files}
+    readers = {ext: sorted(matches) for ext in sorted(reader_formats)
+               if (matches := runner.taskimage.READERS.get(ext, set()) & names)}
+    data = bool(readers) or bool(str(spec.get("data_realism_note") or "").strip()) or size >= 2_000_000 or bool(
         set(formats) - {".csv", ".npy", ".json", ".txt"})
+    detail = dict(bytes=size, extensions=formats)
+    if inventory is not None:
+        detail["readers"] = readers
     return {"effort_floor": (effort, dict(solve_sec=times, expert_hours=hours)),
-            "data_realism": (data, dict(bytes=size, extensions=formats))}
+            "data_realism": (data, detail)}
 
 
 def run_gates(cfg: dict, item_dir: Path, spec: dict, thresholds: dict, attempt: int) -> dict:
@@ -432,7 +439,9 @@ def run_gates(cfg: dict, item_dir: Path, spec: dict, thresholds: dict, attempt: 
                          ("assumptions_stated", missing_quotes)):
         g[name], det[name] = not issues, issues
     measured = read_json(item_dir / "S6A_measure.json", {}).get("runs", {})
-    for name, (passed, detail) in realism(spec, work / "detA/environment/data", measured).items():
+    state = read_json(item_dir / "state.json", {})
+    inventory = state.get("inventory", []) if runner.taskimage.is_task(state) else None
+    for name, (passed, detail) in realism(spec, work / "detA/environment/data", measured, inventory).items():
         g[name], det[name] = passed, detail
     nums = numbers_in(ins)
     unstated = [k for k, t in thresholds.items()
@@ -451,8 +460,8 @@ def run_gates(cfg: dict, item_dir: Path, spec: dict, thresholds: dict, attempt: 
     # Inspect the generated files used by PKG.
     gen0 = work / "detA"
     lr = leak_report(gen0 / "environment" / "data", [gen0 / "tests" / "truth"], ins, cfg,
-                     depgraph=spec.get("depgraph"),
-                     introspect="docker" if cfg["sandbox"]["backend"] == "docker" else "skip")
+                     depgraph=spec.get("depgraph"), image=runner.taskimage.image_for(cfg, item_dir) if inventory is not None else None,
+                     introspect="docker" if cfg["sandbox"]["backend"] == "docker" or inventory is not None else "skip")
     g["leak"] = lr["verdict"] != "leak"          # "review" (warn-only findings) is recorded, not blocking
     det["leak"] = lr
     # isolation: nothing answer-bearing under environment/

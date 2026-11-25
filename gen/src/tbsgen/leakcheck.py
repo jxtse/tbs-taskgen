@@ -75,13 +75,17 @@ def _forbidden_mentions(rel: str, forbidden: list[dict]) -> bool:
     return any(k in f["text"] for f in forbidden for k in keys)
 
 
-def l1_placement(public_dir: Path, truth_dirs: list[Path], forbidden: list[dict] | None = None) -> list[dict]:
+def l1_placement(public_dir: Path, truth_dirs: list[Path], forbidden: list[dict] | None = None,
+                 *, hash_large=False) -> list[dict]:
     forbidden = forbidden or []
     """Truth files copied into public data (identical content), or answer-like file names in public data."""
     import hashlib
 
     def h(p: Path) -> str:
-        return hashlib.sha256(p.read_bytes()).hexdigest() if p.stat().st_size < 200e6 else ""
+        if not hash_large and p.stat().st_size >= 200_000_000:
+            return ""  # Preserve the legacy large-file comparison.
+        with p.open("rb") as f:
+            return hashlib.file_digest(f, "sha256").hexdigest()
 
     thash = {h(p): str(p) for d in truth_dirs for p in d.rglob("*") if p.is_file() and p.stat().st_size > 64}
     out = []
@@ -89,16 +93,16 @@ def l1_placement(public_dir: Path, truth_dirs: list[Path], forbidden: list[dict]
         if not p.is_file():
             continue
         rel = str(p.relative_to(public_dir))
-        if p.stat().st_size > 64 and h(p) in thash:
+        if p.stat().st_size > 64 and (digest := h(p)) in thash:
             # truth dirs often keep copies of public inputs: only a warning unless the file is declared off-limits
-            out.append(dict(cls="L1c", file=rel, same_as=Path(thash[h(p)]).name,
+            out.append(dict(cls="L1c", file=rel, same_as=Path(thash[digest]).name,
                             severity="block" if _forbidden_mentions(rel, forbidden) else "warn"))
         elif re.search(r"(?:^|[_-])(?:truth|answers?|oracle_ref|expected|gold)(?:[_.-]|$)", p.name, re.I):
             out.append(dict(cls="L1c", file=rel, name_pattern=True, severity="block"))
     return out[:20]
 
 
-def l3_introspect(cfg: dict, public_dir: Path, timeout: int = 180) -> tuple[list[Leaf], dict]:
+def l3_introspect(cfg: dict, public_dir: Path, timeout: int = 180, image=None) -> tuple[list[Leaf], dict]:
     pys = list(public_dir.rglob("*.py"))
     if not pys:
         return [], dict(status="no_python")
@@ -109,7 +113,7 @@ def l3_introspect(cfg: dict, public_dir: Path, timeout: int = 180) -> tuple[list
         (td / "out").mkdir()
         (td / "out").chmod(0o777)
         r = sandbox.run(cfg, [(public_dir, "/data", "ro"), (td / "probe", "/probe", "ro"), (td / "out", "/out", "rw")],
-                        "python /probe/introspect_probe.py /data /out/introspect.json", timeout, "tbsgen-l3")
+                        "python /probe/introspect_probe.py /data /out/introspect.json", timeout, "tbsgen-l3", image=image)
         f = td / "out" / "introspect.json"
         if not f.exists():
             return [], dict(status="probe_failed", rc=r["rc"], err=r["err"][-500:])
@@ -121,7 +125,7 @@ def l3_introspect(cfg: dict, public_dir: Path, timeout: int = 180) -> tuple[list
 
 
 def leak_report(public_dir: Path, truth_dirs: list[Path], instruction: str, cfg: dict,
-                depgraph: dict | None = None, introspect: str = "docker") -> dict:
+                depgraph: dict | None = None, introspect: str = "docker", image=None) -> dict:
     public_dir = Path(public_dir)
     truth_dirs = [Path(d) for d in truth_dirs if Path(d).exists()]
     rep: dict = dict(findings=[], info={})
@@ -130,7 +134,7 @@ def leak_report(public_dir: Path, truth_dirs: list[Path], instruction: str, cfg:
         rep["findings"] += l1_depgraph(depgraph, instruction, ptext)
     fb = l1_forbidden(instruction)
     rep["findings"] += [dict(f, severity="block") for f in fb]
-    rep["findings"] += l1_placement(public_dir, truth_dirs, fb)
+    rep["findings"] += l1_placement(public_dir, truth_dirs, fb, hash_large=image is not None)
     declared = declared_names(instruction)
     pub, unread = dir_leaves(public_dir)
     truth: list[Leaf] = []
@@ -146,7 +150,7 @@ def leak_report(public_dir: Path, truth_dirs: list[Path], instruction: str, cfg:
     rep["findings"] += [dict(cls="L2", **f) for f in f2]
     rep["findings"] = [dict(f, severity=f.get("severity", "block")) for f in rep["findings"]]
     if introspect == "docker":
-        il, irep = l3_introspect(cfg, public_dir)
+        il, irep = l3_introspect(cfg, public_dir, image=image)
         rep["info"]["l3"] = irep
         if il:
             # only truth values that are NOT already in public files (those are L2's business); no name-based echo

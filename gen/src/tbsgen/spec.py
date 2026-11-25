@@ -26,7 +26,8 @@ def _prompt_at_least(version, standard, code) -> bool:
     match = re.match(r"^(cg-)?v(\d+)(?:\.(\d+))?(?:-|$)", str(version))
     if not match:
         return False
-    return (int(match[2]), int(match[3] or 0)) >= (code if match[1] else standard)
+    minimum = code if match[1] else standard
+    return minimum is not None and (int(match[2]), int(match[3] or 0)) >= minimum
 
 
 def _requires_assumptions(version) -> bool:
@@ -35,6 +36,10 @@ def _requires_assumptions(version) -> bool:
 
 def requires_hidden_provenance(version) -> bool:
     return _prompt_at_least(version, (2, 10), (6, 0))
+
+
+def image_prompt(version) -> bool:
+    return _prompt_at_least(version, None, (7, 0))
 
 
 PIN = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?==[0-9][A-Za-z0-9.!+_-]*")
@@ -74,6 +79,23 @@ def validate_spec(spec, cfg: dict, prompt_version=None) -> list[str]:
                     errs.append("stated generator_assumptions.where needs at least 12 characters after normalization")
                 elif not a["stated"] and not re.match(r"^recovered from data:\s*\S", a["where"]):
                     errs.append("unstated assumption needs recovered from data: <how>")
+    image_version = any(image_prompt(v) for v in (prompt_version, spec.get("prompt_version")))
+    if image_version:
+        formats = spec.get("data_formats")
+        if not isinstance(formats, list) or not formats or not all(
+                isinstance(ext, str) and re.fullmatch(r"\.?[A-Za-z0-9]+(?:[._-][A-Za-z0-9]+)*", ext)
+                for ext in formats):
+            errs.append("data_formats must list public file extensions, e.g. bam or nii.gz")
+    if (image_version and (spec.get("image_kind") != "legacy" or "image" in spec)
+            or spec.get("image_kind") in ("task", "authored")):
+        from .taskimage import IMPORT, valid_base
+        image = spec.get("image")
+        if not isinstance(image, dict):
+            errs.append("image must be an object")
+        elif not (valid_base(image.get("base")) and isinstance(image.get("packages"), list)
+                  and all(isinstance(p, str) and IMPORT.fullmatch(p) for p in image["packages"])
+                  and isinstance(image.get("notes"), str)):
+            errs.append("image requires a specific base tag or digest, a list of Python import names, and text notes")
     form = spec.get("form")
     if form not in cfg["spec"]["allowed_forms"]:
         errs.append(f"form {form!r} not allowed in this phase")

@@ -37,6 +37,10 @@ with coverage, recall or a count. In measure.compute(), pass each measured per-s
 _metrics.hidden_value(input_dir, exact_hidden_metric_name, value) and combine tagged values with hidden_aggregate(operation, values).
 Pass the returned value directly to check. Partial or empty hidden outputs must fail."""
 
+LEGACY_S5_RUNTIME = """- the data are synthetic (simulated by a deterministic generator from the paper's model); numpy/scipy/pandas/
+  scikit-learn/statsmodels only, 2 CPUs, no network, generator < 5 min, reference solution < 15 min."""
+LEGACY_S6_RUNTIME = "numpy/scipy/pandas/sklearn/statsmodels only"
+
 S5_SPEC = """Paper (excerpt, DOI {doi}):
 <<<
 {excerpt}
@@ -55,8 +59,7 @@ Fixed harness contract (the spec must use exactly these locations; do not invent
 - metrics compare deliverables with the truth files only; the verifier never re-runs a reference solution.
   If a metric needs an oracle quantity (e.g. oracle CRPS), the generator precomputes it from the true
   parameters into tests/truth.
-- the data are synthetic (simulated by a deterministic generator from the paper's model); numpy/scipy/pandas/
-  scikit-learn/statsmodels only, 2 CPUs, no network, generator < 5 min, reference solution < 15 min.
+""" + LEGACY_S5_RUNTIME + """
 
 Task size: a real multi-step piece of scientific work an expert needs {hours_lo}-{hours_hi} hours for (derive,
 implement, debug, validate), not a template fill-in or a single library call.  "expert_time_hours" is your honest
@@ -103,7 +106,7 @@ Write the generator and the reference solution.  Files:
 - generator/generate.py: `python generator/generate.py <seed>` run from the task root writes
   environment/data/** (public), tests/truth/** (truth, any format), tests/hidden/** (PROG: shifted hidden inputs
   laid out exactly like /app/data; their truth also goes to tests/truth/).  Deterministic in seed.
-  numpy/scipy/pandas/sklearn/statsmodels only, < 5 min, 2 CPUs.  Public files must not contain truth values or
+  """ + LEGACY_S6_RUNTIME + """, < 5 min, 2 CPUs.  Public files must not contain truth values or
   anything from which they follow trivially (no true-parameter columns, no noise-free copies).
 - solution/solve.py: reads /app/data, writes deliverables to /app/output (for PROG also writes
   /app/output/solution_cli.py taking <input_dir> <output_dir>, e.g. a copy of its own source).  Must use only
@@ -133,6 +136,16 @@ A previous implementation of this spec was rejected: on these metrics the refere
 naive baseline by the factors shown ({ratios}), i.e. the reference is wrong (units, normalisation, sign, a
 mis-scaled output, or a metric that compares the wrong quantities).  Write ALL files again from scratch and check
 the reference against the generator's truth on these metrics before you finish."""
+
+def author_contract(task_images: bool):
+    if not task_images:
+        return S5_SPEC, S6A_GEN
+    spec = S5_SPEC.replace(LEGACY_S5_RUNTIME, """- use the authored task image's pinned tools for real data and native formats when an image is requested.
+  List the extensions of the generated public files in data_formats.
+  2 CPUs, no network, generator < 5 min, reference solution < 15 min.""")
+    gen = S6A_GEN.replace(LEGACY_S6_RUNTIME, "Use the authored task image's pinned packages")
+    return spec, gen
+
 
 S6C_TESTS = """Specification:
 {spec}

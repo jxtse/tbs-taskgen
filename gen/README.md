@@ -10,7 +10,7 @@
 ```
 S1 → S2a 代码信号预筛（不花全文额度） → S2 摘要筛 → S3 全文 → S3b 作者代码硬确认 → S3c 获取代码（构建机）
    → S4 可行性 → S4c 可运行性硬门（构建机 Claude Code agent） → S5G 出题 agent（构建机 Claude Code）
-   → S6A_run → S6B → S6C → S7 → S8 → PKG → S9 → S9R → S10（后段不变）
+   → [S6I] → S6A_run → S6B → S6C → S7 → S8 → PKG → S9 → S9R → S10（后段不变）
 ```
 
 | 阶段 | 产物 | 淘汰原因 |
@@ -31,7 +31,7 @@ S2a 查不到 OpenAlex 时暂停（`code:openalex_unavailable`），都用 `tbsg
 | S4c | 构建机上的 Harbor 作业（`code.agent_launcher`，默认沿用教师路由：Opus 经 Substrate 中继）：agent 在容器里装环境（安装期只放行包索引和代码托管站 `code.install_hosts`，外加模型端点）、通过回执包装 `/work/tbsgen-run.sh` 跑一次作者的示例 / 测试 / 主入口（记录命令、退出码、日志；“可运行”必须有一条退出码 0、命令等于 `entry` 的回执），写 `runnability.json`、`HOWTO.md`（给下一步的“如何运行作者代码”）、`setup.sh`。MATLAB 先试 Octave | `code_not_runnable`、`code_needs_gpu`、`code_needs_commercial_license`（含 Mathematica）、`code_matlab_octave_incompatible`、`code_runnability_agent_failed` |
 | S5G | 构建机上的 Claude Code 出题 agent：输入论文全文、作者仓库、S4c 的 HOWTO、harness 契约原文（S5_SPEC、S6A_GEN、METRICS_API、`_metrics.py` 模板）；输出与 S5 + S6A **完全相同**的产物（`_spec/spec.json`、`task/{instruction.md, generator, solution, tests/measure.py, baselines/mid.py, baselines/naive.py}`）加 `_spec/author_code.json`（包名、主要函数、参考解用了作者哪些代码、数据来源）。agent 可在容器里反复运行生成器、参考解、基线直到拉开差距。之后 S6A_run 起全部沿用旧阶段；S6B 要求重新出规格 / 重写参考解时回到 S5G（每篇最多 `code.authoring_max_jobs` 次） | `s5g_missing_files`、`spec_invalid`、`s5g_jobs_exhausted:*` |
 
-防泄漏：任务镜像（PKG 生成的 Dockerfile）只有固定科学计算栈，agent 写的 `task/environment/` 一律丢弃；作者代码只能
+默认配置下的防泄漏：任务镜像（PKG 生成的 Dockerfile）只有固定科学计算栈，agent 写的 `task/environment/` 一律丢弃；作者代码只能
 被移植进参考解，或在构建期生成真值（存进 `generator/assets/`，附 PROVENANCE）。S7 的 `readymade` 门加入作者仓库名、
 包名、主要函数名（`_spec/author_code.json`）；新 S7 门 `author_leak`（阻断）检查题面和公开数据文件是否点名这些名字；
 PKG 打包时同样检查。S9R 审核清单新增 `i_author_code`：任务是否只是“重跑作者仓库”、是否泄漏作者实现。
@@ -58,6 +58,34 @@ PKG 打包时同样检查。S9R 审核清单新增 `i_author_code`：任务是�
 `authoring_max_jobs`、`agent_harbor_root`、`agent_launcher`、`agent`、`agent_environment`、`agent_model`、
 `agent_effort`、`agent_allowed_hosts`、`install_hosts`、`agent_base_image`、`agent_cpus`、`agent_memory_mb`、
 `agent_jobs_dir`、`agent_hints`。检索侧见 `retrieval/README.md` 的“代码通道”。
+
+#### 每题镜像（S6I，默认关闭）
+
+打开 `taskimage.enabled` 后，S5G 为新题编写 Dockerfile 和依赖清单。S5G 在每个 FROM 中写具体标签或已验证的 digest。S6I 在构建机上将标签解析为 linux/amd64 manifest digest，写回 Dockerfile，并在 spec 和状态中记录固定后的 `base` 和原始标签 `base_resolved_from`，再执行 lint 和构建。pip 用 `==`，conda 用 `=` 或带哈希的 `@EXPLICIT` 锁，apt 用 `包名=版本`。每个下载文件要有明确的输出名，并在同一条 RUN 中逐个用字面 SHA-256 校验。禁止能读取构建上下文的 RUN 挂载。缺少 Dockerfile 的新题沿用原有镜像和 `extra_pip`。关闭开关后，已有每题镜像仍按保存的身份运行。
+
+S6I 用空数据构建 linux/amd64 镜像，上下文哈希含 `build_args`。断网探针检查 Python ≥3.10、pytest、bash、nobody、评分脚本和离线导入，并核查已安装包是否命中论文实现。解题程序可写 `/app/output`、私有 HOME 和临时目录。探针以 nobody 检查评分解释器、Python 搜索路径、PATH 及其父目录的写权限。结果记入 `S6I_image.json`。镜像上限默认 5 GB。新构建失败最多返工一次，计入 S5G 作业、时间和费用预算。`gen.max_public_mb`（默认 500 MB）只对每题镜像硬性限额。
+
+```toml
+[taskimage]
+enabled = true
+host = "build-host"  # 默认沿用 sandbox.host
+docker_config = "$HOME/docker-config"
+builder = "tbs"
+build_timeout_s = 2400
+# 构建机可直连时，可按需清空代理变量。修改构建参数会生成新的任务镜像缓存键。
+build_args = { HTTP_PROXY = "", HTTPS_PROXY = "", http_proxy = "", https_proxy = "" }
+max_gb = 5
+keep_days = 7
+registry_prefix = "registry.example/ns/repo:tbsgen-img"
+
+[calib]
+prepare_command = "bash /absolute/path/to/gen/scripts/prep-task-image.sh {item_id}"
+teacher_prepared_tasks_dir = ""
+```
+
+S6I 在构建机的 Docker daemon 保留按 image ID 命名的本地标签，并从该 ID 导出 OCI layout。沙箱按 ID 运行。教师的 Harbor 从构建机本地标签追加公开数据，S9R 从同一标签复制评审包；`harbor-local` 也要求本机有对应 ID 的标签。恢复和执行前核对宿主机镜像。镜像缺失时返回 S6I；配置不可用或 ID 不符会暂停。旧版已打包题恢复至校准、评审或发布时，会锁定阈值重新过门并重做校准；仍有待处理作业时先暂停。
+
+学生发布用 BuildKit 的 `taskbase` 命名上下文固定 S6I 的 OCI manifest，只添加公开数据。准备命令接收 `TBSGEN_IMAGE_OCI`、`TBSGEN_IMAGE_TAG` 和 `TBSGEN_IMAGE_DIGEST`，核对传输后的 manifest 与 ACR digest，再注册模板。发布前须设置 `taskimage.registry_prefix`。准备脚本从环境变量 `TBS_ALIYUN_ROOT`、`CRANE`、`DOCKER_CONFIG`、`SANDBOX_TEMPLATES` 分别读取准备项目目录、crane 可执行文件、凭据目录和模板工具路径。旧题由 `TBSGEN_LEGACY_PREP` 指定的脚本准备。S10 按题回收；`tbsgen taskimage gc --run DIR --dry-run` 可预览。等待 S9/S9R 的题和其他活跃 run 共用的标签受保护。基础镜像记录默认在 run 上一级的 `taskimage-catalog.jsonl`，可用 `taskimage.catalog` 修改。
 
 ### 0b. 针对校准学生薄弱点出题与加难回路（`[difficulty]`，2026-11-12 起，仅代码驱动条目）
 
@@ -514,14 +542,14 @@ S9 打出标签后，**hard / unstable**（`calib.keep_labels`）必须先过审
 
 - S6B 的阈值舍入最多增加 3 位有效数字。仍无法排除基线时记录 `threshold_unreadable`，进入原有修复流程。naive 基线连精确值都能通过时（该指标本来就拒不掉 naive），不再为它加位数，而是保留 2 位有效数字。S7 的 `threshold_format` 要求阈值处的数最多 6 位有效数字，题面任何数最多 12 位有效数字（GM、J2 等物理常数不受影响）。隐藏指标的参考余量可单独由 `thresholds.min_ref_margin_hidden` 设定，默认 None 即沿用旧规则（`min_ref_margin` 的一半，自定义过 `min_ref_margin` 的配置也一样）；调整余量时需重新校准。阈值格式、题面卫生、适用版本的隐藏指标覆盖和生成假设检查明确失败时进入 S8 修复。
 - `statement_clean` 拦截内部编辑文字（audit copy / audit revision、reviewer note、S7 gate、hardening round、TODO、tbsgen、mid/naive baseline 等）和 HTML 注释；单独的 gate、hardening、lever、audit、revision、patch、internal standard、baseline-free 这类科学用法不拦（gate voltage、strain hardening、lever arm、convergence audit）。新 S5/S5G spec 列出 `generator_assumptions`，已明说的引文在合并空白后须至少 12 个字符。`assumptions_stated` 逐条核对题面原文，未明说的条件须填写 `recovered from data: <恢复方法>`。S9R 对照生成器和参考解复核。
-- PROG 的 `hidden_parity` 对照实际检查的公开、隐藏指标族。v2.7 / cg-v3 及更早版本只记录缺项。v2.8–v2.9 / cg-v4–cg-v5 按隐藏集合计覆盖，兼容内置 max、sum。v2.10 / cg-v6 起逐集检查来源（含单集）；PR #43 变基后须改用 cg-v7。新评分代码用 `hidden_value(d, name, value)` 标记测量值，聚合必须用 `hidden_aggregate("max", values)` 等显式操作，直接将结果传入 `check`。只有传入值携带的来源计入本次检查。指标族按去掉 mean/max/set_a 等聚合词后的词元匹配，公开指标可用 `public_only: true` 和 `public_only_reason` 声明例外。只在隐藏集上查的指标和只记录的资源指标均不算缺失。`hidden_shift` 在两个隐藏集完全相同、隐藏集与公开数据完全相同、或某个隐藏集一半以上字节是公开文件的拷贝（小文件也算）时阻塞；单个共用文件（训练表、时间网格）只记录在 `copied_files`。共用校准表等可按文件名列入 `shared_inputs`。
+- PROG 的 `hidden_parity` 对照实际检查的公开、隐藏指标族。v2.7 / cg-v3 及更早版本只记录缺项。v2.8–v2.9 / cg-v4–cg-v5 按隐藏集合计覆盖，兼容内置 max、sum。v2.10 / cg-v6 起逐集检查来源（含单集）。每题镜像使用 cg-v7，沿用这项检查。新评分代码用 `hidden_value(d, name, value)` 标记测量值，聚合必须用 `hidden_aggregate("max", values)` 等显式操作，直接将结果传入 `check`。只有传入值携带的来源计入本次检查。指标族按去掉 mean/max/set_a 等聚合词后的词元匹配，公开指标可用 `public_only: true` 和 `public_only_reason` 声明例外。只在隐藏集上查的指标和只记录的资源指标均不算缺失。`hidden_shift` 在两个隐藏集完全相同、隐藏集与公开数据完全相同、或某个隐藏集一半以上字节是公开文件的拷贝（小文件也算）时阻塞；单个共用文件（训练表、时间网格）只记录在 `copied_files`。共用校准表等可按文件名列入 `shared_inputs`。
 - S7 在首个配置种子（打包种子）上运行两种输出探针。`one_confident`（报告中的 `coverage`）把超过 5 行的 CSV 缩为置信度最高的一行，`hidden_garbage` 重排隐藏表的答案。两者优先采用值唯一的标识列（如 `filename`、`patient_id`、`sample_key`），找不到时才考虑首列。多个标识列都可作键时跳过该表。纯行重排不算答案变化。
 - 每次只变换公开输出或一个隐藏集。行集合或按键对应的答案发生变化且评分器正常退出、给出 reward 1 时，该范围记为 `shortcut_suspected`，即使原值对照失败也保留。reward 0 且有非资源检查失败、原值对照通过时记为 `caught`。ANS 复用打包种子的参考解评分。PROG 在真值隔离通过后运行探针，仅当有待确认的非资源拒绝时才运行一次该探针共用的全隐藏集原值对照。无适用变换记为 `na`，其余记为 `inconclusive` 并附原因。
 - 两种探针在所有提示词版本中都只提供审核证据。S9R 审核包的 `records/output_probes.json` 保存当前 S7 尝试的逐范围结果、变换文件的相对路径、是否为声明的交付物（无法确定时为 `unknown`）以及各次验证器输出。v8 审核者须把包内 `repro_commands` 为该范围列出的完整 argv 交给 `tbs-repro <scope_id> -- <argv...>` 运行评分器，逐项复现 `shortcut_suspected`，在 `probe_findings` 以完整 ID（如 `hidden_garbage/hidden:A`）填写对应的 `repro_id`、记录中的 `observed_reward`、至少 20 字符的 `observation` 和分类理由。确认评分漏洞须关联阻塞问题并按原规则修订或淘汰。探针误报须说明原因。漏答任一必答 ID 按无效裁决重审。审核者自行发现的评分漏洞在 `issues` 中作为阻塞问题提交证据，可附自选命令的 `repro_id`。
 - **升级部署**时，PR #42 必须与 PR #44 一起部署。#44 为每个 Harbor 作业写入稳定的预留键，供恢复或取消时找回已提交的预算预留。
 - 恢复到 S8、PKG、S9、S9R 或 S10 的条目时，若最近一次 S7 报告使用旧探针策略，生成器会记录该报告 ID 并从 S6A_run 重新过门一次。已结束和已淘汰的条目保留原状。
 - S9R 按作业提交时的契约验证裁决。仅因新版证据字段而失效的合格旧裁决可免费重审一次。有阻塞证据的 `drop` 直接淘汰。关闭审核后，S9R 和 S10 均按作业提交时的执行证据契约接受同一包、轮次和校准 epoch 的有效通过裁决；缺少有效探针结论时暂停发布，保留已有发布记录。
-- S7 报告中，`effort_floor` 提示参考解各次公开求解均少于 30 秒且专家估时至少 2 小时的题目。`data_realism` 提示所有公开文件均为 CSV/NPY/JSON/TXT 且总量小于 2 MB 的题目。两项供 S9R 参考，可分别在 spec 用 `effort_note`、`data_realism_note` 说明理由，`data_formats` 可列出实际格式。
+- S7 报告中，`effort_floor` 提示参考解各次公开求解均少于 30 秒且专家估时至少 2 小时的题目。`data_realism` 提示所有公开文件均为 CSV/NPY/JSON/TXT 且总量小于 2 MB 的题目。两项供 S9R 参考，可分别在 spec 用 `effort_note`、`data_realism_note` 说明理由，cg-v7 要求 `data_formats` 列出公开文件扩展名。S6A 逐个种子与实际生成文件比对，差异仅记入 `S6A_measure.json` 的 `data_formats_warning`。
 - PKG 静态检查两个评分脚本，要求显式的单次 `run_solution` 时限小于 verifier 超时减去 `package.verifier_overhead_sec`。题包必须声明 agent 和 verifier 的网络策略，verifier 始终离线，显式 public 对照组记录警告。`extra_pip` 最多 8 个 `name==version`，加入自包含 Dockerfile；PKG 在配置的沙箱镜像内离线核对安装版本，缺包或不匹配报 `extra_pip_unsupported`。
 - `tbsgen diversity --run DIR [--runs-root ROOT] [--json]` 按 14 个领域统计已发布和在途题目，列出空缺领域和相近方法簇。S5G 按候选主题和标题预估，S10 按完整 spec 复核。已发布题至少 `diversity.min_released`（20）道且领域占比超过 `diversity.max_area_share`（0.25），或同簇已有 `max_per_template`（2）题时，默认只写 state 和 event。`diversity.enforce=true` 时暂存为 parked：S5G 已预留但未启动的作业先把 run.json 退回 intent，再以 `diversity_parked`（不计入调用次数上限）结清预留；S10 对已在 manifest 中的版本不再重新判断，崩溃重试不会撤回已发布的题。
 - S10 以包哈希、校准 epoch、标签、审核摘要及其余发布元数据识别同一次追加，忽略写入时间。相同记录重放时直接完成，审核结论或其他发布字段变化时追加新行，消费者读取该题最后一条有效记录。末行中断时先补换行，再追加发布或撤回记录。旧行缺少包哈希时，从其记录的包目录计算后比对。

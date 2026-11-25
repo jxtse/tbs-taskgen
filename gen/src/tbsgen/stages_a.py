@@ -10,12 +10,12 @@ import shutil
 import re
 from pathlib import Path
 
-from . import blocklist, codegate, intake, runner, screen_jev
+from . import blocklist, codegate, intake, runner, screen_jev, taskimage
 from .budget import BudgetStop
 from .config import resolve_role
 from .models import ModelError, extract_json, parse_files  # noqa: F401
 from .prompts import METRICS_API, PROMPT_VERSION, S5_SPEC, S6A_GEN, S6A_REWRITE, S6M_MID, SYSTEM
-from .spec import crashed_runs, s6b_decision, set_thresholds, validate_spec
+from .spec import crashed_runs, image_prompt, s6b_decision, set_thresholds, validate_spec
 from .state import read_json, write_json
 
 
@@ -298,6 +298,18 @@ def s6a(P, it):
     it.advance("S6A", "S6A_run")
 
 
+def _format_warning(public, formats):
+    declared = {ext.lower().lstrip(".") for ext in formats}
+    observed = set()
+    for path in public.rglob("*"):
+        if path.is_file() and path.suffix:
+            name = path.name.lower()
+            matches = [ext for ext in declared if name.endswith("." + ext)]
+            observed.add(max(matches, key=len) if matches else path.suffix[1:].lower())
+    if declared != observed:
+        return dict(missing=sorted(declared - observed), undeclared=sorted(observed - declared))
+
+
 def s6a_run(P, it):
     """Measure the reference (and mid/naive if S6C already produced them) on each seed."""
     if it.p("_spec", "author_code.json").exists():
@@ -307,6 +319,7 @@ def s6a_run(P, it):
             return it.finish("paused", f"code:config:{why}", paused_stage="S6A_run")
     task = it.p("task")
     work = it.p("runs", "s6")
+    spec = read_json(it.p("_spec", "spec.json"), {})
     meas = {"ref": {}, "mid": {}, "naive": {}, "nop": {}, "runs": {}}
     for s in P.cfg["gen"]["seeds"]:
         gen = work / f"gen{s}"
@@ -315,6 +328,10 @@ def s6a_run(P, it):
         if g["rc"] != 0:
             write_json(it.p("S6A_measure.json"), meas)
             return _to_repair(P, it, "generator_failed", meas)
+        if image_prompt(spec.get("prompt_version")):
+            warning = _format_warning(gen / "environment/data", spec["data_formats"])
+            if warning:
+                meas["runs"][f"gen{s}"]["data_formats_warning"] = warning
         # nop (empty /app/output) gives each metric's missing-output value: a reference equal to it on some
         # metric did not produce that deliverable (review #7: replaces the global |value| >= 1e5 heuristic)
         nd = work / f"out-nop{s}"
@@ -649,14 +666,17 @@ def _agent_stage(P, it, kind: str, instruction: str, need: list[str], timeout_s:
             n = it.bump(f"{kind}:job")
             work = it.p(kind, "work")
             codeagent.stage_inputs(P.cfg, it, work, with_contract)
+            images = kind == "S5G" and taskimage.author_images(P.cfg, it.state)
             task = codeagent.build_agent_task(P.cfg, kind, it.item_id, work, it.p(kind, "task"), instruction, need,
-                                              timeout_s)
+                                              timeout_s, image_outputs=images)
             jobs = Path(codeagent._c(P.cfg).get("agent_jobs_dir") or it.p(kind, "jobs"))
             conf = codeagent.agent_job_config(P.cfg, task, f"tbsgen-{it.item_id}-{kind.lower()}{n}", jobs, max_usd)
             extra = dict(budget=dict(timeout_s=timeout_s, max_usd=max_usd), est_usd=est_usd)
             if kind == "S5G":
-                from .prompts_code import CODE_PROMPT_VERSION
-                extra["prompt_version"] = CODE_PROMPT_VERSION
+                from .prompts_code import CODE_PROMPT_VERSION, LEGACY_CODE_PROMPT_VERSION
+                extra["prompt_version"] = CODE_PROMPT_VERSION if images else LEGACY_CODE_PROMPT_VERSION
+                if images:
+                    extra["image_outputs"] = True
             if rnd is not None:
                 extra["harden_round"] = rnd["round"]
             rec = _launch_admitted_agent(P, it, kind, conf, est_usd, checked_day, extra=extra)
@@ -952,7 +972,7 @@ def _s5g(P, it):
     paper really supports and records them in _spec/difficulty_design.json; in a hardening round (difficulty.py)
     it gets the previous version and the student's passing-run summary and makes the task harder."""
     from . import codeagent, difficulty
-    from .prompts_code import (S5G_AUTHOR, S5G_DIFFICULTY, S5G_HARDEN, S5G_HARDEN_PREFERRED,
+    from .prompts_code import (LEGACY_AUTHOR, S5G_AUTHOR, S5G_DIFFICULTY, S5G_HARDEN, S5G_HARDEN_PREFERRED,
                                S5G_PREFERRED, S5G_VARIANT)
     c = codegate.ccfg(P.cfg)
     d = difficulty.dcfg(P.cfg)
@@ -964,8 +984,19 @@ def _s5g(P, it):
         return it.finish("paused", f"code:config:difficulty_profile:{type(e).__name__}", paused_stage="S5G")
     hround = int(it.state.get("harden_round", 0)) if it.state.get("harden_active") else 0
     hkind = difficulty.round_kind(it) if hround else None
-    instruction = S5G_AUTHOR.format(item=it.item_id, minutes=int(tmo // 60), forms=P.cfg["spec"]["allowed_forms"],
+    images = taskimage.author_images(P.cfg, it.state)
+    prompt = S5G_AUTHOR if images else LEGACY_AUTHOR
+    instruction = prompt.format(item=it.item_id, minutes=int(tmo // 60), forms=P.cfg["spec"]["allowed_forms"],
                                     hours_lo=lo, hours_hi=hi)
+    if images:
+        catalog = taskimage.base_catalog(taskimage.catalog_path(P.cfg))[:10]
+        reuse = [dict(base=r["base"], tasks=len(r["tasks"]), verified_python=r["python"], size=r["size"])
+                 for r in catalog]
+        instruction += (f"\nPublic data cap: {P.cfg['gen']['max_public_mb']} MB. "
+                        f"Image size cap: {P.cfg['taskimage']['max_gb']} GB. "
+                        f"Previously verified bases (measurements from a task using each base): {json.dumps(reuse)}\n")
+        if it.state.get("image_retry_used"):
+            instruction += "Read /work/previous_attempt.json and resolve its image finding.\n"
     need = codeagent.agent_output_files("S5G", with_profile=bool(prof))
     if prof:
         pref = ", ".join(prof.get("preferred") or [])
@@ -996,7 +1027,15 @@ def _s5g(P, it):
     if rec is None:
         return
     version = rec.get("prompt_version", "cg-v3-2026-11-12")  # jobs already launched before the change
+    # A resumed launcher may have authored its result under the previous flag setting.
+    images = image_prompt(version) or taskimage.is_task(it.state)
+    # Both PRs briefly used cg-v5. The staged contract identifies in-flight image-authoring jobs.
+    if not images and version == "cg-v5-2026-11-24":
+        contract = it.p("S5G/work/contract/S5_SPEC.txt")
+        images = contract.is_file() and "use the authored task image" in contract.read_text()
     out = codeagent.deliverable(rec)
+    if images and out and (out / "task/environment/Dockerfile").is_file():
+        need.append("report.md")
     miss = [f for f in need if not (out and codeagent.safe_read(out / f, root=Path(rec["trial"])) is not None)]
     write_json(it.p("S5G_result.json"), dict(job=rec.get("job_name"), outcome=rec.get("outcome"),
                                              exception=rec.get("exception"), cost_usd=rec.get("cost_usd"),
@@ -1014,7 +1053,16 @@ def _s5g(P, it):
         spec = json.loads(codeagent.safe_read(out / "_spec" / "spec.json", root=Path(rec["trial"])) or "")
     except (OSError, ValueError) as e:
         return it.finish("dropped", f"s5g_spec_unparseable:{type(e).__name__}")
+    env = out / "task/environment"
+    authored = images and (env / "Dockerfile").exists()
+    if taskimage.is_task(it.state) and not authored:
+        return _image_failure(P, it, taskimage.lint_failure(["existing task image requires an authored Dockerfile"]))
     if isinstance(spec, dict):
+        spec.pop("image_kind", None)
+        if images:
+            if isinstance(spec.get("image"), dict):
+                spec["image"].pop("base_resolved_from", None)
+            spec["image_kind"] = "task" if authored else "legacy"
         spec["prompt_version"] = version
     errs = validate_spec(spec, P.cfg)
     write_json(it.p("_spec", "spec_errors.json"), errs)
@@ -1034,6 +1082,13 @@ def _s5g(P, it):
             P.store.event("difficulty_design_invalid", item=it.item_id, errors=derrs[:5], harden_round=hround)
             _agent_reauthor(P, it, "difficulty_design_invalid", force=True)
             return
+    if images and (env.exists() or env.is_symlink()):
+        if not env.is_dir() or not codeagent._inside(Path(rec["trial"]), env):
+            return it.finish("dropped", "s5g_unsafe_files", refused=["environment"])
+        # Check names and bounds before copying any environment bytes from the trial.
+        problems = taskimage.context_errors(env) if authored else []
+        if problems:
+            return _image_failure(P, it, taskimage.lint_failure(problems))
     task = it.p("task")
     if task.exists():
         shutil.rmtree(task)
@@ -1041,9 +1096,13 @@ def _s5g(P, it):
     if refused:
         shutil.rmtree(task, ignore_errors=True)
         return it.finish("dropped", "s5g_unsafe_files", refused=refused[:10])
-    for extra_dir in ("environment",):             # the task image is built by PKG only (no agent-made env files)
-        if (task / extra_dir).exists():
-            shutil.rmtree(task / extra_dir)
+    if not authored and (task / "environment").is_dir():
+        shutil.rmtree(task / "environment")
+    for key in taskimage.STATE_FIELDS:
+        it.state.pop(key, None)
+    if images:
+        it.state["image_kind"] = spec["image_kind"]
+    it.p("S6I_image.json").unlink(missing_ok=True)
     # S6C products (tests with the thresholds, exploit baselines) are always rebuilt for a new authored version:
     # an agent that started from an earlier version must not carry its thresholds into the verifier
     if (task / "tests" / "test_outputs.py").exists():
@@ -1085,7 +1144,40 @@ def _s5g(P, it):
     if hround:
         from .stages_b import harden_authored
         harden_authored(P, it)
-    it.advance("S5G", "S6A_run", form=spec.get("form"), cost_usd=rec.get("cost_usd"), minutes=rec.get("minutes"))
+    it.advance("S5G", "S6I" if authored else "S6A_run", form=spec.get("form"),
+               cost_usd=rec.get("cost_usd"), minutes=rec.get("minutes"))
+
+
+def _image_failure(P, it, result):
+    write_json(it.p("S6I_image.json"), result)
+    gate = result["failed_gate"]
+    why = "readymade_image" if gate == "readymade_image" else f"image_build_failed:{gate}"
+    feedback = dict(why=why, finding=result["error"], action="Choose another base or drop that package."
+                    if gate == "readymade_image" else "Correct the image and retest the declared pins.")
+    write_json(it.p("S6_failure.json"), feedback)
+    if it.state.get("image_retry_used"):
+        return it.finish("dropped", why)
+    it.state.pop("image_resume_stage", None)
+    it.state["image_retry_used"] = True
+    _agent_reauthor(P, it, why, force=True)
+
+
+def s6i(P, it):
+    from .stages_b import item_lock
+    with item_lock(it):
+        it.load()
+        if it.state.get("stage") != "S6I" or it.state.get("status") != "active":
+            return
+        result = taskimage.build(P.cfg, it.dir, state=it.state)
+        if not result["ok"]:
+            if it.state.get("image_resume_stage"):
+                raise taskimage.ImageUnavailable(f"S6I restore failed at {result['failed_gate']}: {result['error']}")
+            return _image_failure(P, it, result)
+        write_json(it.p("S6I_image.json"), result)
+        taskimage.record_base(taskimage.catalog_path(P.cfg), result["base"], it.item_id, result)
+        it.state.update({k: result[k] for k in taskimage.STATE_FIELDS if k in result}, image_kind="task")
+        it.p("taskimage-evicted.json").unlink(missing_ok=True)
+        it.advance("S6I", it.state.pop("image_resume_stage", "S6A_run"), image_tag=result["image_tag"])
 
 
 # (the relay-preflight evidence rule lives in calib.relay_preflight_refused, shared with S9 / S9R)

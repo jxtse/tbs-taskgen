@@ -411,17 +411,34 @@ def build_task(cfg: dict, item_dir: Path, state: dict, rnd: int, out: Path | Non
     pkg = item_dir / "pkg"
     (out / "environment").mkdir(parents=True)
     env_src = pkg / "environment"
-    for p in env_src.iterdir():
-        (shutil.copytree if p.is_dir() else shutil.copy2)(p, out / "environment" / p.name)
+    from . import taskimage
+    prov = taskimage.package_identity(item_dir)
+    if prov:
+        alias = taskimage.harbor_tag(item_dir, prov["image_digest"])
+        if not taskimage.check_tag(cfg, alias, prov["image_digest"]):
+            raise taskimage.ImageUnavailable(f"review needs {alias} on the Harbor host")
+        # All private inputs enter only this pipeline-owned recipe.
+        recipe = f"FROM {alias}\nCOPY review/pkg/environment/data /app/data\n"
+    else:
+        for p in env_src.iterdir():
+            (shutil.copytree if p.is_dir() else shutil.copy2)(p, out / "environment" / p.name)
+        recipe = (env_src / "Dockerfile").read_text()
     info = write_bundle(item_dir, out / "environment" / "review", state, int(r.get("trace_digest_kb") or 150))
     helper = out / "environment/tbs-repro"
     shutil.copyfile(Path(__file__).with_name("repro.py"), helper)
     helper.chmod(0o755)
     df = (out / "environment" / "Dockerfile")
-    df.write_text(df.read_text().rstrip() + "\n# S9R review bundle (tbsgen review.build_task)\nCOPY review /review\n"
+    if prov:
+        (out / "environment/empty").mkdir()
+        recipe += ("COPY tbs-repro /usr/local/bin/tbs-repro\nCOPY review /review\n"
+                   "COPY review/pkg/tests /tests\nCOPY review/pkg/solution /solution\n"
+                   "COPY empty /app/review_out/\nCOPY empty /logs/verifier/\n")
+    else:
+        recipe = (recipe.rstrip() + "\n# S9R review bundle (tbsgen review.build_task)\nCOPY review /review\n"
                   "COPY tbs-repro /usr/local/bin/tbs-repro\n"
                   "RUN mkdir -p /tests /solution /app/review_out /logs/verifier && cp -r /review/pkg/tests/. /tests/ && "
                   "cp -r /review/pkg/solution/. /solution/\n")
+    df.write_text(recipe)
     t = tomllib.loads((pkg / "task.toml").read_text())
     env = dict(t.get("environment") or {})
     env["network_mode"] = env.get("network_mode") or "public"
@@ -1164,10 +1181,10 @@ def rescore_run(cfg: dict, item_dir: Path, run: dict) -> dict:
     from .spec import is_resource_metric
     spec = runner.task_spec(item_dir / "task") or {}
     budget = runner.timing_budget(cfg, spec)
-    r = runner.sandbox.run(cfg, [(d, "/src/output", "ro"), (tests, "/src/tests", "ro"),
-                                 (logs, "/logs/verifier", "rw"),
-                                 (pkg / "environment" / "data", "/src/data", "ro")],
-                           runner.VERIFIER_PRE + f"cd /tests && bash /tests/test.sh; rc=$?; sleep {settle:g}; exit $rc",
+    r = runner.taskimage.run(cfg, item_dir, [(d, "/src/output", "ro"), (tests, "/src/tests", "ro"),
+                                           (logs, "/logs/verifier", "rw"),
+                                           (pkg / "environment" / "data", "/src/data", "ro")],
+                           runner.verifier_pre(item_dir) + f"cd /tests && bash /tests/test.sh; rc=$?; sleep {settle:g}; exit $rc",
                            int(cfg["gen"]["test_timeout"] + budget), f"tbsgen-rescore-{run['job_name']}", root=True)
     rf = logs / "reward.txt"
     reward = rf.read_text().strip() if rf.exists() and not rf.is_symlink() else None

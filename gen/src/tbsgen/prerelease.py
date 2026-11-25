@@ -303,13 +303,23 @@ _CODE_FILE = re.compile(r"\.(tar\.gz|tar\.bz2|tar\.xz|tgz|zip|whl|tar|gz|egg|py|
                         r"|so|pyd|pyc|pyo|dylib|dll|a|o|jar|mex\w*)$", re.I)
 
 
+def inventory_hits(inventory, signals):
+    return [dict(kind="dependency", name=p["name"], file=p["source"], matches=why)
+            for p in inventory if (why := _match(p["name"], signals["names"]))]
+
+
 def readymade_check(task: Path, candidate: dict, spec: dict | None, public_env: Path | None = None) -> dict:
     """Rule check: does the task image install, or does the reference / a baseline import, the paper's own
     implementation?  Any third-party import of the reference or baselines outside the pinned stack is reported
     too (the sandbox image has only that stack, so such an import is either unused or a dependency to review)."""
     sg = signals(candidate, spec)
     findings = []
-    for pkg in environment_packages(task):
+    from .state import read_json
+    state = read_json(task.parent / "state.json", {})
+    inventory = state.get("inventory")
+    if inventory is not None:
+        findings.extend(inventory_hits(inventory, sg))
+    for pkg in environment_packages(task) if inventory is None else ():
         if (why := _match(pkg["name"], sg["names"])):
             findings.append(dict(kind="dependency", name=pkg["name"], file=pkg["file"], matches=why))
     for rel in ["solution/solve.py", *sorted(str(p.relative_to(task)) for p in (task / "baselines").glob("*.py"))]:

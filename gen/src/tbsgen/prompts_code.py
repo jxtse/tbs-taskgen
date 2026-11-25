@@ -2,7 +2,8 @@
 
 from .prompts import ASSUMPTION_RULES, GRADING_RULES
 
-CODE_PROMPT_VERSION = "cg-v6-2026-11-25"
+LEGACY_CODE_PROMPT_VERSION = "cg-v6-2026-11-25"
+CODE_PROMPT_VERSION = "cg-v7-2026-11-25"
 
 S4C_RUNNABILITY = """# Runnability check of a paper's published code ({item})
 
@@ -50,7 +51,7 @@ Process hygiene: this agent itself runs as a process in the container.  Never ki
 kill only those PIDs.  A pattern kill once matched the agent and ended the job without its results.
 """
 
-S5G_AUTHOR = """# Build a benchmark task from a paper and its authors' code ({item})
+_S5G_TEMPLATE = """# Build a benchmark task from a paper and its authors' code ({item})
 
 You are an expert task author for a scientific-computing benchmark (Terminal-Bench Science style).  You write a task
 that a strong AI agent must solve in an offline container **without** access to the authors' code.  You have the
@@ -83,34 +84,24 @@ separates a correct expert solution from simpler approaches.
 /app/out/task/tests/measure.py
 /app/out/task/baselines/mid.py
 /app/out/task/baselines/naive.py
-/app/out/report.md                 what you built, the measured reference / mid / naive metric values per seed
+@LAYOUT@/app/out/report.md                 what you built, the measured reference / mid / naive metric values per seed
 ```
 
 ## Grounding in the authors' code (this is the point of this pipeline)
 - The **reference solution** should call or port the authors' implementation of the paper's method (port = copy the
   needed functions into `solution/solve.py`, self-contained; credit the source file in a comment).  It must run in
-  the task image: python 3.11 with exactly numpy 2.1.3, scipy 1.14.1, pandas 2.2.3, scikit-learn 1.5.2,
-  statsmodels 0.14.4 (offline; additional format readers require matching pins in the sandbox image) -- **never** the authors' repository or package (the solver
-  must not get it).  Test that in a fresh venv with only those pins.  If the authors' code is not Python or needs
-  other packages, use it at **build time only**: run it here to produce ground truth / reference outputs for fixed
-  inputs, store them under `generator/assets/` (small, < 20 MB, with `generator/assets/PROVENANCE.md`: exact
-  commands, commit), have `generate.py` read them, and write the reference as a faithful Python re-implementation
-  checked against those assets.
+@RUNTIME@
 - **Data**: prefer the real data shipped with the repository or the authors' own simulator / data generator; vary
   seeds / parameters for the hidden (PROG) inputs.  Synthetic data from your own generator is the fallback.
 - `generator/generate.py <seed>` must be deterministic in the seed and run with the same pinned stack (it runs in a
   network-less container with only that stack; it cannot call the authors' code).
 
-Prefer original scientific formats (FITS, HDF5/NetCDF, FASTA/FASTQ/BAM-like text, mzML, CIF/PDB,
-DICOM, VTK, raw instrument logs). Preserve missing values, mixed units/formats, outliers and instrument
-artefacts when the paper handles them. List data_formats and any extra_pip reader pins (name==version,
-at most eight, available as wheels or pure Python and already installed in the configured sandbox image).
+@FORMATS@
 
 ## No leaks of the authors' implementation
 - `instruction.md` must not name the repository, the package, the authors' function / class names, or their file
   names.  Describe the method scientifically (as the paper does), not by pointing at code.
-- Do not write `task/environment/` (the pipeline builds the task image itself and discards that directory).  The
-  solver's environment never gets `/work/repo` or the authors' package.
+@ENVIRONMENT@
 
 ## Iterate until it works (you can run everything here)
 Run, from `/app/out/task`: `python generator/generate.py 0` and `1`, the reference and both baselines on the
@@ -128,7 +119,45 @@ kill only those PIDs.  A pattern kill once matched the agent and ended the job w
 """
 
 
-S5G_AUTHOR += "\n" + ASSUMPTION_RULES + "\n" + GRADING_RULES
+_S5G_TEMPLATE += "\n" + ASSUMPTION_RULES + "\n" + GRADING_RULES
+
+LEGACY_AUTHOR = _S5G_TEMPLATE.replace("@LAYOUT@", "").replace("@FORMATS@", """Prefer original scientific formats (FITS, HDF5/NetCDF, FASTA/FASTQ/BAM-like text, mzML, CIF/PDB,
+DICOM, VTK, raw instrument logs). Preserve missing values, mixed units/formats, outliers and instrument
+artefacts when the paper handles them. List data_formats and any extra_pip reader pins (name==version,
+at most eight, available as wheels or pure Python and already installed in the configured sandbox image).""").replace("@RUNTIME@", """  the task image: python 3.11 with exactly numpy 2.1.3, scipy 1.14.1, pandas 2.2.3, scikit-learn 1.5.2,
+  statsmodels 0.14.4 (offline; additional format readers require matching pins in the sandbox image) -- **never** the authors' repository or package (the solver
+  must not get it).  Test that in a fresh venv with only those pins.  If the authors' code is not Python or needs
+  other packages, use it at **build time only**: run it here to produce ground truth / reference outputs for fixed
+  inputs, store them under `generator/assets/` (small, < 20 MB, with `generator/assets/PROVENANCE.md`: exact
+  commands, commit), have `generate.py` read them, and write the reference as a faithful Python re-implementation
+  checked against those assets.""").replace(
+    "@ENVIRONMENT@", """- Do not write `task/environment/` (the pipeline builds the task image itself and discards that directory).  The
+  solver's environment never gets `/work/repo` or the authors' package.""")
+
+S5G_AUTHOR = _S5G_TEMPLATE.replace(
+    "@LAYOUT@", "/app/out/task/environment/Dockerfile and its dependency manifests\n").replace(
+    "@FORMATS@", """Use the field's standard tools and native formats when applicable, unless a single tool call would
+trivially solve the task. Examples include BAM/CRAM with samtools or pysam, FITS with astropy, NetCDF with xarray,
+mzML, PDB/mmCIF, DICOM/NIfTI and GeoTIFF with rasterio. Package hosts are allowlisted in this authoring container:
+install the tools here to test. Preserve realistic units, missing values, outliers and instrument artefacts.
+List the file extensions present in the generated public data in spec.data_formats (for example, ["bam", "bai"]).""").replace("@RUNTIME@", """  the task image with the packages declared in the spec.
+  Port the method into the reference. Never install the paper's package, repository or an end-to-end solver.""").replace(
+    "@ENVIRONMENT@", """- Deliver task/environment/Dockerfile. Prefer a maintained domain base from Docker Hub, quay.io or ghcr.io
+  (condaforge/miniforge3, rocker/r-ver, Bioconductor), or python:3.11-slim plus field packages.
+  For every FROM write a specific tag, never latest; the pipeline pins the linux/amd64 manifest digest on the build host.
+  An already verified digest is also accepted. Target linux/amd64. Keep the image under the configured size cap.
+  Install only exact pip name==version, conda name=version or apt pkg=version pins. You can COPY pinned requirements
+  or a conda @EXPLICIT lock with hashed URLs (each manifest <=1 MB, total context <=5 MB). Verify downloads with
+  an explicit output filename per URL and a literal SHA-256 check per file in the same RUN. No entrypoint, CMD, EXPOSE or VOLUME. Finish as root. Include python >=3.10,
+  pytest, bash and nobody. The verifier's Python and its import and executable paths must be read-only for nobody.
+  S6I sets /app as WORKDIR. PKG adds generated data. Do not copy data, tests, solution,
+  generator or other source files. Remove all generated data from the delivered environment/ after testing.
+- The generator, solver and verifier must run offline. Prefer the paper's real data, native formats and realistic
+  sizes within the configured public-data cap. There is no Docker-in-Docker. Test the reference in a clean
+  venv/conda environment with the same pins. The pipeline builds the real image later. Record your exact commands
+  in report.md, identify all installed packages relevant to the method and explain why none solves it end to end.
+- Add image to spec.json with base (exact reference in the final FROM), packages (Python import names to smoke-test
+  offline, e.g. sklearn rather than scikit-learn) and notes (other tools and why you chose this environment).""")
 
 # appended to S5G_AUTHOR when difficulty.profile_path is set (difficulty.py)
 S5G_DIFFICULTY = """
