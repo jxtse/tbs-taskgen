@@ -645,28 +645,34 @@ def preflight_wait(cfg: dict, rec: dict | None) -> str | None:
     return f"relay_down: preflight refused, retry after {time.strftime('%H:%M', time.localtime(time.time() + left))}"
 
 
-def complete_remote_trials(jd: Path, *, review=False, contract=None) -> bool:
-    """A synced Harbor job has a final summary and a result for every configured trial."""
-    summary = _load(jd / "result.json")
+DELIVERY_METRICS = "verifier/metrics.jsonl"
+
+
+def remote_trial_set(jd: Path, *, review=False, contract=None) -> tuple[list[Path], bool]:
+    """Return the complete trials in ingest order and whether the whole configured set is present."""
+    from .review import CURRENT_CONTRACT, JOURNAL_CONTRACTS, REPRO_JOURNAL, VERIFIED_VERDICT
+
+    required = [VERIFIED_VERDICT] if review else [DELIVERY_METRICS]
+    if review and (contract or CURRENT_CONTRACT) in JOURNAL_CONTRACTS:
+        required.append(REPRO_JOURNAL)
+    trials = sorted(p for p in jd.glob("*") if p.is_dir())
+    complete = [p for p in trials if isinstance(_load(p / "result.json"), dict)
+                and all((p / name).is_file() for name in required)]
     config = _load(jd / "config.json")
-    if not isinstance(summary, dict) or not summary.get("finished_at") or not isinstance(config, dict):
-        return False
+    if not isinstance(config, dict):
+        return complete, False
     tasks, agents = config.get("tasks"), config.get("agents")
     attempts = config.get("n_attempts", 1)
     if (not isinstance(tasks, list) or not tasks or not isinstance(agents, list) or not agents
             or type(attempts) is not int or attempts < 1):
-        return False
+        return complete, False
     expected = len(tasks) * len(agents) * attempts
-    trials = [p for p in jd.iterdir() if p.is_dir()]
-    from .review import CURRENT_CONTRACT, JOURNAL_CONTRACTS, REPRO_JOURNAL, VERIFIED_VERDICT
-    required = []
-    if review:
-        required.append(VERIFIED_VERDICT)
-        if (contract or CURRENT_CONTRACT) in JOURNAL_CONTRACTS:
-            required.append(REPRO_JOURNAL)
-    return len(trials) >= expected and all(
-        isinstance(_load(p / "result.json"), dict) and all((p / name).is_file() for name in required)
-        for p in trials)
+    return complete, len(complete) >= expected and len(complete) == len(trials)
+
+
+def complete_remote_trials(jd: Path, *, review=False, contract=None) -> bool:
+    _, complete = remote_trial_set(jd, review=review, contract=contract)
+    return complete
 
 
 def reconcile_remote(cfg, rec, ledger, save):
@@ -679,12 +685,18 @@ def reconcile_remote(cfg, rec, ledger, save):
     else:
         from .review import job_contract
         rec.setdefault("tmux", rec["job_name"][-60:])
-        exited = rec.get("log") and Path(rec["log"] + ".exit").exists()
-        observing = not exited and session_alive(cfg["calib"], rec) is True
-        if complete_remote_trials(jd, review=rec.get("ledger_stage") == "S9R", contract=job_contract(rec)):
+        exit_file = Path(rec["log"] + ".exit") if rec.get("log") else None
+        alive = False
+        if not (exit_file and exit_file.exists()):
+            alive = session_alive(cfg["calib"], rec)
+            if exit_file and exit_file.exists():  # final sync may have ended during the session probe
+                alive = False
+        summary = _load(jd / "result.json")
+        ended = alive is False or isinstance(summary, dict) and summary.get("finished_at")
+        if ended and complete_remote_trials(jd, review=rec.get("ledger_stage") == "S9R", contract=job_contract(rec)):
             action = "awaiting_ingest"
         else:
-            action = "waiting" if observing else "remote_unknown"
+            action = "waiting" if alive is True else "remote_unknown"
     remembered = remembered or remember_remote_marker(rec)
     new_state = "remote_unknown" if action == "remote_unknown" else "launched"
     if state != new_state or not rec.get("ledger_call"):
@@ -823,15 +835,18 @@ def trial_cost(trial: Path, model: str | None, prices: dict, r: dict | None = No
                 **({"price_missing": model} if usage else {}))
 
 
-def delivered(trial: Path) -> bool | None:
+def delivered(trial: Path, *, required=False) -> bool | None:
     """Did the agent leave its deliverable?  From the verifier's metrics.jsonl (tbsgen's _metrics.run_solution
     records `_solution_cli_run`): the entry file missing ("can't open file" / "No such file") = False; any other
     run = True; no record = None (unknown)."""
-    f = trial / "verifier" / "metrics.jsonl"
-    if not f.exists():
+    try:
+        lines = (trial / DELIVERY_METRICS).read_text(errors="replace").splitlines()
+    except FileNotFoundError:
+        if required:
+            raise
         return None
     seen = None
-    for line in f.read_text(errors="replace").splitlines():
+    for line in lines:
         try:
             o = json.loads(line)
         except json.JSONDecodeError:
@@ -881,7 +896,7 @@ def _api_status(trial: Path) -> tuple[int | None, str | None]:
     return None, None
 
 
-def classify_trial(trial: Path, model: str | None = None, prices: dict | None = None) -> dict:
+def classify_trial(trial: Path, model: str | None = None, prices: dict | None = None, *, require_metrics=False) -> dict:
     r = json.loads((trial / "result.json").read_text())
     ei = r.get("exception_info") or {}
     exc = ei.get("exception_type")
@@ -905,15 +920,18 @@ def classify_trial(trial: Path, model: str | None = None, prices: dict | None = 
     else:
         outcome = "fail"
     quota = bool(msg and re.search(r"额度|quota|429", msg))
-    deliv = delivered(trial)
+    deliv = delivered(trial, required=require_metrics)
     c = trial_cost(trial, model, prices or {}, r)
     return dict(trial=trial.name, outcome=outcome, result_type=result_type(outcome, exc, deliv), delivered=deliv,
                 reward=reward, exception=exc, api_status=status, api_msg=msg, quota=quota, minutes=minutes,
                 cost_usd=c["cost_usd"], cost_kind=c["cost_kind"], cost_source=c["cost_source"], usage=c["usage"])
 
 
-def collect(job_dir: Path, model: str | None = None, prices: dict | None = None) -> list[dict]:
-    return [classify_trial(t, model, prices) for t in sorted(Path(job_dir).iterdir()) if (t / "result.json").exists()]
+def collect(job_dir: Path, model: str | None = None, prices: dict | None = None, *,
+            trial_dirs=None, require_metrics=False) -> list[dict]:
+    if trial_dirs is None:
+        trial_dirs = sorted(p.parent for p in Path(job_dir).glob("*/result.json"))
+    return [classify_trial(t, model, prices, require_metrics=require_metrics) for t in trial_dirs]
 
 
 def job_cost(trials: list[dict]) -> tuple[float | None, str, dict | None]:

@@ -107,11 +107,11 @@ def main(argv=None):
             s.add_argument("--interval", type=float, default=None, help="watch: seconds (calib.watch_interval_s)")
             s.add_argument("--max-hours", type=float, default=None, help="watch: stop after this long")
             s.add_argument("--item", default=None, help="prepare / resolve-remote: item id")
-            s.add_argument("--job", help="resolve-remote: parked job name")
+            s.add_argument("--job", help="resolve-remote: remote job name")
             resolution = s.add_mutually_exclusive_group()
             resolution.add_argument("--synced", action="store_true")
             resolution.add_argument("--ended-without-result", "--died", action="store_true",
-                                    help="confirm the directory is fully synced and the remote job ended without a result")
+                                    help="confirm the remote job ended and is fully synced; ingest any complete trials")
             s.add_argument("--remote-task", metavar="PATH", help="remote task path when the launcher marker was lost")
             resolution.add_argument("--not-started", action="store_true")
             s.add_argument("--force-local-gone", action="store_true",

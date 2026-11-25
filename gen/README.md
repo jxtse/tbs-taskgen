@@ -311,11 +311,11 @@ uv run tbsgen ping --run state/ping --calls 1 --budget-usd 1        # Opus 连�
 
 **人工处理远端校准或审核作业**。条目以 `remote_unknown: NAME` 暂存时，原预算预留和并发槽位继续占用。`tbsgen status` 和 `tbsgen report` 会显示待处理的作业数。
 
-- 已将完整作业同步到记录的本地目录时，运行 `tbsgen calib resolve-remote --run runs/R --config config.toml --item ID --job NAME --synced`。命令核对作业身份、结束标记、配置要求的试次数和各试次的 `result.json`。审核作业还要求每个试次都有正式裁决及该审核版本读取的复现日志。
-- 确认远端作业已结束、目录已完整同步且缺少完整结果时，使用 `--ended-without-result`（别名 `--died`）。即使已有 `finished_at` 也可使用。命令合计可读试次费用，没有可读费用时按预留额结算，然后释放槽位并按 infra 策略重试。
+- 已将完整作业同步到记录的本地目录时，运行 `tbsgen calib resolve-remote --run runs/R --config config.toml --item ID --job NAME --synced`。命令核对作业身份、配置要求的试次数和各试次的 `result.json`。S9 每个试次还需 `verifier/metrics.jsonl`，S9R 则需要正式裁决及该审核版本读取的复现日志。即使 Harbor 未写入作业级 `finished_at`，完整试次仍可接收。
+- 确认远端作业已结束且目录已完整同步时，使用 `--ended-without-result`（别名 `--died`）接收其中已完成的试次。若没有完整试次，命令合计可读试次费用，没有可读费用时按预留额结算，然后按 infra 策略重试。
 - 确认远端从未启动该作业且本地 launcher 已退出时，使用 `--not-started` 按零费用结算。tmux 无法确定会话状态时，独立核实 launcher 已退出后可加 `--force-local-gone`。本地已有作业配置、顶层或试次结果时，命令会拒绝零费用结算。
 
-替换目录导致本机 `tbsgen-remote.json` 丢失时，命令会从运行记录恢复它。若从未取得映射，使用 `--remote-task PATH` 提供远端任务路径。对尚有校准或审核作业未结算的条目，`regate` 会报告待处理作业。
+替换目录导致本机 `tbsgen-remote.json` 丢失时，命令会从运行记录恢复它。若从未取得映射，使用 `--synced --remote-task PATH` 提供原远端任务路径。watcher 报作业身份不匹配且条目仍在等待时，也可用此命令。对尚有校准或审核作业未结算的条目，`regate` 会报告待处理作业。
 
 `config.toml` 示例（只需写要覆盖的项）：
 

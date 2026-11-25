@@ -203,17 +203,19 @@ classifies all configured scripts as local. A launcher's remote marker also iden
 
 Use `tbsgen calib resolve-remote --run RUN --config CFG --item ID --job NAME` with one of these outcomes.
 
-- `--synced` ingests a finished job after its full directory has been copied back. Every trial needs a result.
-  Each S9R trial also needs its formal verifier verdict and the reproduction journal if its review contract reads one.
-- `--ended-without-result` (alias `--died`) confirms that the directory is fully synced and the remote job
-  ended without a complete result, even if it recorded `finished_at`. The controller charges the readable trial
-  costs, or the reservation when none is available, then applies the infra retry policy.
+- `--synced` ingests every expected trial once its files are present, even if Harbor never wrote the job's
+  `finished_at`. Each trial needs its `result.json`. S9 also requires `verifier/metrics.jsonl`. S9R requires
+  the formal verifier verdict and the reproduction journal if the review contract reads one.
+- `--ended-without-result` (alias `--died`) confirms that the remote job has ended and its directory is fully
+  synced. The controller ingests the complete trials. If none is complete, it applies the infra retry policy
+  and charges the readable trial costs, or the reservation when none is available.
 - `--not-started` settles at zero after the operator verifies that the remote job never started and the local
   launcher is gone. If tmux cannot determine the session state, independently confirm it is gone and add
   `--force-local-gone`. A job config, top-level result, or trial result blocks this outcome.
 
 Directory replacement can remove the local `tbsgen-remote.json`. Ingest uses the saved mapping and resolution restores the marker.
-If the controller never captured the mapping, supply the original remote task path with `--remote-task PATH`.
+If the controller never captured the mapping, `--synced --remote-task PATH` restores it using the original remote
+task path. This also works when the item is still waiting after the watcher reported a job identity mismatch.
 `regate` requires all calibration and review runs for the item to be closed.
 
 ### Running unattended

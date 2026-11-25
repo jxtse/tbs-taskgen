@@ -877,13 +877,14 @@ def read_verdict(trial: Path, *, require_verified=False) -> dict | None:
 
 
 def classify(job_dir: Path, model: str | None, prices: dict, allow_human: bool = False, suspected_scopes=(),
-              contract=CURRENT_CONTRACT, allowed_verdicts=None, *, require_verified=False) -> dict:
+              contract=CURRENT_CONTRACT, allowed_verdicts=None, *, require_verified=False, trial_dirs=None) -> dict:
     """A finished review job: outcome "done" (a verdict file came back; verdict may still be None = invalid,
     retried by routing) or "infra"; cost as for calibration."""
-    trials = calib.collect(job_dir, model, prices)
+    trials = calib.collect(job_dir, model, prices, trial_dirs=trial_dirs)
     usd, kind, usage = calib.job_cost(trials)
     raw, trial = None, None
-    for t in sorted(p for p in Path(job_dir).iterdir() if (p / "result.json").exists()):
+    for result in trials:
+        t = Path(job_dir) / result["trial"]
         v = read_verdict(t, require_verified=require_verified)
         if v is not None:
             raw, trial = v, t

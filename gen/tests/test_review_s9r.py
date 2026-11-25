@@ -2407,8 +2407,6 @@ def test_remote_review_result_waits_for_verdict_and_restores_alias(tmp_path, obs
     with pytest.raises(SystemExit, match="incomplete remote trial set"):
         main(cmd + ["--synced"])
     write_json(jd / "trial__a/verifier/verdict.json", V("drop", [BLOCK]))
-    with pytest.raises(SystemExit, match="complete result"):
-        main(cmd + ["--ended-without-result"])
     args = [] if cached else ["--remote-task", remote]
     if not cached:
         with pytest.raises(SystemExit, match="identity mismatch"):
@@ -2422,24 +2420,149 @@ def test_remote_review_result_waits_for_verdict_and_restores_alias(tmp_path, obs
     assert it.load().state["status"] == "dropped" and it.state["reason"].startswith("review:drop")
 
 
-def test_final_sync_at_launcher_exit_ingests_drop(tmp_path, monkeypatch):
+@pytest.mark.parametrize("during_probe", [False, True])
+def test_final_sync_at_launcher_exit_ingests_drop(tmp_path, monkeypatch, during_probe):
     P, it, directory, rec, jd, _ = _remote_launch(tmp_path, "S9R")
     write_json(jd / "config.json", read_json(Path(rec["config"])))
     _finish(jd.parent, jd.name, reward=1, cost=7)
     watch_tick(P, max_steps=0)
     assert _runs(P, it.item_id, directory)[0]["state"] == "launched"
     exit_file = Path(rec["log"] + ".exit")
-    exists = Path.exists
-    def final_sync(path):
-        if path == exit_file and not exists(path):
-            write_json(jd / "trial__a/verifier/verdict.json", V("drop", [BLOCK]))
-            exit_file.write_text("0")
-        return exists(path)
-    monkeypatch.setattr(Path, "exists", final_sync)
+    def finish_sync():
+        write_json(jd / "trial__a/verifier/verdict.json", V("drop", [BLOCK]))
+        exit_file.write_text("0")
+
+    if during_probe:
+        (jd / "result.json").unlink()
+        def probe(c, rec):
+            finish_sync()
+            return None
+        monkeypatch.setattr("tbsgen.calib.session_alive", probe)
+    else:
+        exists = Path.exists
+        def final_sync(path):
+            if path == exit_file and not exists(path):
+                finish_sync()
+            return exists(path)
+        monkeypatch.setattr(Path, "exists", final_sync)
     watch_tick(P, only=[it.item_id])
     settled, = _runs(P, it.item_id, directory)
     assert settled["verdict"] == "drop" and settled["cost_usd"] == 7
     assert it.load().state["status"] == "dropped"
+
+
+@pytest.mark.parametrize("resolution", ["watch", "--synced", "--ended-without-result"])
+@pytest.mark.parametrize("stage", ["S9", "S9R"])
+def test_complete_trials_without_finished_at(tmp_path, stage, resolution):
+    from tbsgen.cli import main
+
+    P, it, directory, rec, jd, cmd = _remote_launch(tmp_path, stage)
+    exit_file = Path(rec["log"] + ".exit")
+    if resolution != "watch":
+        exit_file.write_text("143")
+        watch_tick(P, max_steps=0)
+        assert _runs(P, it.item_id, directory)[0]["state"] == "remote_unknown"
+    write_json(jd / "config.json", read_json(Path(rec["config"])))
+    _finish(jd.parent, jd.name, verdict=V("drop", [BLOCK]) if stage == "S9R" else None, cost=7)
+    write_json(jd / "result.json", {"finished_at": None})
+    if resolution == "watch":
+        watch_tick(P, max_steps=0)
+        assert _runs(P, it.item_id, directory)[0]["outcome"] is None
+        exit_file.write_text("143")
+        watch_tick(P, max_steps=0)
+    else:
+        assert main(cmd + [resolution]) == 0
+    settled, = _runs(P, it.item_id, directory)
+    assert settled["ledger_call"] == rec["ledger_call"] and settled["cost_usd"] == P.item_cost(it.item_id)["usd"] == 7
+    if stage == "S9R":
+        assert settled["verdict"] == "drop"
+        if resolution == "watch":
+            P.run(only=[it.item_id], max_steps=1)
+        assert it.load().state["status"] == "dropped"
+    else:
+        assert settled["outcome"] == "fail"
+
+
+@pytest.mark.parametrize("stage", ["S9", "S9R"])
+def test_ended_without_result_ingests_complete_subset(tmp_path, stage):
+    from tbsgen.cli import main
+
+    P, it, directory, rec, jd, cmd = _remote_launch(tmp_path, stage)
+    write_json(jd / "config.json", dict(read_json(Path(rec["config"])), n_attempts=3))
+    _finish(jd.parent, jd.name, name="complete", reward=1, cost=7, verdict=V("drop", [BLOCK]))
+    # The incomplete result sorts first for S9 and last for S9R, where it could mask the completed trial.
+    name = "a-partial" if stage == "S9" else "z-partial"
+    _finish(jd.parent, jd.name, name=name, reward=0, verdict=V("pass"))
+    (jd / name / ("verifier/metrics.jsonl" if stage == "S9" else review.REPRO_JOURNAL)).unlink()
+    (jd / "result.json").unlink()
+    Path(rec["log"] + ".exit").write_text("143")
+    watch_tick(P, max_steps=0)
+    with pytest.raises(SystemExit, match="incomplete remote trial set"):
+        main(cmd + ["--synced"])
+    assert main(cmd + ["--ended-without-result"]) == 0
+    settled, = _runs(P, it.item_id, directory)
+    assert settled["n_trials"] == 1 and settled["trial"]["trial"] == "complete" and settled["cost_usd"] == 7
+    if stage == "S9R":
+        assert settled["verdict"] == "drop" and it.load().state["status"] == "dropped"
+    else:
+        assert settled["outcome"] == "pass"
+
+
+@pytest.mark.parametrize("during_classification", [False, True])
+def test_remote_s9_waits_for_delivery_metrics(tmp_path, monkeypatch, during_classification):
+    from tbsgen import calib
+    from tbsgen.cli import main
+
+    P, it, directory, rec, jd, cmd = _remote_launch(tmp_path, "S9")
+    write_json(jd / "config.json", read_json(Path(rec["config"])))
+    _finish(jd.parent, jd.name, reward=0, cost=7)
+    metrics = jd / "trial__a/verifier/metrics.jsonl"
+    Path(rec["log"] + ".exit").write_text("0")
+    with monkeypatch.context() as m:
+        if during_classification:
+            delivered = calib.delivered
+            def lose_metrics(*args, **kwargs):
+                metrics.unlink()
+                return delivered(*args, **kwargs)
+            m.setattr(calib, "delivered", lose_metrics)
+        else:
+            metrics.unlink()
+        watch_tick(P, max_steps=0)
+    held, = _runs(P, it.item_id, directory)
+    assert held["state"] == "remote_unknown" and held["outcome"] is None
+    with pytest.raises(SystemExit, match="incomplete remote trial set"):
+        main(cmd + ["--synced"])
+    metrics.write_text(json.dumps(dict(name="_solution_cli_run", entry_exists=False)) + "\n")
+    assert main(cmd + ["--synced"]) == 0
+    settled, = _runs(P, it.item_id, directory)
+    assert settled["result_type"] == "fail_no_output" and settled["cost_usd"] == 7
+
+
+@pytest.mark.parametrize("stage", ["S9", "S9R"])
+def test_synced_remote_task_recovers_waiting_identity(tmp_path, stage):
+    from tbsgen.cli import main
+
+    P, it, directory, rec, jd, cmd = _remote_launch(tmp_path, stage)
+    remote = str(tmp_path / "worker/task")
+    conf = read_json(Path(rec["config"]))
+    conf["tasks"][0]["path"] = remote
+    write_json(jd / "config.json", conf)
+    _finish(jd.parent, jd.name, verdict=V("drop", [BLOCK]) if stage == "S9R" else None, cost=7)
+    action, = watch_tick(P, max_steps=0)["actions"]
+    assert "identity mismatch" in action["error"]
+    waiting, = _runs(P, it.item_id, directory)
+    assert waiting["state"] == "launched" and it.load().state["status"] == "waiting"
+    with pytest.raises(SystemExit, match="no remote_unknown"):
+        main(cmd + ["--synced"])
+    with pytest.raises(SystemExit, match="identity mismatch"):
+        main(cmd + ["--synced", "--remote-task", remote + "-wrong"])
+    assert not (jd / "tbsgen-remote.json").exists() and _runs(P, it.item_id, directory) == [waiting]
+    assert main(cmd + ["--synced", "--remote-task", remote]) == 0
+    settled, = _runs(P, it.item_id, directory)
+    assert settled["remote_marker"] == read_json(jd / "tbsgen-remote.json") == dict(local_task=rec["task"], remote_task=remote)
+    assert settled["cost_usd"] == 7 and settled["ledger_call"] == rec["ledger_call"]
+    if stage == "S9R":
+        assert settled["verdict"] == "drop"
 
 
 @pytest.mark.parametrize("stage", ["S9", "S9R"])

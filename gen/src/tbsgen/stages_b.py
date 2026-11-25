@@ -901,17 +901,21 @@ def ingest(P, it, job_dir: str | None = None) -> dict:
                 _after_ingest(P, it, runs[-1], stage)
                 return dict(recovered=True, job_name=runs[-1]["job_name"])
             raise ValueError(f"no pending {'review' if stage == 'S9R' else 'calibration'} run for this item")
+        jd = Path(job_dir or rec["job_dir"])
         if calib.remote_job(rec, P.ledger):
             if _remote_parked(it):
                 raise ValueError("remote_unknown requires calib resolve-remote")
             save = _save_review if stage == "S9R" else _save_run
-            if _reconcile_remote(P, it, rec, save) == "remote_unknown":
+            action = _reconcile_remote(P, it, rec, save)
+            if action == "remote_unknown":
                 raise ValueError("remote_unknown requires calib resolve-remote")
-        return _ingest_run(P, it, rec, stage, Path(job_dir or rec["job_dir"]))
+            if action == "waiting" and not (read_json(jd / "result.json", {}) or {}).get("finished_at"):
+                raise ValueError(f"job not finished yet: {jd}")
+        return _ingest_run(P, it, rec, stage, jd)
 
 
 def resolve_remote(P, it, job, *, synced, ended_without_result=False, remote_task=None, force_local_gone=False):
-    """Resolve one named parked run under the same lock as the watcher."""
+    """Resolve a parked run or restore a waiting remote run's missing identity mapping."""
     if not it.p("state.json").is_file():
         raise ValueError(f"unknown item: {it.item_id}")
     with item_lock(it):
@@ -926,19 +930,25 @@ def resolve_remote(P, it, job, *, synced, ended_without_result=False, remote_tas
             # Resolution committed to runs.json before the item transition.
             _after_ingest(P, it, rec, stage)
             return dict(job_name=job, recovered=True)
-        if not rec or rec.get("state") != "remote_unknown" or rec.get("outcome") is not None:
+        if not rec or rec.get("outcome") is not None:
             raise ValueError(f"no remote_unknown run named {job} for this item")
         jd = Path(rec["job_dir"])
+        if rec.get("state") != "remote_unknown":
+            if not (synced and remote_task and rec.get("state") == "launched" and it.state["status"] == "waiting"
+                    and rec.get("remote_route") and not rec.get("remote_marker") and not calib.has_remote_marker(rec)):
+                raise ValueError(f"no remote_unknown run named {job} for this item")
+            tasks = (read_json(jd / "config.json", {}) or {}).get("tasks") or [{}]
+            if remote_task != tasks[0].get("path") or remote_task == rec.get("task"):
+                raise ValueError("job identity mismatch: --remote-task must match the job's remote task path")
         save = _save_review if stage == "S9R" else _save_run
         if synced or ended_without_result:
-            if synced and not (read_json(jd / "result.json", {}) or {}).get("finished_at"):
-                raise ValueError("missing finished_at: use --ended-without-result (--died) if fully synced and ended")
-            if ended_without_result and calib.complete_remote_trials(
-                    jd, review=stage == "S9R", contract=review.job_contract(rec)):
-                raise ValueError("job has a complete result: use --synced")
-            calib.restore_remote_marker(jd, rec, remote_task, review=stage == "S9R", partial=ended_without_result)
-            if synced:
-                return _ingest_run(P, it, rec, stage, jd)
+            trials, complete = calib.remote_trial_set(jd, review=stage == "S9R", contract=review.job_contract(rec))
+            if synced and not complete:
+                raise ValueError(f"incomplete remote trial set: {jd}; use --ended-without-result (--died) "
+                                 "if fully synced and ended")
+            calib.restore_remote_marker(jd, rec, remote_task, review=stage == "S9R", partial=not trials)
+            if trials:
+                return _ingest_run(P, it, rec, stage, jd, trial_dirs=trials)
             calib.check_job_identity(jd, rec, review=stage == "S9R", partial=True)
             _settle_dead_job(P, it, rec, save, confirmed=True)
         else:
@@ -973,28 +983,35 @@ def _after_ingest(P, it, rec, stage):
     it.save()
 
 
-def _ingest_run(P, it, rec, stage, jd):
-    if calib.remote_job(rec, P.ledger) and not calib.complete_remote_trials(
-            jd, review=stage == "S9R", contract=review.job_contract(rec)):
-        raise ValueError(f"incomplete remote trial set: {jd}")
-    jr = read_json(jd / "result.json", {})
-    if not jr.get("finished_at"):
+def _ingest_run(P, it, rec, stage, jd, *, trial_dirs=None):
+    remote = calib.remote_job(rec, P.ledger)
+    if remote and trial_dirs is None:
+        trial_dirs, complete = calib.remote_trial_set(jd, review=stage == "S9R", contract=review.job_contract(rec))
+        if not complete:
+            raise ValueError(f"incomplete remote trial set: {jd}")
+    if not remote and not (read_json(jd / "result.json", {}) or {}).get("finished_at"):
         raise ValueError(f"job not finished yet: {jd}")
     calib.check_job_identity(jd, rec, review=stage == "S9R")
     if stage == "S9R":
-        return _ingest_review(P, it, rec, jd)
+        return _ingest_review(P, it, rec, jd, trial_dirs=trial_dirs)
     runs = read_json(it.p("calib", "runs.json"), [])
     used = {r.get("trial", {}).get("job_dir") for r in runs if r.get("outcome") is not None}
     if str(jd.resolve()) in used:
         raise ValueError(f"job dir already consumed: {jd}")
-    trials = calib.collect(jd, rec.get("model"), P.cfg["models"].get("prices", {}))
+    try:
+        trials = calib.collect(jd, rec.get("model"), P.cfg["models"].get("prices", {}),
+                               trial_dirs=trial_dirs, require_metrics=remote)
+    except FileNotFoundError as e:
+        if not remote:
+            raise
+        _park_missing_trial(P, it, rec, _save_run, e)
     if not trials:
         raise ValueError("no trial results in job dir")
     t = dict(trials[0], job_dir=str(jd.resolve()))
     usd, kind, usage = calib.job_cost(trials)
     rec.update(outcome=t["outcome"], result_type=t["result_type"], minutes=t["minutes"], trial=t,
                cost_usd=usd, cost_kind=kind, n_trials=len(trials))
-    if calib.remote_job(rec, P.ledger):
+    if remote:
         calib.bind_started_call(P.cfg, rec, P.ledger)
         rec["state"] = "launched"
     if rec.get("ledger_call"):
@@ -1219,7 +1236,8 @@ def watch_tick(P, only: list[str] | None = None, max_steps: int = 50) -> dict:
                 continue
             if it.state.get("status") != "waiting":
                 continue
-            if calib.remote_job(cur, P.ledger):
+            remote = calib.remote_job(cur, P.ledger)
+            if remote:
                 save = _save_run if stage == "S9" else _save_review
                 action = _reconcile_remote(P, it, cur, save)
                 if action == "remote_unknown":
@@ -1227,7 +1245,7 @@ def watch_tick(P, only: list[str] | None = None, max_steps: int = 50) -> dict:
                 if action != "awaiting_ingest":
                     continue
             jd = Path(cur["job_dir"])
-            if (read_json(jd / "result.json", {}) or {}).get("finished_at"):
+            if remote or (read_json(jd / "result.json", {}) or {}).get("finished_at"):
                 try:
                     t = _ingest_run(P, it, cur, stage, jd)
                     did.append(dict(item=it.item_id, action="ingest", job=cur["job_name"], outcome=t.get("outcome"),
@@ -1449,22 +1467,28 @@ def _s9r(P, it):
     return it.goto("S9R", f"review launch failed: {rec.get('error', '')[:120]}")
 
 
-def _ingest_review(P, it, rec, jd):
+def _park_missing_trial(P, it, rec, save, error):
+    # The synced directory can be replaced after the completeness check, during classification.
+    cfg = review.review_cfg(P.cfg) if save is _save_review else P.cfg
+    calib.bind_started_call(cfg, rec, P.ledger)
+    rec.update(state="remote_unknown", submitted=True)
+    save(it, rec)
+    it.finish("parked", f"remote_unknown: {rec['job_name']}")
+    raise ValueError(f"incomplete remote trial set: missing {error.filename}") from error
+
+
+def _ingest_review(P, it, rec, jd, *, trial_dirs=None):
     assigned = rec.get("suspected_scopes", [])
     remote = calib.remote_job(rec, P.ledger)
     try:
         res = review.classify(jd, rec.get("model"), P.cfg["models"].get("prices", {}),
                               allowed_verdicts=rec.get("allowed_verdicts"), allow_human=True,
-                              suspected_scopes=assigned, contract=review.job_contract(rec), require_verified=remote)
+                              suspected_scopes=assigned, contract=review.job_contract(rec), require_verified=remote,
+                              trial_dirs=trial_dirs)
     except FileNotFoundError as e:
         if not remote:
             raise
-        # The synced directory can be replaced after the completeness check, during validation.
-        calib.bind_started_call(review.review_cfg(P.cfg), rec, P.ledger)
-        rec.update(state="remote_unknown", submitted=True)
-        _save_review(it, rec)
-        it.finish("parked", f"remote_unknown: {rec['job_name']}")
-        raise ValueError(f"incomplete remote trial set: missing {e.filename}") from e
+        _park_missing_trial(P, it, rec, _save_review, e)
     rec.update(outcome="invalid" if (res["outcome"] == "done" and (res["verdict"] or {}).get("verdict") is None)
                else res["outcome"],
                minutes=res["minutes"], cost_usd=res["cost_usd"], cost_kind=res["cost_kind"],
