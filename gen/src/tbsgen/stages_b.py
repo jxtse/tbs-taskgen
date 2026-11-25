@@ -1080,7 +1080,7 @@ def _resolve_remote_agent(P, it, stage, job, synced, ended_without_result, remot
     with stages_a._agent_slot_lock(P):
         if rec.get("state") == "remote_unknown":
             if synced or ended_without_result:
-                complete = codeagent.complete_remote_agent(P.cfg, rec)
+                complete = codeagent.complete_remote_agent(P.cfg, rec, final=True)
                 if synced and not complete:
                     raise ValueError(f"incomplete remote trial set: {jd}")
                 if ended_without_result and complete:

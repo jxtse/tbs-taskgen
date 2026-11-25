@@ -341,7 +341,7 @@ uv run tbsgen ping --run state/ping --calls 1 --budget-usd 1        # Opus 连�
 
 **人工处理 S4c、S5G、S9 或 S9R 的远端作业**。条目以 `remote_unknown: NAME` 暂存时，原预算预留和并发槽位继续占用。`tbsgen status` 和 `tbsgen report` 会显示待处理的作业数。
 
-- 已将完整作业同步到记录的本地目录时，运行 `tbsgen calib resolve-remote --run runs/R --config config.toml --item ID --job NAME --synced`。命令核对作业身份、配置要求的试次数和各试次的 `result.json`。S9 每个试次还需 `verifier/metrics.jsonl`，S9R 则需要正式裁决及该审核版本读取的复现日志。这两个阶段即使缺少作业级 `finished_at` 也能接收完整试次。S4c 和 S5G 需要作业完成摘要，以及各试次 `verifier/out` 下的阶段交付文件。
+- 已将完整作业同步到记录的本地目录时，运行 `tbsgen calib resolve-remote --run runs/R --config config.toml --item ID --job NAME --synced`。命令核对作业身份、配置要求的试次数和各试次的 `result.json`。S9 每个试次还需 `verifier/metrics.jsonl`，S9R 则需要正式裁决及该审核版本读取的复现日志。这两个阶段即使缺少作业级 `finished_at` 也能接收完整试次。S4c 和 S5G 需要作业级 `finished_at`，各试次需要 `verifier/out` 下的阶段交付文件。launcher 写出退出状态（最终同步结束）后，或操作员用 `--synced` 确认后，记录了 `exception_info` 的试次也算完整。agent 因 API 错误、超时或非零退出而没有可用交付时，S4c/S5G 最多重试两次；已有完整交付的作业照常使用。
 - 确认远端作业已结束且目录已完整同步时，使用 `--ended-without-result`（别名 `--died`）接收其中已完成的试次。若没有完整试次，命令合计可读试次费用，没有可读费用时按预留额结算，然后按 infra 策略重试。
 - 确认远端从未启动该作业且本地 launcher 已退出时，使用 `--not-started` 按零费用结算。tmux 无法确定会话状态时，独立核实 launcher 已退出后可加 `--force-local-gone`。结算前会原子撤销本次启动许可。许可已被领取，或本地已有作业配置、顶层或试次结果时，命令会拒绝零费用结算。
 
