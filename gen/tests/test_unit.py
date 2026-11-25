@@ -169,8 +169,9 @@ def test_non_separating_threshold_rejects_clearly_worse_naive():
             "naive": {"0": {"p": 0.8908}, "1": {"p": 0.9238}}}
     t = set_thresholds(spec, meas, cfg)["thresholds"]["p"]
     # capped at the reference margin floor (0.99623*0.9 = 0.8966 -> 0.89 after loose rounding), not at 0.49;
-    # the naive (0.89-0.92) is inside the 10% reference margin here, so it is rejected by its other metrics
-    assert t["naive_capped"] and 0.85 < t["threshold"] <= 0.99623 * 0.9, t
+    # the naive (0.89-0.92) is inside the 10% reference margin here, so it is rejected by its other metrics.
+    # naive_capped is False since review-feedback-gates: naive clears even the exact floor, so no digits are added
+    assert not t["naive_capped"] and 0.85 < t["threshold"] <= 0.99623 * 0.9, t
 
 def test_reference_equal_to_empty_output_value_is_missing():
     """Review #7: missing output is detected against the nop measurement, not by a global magnitude."""
@@ -455,7 +456,7 @@ def _s9_env(tmp_path, monkeypatch=None, launcher_rc=0, make_job=True, **calib_kw
           % (jobs, jobs)) if make_job else "true"
     (hr / "launch.sh").write_text("#!/bin/bash\n%s\nexit %d\n" % (mk, launcher_rc))
     (hr / "launch.sh").chmod(0o755)
-    cal = dict(allow_submit=True, harbor_root=str(hr), jobs_dir=str(jobs), student_launcher="launch.sh",
+    cal = dict(allow_submit=True, remote_launchers=[], harbor_root=str(hr), jobs_dir=str(jobs), student_launcher="launch.sh",
                agent_allowed_hosts=["models.example.com"],
                tmux_bin=str(tmux), est_usd_per_run=10.0)
     cal.update(calib_kw)

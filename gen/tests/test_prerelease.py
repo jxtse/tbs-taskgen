@@ -202,7 +202,7 @@ def test_network_modes_are_configurable(tmp_path):
     t = _pkg_toml(tmp_path, mode="agent-allowlist", agent_hosts=["api.example.com"])
     assert t["agent"]["allowed_hosts"] == ["api.example.com"]
     t = _pkg_toml(tmp_path, mode="no-network")
-    assert t["environment"]["network_mode"] == "no-network" and "network_mode" not in t["agent"]
+    assert t["environment"]["network_mode"] == "no-network" and t["agent"]["network_mode"] == "no-network"
     with pytest.raises(ValueError):
         _pkg_toml(tmp_path, mode="open")
 
@@ -272,7 +272,7 @@ def test_an_intent_saved_with_submit_off_is_rechecked_and_rewritten_at_launch(tm
     must not launch a job whose agent cannot reach its model; once the host is set the job config gets it."""
     item = tmp_path / "items" / "i1"
     _pkg_task(item)
-    base = {"harbor_root": str(tmp_path), "student_launcher": "x.sh", "jobs_dir": str(tmp_path / "jobs"),
+    base = {"remote_launchers": [], "harbor_root": str(tmp_path), "student_launcher": "x.sh", "jobs_dir": str(tmp_path / "jobs"),
             "tmux_bin": "/nonexistent-tmux"}
     rec = calib.prepare(load_config(overrides={"calib": base}), item, "glm", 1)
     assert rec["state"] == "intent" and "warning" in rec

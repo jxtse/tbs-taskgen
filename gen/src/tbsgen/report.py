@@ -19,6 +19,7 @@ def daily_report(P, day: str | None = None) -> Path:
     lines = [f"# tbsgen 日报 {day}", "", f"运行目录：`{P.store.root}`", "",
              "## 条目状态", "", "| 状态 | 数 |", "|---|---|"]
     lines += [f"| {k} | {v} |" for k, v in sorted(st["by_status"].items())]
+    lines += ["", f"待人工核实的远端作业（remote_unknown）：{st['remote_unknown']}"]
     lines += ["", "## 当前阶段 × 状态", "", "| 阶段/状态 | 数 |", "|---|---|"]
     lines += [f"| {k} | {v} |" for k, v in sorted(st["by_stage"].items())]
     lines += ["", "## 丢弃 / 暂停 / 暂存原因", "", "| 原因 | 数 |", "|---|---|"]

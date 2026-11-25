@@ -26,7 +26,10 @@ import json
 import os
 import re
 import time
+from collections.abc import Callable
 from pathlib import Path
+
+from .state import read_json, write_json
 
 INFRA_EXC = {"NetworkConnectionError", "EnvironmentStartTimeoutError", "AgentSetupTimeoutError", "CancelledError",
              "UnknownApiError", "RateLimitError", "AgentInstallError"}
@@ -91,7 +94,7 @@ FRONTIER_CHECKS = ("a_consistency", "b_missing_conditions", "e_shortcuts_leaks",
 def frontier_evidence(runs: list[dict], cfg: dict) -> dict:
     """Release record of a frontier task: decisive / infra / timeout counts of the teacher runs of this epoch."""
     tea = [r for r in runs if r.get("who") == "teacher" and r.get("outcome") is not None and
-           not r.get("preflight_refused")]
+           not r.get("preflight_refused") and not r.get("obsolete_probe_job")]
     dec = [r for r in tea if r["outcome"] != "infra"]
     return dict(teacher_runs=len(tea), teacher_decisive=len(dec), teacher_infra=len(tea) - len(dec),
                 teacher_timeouts=sum(1 for r in dec if is_timeout(r)),
@@ -110,8 +113,8 @@ def next_action(runs: list[dict], cfg: dict) -> tuple[str, str | None]:
         return "label", str(e)
     trailing_infra = 0
     for r in reversed(runs):
-        if r.get("preflight_refused"):
-            continue                    # the relay refused before Harbor: no attempt, no infra retry used up
+        if r.get("preflight_refused") or r.get("obsolete_probe_job"):
+            continue                    # no attempt was made
         if r["outcome"] != "infra":
             break
         trailing_infra += 1
@@ -290,7 +293,7 @@ def prepare(cfg: dict, item_dir: Path, who: str, n: int, epoch: int = 0) -> dict
     root = role(c, who, "harbor_root")
     command = (f"cd {root} && ./{launcher} run {p}" if launcher and root else f"harbor run --config {p} --yes")
     rec = dict(who=who, n=n, item=item_dir.name, model=model, job_name=job_name, config=str(p),
-               command=command, state="intent", submitted=False,
+               command=command, state="intent", submitted=False, remote_route=is_remote_launcher(c, launcher),
                ts=time.time(), job_dir=str(Path(c["jobs_dir"]) / job_name), task=conf["tasks"][0]["path"],
                outcome=None, epoch=epoch)
     if _unprepared(cfg, who, rec["task"]):
@@ -328,45 +331,152 @@ def stale_prepared(cfg: dict, item_dir: Path, who: str, epoch: int) -> str | Non
             "set calib.prepare_command (S9 re-prepares) or prepare it and run `tbsgen calib prepare --item ID`")
 
 
-def remote_alias(job_dir: Path) -> dict:
+def remote_alias(job_dir: Path, *, if_missing=None) -> dict:
     """Marker a remote launcher leaves in the local job dir (tbsgen-remote.json: host, local_task, remote_task,
     remote_job_dir): the job ran on another host from a synced copy of the task, so Harbor's config.json names the
     remote path.  ingest() accepts that path only when the marker maps it to the run's own local task."""
     try:
         m = json.loads((Path(job_dir) / "tbsgen-remote.json").read_text())
+    except FileNotFoundError:
+        return if_missing or {}
     except (OSError, ValueError):
         return {}
     return m if isinstance(m, dict) else {}
 
 
-def task_matches(job_dir: Path, job_task: str | None, want_task: str | None) -> bool:
+def task_matches(job_dir: Path, job_task: str | None, want_task: str | None, *, marker=None) -> bool:
     if job_task == want_task:
         return True
-    m = remote_alias(job_dir)
+    m = remote_alias(job_dir) if marker is None else marker
     return bool(m) and m.get("remote_task") == job_task and m.get("local_task") == want_task
 
 
+def is_remote_launcher(settings: dict, launcher: str | None) -> bool:
+    """Classify the effective launcher before submission. An explicit list replaces the default."""
+    if not launcher:
+        return False
+    name = Path(launcher).name
+    names = settings.get("remote_launchers")
+    return name != "harbor" if names is None else any(name == Path(entry).name for entry in names)
+
+
+def remember_remote_marker(rec: dict) -> bool:
+    """Keep the launcher's local identity mapping across replacement of the synced directory."""
+    if rec.get("remote_marker"):
+        return False
+    marker = _load(Path(rec["job_dir"]) / "tbsgen-remote.json")
+    if not isinstance(marker, dict) or marker == rec.get("remote_marker"):
+        return False
+    rec.update(remote_route=True, remote_marker=marker)
+    return True
+
+
+def has_remote_marker(rec: dict) -> bool:
+    return bool(rec.get("job_dir") and (Path(rec["job_dir"]) / "tbsgen-remote.json").exists())
+
+
+def remote_job(rec: dict, ledger=None) -> bool:
+    """A remote launcher is configured on intents too. Only protect a possible submission."""
+    if rec.get("state") == "remote_unknown" or rec.get("remote_marker") is not None or has_remote_marker(rec):
+        return True
+    if not rec.get("remote_route"):
+        return False
+    if (rec.get("launch_attempted") or rec.get("state") == "launched"
+            or rec.get("job_dir") and Path(rec["job_dir"]).is_dir()
+            or rec.get("log") and Path(rec["log"]).is_file()):
+        return True
+    stage = rec.get("ledger_stage", "S9")
+    return ledger is not None and ledger.job_was_sent(
+        rec["item"], stage, reservation_key(rec, rec["item"], stage), rec.get("ledger_call"))
+
+
 def job_started(rec: dict) -> bool:
-    """Harbor created the job dir (or the launcher wrote its start marker): the job exists, never relaunch."""
+    """Local evidence of a possible launch. A route alone is also present on a fresh intent."""
     jd = Path(rec["job_dir"])
-    return (jd / "config.json").exists() or (jd / "result.json").exists() or Path(rec.get("log", "/x")).exists()
+    return (rec.get("state") == "remote_unknown" or has_remote_marker(rec)
+            or (jd / "config.json").exists() or (jd / "result.json").exists()
+            or bool(rec.get("log") and Path(rec["log"]).exists()))
+
+
+def pending_launcher(rec: dict, ledger=None) -> bool:
+    return rec.get("outcome") is None and (rec.get("state", "launched") == "launched" or remote_job(rec, ledger))
+
+
+def check_job_identity(jd, rec, *, review=False, marker=None, partial=False):
+    conf = read_json(jd / "config.json", {})
+    agents = conf.get("agents") or [{}]
+    tasks = conf.get("tasks") or [{}]
+    ident = dict(job_name=conf.get("job_name"), model=agents[0].get("model_name"), task=tasks[0].get("path"))
+    want = dict(job_name=rec["job_name"],
+                model=rec.get("model", None if review else ident["model"]),
+                task=rec.get("task", None if review else ident["task"]))
+    if marker is None:
+        marker = remote_alias(jd, if_missing=rec.get("remote_marker"))
+    if task_matches(jd, ident["task"], want["task"], marker=marker):
+        ident["task"] = want["task"]                  # a remote launcher's synced copy of the run's own task
+    if any(got != want[key] for key, got in ident.items() if not partial or got is not None):
+        raise ValueError(f"job identity mismatch: job {ident} vs pending run {want}")
+
+
+def restore_remote_marker(jd, rec, remote_task, *, review, partial):
+    path = jd / "tbsgen-remote.json"
+    local = remote_alias(jd)
+    marker = local or rec.get("remote_marker")
+    if remote_task:
+        if marker and marker.get("remote_task") != remote_task:
+            raise ValueError("--remote-task conflicts with the recorded marker")
+        marker = marker or dict(local_task=rec["task"], remote_task=remote_task)
+    if marker is not None and (not path.exists() or marker != local):
+        if (jd / "config.json").exists():
+            check_job_identity(jd, rec, review=review, marker=marker, partial=partial)
+        write_json(path, marker)
+        rec["remote_marker"] = marker
+
+
+def reservation_key(rec, item, stage):
+    # The launch key written by the stacked concurrency change (#44).
+    attempt = rec.get("attempt", rec.get("n", 1))
+    return rec.get("reservation_key") or json.dumps([item, stage, rec["job_name"], attempt])
+
+
+def bind_started_call(cfg, rec, ledger, cost=None):
+    stage = rec.get("ledger_stage", "S9")
+    rec["ledger_call"] = ledger.adopt_started_job(
+        rec["model"], stage, rec["item"], rec["job_name"], reservation_key(rec, rec["item"], stage),
+        float(cfg["calib"]["est_usd_per_run"]), cost, rec.get("ledger_call"))
+
+
+def adopt_started(cfg, rec, ledger, save):
+    """Recover an existing Harbor job with its original identity and without a new submission."""
+    if remote_job(rec, ledger):
+        reconcile_remote(cfg, rec, ledger, save)
+        return rec
+    if ledger is not None:
+        stage = rec.get("ledger_stage", "S9")
+        jd = Path(rec["job_dir"])
+        cost = None
+        if read_json(jd / "result.json", {}).get("finished_at"):
+            check_job_identity(jd, rec, review=stage == "S9R")
+            cost = job_cost(collect(jd, rec["model"], cfg["models"].get("prices", {})))
+        if not rec.get("ledger_call"):
+            bind_started_call(cfg, rec, ledger, cost)
+        elif cost is not None:
+            usd, kind, usage = cost
+            ledger.settle(rec["ledger_call"], usd, kind=kind, usage=usage)
+    rec.update(state="launched", submitted=True, recovered=True)
+    save(rec)
+    return rec
 
 
 def launch(cfg: dict, rec: dict, ledger, save) -> dict:
     """intent -> reserved -> launched.  `save(rec)` persists the run record; it is called after every step so a
     crash at any point is recoverable: a reserved-but-not-started job is launched once on resume, a started job
-    is never launched again.  Any launch exception settles the reservation at 0 and marks the run failed."""
-    import shlex
-    import subprocess
+    is never launched again. Remote launcher failures retain the reservation for reconciliation."""
     c = cfg["calib"]
-    if rec["state"] == "intent" and job_started(rec):
-        # its printed command was already run (by hand): take the job over as it is (task, config, identity
-        # unchanged); no preparation, path rewrite or pre-submit check applies to a job that exists
-        rec["ledger_call"] = ledger.reserve(rec["model"], rec.get("ledger_stage", "S9"), rec["item"], True,
-                                            est_usd=float(c["est_usd_per_run"])) if ledger is not None else None
-        rec.update(state="launched", submitted=True, recovered=True)
-        save(rec)
-        return rec
+    launcher = rec.get("launcher_script") or c.get("student_launcher" if rec["who"] == "glm" else "teacher_launcher")
+    rec.setdefault("remote_route", is_remote_launcher(c, launcher))
+    if remote_job(rec, ledger) or (rec["state"] == "intent" and job_started(rec)):
+        return adopt_started(cfg, rec, ledger, save)
     if rec["state"] == "intent":
         # an intent has no side effect outside item_dir.  It may have been written while submit was off, before
         # calib.agent_allowed_hosts was set: update only that field of its job config (model, job dir and task stay
@@ -419,6 +529,9 @@ def launch(cfg: dict, rec: dict, ledger, save) -> dict:
             conf = {}
         why = network_problem(cfg, Path(rec["task"]), conf)
         if why:
+            if remote_job(rec):
+                reconcile_remote(cfg, rec, ledger, save)
+                return rec
             if ledger is not None and rec.get("ledger_call"):
                 ledger.settle(rec["ledger_call"], 0.0, status="error", kind="not_launched", note=f"not launched: {why}"[:500])
             rec.update(state="launch_failed", outcome="infra", result_type="infra", cost_usd=0.0, cost_kind="not_launched", error=f"not launched: {why}")
@@ -437,12 +550,24 @@ def launch(cfg: dict, rec: dict, ledger, save) -> dict:
             return rec
         # session gone and no job: the launcher exited without one (launcher_failed() in s9 settles it) or never
         # ran; either way nothing is running, so it is safe to launch again below
+    return _start_launcher(cfg, rec, ledger, save)
+
+
+def _start_launcher(cfg, rec, ledger, save):
+    import shlex
+    import subprocess
+
+    c = cfg["calib"]
     item_dir = Path(rec["config"]).parent.parent
-    log = item_dir / "calib" / f"{rec['job_name']}.log"
-    launcher = c["student_launcher"] if rec["who"] == "glm" else c["teacher_launcher"]
-    root = role(c, rec["who"], "harbor_root")
+    log = item_dir / "calib" / (rec["job_name"] + ".log")
+    log.parent.mkdir(parents=True, exist_ok=True)
+    launcher = rec.get("launcher_script") or c.get("student_launcher" if rec["who"] == "glm" else "teacher_launcher")
+    root = rec.get("launcher_root") or role(c, rec["who"], "harbor_root")
     if not (launcher and root):
         err = "no launcher / harbor_root for this role"
+        if remote_job(rec):
+            reconcile_remote(cfg, rec, ledger, save)
+            return rec
         if ledger is not None and rec.get("ledger_call"):
             ledger.settle(rec["ledger_call"], 0.0, status="error", kind="not_launched", note=f"launch failed: {err}")
         rec.update(state="launch_failed", outcome="infra", result_type="infra", cost_usd=0.0, cost_kind="not_launched", error=err)
@@ -452,12 +577,13 @@ def launch(cfg: dict, rec: dict, ledger, save) -> dict:
     inner = (f"cd {shlex.quote(root)} && env -u PYTHONPATH -u VIRTUAL_ENV ./{launcher} run "
              f"{shlex.quote(rec['config'])} > {shlex.quote(str(log))} 2>&1; "
              f"echo $? > {shlex.quote(str(log) + '.exit')}")
-    rec.update(log=str(log), tmux=rec["job_name"][-60:], launch_attempted=time.time())
+    rec.update(log=str(log), tmux=rec.get("tmux") or rec["job_name"][-60:], launch_attempted=time.time(),
+               launcher_script=launcher, launcher_root=root, remote_route=is_remote_launcher(c, launcher))
     if Path(str(log) + ".exit").exists():
         Path(str(log) + ".exit").unlink()                  # a previous attempt's exit status
     save(rec)                                              # persisted before the side effect
     try:
-        r = subprocess.run([c.get("tmux_bin", "tmux"), "new-session", "-d", "-s", rec["job_name"][-60:],
+        r = subprocess.run([c.get("tmux_bin", "tmux"), "new-session", "-d", "-s", rec["tmux"],
                             "bash", "-lc", inner], capture_output=True, text=True, timeout=60)
         err = None if r.returncode == 0 else f"tmux rc={r.returncode}: {r.stderr[-300:]}"
         uncertain = False
@@ -465,6 +591,9 @@ def launch(cfg: dict, rec: dict, ledger, save) -> dict:
         err = f"{type(e).__name__}: {e}"
         uncertain = isinstance(e, subprocess.TimeoutExpired)    # tmux may have started the session anyway
     if err:
+        if remote_job(rec):
+            reconcile_remote(cfg, rec, ledger, save)
+            return rec
         alive = session_alive(c, rec)
         if job_started(rec) or alive or (uncertain and alive is None):
             # the launch may have happened: keep the reservation, never start another attempt; watch / s9
@@ -477,7 +606,8 @@ def launch(cfg: dict, rec: dict, ledger, save) -> dict:
         rec.update(state="launch_failed", outcome="infra", result_type="infra", cost_usd=0.0, cost_kind="not_launched", error=err)
         save(rec)
         return rec
-    rec.update(state="launched", submitted=True, tmux=rec["job_name"][-60:])
+    remember_remote_marker(rec)
+    rec.update(state="launched", submitted=True)
     save(rec)
     return rec
 
@@ -516,9 +646,102 @@ def preflight_wait(cfg: dict, rec: dict | None) -> str | None:
     return f"relay_down: preflight refused, retry after {time.strftime('%H:%M', time.localtime(time.time() + left))}"
 
 
+DELIVERY_METRICS = "verifier/metrics.jsonl"
+
+
+def _trial_reward(result):
+    return ((result.get("verifier_result") or {}).get("rewards") or {}).get("reward")
+
+
+def _s9_requires_metrics(result):
+    return not result.get("exception_info") or _trial_reward(result) is not None
+
+
+def _s9_complete(trial, result, contract):
+    return not _s9_requires_metrics(result) or (trial / DELIVERY_METRICS).is_file()
+
+
+def _s9r_complete(trial, result, contract):
+    from .review import CURRENT_CONTRACT, JOURNAL_CONTRACTS, REPRO_JOURNAL, VERIFIED_VERDICT
+
+    return (trial / VERIFIED_VERDICT).is_file() and (
+        (contract or CURRENT_CONTRACT) not in JOURNAL_CONTRACTS or (trial / REPRO_JOURNAL).is_file())
+
+
+CompletenessRule = Callable[[Path, dict, str | None], bool]
+_COMPLETENESS_RULES: dict[str, CompletenessRule] = {"S9": _s9_complete, "S9R": _s9r_complete}
+
+
+def register_completeness(stage: str, fn: CompletenessRule) -> None:
+    """Register fn(trial_dir, result_json, contract) for this stage before reconciling jobs."""
+    _COMPLETENESS_RULES[stage] = fn
+
+
+def remote_trial_set(jd: Path, stage: str, *, contract=None) -> tuple[list[Path], bool]:
+    """Unregistered stages require only a readable trial result. All stages check the configured trial count."""
+    rule = _COMPLETENESS_RULES.get(stage)
+    trials = sorted(p for p in jd.glob("*") if p.is_dir())
+    complete = []
+    for trial in trials:
+        result = _load(trial / "result.json")
+        if isinstance(result, dict) and (rule is None or rule(trial, result, contract)):
+            complete.append(trial)
+    config = _load(jd / "config.json")
+    if not isinstance(config, dict):
+        return complete, False
+    tasks, agents = config.get("tasks"), config.get("agents")
+    attempts = config.get("n_attempts", 1)
+    if (not isinstance(tasks, list) or not tasks or not isinstance(agents, list) or not agents
+            or type(attempts) is not int or attempts < 1):
+        return complete, False
+    expected = len(tasks) * len(agents) * attempts
+    return complete, len(complete) >= expected and len(complete) == len(trials)
+
+
+def complete_remote_trials(jd: Path, stage: str, *, contract=None) -> bool:
+    _, complete = remote_trial_set(jd, stage, contract=contract)
+    return complete
+
+
+def reconcile_remote(cfg, rec, ledger, save):
+    """Observe the original submission locally. Only the operator can clear remote_unknown."""
+    jd = Path(rec["job_dir"])
+    state = rec.get("state")
+    remembered = remember_remote_marker(rec)
+    if state == "remote_unknown":
+        action = "remote_unknown"
+    else:
+        from .review import job_contract
+        rec.setdefault("tmux", rec["job_name"][-60:])
+        exit_file = Path(rec["log"] + ".exit") if rec.get("log") else None
+        alive = False
+        if not (exit_file and exit_file.exists()):
+            alive = session_alive(cfg["calib"], rec)
+            if exit_file and exit_file.exists():  # final sync may have ended during the session probe
+                alive = False
+        summary = _load(jd / "result.json")
+        ended = alive is False or isinstance(summary, dict) and summary.get("finished_at")
+        if ended and complete_remote_trials(jd, rec.get("ledger_stage", "S9"), contract=job_contract(rec)):
+            action = "awaiting_ingest"
+        else:
+            action = "waiting" if alive is True else "remote_unknown"
+    remembered = remembered or remember_remote_marker(rec)
+    new_state = "remote_unknown" if action == "remote_unknown" else "launched"
+    if state != new_state or not rec.get("ledger_call"):
+        if ledger is not None:
+            bind_started_call(cfg, rec, ledger)
+        rec.update(state=new_state, submitted=True)
+        save(rec)
+    elif remembered:
+        save(rec)
+    return action
+
+
 def launcher_failed(rec: dict, c: dict | None = None) -> str | None:
     """Launcher exited without creating a Harbor job (bad cwd, missing script, key fetch failure ...), or its
     tmux session vanished without an exit status and without a job."""
+    if remote_job(rec):
+        return None  # reconcile_remote owns the remote launcher's exit protocol
     ex = Path(rec.get("log", "") + ".exit")
     if rec.get("state") == "launched" and c is not None and not ex.exists() and not job_started(rec) and \
             session_alive(c, rec) is False and not ex.exists() and not job_started(rec):   # re-read after the check
@@ -531,8 +754,7 @@ def launcher_failed(rec: dict, c: dict | None = None) -> str | None:
 
 def session_alive(c: dict, rec: dict) -> bool | None:
     """Is the tmux session this run was launched in still there?  None = cannot tell (no tmux name recorded,
-    e.g. a job started by hand, or tmux unusable).  The launchers run Harbor in the foreground, so the session
-    lives exactly as long as the job's Harbor process."""
+    e.g. a job started by hand, or tmux unusable). A remote job can outlive this local session."""
     import subprocess
     name = rec.get("tmux")
     if not name:
@@ -557,7 +779,7 @@ def launcher_died(rec: dict, c: dict | None = None) -> bool:
     and either the launcher exited (its .exit file, written after Harbor returns) or its tmux session is gone
     without an .exit (killed / reboot).  .exit and finished_at are re-read after the session check, so a job
     ending meanwhile is not taken for a dead one."""
-    if rec.get("state") != "launched":
+    if rec.get("state") != "launched" or remote_job(rec):
         return False
     jr = Path(rec["job_dir"]) / "result.json"
     ex = Path(rec.get("log", "") + ".exit")
@@ -641,15 +863,18 @@ def trial_cost(trial: Path, model: str | None, prices: dict, r: dict | None = No
                 **({"price_missing": model} if usage else {}))
 
 
-def delivered(trial: Path) -> bool | None:
+def delivered(trial: Path, *, required=False) -> bool | None:
     """Did the agent leave its deliverable?  From the verifier's metrics.jsonl (tbsgen's _metrics.run_solution
     records `_solution_cli_run`): the entry file missing ("can't open file" / "No such file") = False; any other
     run = True; no record = None (unknown)."""
-    f = trial / "verifier" / "metrics.jsonl"
-    if not f.exists():
+    try:
+        lines = (trial / DELIVERY_METRICS).read_text(errors="replace").splitlines()
+    except FileNotFoundError:
+        if required:
+            raise
         return None
     seen = None
-    for line in f.read_text(errors="replace").splitlines():
+    for line in lines:
         try:
             o = json.loads(line)
         except json.JSONDecodeError:
@@ -699,11 +924,11 @@ def _api_status(trial: Path) -> tuple[int | None, str | None]:
     return None, None
 
 
-def classify_trial(trial: Path, model: str | None = None, prices: dict | None = None) -> dict:
+def classify_trial(trial: Path, model: str | None = None, prices: dict | None = None, *, require_metrics=False) -> dict:
     r = json.loads((trial / "result.json").read_text())
     ei = r.get("exception_info") or {}
     exc = ei.get("exception_type")
-    reward = ((r.get("verifier_result") or {}).get("rewards") or {}).get("reward")
+    reward = _trial_reward(r)
     status, msg = _api_status(trial)
     minutes = None
     try:
@@ -723,15 +948,18 @@ def classify_trial(trial: Path, model: str | None = None, prices: dict | None = 
     else:
         outcome = "fail"
     quota = bool(msg and re.search(r"额度|quota|429", msg))
-    deliv = delivered(trial)
+    deliv = delivered(trial, required=require_metrics and _s9_requires_metrics(r))
     c = trial_cost(trial, model, prices or {}, r)
     return dict(trial=trial.name, outcome=outcome, result_type=result_type(outcome, exc, deliv), delivered=deliv,
                 reward=reward, exception=exc, api_status=status, api_msg=msg, quota=quota, minutes=minutes,
                 cost_usd=c["cost_usd"], cost_kind=c["cost_kind"], cost_source=c["cost_source"], usage=c["usage"])
 
 
-def collect(job_dir: Path, model: str | None = None, prices: dict | None = None) -> list[dict]:
-    return [classify_trial(t, model, prices) for t in sorted(Path(job_dir).iterdir()) if (t / "result.json").exists()]
+def collect(job_dir: Path, model: str | None = None, prices: dict | None = None, *,
+            trial_dirs=None, require_metrics=False) -> list[dict]:
+    if trial_dirs is None:
+        trial_dirs = sorted(p.parent for p in Path(job_dir).glob("*/result.json"))
+    return [classify_trial(t, model, prices, require_metrics=require_metrics) for t in trial_dirs]
 
 
 def job_cost(trials: list[dict]) -> tuple[float | None, str, dict | None]:
@@ -754,6 +982,8 @@ def run_summary(runs: list[dict]) -> list[dict]:
     keys = ("who", "n", "model", "job_name", "outcome", "result_type", "minutes", "cost_usd", "cost_kind")
     out = []
     for r in runs:
+        if r.get("obsolete_probe_job"):
+            continue
         t = r.get("trial") or {}
         d = {k: r.get(k, t.get(k)) for k in keys}
         if d["result_type"] is None and r.get("outcome") == "infra":

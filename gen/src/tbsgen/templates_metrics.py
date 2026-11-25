@@ -102,6 +102,30 @@ def speed_bench(repeats: int = 5):
     return med
 
 
+class _HiddenValue(float):
+    """A JSON-serializable measurement that retains its sources until check() records it."""
+    def __new__(cls, value, name, scopes):
+        result = super().__new__(cls, value)
+        result.name = name
+        result.scopes = scopes
+        return result
+
+
+def hidden_value(input_dir, name, value):
+    scope = os.path.basename(os.path.normpath(input_dir))
+    return _HiddenValue(value, name, (scope,))
+
+
+def hidden_aggregate(operation, values):
+    """Reduce tagged per-set measurements of one metric, carrying exactly those inputs' scopes."""
+    values = list(values)
+    if not values or not all(isinstance(v, _HiddenValue) and v.name == values[0].name for v in values):
+        raise ValueError("expected tagged measurements of a single hidden metric")
+    reducers = {"min": min, "max": max, "sum": sum, "mean": lambda xs: sum(xs) / len(xs), "median": _median}
+    scopes = {scope for v in values for scope in v.scopes}
+    return _HiddenValue(reducers[operation](values), values[0].name, scopes)
+
+
 def _record(rec):
     os.makedirs(os.path.dirname(_PATH), exist_ok=True)
     with open(_PATH, "a") as f:
@@ -116,6 +140,7 @@ def check(name, value, threshold, direction):
     [SPEED_MIN, SPEED_MAX]); memory-like ones do not.  The recorded "threshold" stays the locked literal — the
     pipeline's lock checks compare it (runner / review.runtime_thresholds); the effective one is recorded next to
     it.  Non-resource metrics are asserted at the literal threshold as before."""
+    source = {"hidden_sets": sorted(value.scopes)} if isinstance(value, _HiddenValue) and value.name == name else {}
     value = float(value)
     kind = resource_kind(name)
     if kind:
@@ -128,7 +153,7 @@ def check(name, value, threshold, direction):
                     ratio = 1.0                      # same host: noise never moves a threshold
                 ratio = min(SPEED_MAX, max(SPEED_MIN, ratio))
         eff = float(threshold) * ratio if direction == "<=" else float(threshold) / ratio
-        rec = {"name": name, "value": value, "threshold": float(threshold), "direction": direction,
+        rec = {**source, "name": name, "value": value, "threshold": float(threshold), "direction": direction,
                "threshold_effective": eff, "speed_ratio": round(ratio, 4)}
         if not RESOURCE_GATING:
             rec["gated"] = False
@@ -145,7 +170,7 @@ def check(name, value, threshold, direction):
     passed = (value >= threshold) if direction == ">=" else (value <= threshold)
     if math.isnan(value):
         passed = False
-    _record({"name": name, "value": value, "threshold": float(threshold), "direction": direction,
+    _record({**source, "name": name, "value": value, "threshold": float(threshold), "direction": direction,
              "passed": bool(passed)})
     assert passed, f"{name}={value:.6g} fails {direction} {threshold}"
 
@@ -591,7 +616,13 @@ def _run_once(entry, input_dir, out, timeout_sec, sb, home=None):
         except subprocess.TimeoutExpired:
             pass
         fe.seek(0)
-        err = fe.read()[-4000:].decode("utf-8", "replace") + err_extra
+        stderr = fe.read()
+        # S7 wrappers end stderr with a JSON file list which may exceed the diagnostic tail.
+        if os.environ.get("TBSGEN_PROBE_REPORT") == "1":
+            stderr = stderr.rstrip(b"\n").rsplit(b"\n", 1)[-1]
+        else:
+            stderr = stderr[-4000:]
+        err = stderr.decode("utf-8", "replace") + err_extra
     return rc, err, sec, left
 
 
@@ -729,7 +760,8 @@ def run_solution(timeout_sec, input_dir=HIDDEN, entry=ENTRY):
     if left:                                          # could not kill what it left running: no score
         rc, err = -10, (err + f"\nsandbox processes survived SIGKILL: {left[:5]}")[-2000:]
     med = max(_median(times), sec / MAX_SPEEDUP)
-    _record({"name": "_solution_cli_run", "value": med, "rc": rc, "stderr_tail": err[-500:],
+    _record({"name": "_solution_cli_run", "value": med, "rc": rc,
+             "stderr_tail": err if os.environ.get("TBSGEN_PROBE_REPORT") == "1" and err.startswith("TBSGEN_PROBE ") else err[-500:],
              "threshold": float(timeout_sec), "timeout_effective": round(t_first, 3) if math.isfinite(t_first) else None, "direction": "<=",
              "passed": rc == 0, "aux": True, "sandboxed": sb is not None, "entry": entry, "entry_exists": entry_exists,
              "wall_times": [round(t, 6) if math.isfinite(t) else None for t in times], "timing_repeats": len(times),

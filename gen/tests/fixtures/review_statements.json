@@ -1,0 +1,5 @@
+{
+ "synthetic-ans": "# Cooling blocks\nWrite rates.csv with one row per block. Estimate the slope from the final three samples.",
+ "synthetic-prog": "# Sorting toy tiles\nWrite tiles.csv and bins.csv. Run solution_cli.py on each tray of tiles.",
+ "synthetic-scientific-words": "# Lamp calibration\nUse the central patch as an internal standard. Report a baseline-free estimate in lamp.csv."
+}

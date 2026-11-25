@@ -21,10 +21,59 @@ import re
 FORMS_ALL = {"ANS", "PROG", "DOMF", "CODE", "MULTI", "DESIGN", "INTERACT", "TRAJ", "PROOF"}
 
 
-def validate_spec(spec, cfg: dict) -> list[str]:
+# The two prompt families have independent version sequences.
+def _prompt_at_least(version, standard, code) -> bool:
+    match = re.match(r"^(cg-)?v(\d+)(?:\.(\d+))?(?:-|$)", str(version))
+    if not match:
+        return False
+    return (int(match[2]), int(match[3] or 0)) >= (code if match[1] else standard)
+
+
+def _requires_assumptions(version) -> bool:
+    return _prompt_at_least(version, (2, 8), (4, 0))
+
+
+def requires_hidden_provenance(version) -> bool:
+    return _prompt_at_least(version, (2, 10), (6, 0))
+
+
+PIN = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?==[0-9][A-Za-z0-9.!+_-]*")
+
+
+def valid_pins(pins) -> bool:
+    return isinstance(pins, list) and len(pins) <= 8 and all(isinstance(p, str) and PIN.fullmatch(p) for p in pins)
+
+
+def assumption_quote(where: str, require_long_quote: bool = True) -> str:
+    """The statement quote after whitespace normalization, or empty if too short."""
+    quote = " ".join(where.split())
+    return quote if not require_long_quote or len(quote) >= 12 else ""
+
+
+def validate_spec(spec, cfg: dict, prompt_version=None) -> list[str]:
     if not isinstance(spec, dict):
         return ["spec is not a JSON object"]
     errs = []
+    for key in ("shared_inputs", "data_formats"):
+        if key in spec and (not isinstance(spec[key], list) or
+                            not all(isinstance(x, str) and x.strip() for x in spec[key])):
+            errs.append(f"{key} must be a list of nonempty names")
+    if not valid_pins(spec.get("extra_pip", [])):
+        errs.append("extra_pip must contain at most 8 name==version pins")
+    new_rules = any(_requires_assumptions(v) for v in (prompt_version, spec.get("prompt_version")))
+    if "generator_assumptions" in spec or new_rules:
+        entries = spec.get("generator_assumptions")
+        if not isinstance(entries, list):
+            errs.append("generator_assumptions must be a list")
+        else:
+            for a in entries:
+                if not isinstance(a, dict) or not all(isinstance(a.get(k), str) and a[k].strip()
+                                                      for k in ("assumption", "where")) or not isinstance(a.get("stated"), bool):
+                    errs.append("invalid generator_assumptions entry")
+                elif new_rules and a["stated"] and not assumption_quote(a["where"]):
+                    errs.append("stated generator_assumptions.where needs at least 12 characters after normalization")
+                elif not a["stated"] and not re.match(r"^recovered from data:\s*\S", a["where"]):
+                    errs.append("unstated assumption needs recovered from data: <how>")
     form = spec.get("form")
     if form not in cfg["spec"]["allowed_forms"]:
         errs.append(f"form {form!r} not allowed in this phase")
@@ -77,6 +126,9 @@ def validate_spec(spec, cfg: dict) -> list[str]:
     if not 3 <= len(mets) <= 8:
         errs.append("need 3..8 metrics")
     for m in mets:
+        if m.get("public_only") is True and not (isinstance(m.get("public_only_reason"), str) and
+                                                  m["public_only_reason"].strip()):
+            errs.append("public_only needs a nonempty public_only_reason")
         if m.get("direction") not in ("<=", ">=") or not m.get("name"):
             errs.append(f"bad metric {m}")
     if form == "PROG":
@@ -177,7 +229,6 @@ def set_thresholds(spec: dict, measure: dict, cfg: dict) -> dict:
                 thr = math.exp(math.log(r) + tc["frac"] * (math.log(m_best) - math.log(r)))
             else:
                 thr = r + tc["frac"] * (m_best - r)
-            sep.append(name)
         else:
             # resource metrics (wall time / memory) are noisy run to run (e2e-prod-20261109: reference 0.58 s in S6A,
             # 0.93 s when S7 re-measured it -> threshold ref x1.5 = 0.88 failed the oracle gate): wider margin
@@ -216,13 +267,23 @@ def set_thresholds(spec: dict, measure: dict, cfg: dict) -> dict:
         thr = exact if at_floor else _round_sig(exact, tc["sig_digits"], d, toward_loose=True)   # floor: kept exact
         if separating and not _worse(d, m_best, thr):   # rounding must not let the mid baseline pass
             thr = _round_sig(exact, tc["sig_digits"] + 2, d, toward_loose=False)
+        if naive_capped and not _worse(d, n_best, exact):
+            # the cap fell back to the reference-margin floor and the naive baseline clears even the exact value:
+            # this metric does not reject naive at any precision, so keep the readable rounding.
+            naive_capped = False
         if naive_capped and not _worse(d, n_best, thr):  # nor the naive baseline (review #9)
             for extra in (1, 2, 3):
                 thr = _round_sig(exact, tc["sig_digits"] + extra, d, toward_loose=True)
                 if _worse(d, n_best, thr):
                     break
-            else:
-                thr = exact
+        if naive_capped and not _worse(d, n_best, thr):
+            # last readable try: tighten at sig+3 (<= 1e-5 relative, far inside the reference's >= 10 % margin)
+            thr = _round_sig(exact, tc["sig_digits"] + 3, d, toward_loose=False)
+        if (naive_capped and not _worse(d, n_best, thr)) or (separating and not _worse(d, m_best, thr)):
+            out[name] = dict(direction=d, threshold=None, error="threshold_unreadable: rounding admits baseline")
+            continue
+        if separating:
+            sep.append(name)
         ok_ref = not _worse(d, r, thr)
         out[name] = dict(direction=d, threshold=thr, ref_worst=r, mid_best=m_best, separating=separating,
                          ref_passes=ok_ref, naive_capped=naive_capped)

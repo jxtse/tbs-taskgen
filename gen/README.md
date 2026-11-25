@@ -250,7 +250,7 @@ items/<item_id>/
 | S6C | 规格 + 阈值 + 实测 | `tests/test_outputs.py`、`instruction.md`、`baselines/exploit_*.py` | Opus | 缺文件 `dropped` |
 | S7 | 完整工作树 | `gates/attempt-n.json` | 无（Docker） | 阻塞级 → S8；只有“阈值未写明”时由程序追加判据表 |
 | S8 | 门日志 + 依赖图 + 相关文件 | `repair/round-n/`（补丁 + 审查结论） | Opus 修复；审查为机械 diff | 审查不过算用掉 1 轮；2 轮后 `dropped: repair_limit` |
-| PKG | 通过 S7 的题 + 种子 0 产物 | `pkg/` + `PKG_check.json` | 无 | `parked: package_invalid` |
+| PKG | 通过 S7 的题 + 首个配置种子的产物 | `pkg/` + `PKG_check.json` | 无 | `parked: package_invalid` |
 | S9 | `pkg/` | `calib/*.json` 作业配置 + 启动命令；`runs.json` | 不调用（只调度） | 见 §5 |
 | S10 | 标签为 hard/unstable（channel main）或 frontier（channel frontier）的题 | `release/manifest.jsonl` | 无 | — |
 
@@ -308,6 +308,14 @@ uv run tbsgen run    --run runs/R --until S4                      # 只跑到 S4
 uv run tbsgen reset  --run runs/R --item ID --stage S6B [--regen]    # 管线修复后让条目从某阶段重来（记入 history）
 uv run tbsgen ping --run state/ping --calls 1 --budget-usd 1        # Opus 连通性（真实调用）
 ```
+
+**人工处理远端校准或审核作业**。条目以 `remote_unknown: NAME` 暂存时，原预算预留和并发槽位继续占用。`tbsgen status` 和 `tbsgen report` 会显示待处理的作业数。
+
+- 已将完整作业同步到记录的本地目录时，运行 `tbsgen calib resolve-remote --run runs/R --config config.toml --item ID --job NAME --synced`。命令核对作业身份、配置要求的试次数和各试次的 `result.json`。S9 每个试次还需 `verifier/metrics.jsonl`，S9R 则需要正式裁决及该审核版本读取的复现日志。即使 Harbor 未写入作业级 `finished_at`，完整试次仍可接收。
+- 确认远端作业已结束且目录已完整同步时，使用 `--ended-without-result`（别名 `--died`）接收其中已完成的试次。若没有完整试次，命令合计可读试次费用，没有可读费用时按预留额结算，然后按 infra 策略重试。
+- 确认远端从未启动该作业且本地 launcher 已退出时，使用 `--not-started` 按零费用结算。tmux 无法确定会话状态时，独立核实 launcher 已退出后可加 `--force-local-gone`。本地已有作业配置、顶层或试次结果时，命令会拒绝零费用结算。
+
+替换目录导致本机 `tbsgen-remote.json` 丢失时，命令会从运行记录恢复它。若从未取得映射，使用 `--synced --remote-task PATH` 提供原远端任务路径。watcher 报作业身份不匹配且条目仍在等待时，也可用此命令。对尚有校准或审核作业未结算的条目，`regate` 会报告待处理作业。
 
 `config.toml` 示例（只需写要覆盖的项）：
 
@@ -367,6 +375,7 @@ allow_submit = false
 | `calib.variant_depth` | 0 | S9b 更难变体（**待定**，MVP 关闭） |
 | `calib.infra_retries` | 2 | API/沙箱异常不计入校准次数 |
 | `calib.allow_submit` | **False** | True 时：账本预留 → tmux 后台运行启动脚本；预留超总额则拒绝；没配 `harbor_root` 和启动脚本时拒绝提交 |
+| `calib.remote_launchers`（S9/S9R）、`agent.remote_launchers`（S4c/S5G） | None | 启动前按脚本文件名记录路由。默认直接调用 `harbor` 为本地，自定义启动脚本为远端。显式列表只将列出的脚本标记为远端，空列表表示所有脚本均为本地。远端 marker 也可独立识别远端作业。 |
 | `calib.harbor_root / student_launcher / teacher_launcher` | None | 启动脚本目录与脚本名（`./<launcher> run <作业配置>`）；未设置时只打印 `harbor run --config ...` |
 | `calib.student_agent / teacher_agent / environment` | None | Harbor 自定义 agent/环境的 `module:Class`；未设置用内置 `claude-code` agent 和 `docker` 环境 |
 | `calib.est_usd_per_run` | 20 | 每次校准作业的预留额，`calib-ingest` 冲销：Harbor 报了 `cost_usd` 用实报（`reported`）；没报（如超时）用 trial 的 token 用量 × `models.prices[模型]` 估算（`tokens`，来源依次为 agent_result、trajectory.json、Claude Code stream-json）；都没有则保留预留额并标 `reservation`——它仍占用预留额度，但不算进 `run_usd_total` 的实际花费门。`tbsgen ledger` 的 `usd_by_cost_kind` 分开列出 |
@@ -421,14 +430,14 @@ S9 打出标签后，**hard / unstable**（`calib.keep_labels`）必须先过审
 任一项不满足，记为 `parked`（`frontier:unconfirmed`）。审核关闭时，frontier 一律不发布。发布记录中 `channel = "frontier"`，与 hard/unstable（`channel = "main"`）分开；附带 `frontier`（教师有效、infra、超时的次数）和 `reference_check`。frontier 题没有通过轨迹，下游不要把它放进 SFT 主体。
 
 - **审核者**：能执行代码的 Claude Code agent（默认 Opus，`review.model` 未设则用 `calib.teacher_model`），全新上下文，在**题目自己的镜像**里运行（审核任务由 `review.build_task` 生成：原 Dockerfile 加 `COPY review /review`，`/tests`、`/solution` 照真实运行装好，可直接 `bash /solution/solve.sh && bash /tests/test.sh` 复现参考解）。网络与教师相同：agent 阶段只能连模型中继（`review.agent_allowed_hosts`，未设沿用教师的），verifier 阶段断网。
-- **能看到**（`/review`）：题包全部文件（含 hidden/truth、参考解）、`extra/`（baselines、generator）、`records/`（thresholds.json、S6A 实测、S6B 决策、S7 门报告、S8 修复记录、spec、阶段历史）、`calibration/`（当前校准轮次每次运行的 result 摘要、verifier 输出与逐项指标、trace 摘要：工具调用序列、助手文字、最后的工具输出和最终消息）。
+- **能看到**（`/review`）：题包全部文件（含 hidden/truth、参考解）、`extra/`（baselines、generator）、`records/`（thresholds.json、S6A 实测、S6B 决策、S7 门报告、当前探针证据 `output_probes.json`、S8 修复记录、spec、阶段历史）、`calibration/`（当前校准轮次每次运行的 result 摘要、verifier 输出与逐项指标、trace 摘要：工具调用序列、助手文字、最后的工具输出和最终消息）。
 - **清单**（写在提示词里，逐项给结论与证据）：a 题面/格式说明/测试/评分一致性；b 缺失条件与测试检查题面未要求的东西；c 阈值是否以参考解为依据、是否合理；d 计时/随机性不稳定；e 捷径与泄漏；f 依赖网络或现成实现；g 结合校准 trace 判断失败/通过是否由题目缺陷或基础设施导致、标签是否可信；h 计时项是否应当参与判定（`resource_metric_gating`，只有速度本身是论文贡献时才为 true）。
-- **输出** `/app/review_out/verdict.json`：`verdict ∈ {pass, revise, drop}`、`checklist`、`issues[]`（类别、`blocking|minor`、问题类别 `problem`、证据、修法）、`label_assessment`。每个 blocking 必须标 `problem`：
+- **输出** `/app/review_out/verdict.json`：`verdict ∈ {pass, revise, drop}`、`checklist`、逐范围复现结论 `probe_findings`、`issues[]`（类别、`blocking|minor`、问题类别 `problem`、证据、修法）、`label_assessment`。每个 blocking 必须标 `problem`：
   - 局部问题（可修 → revise）：`statement`（题面表述/条件缺失或矛盾）、`format_notes`（格式说明）、`grader_io`（评分脚本的输入输出：路径、列、读哪个文件）、`exploit_baseline`（作弊基线缺失或错误）、`test_gap`（测试遗漏或检查了题面没要求的东西）、`timing_gate`（计时判定策略/余量，阈值仍锁定）；
   - 根本问题（不可修 → drop）：`reference_wrong`（参考解本身错误）、`truth_regen`（真值/数据需要重新生成）、`core_invalid`（题目核心不成立）、`calibration`（标签不可信且局部修改改变不了）。
 - **裁决契约**（`review.normalize`）：**没有证据的 blocking 降为 minor**；**泄露真值/答案或可篡改评分的问题一律 blocking**（`"leak": true` 且有证据即升级）。`fix_kind` 由 `problem` 决定（审核自己写的 fix_kind 与类别矛盾时以类别为准并记录），裁决由 blocking 推出：有根本问题 → drop；只有局部问题 → revise；没有 blocking → pass。审核写的 verdict 与此不一致时以推出的为准（记在 `problems` 里），例如判了 revise 但 blocking 全是不可修类别 → drop。结构问题（未知 verdict 或类别、blocking 没有类别、verifier reward≠1、revise/drop 却没有带证据的 blocking）→ 裁决无效，本轮重新审核，超过 `review.infra_retries` 次 → dropped（`review:invalid`）。
 - **没有人工出口**：每题去留由审核 agent 决定。`human` 只在显式打开 `review.allow_human = true`（默认 false）时才是合法裁决，并在修订用尽、修订被拒、无效裁决等出口改为 parked（`review:human`）。
-- **路由**：pass → S10（minor 写进 manifest 的 `review.minor`）；parked 标签的 pass 仍保持 parked。revise → S8 审核修订（下条），修订轮数用完（`review.max_revisions`，默认 3）→ dropped。drop → dropped。已在 manifest 里的题若审核非 pass，追加一行 `withdrawn: true`（manifest 只追加，同一题以最后一行为准）。
+- **路由**：pass → S10（minor 写进 manifest 的 `review.minor`）；parked 标签的 pass 仍保持 parked。revise → S8 审核修订（下条），修订轮数用完（`review.max_revisions`，默认 3）→ dropped。drop → dropped。已在 manifest 里的题若审核非 pass，追加一行 `withdrawn: true`（manifest 只追加，同一题以最后一行为准）。关闭审核后，若当前包、轮次和校准 epoch 没有对应裁决，发布记录写入 `review: {"status": "not_reviewed", "reason": "review_disabled"}`。
 - **审核修订**：S8 把审核 issues 交给模型，只允许改 `instruction.md`、`tests/test_outputs.py`、`tests/measure.py`、`generator/generate.py`（格式说明由生成器写出）和已有的 `baselines/exploit_*.py`；保工审查（`review.revision_review`）拒绝其他路径、拒绝 `check()` 的指标/阈值/方向有任何变化。**阈值始终锁定，不允许放宽**。修订被拒、或修订后参考解达不到锁定阈值 / S7 门 / PKG 检查失败：把失败原因作为反馈再修一轮（占用一轮修订），轮数用完 → dropped。通过 →
   - **只改了评分脚本**（`tests/test_outputs.py`、`tests/measure.py`；题面、数据、阈值都没变）且 `review.rescore_scoring_only = true`（默认）：保留当前校准，S9 先用新评分器在本地沙箱重评已有 GLM 与教师交付物（`items/<id>/calib/deliverables/<job>/`，用 `tbsgen review deliverable` 登记，例如从 trace 离线重放出的 `/app/output`）。所有运行的结果都不变 → 保留标签，直接进下一轮审核；结果变了、缺交付物或沙箱没写出 reward → 归档并重新校准。没有任何交付物的失败（`timeout_no_output`/`no_output`）不需要重评（S7 的 nop 门保证新评分器判空输出为失败）。结果写在 `calib/rescore.json`。
   - **其他修订**：旧校准记录归档到 `calib/epoch-<k>/`、`calib_epoch+1`、标签清空 → S6A_run 重新实测 → **S6B 锁定阈值**（新推导值只写进 `thresholds.relock.json` 供审核对照）→ S6C → S7 → PKG → S9 从 GLM 重新校准（作业名带 `-e<k>`）→ S9R 下一轮。
@@ -437,7 +446,7 @@ S9 打出标签后，**hard / unstable**（`calib.keep_labels`）必须先过审
 
 | 配置 | 默认 | 说明 |
 |---|---|---|
-| `review.enabled` | true | 关闭后 S9 标签直接按原规则走 |
+| `review.enabled` | true | 关闭后有可疑探针范围的题暂存为 `parked:probe_unreviewed`，开启后可用 `tbsgen resume` 恢复 |
 | `review.model / agent / environment / agent_allowed_hosts / harbor_root / launcher / jobs_dir` | None（沿用教师路由） | 审核作业的模型、agent、Harbor 环境、agent 阶段放行主机、启动脚本目录与脚本、作业目录 |
 | `review.est_usd_per_run` | None（= `calib.est_usd_per_run`） | 账本预留 |
 | `review.timeout_sec` | 3600 | 审核任务的 agent 超时 |
@@ -498,3 +507,20 @@ S9 打出标签后，**hard / unstable**（`calib.keep_labels`）必须先过审
   - 其余拉不开 → S6M 一次；之后默认直接丢弃（`gen.back_to_spec_max` 默认 0）；若打开，只有“差一点”（失败 1 到 max_mid_fail+1 项）才回 S5；
   - `ref_worse_than_naive` 且某指标参考比 naive 差 ≥ `gen.ref_gross_ratio` 倍（默认 10）→ 判为参考实现错误，带倍数回 S6A 重写全部代码一次（规则 `ref_gross`，`gen.ref_rewrite_max`=1），仍然如此 → `dropped: ref_grossly_wrong`；倍数较小的仍走 S8。
   - 依据：e2e-prod-20261109 的离线回放（9 篇丢弃题的真实 S6A/S6M/S8 产物重新在沙箱实测）：3 篇入库题首轮 S6B 均为 mid 失败 3/4 判据、S6M 后变成 1 项，规则不误伤；回 S5 的 5 篇无一救回。
+
+### 6c. 题面、隐藏集与题库分布（2026-11-24）
+
+- S6B 的阈值舍入最多增加 3 位有效数字。仍无法排除基线时记录 `threshold_unreadable`，进入原有修复流程。naive 基线连精确值都能通过时（该指标本来就拒不掉 naive），不再为它加位数，而是保留 2 位有效数字。S7 的 `threshold_format` 要求阈值处的数最多 6 位有效数字，题面任何数最多 12 位有效数字（GM、J2 等物理常数不受影响）。隐藏指标的参考余量可单独由 `thresholds.min_ref_margin_hidden` 设定，默认 None 即沿用旧规则（`min_ref_margin` 的一半，自定义过 `min_ref_margin` 的配置也一样）；调整余量时需重新校准。阈值格式、题面卫生、适用版本的隐藏指标覆盖和生成假设检查明确失败时进入 S8 修复。
+- `statement_clean` 拦截内部编辑文字（audit copy / audit revision、reviewer note、S7 gate、hardening round、TODO、tbsgen、mid/naive baseline 等）和 HTML 注释；单独的 gate、hardening、lever、audit、revision、patch、internal standard、baseline-free 这类科学用法不拦（gate voltage、strain hardening、lever arm、convergence audit）。新 S5/S5G spec 列出 `generator_assumptions`，已明说的引文在合并空白后须至少 12 个字符。`assumptions_stated` 逐条核对题面原文，未明说的条件须填写 `recovered from data: <恢复方法>`。S9R 对照生成器和参考解复核。
+- PROG 的 `hidden_parity` 对照实际检查的公开、隐藏指标族。v2.7 / cg-v3 及更早版本只记录缺项。v2.8–v2.9 / cg-v4–cg-v5 按隐藏集合计覆盖，兼容内置 max、sum。v2.10 / cg-v6 起逐集检查来源（含单集）；PR #43 变基后须改用 cg-v7。新评分代码用 `hidden_value(d, name, value)` 标记测量值，聚合必须用 `hidden_aggregate("max", values)` 等显式操作，直接将结果传入 `check`。只有传入值携带的来源计入本次检查。指标族按去掉 mean/max/set_a 等聚合词后的词元匹配，公开指标可用 `public_only: true` 和 `public_only_reason` 声明例外。只在隐藏集上查的指标和只记录的资源指标均不算缺失。`hidden_shift` 在两个隐藏集完全相同、隐藏集与公开数据完全相同、或某个隐藏集一半以上字节是公开文件的拷贝（小文件也算）时阻塞；单个共用文件（训练表、时间网格）只记录在 `copied_files`。共用校准表等可按文件名列入 `shared_inputs`。
+- S7 在首个配置种子（打包种子）上运行两种输出探针。`one_confident`（报告中的 `coverage`）把超过 5 行的 CSV 缩为置信度最高的一行，`hidden_garbage` 重排隐藏表的答案。两者优先采用值唯一的标识列（如 `filename`、`patient_id`、`sample_key`），找不到时才考虑首列。多个标识列都可作键时跳过该表。纯行重排不算答案变化。
+- 每次只变换公开输出或一个隐藏集。行集合或按键对应的答案发生变化且评分器正常退出、给出 reward 1 时，该范围记为 `shortcut_suspected`，即使原值对照失败也保留。reward 0 且有非资源检查失败、原值对照通过时记为 `caught`。ANS 复用打包种子的参考解评分。PROG 在真值隔离通过后运行探针，仅当有待确认的非资源拒绝时才运行一次该探针共用的全隐藏集原值对照。无适用变换记为 `na`，其余记为 `inconclusive` 并附原因。
+- 两种探针在所有提示词版本中都只提供审核证据。S9R 审核包的 `records/output_probes.json` 保存当前 S7 尝试的逐范围结果、变换文件的相对路径、是否为声明的交付物（无法确定时为 `unknown`）以及各次验证器输出。v8 审核者须把包内 `repro_commands` 为该范围列出的完整 argv 交给 `tbs-repro <scope_id> -- <argv...>` 运行评分器，逐项复现 `shortcut_suspected`，在 `probe_findings` 以完整 ID（如 `hidden_garbage/hidden:A`）填写对应的 `repro_id`、记录中的 `observed_reward`、至少 20 字符的 `observation` 和分类理由。确认评分漏洞须关联阻塞问题并按原规则修订或淘汰。探针误报须说明原因。漏答任一必答 ID 按无效裁决重审。审核者自行发现的评分漏洞在 `issues` 中作为阻塞问题提交证据，可附自选命令的 `repro_id`。
+- **升级部署**时，PR #42 必须与 PR #44 一起部署。#44 为每个 Harbor 作业写入稳定的预留键，供恢复或取消时找回已提交的预算预留。
+- 恢复到 S8、PKG、S9、S9R 或 S10 的条目时，若最近一次 S7 报告使用旧探针策略，生成器会记录该报告 ID 并从 S6A_run 重新过门一次。已结束和已淘汰的条目保留原状。
+- S9R 按作业提交时的契约验证裁决。仅因新版证据字段而失效的合格旧裁决可免费重审一次。有阻塞证据的 `drop` 直接淘汰。关闭审核后，S9R 和 S10 均按作业提交时的执行证据契约接受同一包、轮次和校准 epoch 的有效通过裁决；缺少有效探针结论时暂停发布，保留已有发布记录。
+- S7 报告中，`effort_floor` 提示参考解各次公开求解均少于 30 秒且专家估时至少 2 小时的题目。`data_realism` 提示所有公开文件均为 CSV/NPY/JSON/TXT 且总量小于 2 MB 的题目。两项供 S9R 参考，可分别在 spec 用 `effort_note`、`data_realism_note` 说明理由，`data_formats` 可列出实际格式。
+- PKG 静态检查两个评分脚本，要求显式的单次 `run_solution` 时限小于 verifier 超时减去 `package.verifier_overhead_sec`。题包必须声明 agent 和 verifier 的网络策略，verifier 始终离线，显式 public 对照组记录警告。`extra_pip` 最多 8 个 `name==version`，加入自包含 Dockerfile；PKG 在配置的沙箱镜像内离线核对安装版本，缺包或不匹配报 `extra_pip_unsupported`。
+- `tbsgen diversity --run DIR [--runs-root ROOT] [--json]` 按 14 个领域统计已发布和在途题目，列出空缺领域和相近方法簇。S5G 按候选主题和标题预估，S10 按完整 spec 复核。已发布题至少 `diversity.min_released`（20）道且领域占比超过 `diversity.max_area_share`（0.25），或同簇已有 `max_per_template`（2）题时，默认只写 state 和 event。`diversity.enforce=true` 时暂存为 parked：S5G 已预留但未启动的作业先把 run.json 退回 intent，再以 `diversity_parked`（不计入调用次数上限）结清预留；S10 对已在 manifest 中的版本不再重新判断，崩溃重试不会撤回已发布的题。
+- S10 以包哈希、校准 epoch、标签、审核摘要及其余发布元数据识别同一次追加，忽略写入时间。相同记录重放时直接完成，审核结论或其他发布字段变化时追加新行，消费者读取该题最后一条有效记录。末行中断时先补换行，再追加发布或撤回记录。旧行缺少包哈希时，从其记录的包目录计算后比对。
+- 只读审计分享包可运行 `python scripts/audit_share.py <share>/1-hard --runs-root <runs>`，标准输出为逐题表和 JSON 汇总。

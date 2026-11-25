@@ -192,6 +192,32 @@ are documented in [`gen/README.md`](gen/README.md) §3; calibrating only some it
 (`calib.prepare_command`), teacher-only routing (`calib.teacher_*`) and the S9R review settings (`review.*`, on by
 default; routed like the teacher unless set) are in §4–§5b there.
 
+### Resolving a parked remote job
+
+For S9 and S9R, `tbsgen status` and `tbsgen report` count unresolved `remote_unknown` runs. The item reason
+`remote_unknown: NAME` identifies the job. Its budget reservation and concurrency slot stay held until an
+operator resolves it. The controller records the route before submission. By default, plain Harbor runs locally
+and custom launcher scripts are treated as remote. Set `calib.remote_launchers` (S9 and S9R) or
+`agent.remote_launchers` (S4c and S5G) to an explicit list of remote script basenames. An empty list
+classifies all configured scripts as local. A launcher's remote marker also identifies a remote run.
+
+Use `tbsgen calib resolve-remote --run RUN --config CFG --item ID --job NAME` with one of these outcomes.
+
+- `--synced` ingests every expected trial once its files are present, even if Harbor never wrote the job's
+  `finished_at`. Each trial needs its `result.json`. S9 also requires `verifier/metrics.jsonl`. S9R requires
+  the formal verifier verdict and the reproduction journal if the review contract reads one.
+- `--ended-without-result` (alias `--died`) confirms that the remote job has ended and its directory is fully
+  synced. The controller ingests the complete trials. If none is complete, it applies the infra retry policy
+  and charges the readable trial costs, or the reservation when none is available.
+- `--not-started` settles at zero after the operator verifies that the remote job never started and the local
+  launcher is gone. If tmux cannot determine the session state, independently confirm it is gone and add
+  `--force-local-gone`. A job config, top-level result, or trial result blocks this outcome.
+
+Directory replacement can remove the local `tbsgen-remote.json`. Ingest uses the saved mapping and resolution restores the marker.
+If the controller never captured the mapping, `--synced --remote-task PATH` restores it using the original remote
+task path. This also works when the item is still waiting after the watcher reported a job identity mismatch.
+`regate` requires all calibration and review runs for the item to be closed.
+
 ### Running unattended
 
 A long-running deployment uses a small driver script, written for the deployment; the repository has no such

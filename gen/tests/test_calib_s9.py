@@ -41,7 +41,7 @@ def _env(tmp_path, n_items=1, **calib_kw):
     for name in ("launch.sh", "teach.sh"):
         (hr / name).write_text("#!/bin/bash\n%s\n" % mk)
         (hr / name).chmod(0o755)
-    cal = dict(allow_submit=True, harbor_root=str(hr), jobs_dir=str(jobs), student_launcher="launch.sh",
+    cal = dict(allow_submit=True, remote_launchers=[], harbor_root=str(hr), jobs_dir=str(jobs), student_launcher="launch.sh",
                teacher_launcher="teach.sh", agent_allowed_hosts=["models.example.com"], tmux_bin=str(tmux),
                est_usd_per_run=30.0)
     cal.update(calib_kw)

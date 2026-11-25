@@ -15,6 +15,8 @@ from pathlib import Path
 SPEC = {
     "title": "Spike-robust exponential decay fitting for detector afterglow traces",
     "domain": "physics", "field": "signal processing / detector calibration", "form": "ANS",
+    "generator_assumptions": [{"assumption": "exponential decay", "stated": True,
+                               "where": "Each trace is a single exponential decay"}],
     "expert_time_hours": 0.5,
     "competencies": ["log-linear least squares with heteroscedastic weights", "one-sided outlier rejection"],
     "grounding_vs_extension": "toy fixture (no paper)",

@@ -15,7 +15,7 @@ import traceback
 from pathlib import Path
 
 from . import blocklist, intake, screen_jev, stages_a as A, stages_b as B
-from .budget import BudgetStop, Ledger, harden_scope, today, variant_scope
+from .budget import EXCLUDE_UNSTARTED_JOBS, BudgetStop, Ledger, harden_scope, today, variant_scope
 from .config import resolve_role
 from .models import ModelError, get_client
 from .state import STAGES, Store, read_json, write_json
@@ -110,7 +110,8 @@ class Pipeline:
 
     def item_cost(self, item_id: str) -> dict:
         with self.ledger._db() as db:
-            r = db.execute("SELECT count(*), SUM(COALESCE(usd,0)), SUM(in_tok), SUM(out_tok) FROM calls WHERE item=?",
+            r = db.execute("SELECT count(*), SUM(COALESCE(usd,0)), SUM(in_tok), SUM(out_tok) FROM calls "
+                           f"WHERE item=? AND {EXCLUDE_UNSTARTED_JOBS}",
                            (item_id,)).fetchone()
         return dict(calls=r[0], usd=round(r[1] or 0, 4), in_tok=r[2] or 0, out_tok=r[3] or 0)
 
@@ -145,7 +146,33 @@ class Pipeline:
         with harden_scope(hk), variant_scope(vk):
             return self._step(it)
 
+    def _finish_failed_stage(self, it, stage, status, reason, **info):
+        if stage in ("S4c", "S5G", "S9", "S9R"):
+            previous_status = it.state["status"]
+            with B.item_lock(it):
+                it.load()
+                if it.state["stage"] == stage and it.state["status"] == previous_status:
+                    B.finish_job_stage(self, it, status, reason, **info)
+        else:
+            it.finish(status, reason, **info)
+
+    def _migrate_probe_report(self, it):
+        try:
+            return "ok" if B.migrate_probe_report(self, it) else None
+        except Exception as exc:
+            with B.item_lock(it):
+                it.load()
+                stage = it.state["stage"]
+                self.store.event("stage_crash", item=it.item_id, stage=stage, err=f"{type(exc).__name__}: {exc}",
+                                 tb=traceback.format_exc()[-1500:])
+                if B.legacy_report_id(it):
+                    it.finish("paused", f"probe migration: {exc}", paused_stage=stage)
+            return "paused"
+
     def _step(self, it) -> str:
+        migrated = self._migrate_probe_report(it)
+        if migrated:
+            return migrated
         st = it.state["stage"]
         role = MODEL_STAGES.get(st)
         alias = resolve_role(self.cfg, role) if role else None
@@ -167,7 +194,7 @@ class Pipeline:
                 # this paper's authoring allowance (budget.item_usd_cap, item_harden_usd_cap in a hardening round,
                 # item_variant_usd_cap in an S9b variant round) is used up: final for the paper / the round, and
                 # the model stays available for the others
-                it.finish("dropped", e.reason + "_cap", detail=e.detail)
+                self._finish_failed_stage(it, st, "dropped", e.reason + "_cap", detail=e.detail)
                 if B.harden_needs_step(it):
                     B.harden_step(self, it)     # a hardened version: back to the previous one
                 self.store.event("budget_stop", item=it.item_id, stage=st, reason=e.reason, detail=e.detail)
@@ -184,14 +211,14 @@ class Pipeline:
                 self.stopped_models.add(alias if role else st)
                 return "paused"
             if n >= 2:
-                it.finish("parked", f"model_error:{st}:{e.cls}")
+                self._finish_failed_stage(it, st, "parked", f"model_error:{st}:{e.cls}")
             return "error"
         except Exception as e:  # noqa: BLE001  (bug or unexpected data: park the item, keep the run going)
             self.store.event("stage_crash", item=it.item_id, stage=st, err=f"{type(e).__name__}: {e}",
                              tb=traceback.format_exc()[-1500:])
             n = it.bump(f"crash:{st}")
             if n >= 2:
-                it.finish("parked", f"crash:{st}:{type(e).__name__}")
+                self._finish_failed_stage(it, st, "parked", f"crash:{st}:{type(e).__name__}")
             return "crash"
         self.store.event("stage_end", item=it.item_id, stage=st, to=it.state["stage"], status=it.state["status"],
                          sec=round(time.time() - t0, 2))
@@ -265,7 +292,7 @@ class Pipeline:
                 return False
             if last is not None and _stage_pos(it.state["stage"]) > last:
                 return False
-            if it.state["status"] == "active":
+            if it.state["status"] == "active" or B.legacy_report_id(it):
                 return True
             if B.harden_needs_step(it):         # an interrupted hardening transaction (any status)
                 return it.item_id not in polled
@@ -286,7 +313,7 @@ class Pipeline:
                     polled.add(it.item_id)
                 elif it.state["status"] == "waiting" and it.state["stage"] in AGENT_STAGES:
                     polled.add(it.item_id)
-                elif it.state["status"] == "waiting":
+                elif it.state["status"] == "waiting" and not B.legacy_report_id(it):
                     rewoken.add(it.item_id)
                     if not B.rewake(self.cfg, it):      # re-checked under the item lock
                         continue
@@ -300,7 +327,7 @@ class Pipeline:
             out["until"] = until
         return out
 
-    def resume(self, reasons_prefix: tuple[str, ...] = ("budget:", "model:"), only: list[str] | None = None,
+    def resume(self, reasons_prefix: tuple[str, ...] = ("budget:", "model:", "parked:probe_unreviewed"), only: list[str] | None = None,
                stages: list[str] | None = None) -> list[str]:
         """Re-activate paused items whose reason starts with one of reasons_prefix; only: just these item ids;
         stages: just items paused at these stages."""
@@ -311,7 +338,14 @@ class Pipeline:
             hist = it.state.get("history") or [{}]
             if stages and hist[-1].get("paused_stage", it.state["stage"]) not in stages:
                 continue
-            if it.state["status"] == "paused" and str(it.state.get("reason", "")).startswith(reasons_prefix):
+            migrated = self._migrate_probe_report(it)
+            if migrated:
+                if migrated == "ok":
+                    out.append(it.item_id)
+                continue
+            probe_park = (it.state["status"] == "parked" and it.state.get("reason") == "parked:probe_unreviewed"
+                          and (self.cfg.get("review") or {}).get("enabled"))
+            if (it.state["status"] == "paused" or probe_park) and str(it.state.get("reason", "")).startswith(reasons_prefix):
                 it.state["stage"] = hist[-1].get("paused_stage", it.state["stage"])
                 it.state["status"] = "active"
                 it.save()
@@ -325,4 +359,7 @@ class Pipeline:
         return dict(n=len(items), by_status=dict(Counter(i.state["status"] for i in items)),
                     by_stage=dict(Counter(f"{i.state['stage']}/{i.state['status']}" for i in items)),
                     reasons=dict(Counter(i.state.get("reason") for i in items if i.state.get("reason"))),
+                    remote_unknown=sum(r.get("state") == "remote_unknown" and r.get("outcome") is None
+                                       for i in items for directory in ("calib", "review")
+                                       for r in read_json(i.p(directory, "runs.json"), [])),
                     ledger_today=self.ledger.summary(today()))

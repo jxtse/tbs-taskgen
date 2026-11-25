@@ -26,6 +26,7 @@ import time
 from pathlib import Path
 
 CN = dt.timezone(dt.timedelta(hours=8))
+EXCLUDE_UNSTARTED_JOBS = "COALESCE(cost_kind,'') NOT IN ('probe_migration_cancelled','cancelled_unstarted','expired_unsent')"
 # hardening round of the item being stepped (Pipeline.step sets it while state.harden_active; 0 = not a hardening
 # round).  Every reservation is tagged with it (calls.harden), so budget.item_harden_usd_cap can keep a hardening
 # round's authoring spend (S5G, S6A, S6M, S6C, S7, S8 ...) apart from the first version's budget.item_usd_cap.
@@ -117,6 +118,7 @@ class Ledger:
         self.cfg = cfg
         with self._db() as db:
             db.executescript(SCHEMA)
+            db.execute("BEGIN IMMEDIATE")
             cols = {r[1] for r in db.execute("PRAGMA table_info(calls)")}
             if "cost_kind" not in cols:     # added for S9 runs: reported / tokens / reservation (older ledgers: NULL)
                 db.execute("ALTER TABLE calls ADD COLUMN cost_kind TEXT")
@@ -124,6 +126,12 @@ class Ledger:
                 db.execute("ALTER TABLE calls ADD COLUMN harden INTEGER")
             if "variant" not in cols:       # S9b variant round of the call (older ledgers: NULL = not a variant)
                 db.execute("ALTER TABLE calls ADD COLUMN variant INTEGER")
+            if "reservation_key" not in cols:
+                db.execute("ALTER TABLE calls ADD COLUMN reservation_key TEXT")
+            # A cross-day replacement shares the key of the expired reservation.
+            db.execute("DROP INDEX IF EXISTS calls_reservation")
+            db.execute("CREATE UNIQUE INDEX IF NOT EXISTS calls_open_reservation ON calls(reservation_key) "
+                       "WHERE reservation_key IS NOT NULL AND status='reserved'")
 
     def _db(self):
         db = sqlite3.connect(self.path, timeout=60, isolation_level=None)
@@ -131,8 +139,76 @@ class Ledger:
         return db
 
     # ------------------------------------------------------------------ reserve / finish
+    def reserved_call(self, key: str) -> int | None:
+        with self._db() as db:
+            return self._reserved_call(db, key)
+
+    @staticmethod
+    def _reserved_call(db, key):
+        row = db.execute("SELECT id FROM calls WHERE reservation_key=? AND status='reserved'", (key,)).fetchone()
+        return row[0] if row else None
+
+    def job_was_sent(self, item, stage, key, saved_id):
+        with contextlib.closing(self._db()) as db:
+            row = db.execute("SELECT 1 FROM calls WHERE item=? AND stage=? AND status='sent' "
+                             "AND (reservation_key=? OR id=?) LIMIT 1", (item, stage, key, saved_id)).fetchone()
+            return row is not None
+
+    def cancel_unstarted_job(self, item, stage, key, saved_id, kind):
+        """Cancel all open calls for this launch, including a replacement missing from the job record."""
+        with contextlib.closing(self._db()) as db, db:
+            db.execute("BEGIN IMMEDIATE")
+            rows = db.execute("SELECT id FROM calls WHERE item=? AND stage=? AND status IN ('reserved','sent') "
+                              "AND (reservation_key=? OR id=?) ORDER BY id", (item, stage, key, saved_id)).fetchall()
+            for (call,) in rows:
+                self._settle(db, call, 0.0, "error", "", kind, None)
+            if rows:
+                return rows[-1][0]
+            # A previous cancellation may have committed before the replacement id reached runs.json.
+            row = db.execute("SELECT MAX(id) FROM calls WHERE item=? AND stage=? AND reservation_key=? "
+                             "AND status IN ('cancelled','ok','error')", (item, stage, key)).fetchone()
+            return row[0] or saved_id
+
+    def adopt_started_job(self, model, stage, item, job_name, launch_key, estimate, cost, saved_id=None):
+        """Track a job that already started. Admission limits apply only before launch."""
+        key = f"harbor-adopt:{job_name}"
+        with contextlib.closing(self._db()) as db, db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT id FROM calls WHERE item=? AND stage=? AND "
+                             "(reservation_key=? OR ((id=? OR reservation_key=?) AND status IN ('reserved','sent','ok'))) "
+                             "ORDER BY id DESC LIMIT 1", (item, stage, key, saved_id, launch_key)).fetchone()
+            if row:
+                call = row[0]
+            else:
+                call = db.execute(
+                    "INSERT INTO calls(day,started,model,real,stage,item,status,est_usd,reservation_key) "
+                    "VALUES(?,?,?,1,?,?,'reserved',?,?)",
+                    (today(), time.time(), model, stage, item, estimate, key)).lastrowid
+            if cost is not None:
+                usd, kind, usage = cost
+                self._settle(db, call, usd, "ok", "adopted completed Harbor job", kind, usage)
+            return call
+
+    def adopt_legacy_agent_call(self, key, item, stage, model, intent_ts):
+        """Attach a job's stable key to its outstanding pre-key reservation, if present."""
+        with self._db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            held = self._reserved_call(db, key)
+            if held:
+                return held  # upgrade interrupted before run.json was saved
+            rows = db.execute("SELECT id FROM calls WHERE item=? AND stage=? AND model=? AND started>=? "
+                              "AND status='reserved' AND real=1 AND prompt_sha='' AND reservation_key IS NULL",
+                              (item, stage, model, intent_ts)).fetchall()
+            if len(rows) > 1:
+                raise BudgetStop("ambiguous_reservation", f"{item} {stage}: multiple outstanding legacy calls")
+            if rows:
+                call = rows[0][0]
+                db.execute("UPDATE calls SET reservation_key=? WHERE id=?", (key, call))
+                return call
+            return None
+
     def reserve(self, model: str, stage: str, item: str, real: bool, prompt_sha: str = "",
-                est_usd: float | None = None) -> int:
+                est_usd: float | None = None, reservation_key: str | None = None) -> int:
         b = self.cfg["budget"]
         est = (float(b.get("est_usd_per_call", 0.0)) if est_usd is None else float(est_usd)) if real else 0.0
         hk = harden_round_now()
@@ -141,6 +217,11 @@ class Ledger:
         db = self._db()
         try:
             db.execute("BEGIN IMMEDIATE")
+            if reservation_key is not None:
+                held = self._reserved_call(db, reservation_key)
+                if held:
+                    db.execute("COMMIT")
+                    return held
             row = db.execute("SELECT open, reason FROM breaker WHERE model=?", (model,)).fetchone()
             if row and row[0]:
                 raise BudgetStop("breaker_open", f"{model}: {row[1]}")
@@ -168,7 +249,7 @@ class Ledger:
             cap_r = (b.get("run_calls_per_model") or {}).get(model)
             # call-count caps count calls that were made: a reservation the model relay refused at its preflight
             # (cost_kind relay_refused, calib.relay_preflight_refused: no Harbor job, no model call) is no call
-            made = "AND COALESCE(cost_kind,'') != 'relay_refused'"
+            made = f"AND COALESCE(cost_kind,'') NOT IN ('relay_refused', 'diversity_parked') AND {EXCLUDE_UNSTARTED_JOBS}"
             if cap_r is not None:
                 n = db.execute(f"SELECT count(*) FROM calls WHERE model=? AND real=1 {made}", (model,)).fetchone()[0]
                 if n >= int(cap_r):
@@ -215,10 +296,10 @@ class Ledger:
                 if n >= int(cap_i):
                     raise BudgetStop("item_calls", f"{item} {cap_i} calls")
             cur = db.execute(
-                "INSERT INTO calls(day,started,model,real,stage,item,status,est_usd,prompt_sha,harden,variant) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO calls(day,started,model,real,stage,item,status,est_usd,prompt_sha,harden,variant,reservation_key) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
                 (day, time.time(), model, int(real), stage, item, "reserved", est, prompt_sha, hk or None,
-                 vk or None))
+                 vk or None, reservation_key))
             db.execute("COMMIT")
             return cur.lastrowid
         except BaseException:
@@ -267,18 +348,18 @@ class Ledger:
         reserved estimate as the cost (unknown actual cost is never booked as 0) and marks the row
         cost_kind="reservation".  kind: "reported" (default for a given usd) or "tokens" (estimated from token
         usage); usage (if known) is stored in the token columns."""
+        with contextlib.closing(self._db()) as db, db:
+            self._settle(db, call_id, usd, status, note, kind, usage)
+
+    @staticmethod
+    def _settle(db, call_id, usd, status, note, kind, usage):
         kind = "reservation" if usd is None else (kind or "reported")
         u = usage or {}
-        db = self._db()
-        try:
-            db.execute("UPDATE calls SET ended=?, status=?, usd=COALESCE(?, est_usd), error=?, cost_kind=?, "
-                       "in_tok=COALESCE(?, in_tok), out_tok=COALESCE(?, out_tok), cache_read=COALESCE(?, cache_read), "
-                       "cache_write=COALESCE(?, cache_write) WHERE id=?",
-                       (time.time(), status, usd, note[:500], kind, u.get("input_tokens"), u.get("output_tokens"),
-                        u.get("cache_read_input_tokens"), u.get("cache_creation_input_tokens"), call_id))
-            db.commit()
-        finally:
-            db.close()
+        db.execute("UPDATE calls SET ended=?, status=?, usd=COALESCE(?, est_usd), error=?, cost_kind=?, "
+                   "in_tok=COALESCE(?, in_tok), out_tok=COALESCE(?, out_tok), cache_read=COALESCE(?, cache_read), "
+                   "cache_write=COALESCE(?, cache_write) WHERE id=?",
+                   (time.time(), status, usd, note[:500], kind, u.get("input_tokens"), u.get("output_tokens"),
+                    u.get("cache_read_input_tokens"), u.get("cache_creation_input_tokens"), call_id))
 
     # ------------------------------------------------------------------ breaker / reports
     def breaker(self, model: str) -> dict | None:
@@ -297,9 +378,10 @@ class Ledger:
 
     def summary(self, day: str | None = None) -> dict:
         q = ("SELECT model, stage, real, count(*), SUM(status='error'), SUM(in_tok), SUM(out_tok), SUM(cache_read), "
-             "SUM(COALESCE(usd,est_usd,0)) FROM calls {} GROUP BY model, stage, real ORDER BY model, stage")  # in-flight = reserved est
+             f"SUM(COALESCE(usd,est_usd,0)) FROM calls WHERE {EXCLUDE_UNSTARTED_JOBS} {{}} GROUP BY model, stage, real "
+             "ORDER BY model, stage")
         with self._db() as db:
-            rows = db.execute(q.format("WHERE day=?" if day else ""), (day,) if day else ()).fetchall()
+            rows = db.execute(q.format("AND day=?" if day else ""), (day,) if day else ()).fetchall()
             br = db.execute("SELECT model, open, reason FROM breaker WHERE open=1").fetchall()
         out = [dict(model=r[0], stage=r[1], real=bool(r[2]), calls=r[3], errors=r[4] or 0, in_tok=r[5] or 0,
                     out_tok=r[6] or 0, cache_read=r[7] or 0, usd=round(r[8] or 0, 4)) for r in rows]

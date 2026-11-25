@@ -41,6 +41,7 @@ import shlex
 import shutil
 import subprocess
 import time
+import uuid
 from pathlib import Path
 
 from .state import read_json, write_json
@@ -73,7 +74,6 @@ def run_id(cfg: dict) -> str:
     root = Path(str((cfg.get("run") or {}).get("root") or "."))
     f = root / "code_run_id.txt"
     if not f.exists():
-        import uuid
         root.mkdir(parents=True, exist_ok=True)
         tmp = f.with_suffix(f".tmp{os.getpid()}")
         tmp.write_text(f"{root.name[:40]}-{uuid.uuid4().hex[:8]}\n")
@@ -392,23 +392,50 @@ def agent_job_config(cfg: dict, task: Path, job_name: str, jobs_dir: Path, max_u
             "verifier": {"disable": False}, "agents": [agent], "tasks": [{"path": str(task.resolve())}]}
 
 
+def recover_legacy_agent_call(it, kind, rec, conf, ledger):
+    # b88e514 recorded the job name in the intent and job config, but only item/stage/model/start in SQLite.
+    if (ledger is None or rec.get("reservation_key") or rec.get("state") != "intent"
+            or rec.get("kind") != kind or rec.get("ts") is None or rec.get("job_name") != conf["job_name"]
+            or rec.get("job_dir") != str(Path(conf["jobs_dir"]) / conf["job_name"])):
+        return
+    key = f"legacy:{it.item_id}:{kind}:{conf['job_name']}:{rec['ts']}"
+    model = conf["agents"][0]["model_name"]
+    call = ledger.adopt_legacy_agent_call(key, it.item_id, kind, model, rec["ts"])
+    if call is not None:
+        rec.update(state="reserved", model=model, reservation_key=key, ledger_call=call)
+        write_json(it.p(kind, "run.json"), rec)
+
+
 def launch_agent(cfg: dict, it, kind: str, conf: dict, ledger, est_usd: float, extra: dict | None = None) -> dict:
     """intent -> reserved -> launched, persisted in <item>/<kind>/run.json (one job per stage attempt).  extra:
     fields stored with the intent (e.g. budget, harden_round) so a resumed job keeps them."""
+    from .calib import is_remote_launcher
+    launcher = _c(cfg).get("agent_launcher") or cfg["calib"].get("teacher_launcher")
+    remote_route = is_remote_launcher(cfg.get("agent", {}), launcher)
     d = it.p(kind)
     d.mkdir(parents=True, exist_ok=True)
     recp = d / "run.json"
     rec = read_json(recp, None) or {}
     if rec.get("job_name") != conf["job_name"]:
-        rec = dict(job_name=conf["job_name"], state="intent", ts=time.time(), kind=kind,
+        rec = dict(job_name=conf["job_name"], state="intent", ts=time.time(), kind=kind, remote_route=remote_route,
                    job_dir=str(Path(conf["jobs_dir"]) / conf["job_name"]), config=str((d / "job.json").resolve()),
                    **(extra or {}))
         (d / "job.json").write_text(json.dumps(conf, indent=1))
+        if ledger is not None:
+            rec["reservation_key"] = uuid.uuid4().hex
         write_json(recp, rec)
+    else:
+        recover_legacy_agent_call(it, kind, rec, conf, ledger)
     if rec["state"] == "intent":
         model = conf["agents"][0]["model_name"]
-        rec["ledger_call"] = ledger.reserve(model, kind, it.item_id, True, est_usd=float(est_usd)) \
-            if ledger is not None else None
+        if ledger is not None:
+            if not rec.get("reservation_key"):
+                rec["reservation_key"] = uuid.uuid4().hex
+                write_json(recp, rec)
+            rec["ledger_call"] = ledger.reserve(model, kind, it.item_id, True, est_usd=float(est_usd),
+                                                reservation_key=rec["reservation_key"])
+        else:
+            rec["ledger_call"] = None
         rec["model"] = model
         rec["state"] = "reserved"
         write_json(recp, rec)
@@ -418,7 +445,6 @@ def launch_agent(cfg: dict, it, kind: str, conf: dict, ledger, est_usd: float, e
             write_json(recp, rec)
             return rec
         root = _c(cfg).get("agent_harbor_root") or cfg["calib"].get("teacher_harbor_root")
-        launcher = _c(cfg).get("agent_launcher") or cfg["calib"].get("teacher_launcher")
         if not (root and launcher):
             rec.update(state="launch_failed", error="code.agent_harbor_root / agent_launcher not set")
             if ledger is not None and rec.get("ledger_call"):
@@ -443,7 +469,7 @@ def launch_agent(cfg: dict, it, kind: str, conf: dict, ledger, est_usd: float, e
                 return rec                      # cannot tell: keep the reservation, try again on the next step
         inner = (f"cd {shlex.quote(root)} && env -u PYTHONPATH -u VIRTUAL_ENV ./{launcher} run "
                  f"{shlex.quote(rec['config'])} > {shlex.quote(str(log))} 2>&1; echo $? > {shlex.quote(str(log))}.exit")
-        rec.update(launch_attempted=time.time(), log=str(log), tmux=conf["job_name"][-60:])
+        rec.update(launch_attempted=time.time(), log=str(log), tmux=conf["job_name"][-60:], remote_route=remote_route)
         write_json(recp, rec)
         r = subprocess.run([tmux_bin, "new-session", "-d", "-s", rec["tmux"], "bash", "-lc",
                             inner], capture_output=True, text=True, timeout=60)

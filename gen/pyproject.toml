@@ -26,3 +26,4 @@ tbsretr = { path = "../retrieval", editable = true }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["src", "../retrieval/src"]

@@ -13,6 +13,8 @@
   tbsgen breaker --run DIR --model M --reset
   tbsgen calib-ingest --run DIR --item ID --job-dir JOBDIR      attach Harbor results to the pending S9 run (or the
                                                                  pending S9R review run of an item at S9R)
+  tbsgen calib resolve-remote --run DIR --item ID --job NAME
+                             (--synced | --ended-without-result | --not-started) [--remote-task PATH] [--force-local-gone]
   tbsgen calib watch --run DIR [--only ID,..] [--once] [--interval S] [--max-hours H]
                                                                  poll submitted S9 / S9R jobs: ingest finished ones,
                                                                  step S9 (label, or launch the next run GLM ->
@@ -78,11 +80,14 @@ def _pipeline(a, overrides=None) -> Pipeline:
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="tbsgen")
     sub = ap.add_subparsers(dest="cmd", required=True)
-    for name in ("ingest", "run", "resume", "status", "report", "ledger", "breaker", "calib-ingest", "ping", "reset",
+    for name in ("ingest", "run", "resume", "status", "report", "ledger", "diversity", "breaker", "calib-ingest", "ping", "reset",
                  "harbor-local", "fetch", "remote", "fulltext", "calib", "review", "regate", "harden", "variant"):
         s = sub.add_parser(name)
         s.add_argument("--run", required=True)
         s.add_argument("--config", default=None)
+        if name == "diversity":
+            s.add_argument("--runs-root", type=Path)
+            s.add_argument("--json", action="store_true")
         if name == "ingest":
             s.add_argument("--candidates", required=True)
             s.add_argument("--top", type=int, default=0)
@@ -94,14 +99,23 @@ def main(argv=None):
         if name == "resume":
             s.add_argument("--only", default="", help="ID[,ID]: just these items")
             s.add_argument("--stage", default="", help="STAGE[,STAGE]: just items paused at these stages")
-            s.add_argument("--reason", default="budget:,model:", help="reason prefixes (comma-separated)")
+            s.add_argument("--reason", default="budget:,model:,parked:probe_unreviewed", help="reason prefixes (comma-separated)")
         if name == "calib":
-            s.add_argument("action", choices=["watch", "prepare"])
+            s.add_argument("action", choices=["watch", "prepare", "resolve-remote"])
             s.add_argument("--only", default="", help="watch: ID[,ID]")
             s.add_argument("--once", action="store_true", help="watch: one pass, then exit")
             s.add_argument("--interval", type=float, default=None, help="watch: seconds (calib.watch_interval_s)")
             s.add_argument("--max-hours", type=float, default=None, help="watch: stop after this long")
-            s.add_argument("--item", default=None, help="prepare: item id")
+            s.add_argument("--item", default=None, help="prepare / resolve-remote: item id")
+            s.add_argument("--job", help="resolve-remote: remote job name")
+            resolution = s.add_mutually_exclusive_group()
+            resolution.add_argument("--synced", action="store_true")
+            resolution.add_argument("--ended-without-result", "--died", action="store_true",
+                                    help="confirm the remote job ended and is fully synced; ingest any complete trials")
+            s.add_argument("--remote-task", metavar="PATH", help="remote task path when the launcher marker was lost")
+            resolution.add_argument("--not-started", action="store_true")
+            s.add_argument("--force-local-gone", action="store_true",
+                           help="confirm the local launcher is gone when tmux cannot determine its status")
             s.add_argument("--who", default="glm", choices=["glm", "teacher"])
         if name == "review":
             s.add_argument("action", choices=["build", "summary", "deliverable"])
@@ -165,6 +179,11 @@ def main(argv=None):
     a = ap.parse_args(argv)
     if a.cmd == "ping":
         return _ping(a)
+    if a.cmd == "diversity":
+        from . import diversity
+        result = diversity.report(Path(a.run), a.runs_root)
+        print(json.dumps(result, indent=2) if a.json else diversity.format_report(result))
+        return 0
     P = _pipeline(a)
     if a.cmd == "fetch":
         return _fetch(P, a)
@@ -286,7 +305,24 @@ def _ids(v: str) -> list[str] | None:
 
 def _calib(P: Pipeline, a) -> int:
     import time
-    from .stages_b import watch_tick
+    from .stages_b import resolve_remote, watch_tick
+    if a.action == "resolve-remote":
+        if not (a.item and a.job and (a.synced or a.ended_without_result or a.not_started)):
+            sys.exit("resolve-remote requires --item ID --job NAME and one of --synced, --ended-without-result or --not-started")
+        if a.not_started and a.remote_task:
+            sys.exit("--remote-task requires --synced or --ended-without-result")
+        if a.force_local_gone and not a.not_started:
+            sys.exit("--force-local-gone requires --not-started")
+        try:
+            result = resolve_remote(P, P.store.item(a.item), a.job, synced=a.synced,
+                                    ended_without_result=a.ended_without_result, remote_task=a.remote_task,
+                                    force_local_gone=a.force_local_gone)
+        except ValueError as e:
+            sys.exit(str(e))
+        print(json.dumps(result, ensure_ascii=False))
+        return 0
+    if a.job or a.synced or a.not_started or a.ended_without_result or a.remote_task or a.force_local_gone:
+        sys.exit("remote resolution options require calib resolve-remote")
     if a.action == "prepare":
         if not a.item:
             sys.exit("tbsgen calib prepare: --item is required")
@@ -317,11 +353,13 @@ def _calib(P: Pipeline, a) -> int:
 
 
 def _running(P: Pipeline, item_id: str) -> bool:
+    from .stages_b import job_stage
     it = P.store.item(item_id)
-    if it.state.get("stage") == "S5G":                  # a hardening round's authoring job
+    stage = job_stage(it)
+    if stage == "S5G":                                   # a hardening round's authoring job
         return (read_json(it.p("S5G", "run.json"), {}) or {}).get("state") == "launched"
-    runs = read_json(it.p("review" if it.state.get("stage") == "S9R" else "calib", "runs.json"), []) or []
-    return any(r.get("outcome") is None and r.get("state", "launched") == "launched" for r in runs)
+    runs = read_json(it.p("review" if stage == "S9R" else "calib", "runs.json"), []) or []
+    return any(calib.pending_launcher(r) for r in runs)
 
 
 def fetch_max_default(cfg: dict, given: int | None) -> int:

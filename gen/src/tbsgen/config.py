@@ -298,6 +298,7 @@ DEFAULTS: dict[str, Any] = {
     # S1 -> S2a (code signal, no download quota) -> S2 -> S3 (full text) -> S3b (own code confirmed on its host)
     # -> S4.  A paper without the authors' code is dropped (no exception route).  Licences are recorded only.
     # See codegate.py for the drop reasons.  grounded=false keeps the paper-only pipeline unchanged.
+    "agent": {"remote_launchers": None},  # S4c / S5G launcher classification (same default as calib)
     "code": {
         "grounded": False,
         "prescreen": True,                  # S2a on (needs grounded)
@@ -396,6 +397,9 @@ DEFAULTS: dict[str, Any] = {
     },
     "thresholds": {
         "frac": 0.5,                        # 待定: threshold position between ref and mid (log-midpoint)
+        # hidden-set metrics: the relative reference margin S7 demands.  None = the old rule (half of
+        # min_ref_margin, also when a run config customises min_ref_margin). Recalibrate when changing this margin.
+        "min_ref_margin_hidden": None,
         "min_ref_margin": 0.10,             # reference must clear each threshold by >=10% (relative)
         "loose_margin": 0.50,               # non-separating metrics: threshold = ref worsened by 50%
         "noise_floor_abs": 1e-9,            # two values both below this are floating-point noise: never "separating"
@@ -423,7 +427,8 @@ DEFAULTS: dict[str, Any] = {
         "max_exploit_repair_rounds": 2,     # S8 rounds when exploit_valid is the only blocking gate: only the broken
                                             # baselines/exploit_*.py are rewritten (allowed with locked thresholds)
         "blocking": ["oracle", "hidden_shift", "leak", "isolation", "infeasible", "determinism", "truth_isolation",
-                     "cli_contract", "output_contract", "tdm_verbatim", "readymade", "author_leak"],
+                     "threshold_format", "statement_clean", "hidden_parity",
+                     "assumptions_stated", "cli_contract", "output_contract", "tdm_verbatim", "readymade", "author_leak"],
         # readymade (prerelease.readymade_check): the task image installs, or the reference / a baseline imports,
         # the paper's own implementation (code_links repo names, method_names of the S5 spec).  Rules only.
         # TDM terms (Elsevier: quotes <= 200 chars; Wiley: no redistribution): longest verbatim overlap between
@@ -432,6 +437,7 @@ DEFAULTS: dict[str, Any] = {
         "tdm_verbatim_channels": ["elsevier", "wiley"],
         "tdm_verbatim_unknown": False,      # True: a full text of unknown channel is checked too
     },
+    "diversity": {"max_area_share": 0.25, "max_per_template": 2, "min_released": 20, "enforce": False},
     "sandbox": {
         "backend": "docker",                # "docker" (local) | "ssh" (docker on `host`; code-grounded runs: the
                                             # authors' code runs on the build host only)
@@ -454,6 +460,7 @@ DEFAULTS: dict[str, Any] = {
         # printed command is a plain `harbor run --config ...`, and allow_submit=true refuses to launch.
         "harbor_root": HARBOR_ROOT,
         "jobs_dir": str(REPO_ROOT / "gen" / "state" / "harbor-jobs"),
+        "remote_launchers": None,           # explicit script basenames, default: all wrappers except harbor
         "student_launcher": None,
         "teacher_launcher": None,
         "allow_submit": False,              # must be flipped explicitly; True = reserve in ledger + tmux launch
