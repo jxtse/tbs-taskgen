@@ -2174,6 +2174,8 @@ def harden_needs_step(it) -> bool:
         return False
     if st.get("harden_pending") or st.get("harden_revert_pending"):
         return True
+    if st.get("stage") == "S6I" and st.get("reason") == "parked:infra":
+        return False
     return bool(st.get("harden_active") and st.get("status") in ("dropped", "parked") and
                 st.get("stage") in HARDEN_REVERT_STAGES and not _review_of_version(it))
 

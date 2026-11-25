@@ -1120,7 +1120,13 @@ def _s5g(P, it):
         it.state.pop(key, None)
     if images:
         it.state["image_kind"] = spec["image_kind"]
-    it.p("S6I_image.json").unlink(missing_ok=True)
+    # A new version invalidates the image receipt, but keeps earlier build diagnostics.
+    receipt = it.p("S6I_image.json")
+    history = read_json(receipt, {}).get("history", [])
+    if history:
+        write_json(receipt, {"history": history})
+    else:
+        receipt.unlink(missing_ok=True)
     # S6C products (tests with the thresholds, exploit baselines) are always rebuilt for a new authored version:
     # an agent that started from an earlier version must not carry its thresholds into the verifier
     if (task / "tests" / "test_outputs.py").exists():
@@ -1166,9 +1172,35 @@ def _s5g(P, it):
                cost_usd=rec.get("cost_usd"), minutes=rec.get("minutes"))
 
 
+def _record_image_result(it, result):
+    receipt = it.p("S6I_image.json")
+    previous = read_json(receipt, {})
+    history = previous.get("history", [])
+    if not history and previous.get("failed_gate"):  # pre-history receipt, including legacy drops
+        history.append(dict(gate=previous["failed_gate"], error=previous.get("error")))
+    if not result["ok"]:
+        history.append(dict(gate=result["failed_gate"], error=result["error"], ts=time.time()))
+    write_json(receipt, dict(result, history=history))
+
+
+def image_retry_due(it):
+    st = it.state
+    if not (st["stage"] == "S6I" and st["status"] == "waiting" and st.get("reason", "").startswith("S6I:infra:")):
+        return False
+    retry_at = next((h.get("retry_at") for h in reversed(st.get("history") or []) if "retry_at" in h), None)
+    return retry_at is None or retry_at <= time.time()
+
+
 def _image_failure(P, it, result):
-    write_json(it.p("S6I_image.json"), result)
+    _record_image_result(it, result)
     gate = result["failed_gate"]
+    if taskimage.infra_failure(result):
+        attempts = it.state.setdefault("attempts", {})
+        n = attempts["S6I:infra"] = attempts.get("S6I:infra", 0) + 1
+        if n >= P.cfg["taskimage"]["infra_retries"]:
+            return it.finish("parked", "parked:infra")
+        delay = (600, 1800, 3600)[min(n, 3) - 1]
+        return it.finish("waiting", f"S6I:infra:{gate}", retry_at=time.time() + delay)
     why = "readymade_image" if gate == "readymade_image" else f"image_build_failed:{gate}"
     feedback = dict(why=why, finding=result["error"], action="Choose another base or drop that package."
                     if gate == "readymade_image" else "Correct the image and retest the declared pins.")
@@ -1184,14 +1216,14 @@ def s6i(P, it):
     from .stages_b import item_lock
     with item_lock(it):
         it.load()
-        if it.state.get("stage") != "S6I" or it.state.get("status") != "active":
+        if it.state.get("stage") != "S6I" or (it.state["status"] != "active" and not image_retry_due(it)):
             return
         result = taskimage.build(P.cfg, it.dir, state=it.state)
         if not result["ok"]:
             if it.state.get("image_resume_stage"):
                 raise taskimage.ImageUnavailable(f"S6I restore failed at {result['failed_gate']}: {result['error']}")
             return _image_failure(P, it, result)
-        write_json(it.p("S6I_image.json"), result)
+        _record_image_result(it, result)
         taskimage.record_base(taskimage.catalog_path(P.cfg), result["base"], it.item_id, result)
         it.state.update({k: result[k] for k in taskimage.STATE_FIELDS if k in result}, image_kind="task")
         it.p("taskimage-evicted.json").unlink(missing_ok=True)

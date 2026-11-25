@@ -84,7 +84,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser(prog="tbsgen")
     sub = ap.add_subparsers(dest="cmd", required=True)
     for name in ("ingest", "run", "resume", "status", "report", "ledger", "diversity", "breaker", "calib-ingest", "ping", "reset",
-                 "harbor-local", "fetch", "remote", "fulltext", "calib", "taskimage", "review", "regate", "harden", "variant"):
+                 "harbor-local", "fetch", "remote", "fulltext", "calib", "taskimage", "requeue-image", "review", "regate", "harden", "variant"):
         s = sub.add_parser(name)
         s.add_argument("--run", required=True)
         s.add_argument("--config", default=None)
@@ -109,6 +109,8 @@ def main(argv=None):
         if name == "taskimage":
             s.add_argument("action", choices=["gc"])
             s.add_argument("--dry-run", action="store_true")
+        if name == "requeue-image":
+            s.add_argument("--item", required=True)
         if name == "calib":
             s.add_argument("action", choices=["watch", "prepare", "launch", "resolve-remote"])
             s.add_argument("--only", default="", help="watch: ID[,ID]")
@@ -237,6 +239,10 @@ def main(argv=None):
         if a.loop is not None:
             return _worker_loop(P.store.root, a.loop, run_pass)
         run_pass(None)
+    elif a.cmd == "requeue-image":
+        if not P.requeue_image(a.item):
+            ap.error(f"{a.item}: requeue requires an S6I infrastructure park or a matching legacy drop and receipt")
+        print(json.dumps(dict(requeued=a.item)))
     elif a.cmd == "resume":
         reasons = tuple(x.strip() for x in a.reason.split(",") if x.strip())
         if not reasons:

@@ -43,6 +43,65 @@ STATE_FIELDS = ("base", "base_resolved_from", "image_kind", "image_tag", "image_
                 "inventory_hash", "inventory")
 GATES = ("resolve_base", "lint", "built", "verifier_floor", "offline_imports", "size", "arch", "readymade_image")
 
+# Inspect the final diagnostic. BuildKit also prints earlier steps, including output from
+# the author's RUN commands, while it resolves images in parallel.
+_AUTHOR_ERROR = re.compile(
+    r"\b(?:manifest unknown|not found|unknown package)\b|\b404\b|"
+    r"^(?:unexpected build-context entry:|unused or missing build-context file:|FROM needs |spec\.image\.base must match )|"
+    r"did not complete successfully|returned a non-zero code|\bexit (?:code|status)[: ]+\d+|"
+    r"^#\d+\s+[\d.]+\s|\bRUN\s", re.I)
+_BUILD_TRANSPORT = re.compile(
+    r"\b(?:failed to resolve (?:source metadata|image)|failed to copy|failed to do request|failed to fetch .*token|"
+    r"error response from daemon|docker daemon|docker API|dial tcp|unexpected status from (?:GET|HEAD) request)\b|"
+    r"^(?:ssh[: ]|rsync:|kex_exchange_identification:|host key verification failed|connection closed by |"
+    r"\S+@\S+: permission denied|(?:Get|Head) \"https?://|toomanyrequests:|HTTP[/ ])", re.I)
+_INSPECT_TIMEOUT = re.compile(r"^TIMEOUT after \d+(?:\.\d+)?s$")
+_INFRA_ERRORS = tuple(re.compile(pattern, re.I) for pattern in (
+    r"\b(?:HTTP(?:/[\d.]+)?|status(?: code)?|server returned)\s*[:=]?\s*(?:5\d\d|429)\b",
+    r"\bunexpected status (?:code|from (?:GET|HEAD) request)\b.*:\s*(?:5\d\d|429)\b",
+    r"\b(?:5\d\d (?:internal server error|bad gateway|service unavailable|gateway time-?out)|429 too many requests)\b",
+    r"\btoomanyrequests\b|\b(?:connection (?:refused|reset(?: by peer)?|timed out|timeout)|i/o timeout|operation timed out|"
+    r"context deadline exceeded|timeout exceeded while awaiting headers|network is unreachable|no route to host)\b",
+    r"\b(?:TLS handshake (?:timeout|fail(?:ed|ure))|TLS: handshake failure|unexpected EOF)\b",
+    r"\b(?:no such host|temporary failure in name resolution|name or service not known|could not resolve host(?:name)?|"
+    r"nodename nor servname provided|DNS lookup failed|server misbehaving)\b",
+    r"\b(?:cannot connect to (?:the )?docker daemon|is the docker daemon running|docker daemon is (?:not running|unavailable)|"
+    r"permission denied while trying to connect to the docker daemon socket|failed to connect to the docker API at unix)\b",
+    r"^ssh exited 255$|^ssh: connect to host\b|^.*@\S+: permission denied \(publickey|"
+    r"^(?:ssh: )?host key verification failed|^kex_exchange_identification:|^connection closed by \S+ port \d+",
+))
+
+
+_UNINFORMATIVE = re.compile(r"^(?:error:\s*)?(?:unknown:\s*)?unknown error$|^(?:error:\s*)?exit status \d+$", re.I)
+
+
+def _final_diagnostic(error: str) -> str:
+    """The last line that says something: registry clients often end with a generic `unknown: unknown error`."""
+    lines = [ln.strip() for ln in error.strip().splitlines() if ln.strip()]
+    for line in reversed(lines):
+        if not _UNINFORMATIVE.fullmatch(line):
+            return line
+    return lines[-1] if lines else ""
+
+
+def infra_failure(result):
+    gate = result.get("failed_gate")
+    if gate not in ("resolve_base", "built"):
+        return False
+    error = result.get("error")
+    if not isinstance(error, str) or not error.strip():
+        return False
+    diagnostic = _final_diagnostic(error)
+    if _AUTHOR_ERROR.search(diagnostic):
+        return False
+    if gate == "built" and not _BUILD_TRANSPORT.search(diagnostic):
+        # A build also runs arbitrary authored commands. Only accept a bare transport
+        # diagnostic or one attributed to the image transfer, daemon or SSH connection.
+        return any(pattern.fullmatch(diagnostic) for pattern in _INFRA_ERRORS)
+    if gate == "resolve_base" and _INSPECT_TIMEOUT.fullmatch(diagnostic):
+        return True
+    return any(pattern.search(diagnostic) for pattern in _INFRA_ERRORS)
+
 
 def lint_failure(errors):
     gates = dict.fromkeys(GATES)
