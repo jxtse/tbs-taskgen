@@ -445,7 +445,7 @@ DEFAULTS: dict[str, Any] = {
     "taskimage": {
         "enabled": False, "host": None, "docker_config": None, "builder": None,
         "build_timeout_s": 2400, "build_args": {}, "max_gb": 5, "keep_days": 7, "catalog": None,
-        "registry_prefix": None,
+        "registry_prefix": None, "infra_retries": 6,
     },
     "sandbox": {
         "cleanup_image": None,

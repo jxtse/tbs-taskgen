@@ -383,6 +383,8 @@ class Pipeline:
                 return True
             if B.harden_needs_step(it):         # an interrupted hardening transaction (any status)
                 return it.item_id not in polled
+            if A.image_retry_due(it):
+                return True
             # code-grounded agent job (S4c / S5G) running on the build host: poll it once per run (not while it
             # waits out a relay refusal: calib.preflight_retry_s)
             if it.state["status"] == "waiting" and it.state["stage"] in AGENT_STAGES:
@@ -431,6 +433,26 @@ class Pipeline:
         if until:
             out["until"] = until
         return out
+
+    def requeue_image(self, item_id: str) -> bool:
+        it = next((i for i in self.store.items() if i.item_id == item_id), None)
+        if it is None:
+            return False
+        with it.operator_lock():
+            result = read_json(it.p("S6I_image.json"), {})
+            if (it.state["stage"] != "S6I" or not isinstance(result, dict) or
+                    result.get("ok") is not False or not taskimage.infra_failure(result)):
+                return False
+            why = f"image_build_failed:{result['failed_gate']}"
+            if it.state["status"] == "dropped" and it.state.get("reason") == "s5g_jobs_exhausted:" + why:
+                it.state.pop("image_retry_used", None)
+                feedback = read_json(it.p("S6_failure.json"), {})
+                if isinstance(feedback, dict) and feedback.get("why") == why and feedback.get("finding") == result["error"]:
+                    it.p("S6_failure.json").unlink()
+            elif (it.state["status"], it.state.get("reason")) != ("parked", "parked:infra"):
+                return False
+            it.goto("S6I", "operator requeued image infrastructure failure")
+            return True
 
     def resume(self, reasons_prefix: tuple[str, ...] = ("budget:", "model:", "parked:probe_unreviewed"), only: list[str] | None = None,
                stages: list[str] | None = None) -> list[str]:

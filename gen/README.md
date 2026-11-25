@@ -63,7 +63,9 @@ PKG 打包时同样检查。S9R 审核清单新增 `i_author_code`：任务是�
 
 打开 `taskimage.enabled` 后，S5G 为新题编写 Dockerfile 和依赖清单。S5G 在每个 FROM 中写具体标签或已验证的 digest。S6I 在构建机上将标签解析为 linux/amd64 manifest digest，写回 Dockerfile，并在 spec 和状态中记录固定后的 `base` 和原始标签 `base_resolved_from`，再执行 lint 和构建。pip 用 `==`，conda 用 `=` 或带哈希的 `@EXPLICIT` 锁，apt 用 `包名=版本`。每个下载文件要有明确的输出名，并在同一条 RUN 中逐个用字面 SHA-256 校验。禁止能读取构建上下文的 RUN 挂载。缺少 Dockerfile 的新题沿用原有镜像和 `extra_pip`。关闭开关后，已有每题镜像仍按保存的身份运行。
 
-S6I 用空数据构建 linux/amd64 镜像，上下文哈希含 `build_args`。断网探针检查 Python ≥3.10、pytest、bash、nobody、评分脚本和离线导入，并核查已安装包是否命中论文实现。解题程序可写 `/app/output`、私有 HOME 和临时目录。探针以 nobody 检查评分解释器、Python 搜索路径、PATH 及其父目录的写权限。结果记入 `S6I_image.json`。镜像上限默认 5 GB。新构建失败最多返工一次，计入 S5G 作业、时间和费用预算。`gen.max_public_mb`（默认 500 MB）只对每题镜像硬性限额。
+S6I 用空数据构建 linux/amd64 镜像，上下文哈希含 `build_args`。断网探针检查 Python ≥3.10、pytest、bash、nobody、评分脚本和离线导入，并核查已安装包是否命中论文实现。解题程序可写 `/app/output`、私有 HOME 和临时目录。探针以 nobody 检查评分解释器、Python 搜索路径、PATH 及其父目录的写权限。结果记入 `S6I_image.json`。镜像上限默认 5 GB。基础镜像标签缺失、Dockerfile 命令失败等作者问题最多返工一次，计入 S5G 作业、时间和费用预算。`gen.max_public_mb`（默认 500 MB）只对每题镜像硬性限额。
+
+构建机或镜像仓库的临时故障单独计数，不消耗 S5G 预算。普通 `tbsgen run` 和 `--stages build` 在首次失败 10 分钟后重试，再次失败等待 30 分钟，此后每次等待 60 分钟。第 `taskimage.infra_retries` 次失败（默认 6 次）将题目停在 S6I，标记为 `parked:infra`。可在 `S6I_image.json` 的 `history` 查看逐次错误。故障排除后运行 `tbsgen requeue-image --run DIR --item ID` 可再试一次，也可恢复旧版因同类故障耗尽 S5G 作业而丢弃的题目。命令会核对原始错误记录。
 
 ```toml
 [taskimage]

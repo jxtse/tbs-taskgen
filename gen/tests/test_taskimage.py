@@ -106,7 +106,8 @@ def fake_host(monkeypatch, packages, fail_build=False, imagetools=None):
             assert list((ctx / "data").iterdir()) == []
             assert (ctx / "Dockerfile").read_text().endswith(ti.REQUIRED_TAIL)
             if fail_build:
-                raise ValueError("dependency resolution failed")
+                raise ValueError('#3 0.1 connection refused\nERROR: process "/bin/sh -c fixture-install" '
+                                 'did not complete successfully: exit code: 1')
             ids[argv[-2]] = "sha256:" + "c"*64
         elif argv[:2] == ["docker", "tag"]:
             ids[argv[-1]] = argv[-2]
@@ -234,6 +235,124 @@ def test_s6i_resolution_failure_reaches_reauthor(tmp_path, monkeypatch):
     assert "manifest unknown for " + tag in read_json(it.p("S5G/work/previous_attempt.json"))["S6_failure.json"]["finding"]
 
 
+CACHE_500 = ("failed to copy: httpReadSeeker: failed open: unexpected status from GET request to "
+             "http://cache.example:5000/v2/library/sample/manifests/sha256:abc?ns=upstream.example: "
+             "500 Internal Server Error")
+# The registry client's real output: the transport line, then a generic trailer.
+CACHE_500_RAW = "ERROR: " + CACHE_500 + "\nunknown: unknown error\n"
+
+
+@pytest.mark.parametrize(("gate", "error", "infra"), [
+    ("resolve_base", CACHE_500, True),
+    ("resolve_base", CACHE_500_RAW, True),
+    ("built", CACHE_500_RAW, True),
+    ("resolve_base", "manifest unknown: cache.example/sample:missing\nunknown: unknown error", False),
+    ("built", CACHE_500, True),
+    ("resolve_base", "HTTP/2 503", True),
+    ("resolve_base", "unexpected status code 429", True),
+    ("resolve_base", "toomanyrequests: retry later", True),
+    ("built", 'failed to resolve source metadata: Head "https://cache.example": unexpected EOF', True),
+    ("built", "dial tcp 192.0.2.1:443: connect: connection refused", True),
+    ("resolve_base", "read: connection reset by peer", True),
+    ("resolve_base", "dial tcp: i/o timeout", True),
+    ("resolve_base", "TIMEOUT after 120s", True),
+    ("resolve_base", "net/http: TLS handshake timeout", True),
+    ("resolve_base", "lookup cache.example: no such host", True),
+    ("built", "Cannot connect to the Docker daemon at unix:///var/run/docker.sock", True),
+    ("built", "failed to connect to the docker API at unix:///var/run/docker.sock: no such file or directory", True),
+    ("resolve_base", "ssh: Could not resolve hostname build.example: Name or service not known", True),
+    ("built", "ssh: connect to host build.example port 22: Connection timed out", True),
+    ("built", "ssh exited 255", True),
+    ("resolve_base", "manifest unknown: cache.example/sample:missing", False),
+    ("resolve_base", "HTTP 404 Not Found", False),
+    ("built", "TIMEOUT after 2400s", False),
+    ("built", "unknown package fixture-lib", False),
+    ("built", "curl: (7) connection refused", False),
+    ("built", "unexpected EOF", True),
+    ("resolve_base", "unexpected build-context entry: unexpected EOF", False),
+    ("built", CACHE_500 + '\nERROR: process "/bin/sh -c sample" did not complete successfully: exit code: 1', False),
+    ("lint", "unexpected EOF", False),
+    ("offline_imports", CACHE_500, False),
+    ("verifier_floor", CACHE_500, False),
+])
+def test_image_infra_classifier(gate, error, infra):
+    assert ti.infra_failure(dict(failed_gate=gate, error=error)) is infra
+
+
+def test_image_infra_backoff_and_park(tmp_path, monkeypatch):
+    from tbsgen.pipeline import parse_stages
+    tag = "sample.example/base:1"
+    P, it, launcher = setup_agent(tmp_path, monkeypatch, {"Dockerfile": f"FROM {tag}\n"},
+                                  base=tag, authoring_max_jobs=1)
+    P.cfg["taskimage"]["infra_retries"] = 4
+    it.state["harden_active"] = True  # Infrastructure parking must survive the automatic hardening-revert check.
+    it.save()
+    costs = P.item_cost(it.item_id)
+    calls = []
+    def failing_inspect(argv):
+        calls.append(argv)
+        raise ValueError(CACHE_500)
+    fake_host(monkeypatch, INVENTORY, imagetools=failing_inspect)
+    clock = 100_000
+    monkeypatch.setattr(stages_a.time, "time", lambda: clock)
+    build = parse_stages("build")
+    for n, delay in enumerate([600, 1800, 3600, None], 1):
+        P.run(max_steps=3, stages=build if n % 2 else None)
+        st = it.load().state
+        assert st["stage"] == "S6I"
+        assert st["attempts"]["S6I:infra"] == len(calls) == n
+        assert st["attempts"]["S5G:job"] == len(launcher.calls) == 1
+        assert P.item_cost(it.item_id) == costs
+        assert "image_retry_used" not in st and not it.p("S6_failure.json").exists()
+        history = read_json(it.p("S6I_image.json"))["history"]
+        assert [(h["gate"], h["error"]) for h in history] == [("resolve_base", CACHE_500)] * n
+        if delay:
+            assert (st["status"], st["reason"]) == ("waiting", "S6I:infra:resolve_base")
+            assert st["history"][-1]["retry_at"] == clock + delay
+            clock += delay - 1
+            P.run(stages=build)
+            assert len(calls) == n
+            clock += 1
+    assert (st["status"], st["reason"]) == ("parked", "parked:infra")
+    clock += 86400
+    P.run()
+    assert len(calls) == 4 and P.requeue_image(it.item_id)
+    P.cfg["sandbox"]["backend"] = "docker"
+    manifest = dict(manifests=[dict(digest="sha256:" + "f"*64, platform=dict(os="linux", architecture="amd64"))])
+    fake_host(monkeypatch, INVENTORY, imagetools=lambda argv: json.dumps(manifest))
+    P.run(stages=build)
+    assert it.load().state["stage"] == "S6A_run"
+    receipt = read_json(it.p("S6I_image.json"))
+    assert receipt["ok"] and receipt["history"] == history
+
+
+@pytest.mark.parametrize(("reason", "error", "allowed"), [
+    ("s5g_jobs_exhausted:image_build_failed:resolve_base", CACHE_500, True),
+    ("s5g_jobs_exhausted:image_build_failed:resolve_base", "manifest unknown", False),
+    ("s5g_jobs_exhausted:image_build_failed:built", CACHE_500, False),
+    ("image_build_failed:resolve_base", CACHE_500, False),
+])
+def test_requeue_legacy_image_drop(tmp_path, monkeypatch, reason, error, allowed):
+    from tbsgen import cli
+    P, it, _ = setup_agent(tmp_path, monkeypatch, {"Dockerfile": DF})
+    it.state["image_retry_used"] = True
+    it.finish("dropped", reason)
+    write_json(it.p("S6I_image.json"), dict(ok=False, failed_gate="resolve_base", error=error))
+    write_json(it.p("S6_failure.json"), dict(why="image_build_failed:resolve_base", finding=error))
+    args = ["requeue-image", "--run", str(P.store.root), "--item", it.item_id]
+    before = it.state.copy()
+    if allowed:
+        assert cli.main(args) == 0
+        assert it.load().state["stage"] == "S6I" and it.state["status"] == "active"
+        assert "image_retry_used" not in it.state and not it.p("S6_failure.json").exists()
+        assert it.state["attempts"] == before["attempts"]
+    else:
+        with pytest.raises(SystemExit) as refused:
+            cli.main(args)
+        assert refused.value.code == 2
+        assert it.load().state == before and it.p("S6_failure.json").exists()
+
+
 @pytest.mark.parametrize("version", ["cg-v7", "cg-v10"])
 def test_image_spec_version_boundary(version):
     cfg = load_config()
@@ -281,7 +400,8 @@ def test_s6a_warns_on_public_format_mismatch(tmp_path, monkeypatch):
 
 @pytest.mark.parametrize(("hit", "reason"), [(True, "readymade_image"), (False, "image_build_failed:built")])
 def test_retry_uses_s5g_budget_then_drops(tmp_path, monkeypatch, hit, reason):
-    P, it, launcher = setup_agent(tmp_path, monkeypatch, {"Dockerfile": DF}, authoring_timeout_s=10000)
+    P, it, launcher = setup_agent(tmp_path, monkeypatch, {"Dockerfile": DF + "RUN fixture-install\n"},
+                                  authoring_timeout_s=10000)
     packages = installed("conda", '[{"name":"FastSmoother","version":"1"}]')
     # Simulate the remote build layer only. The S5G launcher continues to enforce its normal SSH contract.
     monkeypatch.setattr(ti, "_host", lambda cfg: None)
@@ -292,7 +412,7 @@ def test_retry_uses_s5g_budget_then_drops(tmp_path, monkeypatch, hit, reason):
     assert it.load().state["reason"] == reason
     assert len(launcher.calls) == 2 and it.state["attempts"]["S5G:job"] == 2
     feedback = read_json(it.p("S5G/work/previous_attempt.json"))["S6_failure.json"]
-    assert ("FastSmoother" if hit else "dependency resolution failed") in feedback["finding"]
+    assert ("FastSmoother" if hit else "fixture-install") in feedback["finding"]
 
 
 def test_inventory_and_pins(tmp_path):
