@@ -20,6 +20,8 @@ stage simply re-runs that stage.
 """
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import json
 import os
 import time
@@ -81,6 +83,10 @@ def passed_gate_report(directory: Path, state: dict) -> dict:
     return json.loads(path.read_text())
 
 
+class StepLockTimeout(TimeoutError):
+    pass
+
+
 @dataclass
 class Item:
     root: Path
@@ -94,9 +100,36 @@ class Item:
     def p(self, *parts) -> Path:
         return self.dir.joinpath(*parts)
 
+    @contextlib.contextmanager
+    def step_lock(self, timeout: float = 0):
+        """Outer worker lock. Never acquire this while holding calib/.lock."""
+        self.dir.mkdir(parents=True, exist_ok=True)
+        with self.p(".step.lock").open("a") as lock:
+            deadline = time.monotonic() + timeout
+            if not _try_lock(lock, deadline):
+                if timeout:
+                    raise StepLockTimeout(f"timed out waiting for {self.item_id} step lock")
+                yield False
+                return
+            yield True
+
+    @contextlib.contextmanager
+    def operator_lock(self, timeout: float = 60, *, deadline=None):
+        if deadline is not None:
+            timeout = min(timeout, max(0, deadline - time.monotonic()))
+        with self.step_lock(timeout) as held:
+            if not held:
+                raise TimeoutError(f"busy item: {self.item_id}")
+            with item_lock(self, deadline=deadline):
+                self.load()
+                yield
+
     def load(self) -> "Item":
-        self.state = read_json(self.p("state.json"), None) or dict(
-            item_id=self.item_id, stage="S1", status="active", history=[], attempts={}, created=time.time())
+        self.state = read_json(self.p("state.json"))
+        if not self.state:
+            candidate = self.p("S1_candidate.json")
+            self.state = dict(item_id=self.item_id, stage="S1", status="active", history=[], attempts={},
+                              created=candidate.stat().st_mtime if candidate.exists() else 0.0)
         return self
 
     def save(self):
@@ -136,6 +169,36 @@ class Item:
         return a[stage]
 
 
+def _try_lock(fh, deadline):
+    while True:
+        try:
+            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except BlockingIOError:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            time.sleep(min(0.05, remaining))
+
+
+@contextlib.contextmanager
+def item_lock(it, deadline=None):
+    """Per-item S9 lock (flock on calib/.lock): `run`, `calib watch` and `calib-ingest` may run at the same
+    time; S9 steps and ingests of one item are serialised so an intent is never launched twice and a result is
+    never attached twice.  Not re-entrant: never nest."""
+    p = it.p("calib", ".lock")
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with open(p, "a") as fh:
+        if deadline is None:
+            fcntl.flock(fh, fcntl.LOCK_EX)
+        elif not _try_lock(fh, deadline):
+            raise StepLockTimeout(f"timed out waiting for {it.item_id} calib lock")
+        try:
+            yield
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+
+
 class Store:
     def __init__(self, root: str | Path):
         self.root = Path(root).resolve()
@@ -145,7 +208,8 @@ class Store:
         return Item(self.root, item_id).load()
 
     def items(self) -> list[Item]:
-        return [Item(self.root, d.name).load() for d in sorted((self.root / "items").iterdir()) if d.is_dir()]
+        return [Item(self.root, d.name).load() for d in sorted((self.root / "items").iterdir())
+                if (d / "state.json").exists() or (d / "S1_candidate.json").exists()]
 
     def event(self, kind: str, **data):
         with (self.root / "events.jsonl").open("a") as f:

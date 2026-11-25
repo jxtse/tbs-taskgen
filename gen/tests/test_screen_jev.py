@@ -379,3 +379,25 @@ def test_pipeline_s4_jev_unavailable_keeps_rule_verdict(tmp_path, monkeypatch):
     it.state.update(stage="S4", status="active")
     stages_a.s4(P, it)
     assert it.state["status"] == "paused" and it.state["reason"].startswith("model:jev_unavailable")
+
+
+def test_jev_crash_after_response_charges_one_call(tmp_path, key, monkeypatch):
+    from tbsgen.budget import BudgetStop
+
+    cfg = jcfg(tmp_path)
+    cfg["budget"]["daily_calls_per_model"] = {cfg["screen"]["jev"]["model"]: 1}
+    path = tmp_path / "ledger.sqlite"
+    transport = Transport([(200, {}, resp(answers()))])
+    ledger = Ledger(path, cfg)
+
+    def crash(*args, **kwargs):
+        with ledger._db() as db:
+            assert db.execute("select status from calls").fetchall() == [("sent",)]
+        raise SystemExit("after response")
+
+    monkeypatch.setattr(ledger, "finish", crash)
+    with pytest.raises(SystemExit, match="after response"):
+        screen_jev.JevClient(ledger, cfg, transport).ask(FAY, stage="S2", item="one")
+    with pytest.raises(BudgetStop, match="daily_calls"):
+        screen_jev.JevClient(Ledger(path, cfg), cfg, transport).ask(FAY, stage="S2", item="one")
+    assert len(transport.calls) == 1

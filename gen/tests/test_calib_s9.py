@@ -356,8 +356,8 @@ def test_teacher_has_its_own_environment_hosts_and_launcher_root(tmp_path):
         ["teacher.example"]
     item = tmp_path / "items" / "i"
     (item / "pkg").mkdir(parents=True)
-    assert calib.prepare(cfg, item, "teacher", 1)["command"].startswith("cd /t && ./b.sh run ")
-    assert calib.prepare(cfg, item, "glm", 1)["command"].startswith("cd /s && ./a.sh run ")
+    assert calib.role(cfg["calib"], "teacher", "harbor_root") == "/t"
+    assert calib.role(cfg["calib"], "glm", "harbor_root") == "/s"
     # unset teacher keys fall back to the shared ones
     cfg2 = load_config(None, {"calib": {"environment": "ext:E", "agent_allowed_hosts": ["h"]}})
     t2 = calib.job_config(cfg2, tmp_path, "teacher", "j")
@@ -490,9 +490,9 @@ def test_reserved_run_is_not_launched_once_the_run_total_is_reached(tmp_path):
     st = P2.store.item(iid).state
     assert st["status"] == "paused" and st["reason"].startswith("budget:run_total_actual") and not counter.exists()
     r = _runs(P2, iid)[0]
-    assert r["state"] == "intent" and r["ledger_call"] is None
+    assert r["state"] == "cancelled_unstarted" and r["ledger_call"] is None
     with P2.ledger._db() as db:
-        assert db.execute("SELECT status, usd FROM calls WHERE item=?", (iid,)).fetchone() == ("error", 0.0)
+        assert db.execute("SELECT status, usd FROM calls WHERE item=?", (iid,)).fetchone() == ("cancelled", 0.0)
 
 
 def test_s9_on_a_stale_item_view_does_nothing(tmp_path):
@@ -536,6 +536,7 @@ def test_crash_after_tmux_before_job_dir_is_not_relaunched(tmp_path):
     P, [iid], counter, jobs = _env(tmp_path, allow_submit=False)
     P.run(only=[iid])
     r = _runs(P, iid)[0]
+    r.pop("launch_permit", None)  # simulate a pre-permit launch
     r.update(state="reserved", ledger_call=P.ledger.reserve(r["model"], "S9", iid, True, est_usd=30.0),
              launch_attempted=1.0, tmux=r["job_name"][-60:], log=str(P.store.item(iid).p("calib", "x.log")))
     P.store.item(iid).p("calib", "runs.json").write_text(json.dumps([r]))
@@ -544,17 +545,19 @@ def test_crash_after_tmux_before_job_dir_is_not_relaunched(tmp_path):
     assert not counter.exists() and _runs(P2, iid)[0]["state"] == "launched"
 
 
-def test_attempted_launch_with_dead_session_and_no_job_is_launched_again(tmp_path):
+def test_attempted_launch_with_dead_session_and_no_job_expires(tmp_path):
     P, [iid], counter, jobs = _env(tmp_path, allow_submit=False)
     P.run(only=[iid])
     r = _runs(P, iid)[0]
+    r.pop("launch_permit", None)  # simulate a pre-permit launch
     r.update(state="reserved", ledger_call=P.ledger.reserve(r["model"], "S9", iid, True, est_usd=30.0),
              launch_attempted=1.0, tmux=r["job_name"][-60:], log=str(P.store.item(iid).p("calib", "x.log")))
     P.store.item(iid).p("calib", "runs.json").write_text(json.dumps([r]))
     _kill_session(tmp_path, r)
     P2 = Pipeline(load_config(None, dict(P.cfg, calib=dict(P.cfg["calib"], allow_submit=True))), clients={})
     P2.run(only=[iid])
-    assert counter.read_text().count("x") == 1 and _runs(P2, iid)[0]["state"] == "launched"
+    assert _runs(P2, iid)[0]["state"] == "launch_failed"
+    assert _runs(P2, iid)[0]["cost_kind"] == "not_launched"
 
 
 def test_hand_started_intent_is_taken_over_even_with_preparation_enabled(tmp_path):
@@ -646,25 +649,26 @@ def test_tmux_permission_error_is_unknown_not_dead(tmp_path):
     assert calib.session_alive({"tmux_bin": str(t)}, {"tmux": "x"}) is False
 
 
-def test_tmux_timeout_with_live_session_keeps_the_reservation(tmp_path):
-    t = tmp_path / "tmux-slow"
-    t.write_text("#!/bin/bash\nif [ \"$1\" = has-session ]; then exit 0; fi\nsleep 5\n")
-    t.chmod(0o755)
-    P, [iid], counter, jobs = _env(tmp_path, tmux_bin=str(t))
+def test_tmux_timeout_after_claim_keeps_the_reservation(tmp_path, monkeypatch):
     import subprocess
-    real = subprocess.run
 
-    def fast(cmd, *a, **kw):
-        if cmd and cmd[0] == str(t) and cmd[1] == "new-session":
-            raise subprocess.TimeoutExpired(cmd, 60)
-        return real(cmd, *a, **kw)
-    import unittest.mock
-    with unittest.mock.patch("subprocess.run", fast):
-        P.run(only=[iid], max_steps=1)
-    r = _runs(P, iid)[0]
-    assert r["state"] == "launched" and "launch_uncertain" in r and len(_runs(P, iid)) == 1
+    P, [iid], _, _ = _env(tmp_path)
+    run = subprocess.run
+
+    def timeout(cmd, **kw):
+        if cmd[1] == "has-session":
+            return run(cmd, **kw)
+        assert cmd[1] == "new-session"
+        preamble = cmd[-1].split("\n", 1)[0]
+        run(["bash", "-c", preamble], check=True)
+        raise subprocess.TimeoutExpired(cmd, 60)
+
+    monkeypatch.setattr(subprocess, "run", timeout)
+    P.run(only=[iid], max_steps=1)
+    [r] = _runs(P, iid)
+    assert r["state"] == "launched" and "launch_uncertain" in r
     with P.ledger._db() as db:
-        assert db.execute("SELECT status FROM calls WHERE item=?", (iid,)).fetchone() == ("reserved",)
+        assert db.execute("SELECT status FROM calls WHERE item=?", (iid,)).fetchone() == ("sent",)
 
 
 def test_launcher_exit_without_job_records_not_launched_cost(tmp_path):

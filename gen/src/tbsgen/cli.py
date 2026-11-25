@@ -1,14 +1,14 @@
 """tbsgen command line.
 
   tbsgen ingest  --run DIR --candidates FILE [--config C]      S1: create item dirs from retrieval output
-  tbsgen run     --run DIR [--config C] [--max-steps N] [--only ID,..] [--until STAGE]
+  tbsgen run     --run DIR [--config C] [--max-steps N] [--only ID,..] [--until STAGE] [--stages LIST] [--loop SECONDS]
                                                                  --until S4: stop after that stage (no model stage is
                                                                  started, so no model:config pause without a teacher)
   tbsgen resume  --run DIR [--only ID,..] [--stage S9,..] [--reason budget:,model:]
                                                                  re-activate paused items (default reasons budget:/model:);
                                                                  --only / --stage / --reason narrow which ones
   tbsgen status  --run DIR
-  tbsgen report  --run DIR [--day YYYY-MM-DD]
+  tbsgen report  --run DIR [--day YYYY-MM-DD | --throughput [--days N]]
   tbsgen ledger  --run DIR                                       spend summary (all days)
   tbsgen breaker --run DIR --model M --reset
   tbsgen calib-ingest --run DIR --item ID --job-dir JOBDIR      attach Harbor results to the pending S9 run (or the
@@ -32,7 +32,7 @@
                                                                  and re-gate with locked thresholds, repackage, S9R
   tbsgen reset   --run DIR --item ID --stage S5 [--regen]        re-activate an item at a stage (after a pipeline fix);
                                                                  --regen also forces S6A/S6C to regenerate files
-  tbsgen fetch   --run DIR [--max N] [--channels a,b] [--no-browser] [--dry-run] [--status] [--finish-browser]
+  tbsgen fetch   --run DIR [--max N] [--channels a,b] [--no-browser] [--dry-run] [--status] [--finish-browser] [--loop SECONDS]
                  [--only IDENT[,IDENT]]                          drain the S3 full-text queue (incl. the ego-browser
                                                                  channel; HTTP channels on fulltext.remote.host when
                                                                  remote mode is on); fetched items go back to S3.
@@ -57,7 +57,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
+import signal
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -65,8 +68,8 @@ from . import calib
 from .budget import BudgetStop
 from .config import load_config
 from .models import ModelError, TeacherClient
-from .pipeline import Pipeline
-from .report import daily_report
+from .pipeline import Pipeline, parse_stages
+from .report import daily_report, throughput
 from .state import STAGES, read_json, write_json
 
 
@@ -74,7 +77,7 @@ def _pipeline(a, overrides=None) -> Pipeline:
     ov = {"run": {"root": a.run}}
     if overrides:
         ov.update(overrides)
-    return Pipeline(load_config(a.config, ov))
+    return Pipeline(load_config(a.config, ov), init_deadline=getattr(a, "fetch_deadline", None))
 
 
 def main(argv=None):
@@ -91,7 +94,10 @@ def main(argv=None):
         if name == "ingest":
             s.add_argument("--candidates", required=True)
             s.add_argument("--top", type=int, default=0)
+        if name in ("run", "fetch"):
+            s.add_argument("--loop", type=float, metavar="SECONDS")
         if name == "run":
+            s.add_argument("--stages", type=parse_stages)
             s.add_argument("--max-steps", type=int, default=10000)
             s.add_argument("--only", default="")
             s.add_argument("--until", default=None, choices=STAGES,
@@ -101,13 +107,14 @@ def main(argv=None):
             s.add_argument("--stage", default="", help="STAGE[,STAGE]: just items paused at these stages")
             s.add_argument("--reason", default="budget:,model:,parked:probe_unreviewed", help="reason prefixes (comma-separated)")
         if name == "calib":
-            s.add_argument("action", choices=["watch", "prepare", "resolve-remote"])
+            s.add_argument("action", choices=["watch", "prepare", "launch", "resolve-remote"])
             s.add_argument("--only", default="", help="watch: ID[,ID]")
             s.add_argument("--once", action="store_true", help="watch: one pass, then exit")
             s.add_argument("--interval", type=float, default=None, help="watch: seconds (calib.watch_interval_s)")
             s.add_argument("--max-hours", type=float, default=None, help="watch: stop after this long")
             s.add_argument("--item", default=None, help="prepare / resolve-remote: item id")
             s.add_argument("--job", help="resolve-remote: remote job name")
+            s.add_argument("--attempt", type=int, help="launch: current attempt number")
             resolution = s.add_mutually_exclusive_group()
             resolution.add_argument("--synced", action="store_true")
             resolution.add_argument("--ended-without-result", "--died", action="store_true",
@@ -129,6 +136,8 @@ def main(argv=None):
             s.add_argument("--out", default=None)
         if name == "report":
             s.add_argument("--day", default=None)
+            s.add_argument("--throughput", action="store_true")
+            s.add_argument("--days", type=int)
         if name == "breaker":
             s.add_argument("--model", required=True)
             s.add_argument("--reset", action="store_true")
@@ -168,6 +177,9 @@ def main(argv=None):
             s.add_argument("--no-browser", action="store_true")
             s.add_argument("--dry-run", action="store_true")
             s.add_argument("--status", action="store_true")
+            s.add_argument("--release-stale", metavar="JOB_ID", help="release a verified stale remote fetch job")
+            s.add_argument("--legacy-worker-stopped", action="store_true",
+                           help="confirm no legacy fetch worker process is running on the original host")
             s.add_argument("--finish-browser", action="store_true")
             s.add_argument("--browser", action="store_true", help="run one egress-gated browser batch")
             s.add_argument("--wait-for-egress", action="store_true")
@@ -177,6 +189,12 @@ def main(argv=None):
             s.add_argument("--budget-usd", type=float, required=True)
             s.add_argument("--max-tokens", type=int, default=1024)
     a = ap.parse_args(argv)
+    if getattr(a, "loop", None) is not None and (not math.isfinite(a.loop) or a.loop <= 0):
+        ap.error("--loop requires a positive interval")
+    if a.cmd == "report" and a.days is not None and (not a.throughput or a.days <= 0):
+        ap.error("--days requires --throughput and a positive day count")
+    if a.cmd == "fetch" and a.max_wait is not None and (not math.isfinite(a.max_wait) or a.max_wait < 0):
+        ap.error("--max-wait requires a finite non-negative interval")
     if a.cmd == "ping":
         return _ping(a)
     if a.cmd == "diversity":
@@ -184,9 +202,9 @@ def main(argv=None):
         result = diversity.report(Path(a.run), a.runs_root)
         print(json.dumps(result, indent=2) if a.json else diversity.format_report(result))
         return 0
-    P = _pipeline(a)
     if a.cmd == "fetch":
-        return _fetch(P, a)
+        return _fetch_command(a, ap)
+    P = _pipeline(a)
     if a.cmd == "remote":
         return _remote(P, a)
     if a.cmd == "fulltext":
@@ -202,8 +220,15 @@ def main(argv=None):
             cs = cs[: a.top]
         print(json.dumps(dict(ingested=len(P.ingest(cs))), ensure_ascii=False))
     elif a.cmd == "run":
-        print(json.dumps(P.run(a.max_steps, [x for x in a.only.split(",") if x] or None, until=a.until), indent=1,
-                         ensure_ascii=False))
+        def run_pass(stopping):
+            P.stopped_models.clear()
+            result = P.run(a.max_steps, _ids(a.only), until=a.until, stages=a.stages, stopping=stopping,
+                           poll_calib=a.loop is not None or a.stages is not None)
+            print(json.dumps(result, indent=1, ensure_ascii=False), flush=True)
+            return 0, result["progress"]
+        if a.loop is not None:
+            return _worker_loop(P.store.root, a.loop, run_pass)
+        run_pass(None)
     elif a.cmd == "resume":
         reasons = tuple(x.strip() for x in a.reason.split(",") if x.strip())
         if not reasons:
@@ -223,22 +248,24 @@ def main(argv=None):
             sys.exit(f"tbsgen review {a.action}: --item is required")
         if a.action == "deliverable":
             it = P.store.item(a.item)
-            jobs = {x.get("job_name") for x in read_json(it.p("calib", "runs.json"), []) or []}
-            if not a.job or not a.src or a.job not in jobs or not Path(a.src).is_dir():
-                sys.exit("tbsgen review deliverable: --job must name a run of the current calibration and --src "
-                         "an existing directory")
-            d = review.save_deliverable(it.dir, a.job, Path(a.src), a.note)
+            with it.operator_lock():
+                jobs = {x.get("job_name") for x in read_json(it.p("calib", "runs.json"), []) or []}
+                if not a.job or not a.src or a.job not in jobs or not Path(a.src).is_dir():
+                    sys.exit("tbsgen review deliverable: --job must name a run of the current calibration and --src "
+                             "an existing directory")
+                d = review.save_deliverable(it.dir, a.job, Path(a.src), a.note)
             P.store.event("review_deliverable_saved", item=a.item, job=a.job, note=a.note[:200], operator=True)
             print(json.dumps(dict(item=a.item, job=a.job, saved=str(d))))
             return 0
         it = P.store.item(a.item)
-        rnd = a.round or int(it.state.get("review_round") or 1)
-        out = review.build_task(P.cfg, it.dir, it.state, rnd, Path(a.out) if a.out else None)
+        with it.operator_lock():
+            rnd = a.round or int(it.state.get("review_round") or 1)
+            out = review.build_task(P.cfg, it.dir, it.state, rnd, Path(a.out) if a.out else None)
         print(json.dumps(dict(item=a.item, round=rnd, task=str(out))))
     elif a.cmd == "status":
         print(json.dumps(P.status(), indent=1, ensure_ascii=False))
     elif a.cmd == "report":
-        print(daily_report(P, a.day))
+        print(json.dumps(throughput(P, a.days), indent=1) if a.throughput else daily_report(P, a.day))
     elif a.cmd == "ledger":
         print(json.dumps(P.ledger.summary(None), indent=1))
     elif a.cmd == "breaker":
@@ -253,14 +280,15 @@ def main(argv=None):
             print(json.dumps(harbor_local.check(P.cfg, Path(a.run), P.store.item(i).dir)))
     elif a.cmd == "reset":
         it = P.store.item(a.item)
-        it.state.setdefault("history", []).append(dict(stage=it.state["stage"], result="manual_reset", to=a.stage,
-                                                      prev_status=it.state["status"], prev_reason=it.state.get("reason"),
-                                                      ts=__import__("time").time()))
-        it.state.update(stage=a.stage, status="active")
-        it.state.pop("reason", None)
-        if a.regen:
-            it.state["regen_6a"] = it.state["regen_6c"] = True
-        it.save()
+        with it.operator_lock():
+            it.state.setdefault("history", []).append(dict(stage=it.state["stage"], result="manual_reset", to=a.stage,
+                                                          prev_status=it.state["status"], prev_reason=it.state.get("reason"),
+                                                          ts=__import__("time").time()))
+            it.state.update(stage=a.stage, status="active")
+            it.state.pop("reason", None)
+            if a.regen:
+                it.state["regen_6a"] = it.state["regen_6c"] = True
+            it.save()
         P.store.event("manual_reset", item=a.item, stage=a.stage, regen=a.regen)
         print(json.dumps(dict(item=a.item, stage=a.stage, regen=a.regen)))
     elif a.cmd == "regate":
@@ -299,6 +327,73 @@ def main(argv=None):
     return 0
 
 
+def _fetch_command(a, ap):
+    from . import remote
+    if a.legacy_worker_stopped and a.release_stale is None:
+        ap.error("--legacy-worker-stopped requires --release-stale")
+    if a.release_stale is not None and any((a.loop, a.dry_run, a.browser, a.status, a.finish_browser,
+                                            a.only, a.channels)):
+        ap.error("--release-stale is a separate fetch operation")
+    if a.loop is not None and (a.status or a.dry_run or a.finish_browser or a.browser):
+        ap.error("--loop is for draining the fetch queue")
+
+    pipeline = None
+
+    def fetch_pass(stopping=None):
+        nonlocal pipeline
+        a.fetch_deadline = time.monotonic() + a.max_wait if a.max_wait is not None else None
+        if pipeline is None:
+            try:
+                pipeline = _pipeline(a)
+            except TimeoutError as exc:
+                print(f"tbsgen fetch: {exc}", file=sys.stderr)
+                return (0, False) if stopping else 3
+            if a.release_stale is not None:
+                deadline = a.fetch_deadline
+                try:
+                    result = remote.release_stale(pipeline.fulltext_fetcher(deadline=deadline), a.release_stale,
+                                                  deadline=deadline, legacy_worker_stopped=a.legacy_worker_stopped)
+                except TimeoutError as exc:
+                    result = dict(error=str(exc))
+                print(json.dumps(result))
+                return 3 if result.get("error") else 0
+            for receipt in remote.outstanding_jobs(pipeline.cfg):
+                if remote.legacy_receipt(receipt):
+                    print(f"legacy fetch receipt {receipt['job']} ({receipt['stage']}) in the owning queue. "
+                          f"After confirming the legacy worker stopped, use tbsgen fetch --release-stale "
+                          f"{receipt['job']} --legacy-worker-stopped with the original --run and --config.",
+                          file=sys.stderr)
+        if stopping and stopping():
+            return 0, False
+        return _fetch(pipeline, a, looping=stopping is not None)
+
+    if a.loop is not None:
+        return _worker_loop(Path(a.run), a.loop, fetch_pass)
+    return fetch_pass()
+
+
+def _worker_loop(root, interval, run_pass):
+    stopped = threading.Event()
+    previous = signal.signal(signal.SIGTERM, lambda *_: stopped.set())
+    stop_file = root / "driver.stop"
+
+    def stopping():
+        return stopped.is_set() or stop_file.exists()
+
+    try:
+        while not stopping():
+            code, progress = run_pass(stopping)
+            if code:
+                return code
+            if not progress:
+                until = time.monotonic() + interval
+                while not stopping() and (left := until - time.monotonic()) > 0:
+                    stopped.wait(min(left, 1.0))
+        return 0
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+
+
 def _ids(v: str) -> list[str] | None:
     return [x.strip() for x in (v or "").split(",") if x.strip()] or None
 
@@ -306,6 +401,18 @@ def _ids(v: str) -> list[str] | None:
 def _calib(P: Pipeline, a) -> int:
     import time
     from .stages_b import resolve_remote, watch_tick
+    if a.action == "launch":
+        from .budget import BudgetStop
+        from .stages_b import manual_launch
+        if (not (a.item and a.job and a.attempt) or a.synced or a.not_started or a.ended_without_result
+                or a.remote_task or a.force_local_gone):
+            sys.exit("calib launch requires --item ID --job NAME --attempt N")
+        try:
+            return manual_launch(P, P.store.item(a.item), a.job, a.attempt)
+        except (BudgetStop, ValueError, OSError) as e:
+            sys.exit(str(e))
+    if a.attempt is not None:
+        sys.exit("--attempt requires calib launch")
     if a.action == "resolve-remote":
         if not (a.item and a.job and (a.synced or a.ended_without_result or a.not_started)):
             sys.exit("resolve-remote requires --item ID --job NAME and one of --synced, --ended-without-result or --not-started")
@@ -329,9 +436,10 @@ def _calib(P: Pipeline, a) -> int:
         if not P.cfg["calib"].get("prepare_command") or not calib.prepared_dir(P.cfg, a.who):
             sys.exit("tbsgen calib prepare: set calib.prepare_command and calib.prepared_tasks_dir")
         it = P.store.item(a.item)
-        if not (it.p("pkg") / "task.toml").exists():
-            sys.exit(f"tbsgen calib prepare: {a.item} has no packaged task (pkg/task.toml)")
-        res = calib.ensure_prepared(P.cfg, it.dir, a.who, force=True)
+        with it.operator_lock():
+            if not (it.p("pkg") / "task.toml").exists():
+                sys.exit(f"tbsgen calib prepare: {a.item} has no packaged task (pkg/task.toml)")
+            res = calib.ensure_prepared(P.cfg, it.dir, a.who, force=True)
         P.store.event("calib_prepared", item=a.item, who=a.who, ok=res.get("ok"), sec=res.get("sec"), manual=True)
         print(json.dumps(res, ensure_ascii=False))
         return 0 if res.get("ok") else 1
@@ -371,10 +479,18 @@ def fetch_max_default(cfg: dict, given: int | None) -> int:
     return int(rc.get("batch_max", 50)) if rc.get("enabled") else 10
 
 
-def _fetch(P: Pipeline, a) -> int:
+def _fetch(P: Pipeline, a, *, looping=False):
     from . import browser_ego, fulltext
     from .state import Store
-    f = P.fulltext_fetcher()
+    max_wait = getattr(a, "max_wait", None)
+    deadline = vars(a).pop("fetch_deadline", None)  # later loop passes get a new budget
+    if deadline is None and max_wait is not None:
+        deadline = time.monotonic() + max_wait
+    try:
+        f = P.fulltext_fetcher(deadline=deadline)
+    except TimeoutError as exc:
+        print(f"tbsgen fetch: {exc}", file=sys.stderr)
+        return (0, False) if looping else 3
     if a.status:
         print(json.dumps(dict(ledger=str(fulltext.ledger_path(P.cfg)), usage=f.ledger.usage(),
                               queue=len(fulltext.read_queue(fulltext.queue_path(P.cfg)))), indent=1))
@@ -382,6 +498,8 @@ def _fetch(P: Pipeline, a) -> int:
     if a.finish_browser:
         print(json.dumps(browser_ego.finish(P.cfg["fulltext"]["browser"])))
         return 0
+
+    delivery_deadline = deadline if not getattr(a, "browser", False) else None
 
     def reactivate(entry, out, sub) -> bool:
         """Deliver the fetched text to one waiting item and move it on to S4 (the same transition S3 makes), so
@@ -391,37 +509,55 @@ def _fetch(P: Pipeline, a) -> int:
         if not (run / "items" / iid / "state.json").exists():
             return True                                    # item gone: nothing to wait for
         it = Store(run).item(iid)
-        st = it.state
-        if st.get("stage") == "S3" and st.get("status") == "parked" and st.get("reason") == "fulltext_unavailable":
-            write_json(it.p("S3_fulltext.json"), dict(out.rec, delivered_by="tbsgen fetch"))
-            it.p("fulltext.txt").write_text(out.text)
-            # the next stage belongs to the subscriber's run (its own config), not to this fetch process:
-            # S3 records it in S3_queue.json when it parks; an item parked before code-grounding goes to S4
-            nxt = (read_json(it.p("S3_queue.json"), {}) or {}).get("next_stage") or "S4"
-            it.advance("S3", nxt, source=out.rec.get("source"), chars=len(out.text), via="tbsgen fetch")
-        return True                                        # delivered now, or already past S3 / not waiting
+        if delivery_deadline is not None and time.monotonic() >= delivery_deadline:
+            raise TimeoutError("subscriber delivery deadline reached")
+        with it.operator_lock(deadline=delivery_deadline):
+            st = it.state
+            if st.get("stage") == "S3" and st.get("status") == "parked" and st.get("reason") == "fulltext_unavailable":
+                write_json(it.p("S3_fulltext.json"), dict(out.rec, delivered_by="tbsgen fetch"))
+                it.p("fulltext.txt").write_text(out.text)
+                # the next stage belongs to the subscriber's run (its own config), not to this fetch process:
+                # S3 records it in S3_queue.json when it parks; an item parked before code-grounding goes to S4
+                nxt = (read_json(it.p("S3_queue.json"), {}) or {}).get("next_stage") or "S4"
+                it.advance("S3", nxt, source=out.rec.get("source"), chars=len(out.text), via="tbsgen fetch")
+            return True                                        # delivered now, or already past S3 / not waiting
 
-    readded = fulltext.reconcile(P.store, fulltext.queue_path(P.cfg)) if not a.dry_run else 0
+    try:
+        readded = fulltext.reconcile(P.store, fulltext.queue_path(P.cfg), deadline=delivery_deadline) if not a.dry_run else 0
+    except TimeoutError as exc:
+        print(f"tbsgen fetch: {exc}", file=sys.stderr)
+        return (0, False) if looping else 3
     if getattr(a, "browser", False) and (getattr(a, "only", "") or "").strip():
         print("tbsgen fetch: --only is not supported with --browser (a browser batch plans its own papers)",
               file=sys.stderr)
         return 2
     if getattr(a, "browser", False):
         from . import browser_agent
-        stats = browser_agent.run_batch(f, wait_for_egress=a.wait_for_egress, max_wait_s=a.max_wait, dry_run=a.dry_run,
+        remaining = max(0, deadline - time.monotonic()) if deadline is not None else None
+        stats = browser_agent.run_batch(f, wait_for_egress=a.wait_for_egress, max_wait_s=remaining, dry_run=a.dry_run,
                                         on_success=reactivate, log=lambda s: print(s, file=sys.stderr, flush=True))
         stats["requeued_from_items"] = readded
         print(json.dumps(stats, indent=1, ensure_ascii=False, default=str))
         return 2 if stats.get("refused") else 0
     only = [x.strip() for x in (getattr(a, "only", "") or "").split(",") if x.strip()] or None
-    stats = fulltext.drain_queue(f, max_papers=0 if only else fetch_max_default(P.cfg, a.max),
-                                 channels=[x for x in a.channels.split(",") if x] or None,
-                                 browser=not a.no_browser, dry_run=a.dry_run, on_success=reactivate,
-                                 log=lambda s: print(s, file=sys.stderr), only=only)
+    try:
+        stats = fulltext.drain_queue(f, max_papers=0 if only else fetch_max_default(P.cfg, a.max),
+                                     channels=[x for x in a.channels.split(",") if x] or None,
+                                     browser=not a.no_browser, dry_run=a.dry_run, on_success=reactivate,
+                                     log=lambda s: print(s, file=sys.stderr), only=only, poll_once=looping,
+                                     max_wait_s=max(0, delivery_deadline - time.monotonic()) if delivery_deadline is not None else None)
+    except TimeoutError as exc:
+        print(f"tbsgen fetch: {exc}", file=sys.stderr)
+        return (0, False) if looping else 3
     stats["requeued_from_items"] = readded
-    print(json.dumps(stats, indent=1, ensure_ascii=False))
+    print(json.dumps(stats, indent=1, ensure_ascii=False), flush=True)
+    if looping:
+        return 0, bool(stats.get("progress") or readded)
     if stats.get("remote_error"):
         print(f"tbsgen fetch: remote job refused: {stats['remote_error']}", file=sys.stderr)
+        return 3
+    if stats.get("undelivered") or stats.get("busy") or stats.get("deferred") or stats.get("remote", {}).get("busy"):
+        print("tbsgen fetch: papers remain unprocessed or awaiting delivery", file=sys.stderr)
         return 3
     if only and stats.get("only_unmatched"):
         print(f"tbsgen fetch: not in the queue: {', '.join(stats['only_unmatched'])}", file=sys.stderr)
@@ -436,10 +572,8 @@ def _remote(P: Pipeline, a) -> int:
         out = remote.deploy(f, dry_run=a.dry_run, force=a.force, log=lambda s: print(s, file=sys.stderr))
     else:
         out = remote.status(f)
-    print(json.dumps(out, indent=1, ensure_ascii=False, default=str))
-    if a.action == "status":
-        return 0 if out.get("same_code") else 2
-    return 0 if out.get("ok") else 2
+    print(json.dumps(out, indent=1, ensure_ascii=False))
+    return 0 if out.get("same_code" if a.action == "status" else "ok") else 2
 
 
 def _ping(a):

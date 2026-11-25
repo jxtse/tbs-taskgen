@@ -24,11 +24,11 @@ Flow of one job (`run_job`):
      naming), merge the remote ledger rows into the local ledger and drop the lease (one transaction, idempotent
      through the `remote_merged` table), then `cleanup` the remote job dir.
   5. the local job file (<queue>.remote/<job>.json) records the stage, so an interrupted run is finished by the
-     next `tbsgen fetch` (it collects outstanding jobs before starting a new one).  One job at a time per queue.
+     next `tbsgen fetch` (it collects outstanding jobs before starting a new one).  One remote job at a time.
 
 Only one ledger is authoritative: the local one.  The remote ledger is a per-job working copy seeded from it;
 its new rows come back exactly once.  Cooldowns set on one side reach the other at the next job (bounded by
-max_job_s); see README.
+max_job_s).
 
 Preflight (before a new job is leased): the local package source must be committed (`remote.require_clean_tree`)
 and the remote code fingerprint (`info`) must equal the local one; otherwise no job is started and the result
@@ -43,10 +43,13 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import copy
+import fcntl
 import hashlib
 import io
 import json
 import os
+import re
 import shlex
 import signal
 import sqlite3
@@ -112,19 +115,47 @@ def _midnight_after(ts: float) -> float:
     return time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday + 1, 0, 0, 0, 0, 0, -1))
 
 
+MIN_WORK_S = 600
+JOB_MARGIN_S = 600
+
+
+def _job_deadline(rcfg, now):
+    return min(now + float(rcfg.get("max_job_s", 7200)), _midnight_after(now) - 60)
+
+
 # ------------------------------------------------------------------------------------------- local: ledger
-def lease_and_snapshot(ledger, job: str, n: int, now: float | None = None) -> dict:
+def lease_and_snapshot(ledger, job: str, n: int, now: float | None = None, *,
+                       fetcher=None, entries=None, deadline=None) -> dict:
     """Book `n` lease rows and snapshot what the remote ledger needs, in one transaction."""
-    from .dlledger import PENDING_TTL_S, local_day
+    from .dlledger import ATTEMPT_COLUMNS, PENDING_TTL_S, local_day
     now = ledger.clock() if now is None else now
     day = local_day(now)
-    with ledger._tx() as db:
-        for _ in range(n):
-            db.execute("insert into attempts values(?,?,?,?,?,?,?,?,?)",
-                       (now, day, "lease", f"lease:{job}", "", "pending", None, 0, f"lease:{job}"))
-        att = db.execute("select ts, day, channel, host, doi, status, http, bytes, note from attempts where "
-                         "(day=? or ts>? or (status='pending' and ts>?)) and note != ?",
-                         (day, now - 3600, now - PENDING_TTL_S, f"lease:{job}")).fetchall()
+    with ledger._tx(deadline) as db:
+        chosen = []
+        if entries is not None:
+            from .fulltext import paper_ident, queue_path, read_queue
+            if db.execute("select 1 from attempts where channel='lease' limit 1").fetchone():
+                return dict(note="another remote job holds a lease on this ledger")
+            queued = {paper_ident(e) for e in read_queue(queue_path(fetcher.cfg))}
+            remaining = min(n, int(ledger.g["daily_ok"]) - ledger._ok_or_pending("1", ()))
+            taken = set()
+            for e in entries:
+                if len(chosen) >= remaining:
+                    break
+                ident = paper_ident(e)
+                if ident in queued and ident not in taken and not ledger.paper_held(ident) and not fetcher.cached(e):
+                    chosen.append(e)
+                    taken.add(ident)
+            if not chosen:
+                return dict(note="no unleased papers or global daily quota available")
+            n = len(chosen)
+        for i in range(n):
+            db.execute(f"insert into attempts({ATTEMPT_COLUMNS}) values(?,?,?,?,?,?,?,?,?)",
+                       (now, day, "lease", f"lease:{job}",
+                        paper_ident(chosen[i]) if chosen else "", "pending", None, 0, f"lease:{job}"))
+        att = db.execute(f"select {ATTEMPT_COLUMNS}, settled_day from attempts where "
+                         "(day=? or settled_day=? or ts>? or (status='pending' and ts>?)) and note != ?",
+                         (day, day, now - 3600, now - PENDING_TTL_S, f"lease:{job}")).fetchall()
         snap = dict(
             attempts=att,
             cooldown=db.execute("select host, until, reason from cooldown where until>?", (now,)).fetchall(),
@@ -132,20 +163,20 @@ def lease_and_snapshot(ledger, job: str, n: int, now: float | None = None) -> di
             blocks=db.execute("select ts, day, channel, host, reason from blocks where day=?", (day,)).fetchall(),
             meta_calls=db.execute("select ts, day, host, status, http from meta_calls where day=? or ts>?",
                                   (day, now - 3600)).fetchall())
-    return dict(day=day, ts=now, rows=snap)
+    return dict(day=day, ts=now, rows=snap, entries=chosen)
 
 
-def release_lease(ledger, job: str):
-    with ledger._tx() as db:
+def release_lease(ledger, job: str, *, deadline=None):
+    with ledger._tx(deadline) as db:
         db.execute("delete from attempts where note=? and channel='lease'", (f"lease:{job}",))
 
 
-def merge_rows(ledger, job: str, rows: dict, keep_lease: bool = False) -> dict:
+def merge_rows(ledger, job: str, rows: dict, keep_lease: bool = False, *, deadline=None) -> dict:
     """Merge the remote job's new ledger rows into the local ledger and drop the job's lease, atomically and at
     most once per remote row (table remote_merged).  Remote rows still pending (worker died) become
     'fail' / 'cancelled: remote worker ended' (they still count as attempts, never towards a breaker)."""
     n = dict(attempts=0, blocks=0, meta_calls=0, cooldown=0, hosts=0, not_entitled=0)
-    with ledger._tx() as db:
+    with ledger._tx(deadline) as db:
         db.execute("create table if not exists remote_merged(job text, kind text, rid int, "
                    "primary key(job, kind, rid))")
         for kind, cols in (("attempts", 9), ("blocks", 5), ("meta_calls", 5)):
@@ -155,7 +186,10 @@ def merge_rows(ledger, job: str, rows: dict, keep_lease: bool = False) -> dict:
                     continue
                 if kind == "attempts" and vals[5] == "pending":
                     vals[5], vals[8] = "fail", "cancelled: remote worker ended"
-                db.execute(f"insert into {kind} values({','.join('?' * cols)})", vals[:cols])
+                vals = vals[:cols]
+                if kind == "attempts":
+                    vals.append(ledger.today() if vals[5] == "ok" else None)
+                db.execute(f"insert into {kind} values({','.join('?' * len(vals))})", vals)
                 n[kind] += 1
         for host, until, reason in rows.get("cooldown") or []:
             db.execute("insert into cooldown values(?,?,?) on conflict(host) do update set "
@@ -204,14 +238,20 @@ def _remote_cmd(rcfg: dict, *args: str) -> str:
     return " ".join(shlex.quote(x) for x in (py, "-m", "tbsgen.remote", *args))
 
 
-def load_secrets(fetcher, names: list[str]) -> dict:
+def load_secrets(fetcher, names: list[str], deadline=None) -> dict:
     """Secrets for the remote worker, in memory only: from `remote.secrets_cmd` (a command printing a JSON object;
     it reads the wanted names as a JSON list on stdin) or else this process's environment / injected secrets."""
     rcfg = fetcher.ft.get("remote") or {}
     out: dict = {}
     if rcfg.get("secrets_cmd"):
-        p = subprocess.run(list(rcfg["secrets_cmd"]), input=json.dumps(names).encode(), capture_output=True,
-                           timeout=120, env=ssh_env())
+        remaining = 120 if deadline is None else min(120, deadline - time.monotonic())
+        if remaining <= 0:
+            raise TimeoutError("deadline reached before secrets command")
+        try:
+            p = subprocess.run(list(rcfg["secrets_cmd"]), input=json.dumps(names).encode(), capture_output=True,
+                               timeout=remaining, env=ssh_env())
+        except subprocess.TimeoutExpired:
+            raise TimeoutError("remote.secrets_cmd timed out") from None
         if p.returncode != 0:
             raise RuntimeError(f"remote.secrets_cmd failed (exit {p.returncode})")
         try:
@@ -246,15 +286,65 @@ def _job_state(cfg, job) -> Path:
     return jobs_dir(cfg) / f"{job}.json"
 
 
-def outstanding_jobs(cfg: dict) -> list[dict]:
+def _receipts(cfg):
     d = jobs_dir(cfg)
-    out = []
-    for p in sorted(d.glob("*.json")) if d.exists() else []:
+    for p in sorted(d.glob("*.json")):
         with contextlib.suppress(OSError, ValueError):
-            j = json.loads(p.read_text())
-            if j.get("stage") not in ("collected", "dropped"):
-                out.append(j)
-    return out
+            yield json.loads(p.read_text())
+
+
+def outstanding_jobs(cfg: dict) -> list[dict]:
+    return [r for r in _receipts(cfg) if r.get("stage") not in ("collected", "dropped")]
+
+
+def collected_papers(cfg):
+    return {ident for r in _receipts(cfg) if r.get("stage") == "collected" for ident in r.get("idents") or ()}
+
+
+def legacy_receipt(receipt):
+    if "submitted_at" in receipt:
+        return False
+    stage = receipt.get("stage")
+    return stage in ("leased", "submitted", "collected") or (
+        stage == "leasing" and "host" not in receipt and "workdir" not in receipt)
+
+
+def release_stale(fetcher, job, *, deadline=None, ssh_runner=None, legacy_worker_stopped=False):
+    """Operator recovery for the owning queue. A missing status file alone cannot prove directory absence."""
+    rcfg = fetcher.ft.get("remote") or {}
+    if not re.fullmatch(r"[A-Za-z0-9_-][A-Za-z0-9_.-]*", job):
+        return dict(error="invalid job id")
+    path = _job_state(fetcher.cfg, job)
+    with open(str(fetcher.ledger.path) + ".remote.lock", "a+") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return dict(error="another controller holds the remote lock")
+        if not path.is_file():
+            return dict(error="no receipt for this job in this queue")
+        receipt = json.loads(path.read_text())
+        if not legacy_receipt(receipt):
+            return dict(error="--release-stale requires a legacy receipt; use normal fetch recovery")
+        if receipt.get("job") != job or not rcfg.get("host") or not rcfg.get("workdir") or any(
+                receipt.get(k) and receipt[k] != rcfg[k] for k in ("host", "workdir")):
+            return dict(error="restore the job's original host and workdir")
+        if not legacy_worker_stopped:
+            return dict(error="confirm no legacy fetch worker is running on the original host, "
+                        "then pass --legacy-worker-stopped")
+        run = ssh_runner or default_ssh_runner(rcfg)
+        if deadline is not None:
+            run = _bounded_runner(run, deadline)
+        # Run the check with the installed worker's interpreter, including on pre-upgrade hosts.
+        cmd = shlex.join([rcfg.get("python") or "python3", "-", rcfg["workdir"], job, receipt["stage"]])
+        rc, so, _ = run(cmd, Path(__file__).with_name("legacy_release.py").read_bytes(), 120)
+        proof = _last_json(so)
+        if rc or proof.get("absent") is not True or proof.get("job") != job:
+            return dict(error=proof.get("error") or "could not confirm idle worker and absent remote job")
+        action = "cleaned collected job" if proof.get("cleaned") else "confirmed absent remote directory"
+        release_lease(fetcher.ledger, job)
+        stage = "collected" if receipt["stage"] == "collected" else "dropped"
+        _set_stage(fetcher.cfg, job, stage, release_stale=action, released_at=fetcher.ledger.clock())
+        return dict(job=job, stage=stage, action=action, lease="released")
 
 
 def remote_info(fetcher, run) -> dict:
@@ -349,13 +439,21 @@ def deploy(fetcher, *, dry_run: bool = False, force: bool = False, ssh_runner=No
     copy = scp_runner or default_scp_runner(rcfg)
     if not force:
         # a job directory on the remote host = a job not collected yet; its export must run the code it started with
-        if outstanding_jobs(fetcher.cfg):
+        if any(j.get("host") in (None, rcfg["host"]) for j in outstanding_jobs(fetcher.cfg)):
             out["error"] = "a remote job is not collected yet (run `tbsgen fetch` first, or --force)"
             return out
         wd = rcfg["workdir"]
         qwd = "~/" + shlex.quote(wd[2:]) if wd.startswith("~/") else shlex.quote(wd)
-        rc, so, _ = run(f"ls -A {qwd}/jobs 2>/dev/null | head -1", b"", 60)
-        if rc == 0 and so.strip():
+        # Use the shell so this check also works before the first package deployment.
+        probe = (f'for d in {qwd}/jobs/* {qwd}/jobs/.[!.]* {qwd}/jobs/..?*; do '
+                 'test -e "$d" || continue; '
+                 'test -f "$d/expired" && continue; '
+                 'echo pending; break; done')
+        rc, so, _ = run(probe, b"", 60)
+        if rc:
+            out["error"] = f"could not check remote job directories (rc={rc})"
+            return out
+        if so.strip():
             out["error"] = "the remote host has job directories (a job is running or not collected); or --force"
             return out
     import tempfile
@@ -405,7 +503,6 @@ def status(fetcher, *, ssh_runner=None) -> dict:
 
 def remote_spec(fetcher, job: str, entries: list[dict], channels: list[str], lease_n: int, snap: dict,
                 now: float) -> dict:
-    import copy
     ft = copy.deepcopy(fetcher.ft)
     rcfg = ft.pop("remote")
     ft.pop("browser", None)
@@ -417,13 +514,14 @@ def remote_spec(fetcher, job: str, entries: list[dict], channels: list[str], lea
     from .dlledger import PENDING_TTL_S
     # count exactly like DownloadLedger._ok_or_pending on the remote copy (live reservations only)
     seeded_global = sum(1 for r in snap["rows"]["attempts"]
-                        if r[1] == snap["day"] and (r[5] == "ok" or (r[5] == "pending" and r[0] > now - PENDING_TTL_S)))
+                        if (r[9] or r[1]) == snap["day"]
+                        and (r[5] == "ok" or (r[5] == "pending" and r[0] > now - PENDING_TTL_S)))
     gl = dict(ft.get("global_limits") or {})
     gl["daily_ok"] = min(int(led.g["daily_ok"]), seeded_global + lease_n)
     ft["global_limits"] = gl
     ft["limits"] = {ch: dict(v) for ch, v in led.limits.items()}       # the local effective limits
     ft["host_caps"] = dict(led.host_caps)
-    deadline = min(now + float(rcfg.get("max_job_s", 7200)), _midnight_after(now) - 60)
+    deadline = _job_deadline(rcfg, now)
     from .fulltext import norm_doi
     dois = sorted({norm_doi(e.get("doi")) for e in entries if e.get("doi")})
     snap = dict(snap, rows=dict(snap.get("rows") or {}, not_entitled=[
@@ -432,95 +530,164 @@ def remote_spec(fetcher, job: str, entries: list[dict], channels: list[str], lea
     return dict(job=job, fingerprint=code_fingerprint(), tz=posix_tz(now), fulltext=ft, entries=entries, channels=channels, deadline=deadline, seed=snap)
 
 
+def poll_deadline(rcfg, max_wait_s, now):
+    if max_wait_s is None:
+        max_wait_s = _job_deadline(rcfg, now) - now + JOB_MARGIN_S
+    return time.monotonic() + max_wait_s
+
+
+def _bounded_runner(run, deadline):
+    def bounded(cmd, stdin=b"", timeout=120):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return 255, b"", b"poll deadline reached"
+        return run(cmd, stdin, min(timeout, 120, remaining))
+    return bounded
+
+
 def run_job(fetcher, entries: list[dict], channels: list[str] | None = None, *, log=print, ssh_runner=None,
-            poll_s: float = 15.0, sleep=time.sleep, max_poll_s: float | None = None) -> dict:
-    """Fetch `entries` on the remote host.  Returns {ident: Outcome-like dict} for collected results plus stats.
-    Outstanding older jobs are collected first."""
+            poll_s: float = 1, sleep=time.sleep, max_poll_s: float | None = None, deadline=None) -> dict:
+    """Collect this queue's outstanding job before submitting the next batch."""
     rcfg = fetcher.ft["remote"]
+    if deadline is None:
+        deadline = poll_deadline(rcfg, max_poll_s or None, fetcher.ledger.clock())
     run = ssh_runner or default_ssh_runner(rcfg)
-    import fcntl
     jobs_dir(fetcher.cfg).mkdir(parents=True, exist_ok=True)
-    lock = Path(str(fetcher.ledger.path) + ".remote.lock")         # per ledger: queues sharing it serialize
-    with open(lock, "a+") as fh:
+    out = dict(results={}, jobs=[], progress=False)
+    with open(str(fetcher.ledger.path) + ".remote.lock", "a+") as lock:
         try:
-            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            return dict(results={}, jobs=[], busy=True, note="another `tbsgen fetch` is running a remote job")
+            return dict(out, busy=True, note="another controller holds the remote lock")
+
+        def collect_job(job):
+            result = collect(fetcher, job, run, log=log, poll_s=poll_s, sleep=sleep,
+                             max_poll_s=max_poll_s, deadline=deadline)
+            out["jobs"].append(result)
+            out["results"].update(result.get("results") or {})
+            out["progress"] |= result["stage"] in ("collected", "dropped")
+            return result
+
+        for receipt in outstanding_jobs(fetcher.cfg):
+            job = receipt["job"]
+            if any(receipt.get(k) and receipt[k] != rcfg.get(k) for k in ("host", "workdir")):
+                return dict(out, refused=f"restore the original remote host and workdir for job {job}")
+            if receipt["stage"] == "leasing":
+                if fetcher.ledger.clock() - receipt["created"] < rcfg.get("submit_grace_s", 600):
+                    out["jobs"].append(dict(job=job, stage="leasing", error="unsubmitted lease within grace period"))
+                    return out
+                release_lease(fetcher.ledger, job)
+                _set_stage(fetcher.cfg, job, "dropped", error="expired unsubmitted lease")
+                out["jobs"].append(dict(job=job, stage="dropped", error="expired unsubmitted lease"))
+                out["progress"] = True
+            else:
+                out["collected_prior"] = collect_job(job)["stage"] == "collected"
+                return out  # deliver and acknowledge this job before waiting on another batch
+
+        job = _submit_batch(fetcher, entries, channels, _bounded_runner(run, deadline), log, deadline,
+                            max_poll_s == 0, out)
+        if job:
+            collect_job(job)
+    return out
+
+
+def available_channels(ledger, channels):
+    from .dlledger import LimitReached
+    ready = []
+    for ch in channels:
         try:
-            return _run_job_locked(fetcher, entries, channels, run, log, poll_s, sleep, max_poll_s)
-        finally:
-            fcntl.flock(fh, fcntl.LOCK_UN)
+            ledger.check(ch)
+            ready.append(ch)
+        except LimitReached:
+            continue
+    return ready
 
 
-def _run_job_locked(fetcher, entries, channels, run, log, poll_s, sleep, max_poll_s) -> dict:
-    from .fulltext import paper_ident
+def _submit_batch(fetcher, entries, channels, run, log, deadline, filter_ready, out):
+    from .fulltext import norm_doi, paper_ident
     rcfg = fetcher.ft["remote"]
-    out: dict = dict(results={}, jobs=[])
-    for j in outstanding_jobs(fetcher.cfg):                 # finish what an interrupted run left
-        r = collect(fetcher, j["job"], run, log=log, poll_s=poll_s, sleep=sleep, max_poll_s=max_poll_s)
-        out["jobs"].append(r)
-        out["results"].update(r.get("results") or {})
-        if r.get("stage") not in ("collected", "dropped"):
-            out["note"] = f"remote job {j['job']} still running; not starting a new one"
-            return out
     channels = [c for c in (channels or HTTP_CHANNELS) if c in HTTP_CHANNELS
                 and (c == "oa" and (fetcher.ft.get("oa") or {}).get("enabled", True)
                      or (fetcher.ft.get(c) or {}).get("enabled"))]
-    entries = [e for e in entries if paper_ident(e) not in out["results"]][: int(rcfg.get("batch_max", 50))]
+    if entries and filter_ready:
+        ready = available_channels(fetcher.ledger, channels)
+        entries = [e for e in entries if any(ch not in (e.get("skip_channels") or ()) and
+                   fetcher.channel_applies(ch, norm_doi(e.get("doi"))) for ch in ready)]
     if not entries or not channels:
-        return out
+        return None
     if not fetcher.ft.get("allow_network"):
         out["note"] = "allow_network=false: remote job not started"
-        return out
+        return None
+    now = fetcher.ledger.clock()
+    min_work = min(MIN_WORK_S, float(rcfg.get("max_job_s", 7200)) / 2)
+    if min_work <= 0 or _job_deadline(rcfg, now) < now + min_work:
+        out.update(note="insufficient remote work window", retry_after=_midnight_after(now))
+        return None
     if (why := preflight(fetcher, run)):
         out["refused"] = why                      # nothing leased or submitted; the papers stay due
         log(json.dumps(dict(remote_refused=why)))
-        return out
+        return None
+    if time.monotonic() >= deadline:
+        out["refused"] = "poll deadline reached before submit"
+        return None
     led = fetcher.ledger
-    # one remote job per LEDGER (not per queue): its seeded copy is only valid while no other job uses the quota
-    live = led.db.execute("select distinct host from attempts where channel='lease'").fetchall()
-    if live:
-        out["note"] = f"another remote job holds a lease on this ledger ({live[0][0]}); not starting a new one"
-        return out
-    gl_left = max(0, int(led.g["daily_ok"]) - led._ok_or_pending("1", ()))
-    lease_n = min(len(entries), gl_left)
-    if lease_n <= 0:
-        out["note"] = "global daily cap reached"
-        return out
-    job = time.strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:6]
-    jobs_dir(fetcher.cfg).mkdir(parents=True, exist_ok=True)
+    job = time.strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:12]
     now = led.clock()
-    # the job file is written before the lease, so a crash right after leasing is still visible
-    _atomic(_job_state(fetcher.cfg, job), json.dumps(dict(job=job, stage="leasing", created=now, n=len(entries),
-                                                          channels=channels,
-                                                          idents=[paper_ident(e) for e in entries])))
-    snap = lease_and_snapshot(led, job, lease_n, now)
+    # Persist the destination and stable id before taking quota or contacting the worker.
+    path = _job_state(fetcher.cfg, job)
+    _atomic(path, json.dumps(dict(job=job, host=rcfg["host"], workdir=rcfg["workdir"], stage="leasing",
+                                  created=now, channels=channels)))
+    try:
+        snap = lease_and_snapshot(led, job, int(rcfg.get("batch_max", 50)), now, fetcher=fetcher,
+                                  entries=entries, deadline=deadline)
+    except TimeoutError:  # the failed lease transaction has no committed rows
+        path.unlink()
+        raise
+    if "note" in snap:
+        path.unlink()
+        out["note"] = snap["note"]
+        return None
+    entries = snap.pop("entries")
+    lease_n = len(entries)
     spec = remote_spec(fetcher, job, entries, channels, lease_n, snap, now)
-    _atomic(_job_state(fetcher.cfg, job), json.dumps(dict(job=job, stage="leased", created=now, n=len(entries),
-                                                          lease_n=lease_n, channels=channels,
-                                                          idents=[paper_ident(e) for e in entries])))
     names = secret_names(fetcher.ft, channels)
-    secrets = load_secrets(fetcher, names)
+    try:
+        secrets = load_secrets(fetcher, names, deadline)
+    except (TimeoutError, RuntimeError, OSError) as exc:
+        release_lease(led, job, deadline=deadline)
+        _set_stage(fetcher.cfg, job, "dropped", error="could not load worker secrets")
+        out["refused"] = str(exc)
+        return None
     payload = (json.dumps(spec) + "\n" + json.dumps(secrets) + "\n").encode()
     del secrets
+    if time.monotonic() >= deadline:
+        release_lease(led, job, deadline=deadline)
+        _set_stage(fetcher.cfg, job, "dropped", note="deadline reached before submit")
+        out["refused"] = "poll deadline reached before submit"
+        return None
+    submitted = led.clock()
+    if spec["deadline"] < submitted + min_work:
+        release_lease(led, job)
+        _set_stage(fetcher.cfg, job, "dropped", note="insufficient remote work window")
+        out.update(note="insufficient remote work window", retry_after=_midnight_after(now))
+        return None
+    _set_stage(fetcher.cfg, job, "submitted", submitted_at=submitted, n=lease_n, lease_n=lease_n,
+               idents=[paper_ident(e) for e in entries])
     rc, so, se = run(_remote_cmd(rcfg, "submit", rcfg["workdir"], job), payload, 120)
     del payload
     msg = _last_json(so)
     if rc == 0 and msg.get("ok"):
-        _set_stage(fetcher.cfg, job, "submitted")
+        out["progress"] = True
         log(json.dumps(dict(remote_job=job, submitted=len(entries), lease=lease_n, channels=channels)))
     elif msg.get("error"):                       # refused by the remote side (fingerprint, bad spec): no work done
         release_lease(led, job)
         _set_stage(fetcher.cfg, job, "dropped", error=fetcher._r(str(msg.get("error")))[:300])
         out["jobs"].append(dict(job=job, stage="dropped", error=fetcher._r(str(msg["error"]))[:300]))
-        return out
+        return None
     else:                                        # ssh dropped: the job may or may not have started; collect decides
         _set_stage(fetcher.cfg, job, "submitted", note=f"submit rc={rc}")
         log(json.dumps(dict(remote_job=job, submit_uncertain=rc, stderr=fetcher._r(se.decode("utf-8", "replace"))[-200:])))
-    r = collect(fetcher, job, run, log=log, poll_s=poll_s, sleep=sleep, max_poll_s=max_poll_s)
-    out["jobs"].append(r)
-    out["results"].update(r.get("results") or {})
-    return out
+    return job
 
 
 def _last_json(b: bytes) -> dict:
@@ -539,49 +706,118 @@ def _set_stage(cfg, job, stage, **kw):
     _atomic(p, json.dumps(j))
 
 
-def collect(fetcher, job: str, run, *, log=print, poll_s: float = 15.0, sleep=time.sleep,
-            max_poll_s: float | None = None) -> dict:
-    """Wait for the remote job to end, import its results and ledger rows, clean up.  Safe to repeat."""
+def collect(fetcher, job: str, run, *, log=print, poll_s=15, sleep=time.sleep, max_poll_s=None,
+            deadline=None) -> dict:
+    """Collect one job, or poll it once when max_poll_s=0."""
+    if deadline is None:
+        deadline = poll_deadline(fetcher.ft["remote"], max_poll_s or None, fetcher.ledger.clock())
+    run = _bounded_runner(run, deadline)
+
+    while True:
+        result = _collect_once(fetcher, job, run, log=log, deadline=deadline)
+        if max_poll_s == 0 or result["stage"] in ("collected", "dropped") or result.get("error"):
+            return result
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return dict(result, error="poll deadline reached; job remains leased")
+        sleep(min(poll_s, remaining))
+
+
+def _collect_once(fetcher, job: str, run, *, log=print, deadline=None) -> dict:
+    """Poll once for the remote job to end, import its results and ledger rows, clean up.  Safe to repeat."""
     rcfg = fetcher.ft["remote"]
     st_path = _job_state(fetcher.cfg, job)
-    js = json.loads(st_path.read_text()) if st_path.exists() else dict(job=job)
+    js = json.loads(st_path.read_text()) if st_path.exists() else dict(job=job, stage="submitted")
     if js.get("stage") in ("collected", "dropped"):
         return dict(job=job, stage=js["stage"])
-    t0 = time.monotonic()
-    limit = float(max_poll_s if max_poll_s is not None else rcfg.get("max_job_s", 7200) + 600)
-    status: dict = {}
-    while True:
-        # every poll pushes the local live cooldowns to the worker (it merges them before each paper) and brings
-        # the worker's cooldowns back, so a block seen on one side stops the other within one poll
-        now = fetcher.ledger.clock()
-        push = fetcher.ledger.db.execute("select host, until, reason from cooldown where until>?", (now,)).fetchall()
-        rc, so, _ = run(_remote_cmd(rcfg, "status", rcfg["workdir"], job), json.dumps(push).encode(), 60)
-        status = _last_json(so) if rc == 0 else {}
-        if status.get("cooldown"):
-            merge_rows(fetcher.ledger, job, dict(cooldown=status["cooldown"]), keep_lease=True)
-        if status.get("state") in ("done", "dead", "missing"):
-            break
-        if time.monotonic() - t0 > limit:
-            return dict(job=job, stage=js.get("stage"), note="still running", status=status)
-        sleep(poll_s)
-    if status["state"] == "missing":
-        # `submit` writes status.json before it answers and the job dir is only removed after the local stage
-        # became "collected": a missing job never started, so nothing was used
+
+    def remote_call(op, payload):
+        return run(_remote_cmd(rcfg, op, rcfg["workdir"], job), payload, 120)
+
+    if js["stage"] == "cleanup_pending":
+        rc, _, _ = remote_call("cleanup", b"")
+        if rc:
+            return dict(job=job, stage=js["stage"], error=f"remote cleanup failed rc={rc}")
+        error = js.get("collection_error")
+        from .fulltext import paper_ident, queue_path, read_queue
+        idents = set(js.get("idents") or ())
+        results = {}
+        for entry in read_queue(queue_path(fetcher.cfg)):
+            ident = paper_ident(entry)
+            if ident in idents and (hit := fetcher.cached(entry)):
+                text, rec = hit
+                results[ident] = dict(ok=True, text=text, rec=rec)
+        _set_stage(fetcher.cfg, job, "collected", error=error)
+        return dict(job=job, stage="collected", results=results, error=error)
+
+    # every poll pushes the local live cooldowns to the worker (it merges them before each paper) and brings
+    # the worker's cooldowns back, so a block seen on one side stops the other within one poll
+    now = fetcher.ledger.clock()
+    push = fetcher.ledger.db.execute("select host, until, reason from cooldown where until>?", (now,)).fetchall()
+    rc, so, _ = remote_call("status", json.dumps(push).encode())
+    status = _last_json(so) if rc == 0 else {}
+    state = status.get("state")
+    if rc == 255:
+        since = js.get("unreachable_since")
+        if since is None:
+            since = now
+            _set_stage(fetcher.cfg, job, js["stage"], unreachable_since=now)
+        if fetcher.ledger.clock() - since >= rcfg.get("unreachable_after_s", 1800):
+            return dict(job=job, stage=js["stage"], error=f"{rcfg['host']} unreachable; job remains leased")
+    elif js.get("unreachable_since") is not None:
+        _set_stage(fetcher.cfg, job, js["stage"], unreachable_since=None)
+    if state in ("starting", "running") and js.get("terminal_state"):
+        js["terminal_state"] = None
+        _set_stage(fetcher.cfg, job, js["stage"], terminal_state=None)
+    if status.get("cooldown"):
+        merge_rows(fetcher.ledger, job, dict(cooldown=status["cooldown"]), keep_lease=True, deadline=deadline)
+    if state in ("dead", "failed", "missing"):
+        if js.get("terminal_state") != state:
+            js.update(terminal_state=state, terminal_since=now)
+            _set_stage(fetcher.cfg, job, js["stage"], terminal_state=state, terminal_since=now)
+        if now - js["terminal_since"] < rcfg.get("stale_after_s", 7200):
+            if state == "missing":
+                status["state"] = "starting"
+            return dict(job=job, stage=js["stage"], note="still running", status=status)
+    elif state != "done":
+        return dict(job=job, stage=js["stage"], note="still running", status=status)
+    rc, so, se = remote_call("export", b"")
+    if state == "missing" and rc == EXPORT_MISSING:
         release_lease(fetcher.ledger, job)
         _set_stage(fetcher.cfg, job, "dropped", error="job not found on remote host")
         return dict(job=job, stage="dropped", error="job not found on remote host")
-    rc, so, se = run(_remote_cmd(rcfg, "export", rcfg["workdir"], job), b"", 600)
     if rc != 0:
         return dict(job=job, stage=js.get("stage"), error=f"export failed rc={rc}")
-    res = import_export(fetcher, job, so, channels=js.get("channels"))
-    _set_stage(fetcher.cfg, job, "collected", merged=res["merged"], n_results=len(res["results"]))
-    run(_remote_cmd(rcfg, "cleanup", rcfg["workdir"], job), b"", 60)
+    res = import_export(fetcher, job, so, channels=js.get("channels"), deadline=deadline)
+    # Successful bodies survive cleanup in the cache. Keep failed outcomes in the
+    # local queue until the drain atomically replaces them with their retry schedule.
+    failures = {k: r for k, r in res["results"].items() if not r["ok"]}
+    if failures:
+        from .fulltext import paper_ident, queue_lock, queue_path, read_queue, write_queue
+        path = queue_path(fetcher.cfg)
+        with queue_lock(path, deadline):
+            entries = read_queue(path)
+            for entry in entries:
+                if failure := failures.get(paper_ident(entry)):
+                    entry["remote_failure"] = failure
+            write_queue(path, entries)
+    missing = set(js.get("idents") or ()) - res["results"].keys()
+    error = f"{len(missing)} paper(s) unprocessed" if missing else None
+    _set_stage(fetcher.cfg, job, "cleanup_pending", merged=res["merged"], n_results=len(res["results"]),
+               collection_error=error)
+    rc, _, _ = remote_call("cleanup", b"")
+    if rc:
+        error = f"remote cleanup failed rc={rc}"
+        _set_stage(fetcher.cfg, job, "cleanup_pending", error=error)
+    else:
+        _set_stage(fetcher.cfg, job, "collected", error=error)
     log(json.dumps(dict(remote_job=job, collected=len(res["results"]), ok=sum(r["ok"] for r in res["results"].values()),
                         merged=res["merged"], worker=status.get("state"))))
-    return dict(job=job, stage="collected", results=res["results"], merged=res["merged"], status=status)
+    return dict(job=job, stage="cleanup_pending" if rc else "collected", results=res["results"],
+                merged=res["merged"], status=status, error=error)
 
 
-def import_export(fetcher, job: str, blob: bytes, channels: list[str] | None = None) -> dict:
+def import_export(fetcher, job: str, blob: bytes, channels: list[str] | None = None, *, deadline=None) -> dict:
     """Unpack the export tar (only regular files under results/ and cache/, plus ledger.json), save texts to the
     local write cache, merge ledger rows.  Returns {results: {ident: dict(ok, text, rec)}, merged}."""
     files: dict[str, bytes] = {}
@@ -605,20 +841,21 @@ def import_export(fetcher, job: str, blob: bytes, channels: list[str] | None = N
             raw = files.get(f"cache/raw/{r.get('raw_file')}") if r.get("raw_file") else None
             prov = dict(rec.get("provenance") or {}, via=f"remote:{job}")
             prov.pop("path", None)
-            saved = fetcher.save_imported(r["entry"], prov, text, raw)
+            saved = fetcher.save_imported(r["entry"], prov, text, raw, deadline=deadline)
             prov = dict(prov, path=saved.get("path"))
             rec = dict(rec, provenance=prov, remote_job=job)
         rec = dict(rec, remote_seconds=r.get("seconds"))
         doi = (r.get("entry") or {}).get("doi")
         for ch in rec.get("not_entitled") or []:     # metadata-only answers seen remotely: never ask again
             from .fulltext import norm_doi
-            fetcher.ledger.mark_not_entitled(ch, norm_doi(doi), f"remote:{job}")
+            fetcher.ledger.mark_not_entitled(ch, norm_doi(doi), f"remote:{job}", deadline=deadline)
         results[r["ident"]] = dict(ok=text is not None, text=text, rec=rec,
                                    entry_ver=int((r.get("entry") or {}).get("ver") or 0),
+                                   partial=(r.get("entry") or {}).get("partial"),
                                    # the job's channel scope (None: unknown, e.g. a job file of an older version)
                                    channels=list(channels) if channels is not None else None)
     rows = json.loads(files.get("ledger.json", b"{}"))
-    merged = merge_rows(fetcher.ledger, job, rows)
+    merged = merge_rows(fetcher.ledger, job, rows, deadline=deadline)
     return dict(results=results, merged=merged)
 
 
@@ -635,10 +872,11 @@ def _seed_ledger(path: Path, seed: dict) -> dict:
     db = sqlite3.connect(path, isolation_level=None)
     db.execute("begin immediate")
     rows = seed.get("rows") or {}
-    for kind, n in (("attempts", 9), ("cooldown", 3), ("hosts", 2), ("blocks", 5), ("meta_calls", 5),
-                    ("not_entitled", 4)):
+    for kind in ("attempts", "cooldown", "hosts", "blocks", "meta_calls", "not_entitled"):
         for r in rows.get(kind) or []:
-            db.execute(f"insert or replace into {kind} values({','.join('?' * n)})", r)
+            if kind == "attempts" and len(r) == 9:  # pre-settled_day snapshot
+                r = [*r, None]
+            db.execute(f"insert or replace into {kind} values({','.join('?' * len(r))})", r)
     marks = {k: db.execute(f"select coalesce(max(rowid),0) from {k}").fetchone()[0]
              for k in ("attempts", "blocks", "meta_calls")}
     db.execute("commit")
@@ -668,6 +906,28 @@ def cmd_submit(workdir: str, job: str, stdin, stdout, daemon: bool = True) -> in
     if not ec.get("enabled") or not ec.get("allow_cidrs"):
         print(json.dumps(dict(ok=False, error="egress_check must be enabled with allow_cidrs")), file=stdout)
         return 2
+    d.parent.parent.mkdir(parents=True, exist_ok=True)
+    with (d.parent.parent / "worker.lock").open("a+") as host_lock:
+        try:
+            fcntl.flock(host_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print(json.dumps(dict(ok=False, error="another worker holds the host lock")), file=stdout)
+            return 2
+        if (d / "expired").exists():
+            print(json.dumps(dict(ok=False, error="job expired before submit")), file=stdout)
+            return 2
+        if (d / "status.json").exists():
+            print(json.dumps(dict(ok=True, already_started=True)), file=stdout)
+            return 0
+        host_lock.seek(0)
+        host_lock.truncate()
+        host_lock.write(job)
+        host_lock.flush()
+        # The detached child inherits the locked file description across both forks.
+        return _start_worker(d, spec, secrets, stdout, daemon)
+
+
+def _start_worker(d, spec, secrets, stdout, daemon):
     d.mkdir(parents=True, exist_ok=True)
     (d / "results").mkdir(exist_ok=True)
     marks = _seed_ledger(d / "ledger.sqlite", spec.get("seed") or {})
@@ -702,6 +962,12 @@ def cmd_submit(workdir: str, job: str, stdin, stdout, daemon: bool = True) -> in
 def work(d: Path, spec: dict, secrets: dict, stop_after: int | None = None) -> int:
     """The remote worker: fetch every entry, one atomic result file each.  `stop_after` (tests): simulate a
     worker that dies after that many entries (it leaves status 'running' and no further results)."""
+    with (d / "worker.lock").open("a+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        return _fetch_entries(d, spec, secrets, stop_after)
+
+
+def _fetch_entries(d, spec, secrets, stop_after):
     from . import fulltext
     from .config import load_config
     if spec.get("tz") and spec["tz"] != posix_tz(time.time()):
@@ -713,15 +979,12 @@ def work(d: Path, spec: dict, secrets: dict, stop_after: int | None = None) -> i
     ft.update(write_cache_dir=str(d / "cache"), ledger_path=str(d / "ledger.sqlite"), queue_path=str(d / "queue.jsonl"))
     if ft.get("pdftotext"):
         fulltext.PDFTOTEXT = ft["pdftotext"]
-    import fcntl
-    lock_fh = open(d / "worker.lock", "a+")
-    fcntl.flock(lock_fh, fcntl.LOCK_EX)           # held for the worker's lifetime; status tests it
     cfg = load_config(None, {"run": {"root": str(d)}, "fulltext": ft})
     cfg["fulltext"]["remote"]["enabled"] = False
     cfg["fulltext"]["browser"]["enabled"] = False
     st = dict(state="running", pid=os.getpid(), ts=time.time(), done=0, n=len(spec["entries"]))
     _atomic(d / "status.json", json.dumps(st))
-    f = fulltext.Fetcher(cfg, secrets=secrets, transport=_TEST_TRANSPORT)
+    f = fulltext.Fetcher(cfg, secrets=secrets, transport=_TEST_TRANSPORT, settle_on_export=True)
     del secrets
     for i, e in enumerate(spec["entries"]):
         ident = fulltext.paper_ident(e)
@@ -781,21 +1044,24 @@ def cmd_status(workdir: str, job: str, stdout, stdin=None) -> int:
         db = sqlite3.connect(d / "ledger.sqlite")
         st["cooldown"] = db.execute("select host, until, reason from cooldown where until>?", (time.time(),)).fetchall()
         db.close()
-    if st.get("state") in ("running", "starting"):
-        # alive <=> someone holds worker.lock (a recycled PID cannot fake this)
-        import fcntl
-        alive = False
-        if (d / "worker.lock").exists():
-            with open(d / "worker.lock", "a+") as fh:
-                try:
-                    fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    fcntl.flock(fh, fcntl.LOCK_UN)
-                except BlockingIOError:
-                    alive = True
-        if not alive and time.time() - float(st.get("ts") or 0) > 30:
+    if st.get("state") in ("running", "starting") and time.time() - float(st.get("ts") or 0) > 30:
+        if not _worker_alive(d):
             st["state"] = "dead"
     print(json.dumps(st, default=str), file=stdout)
     return 0
+
+
+def _worker_alive(d):
+    # The host lock also covers startup before the job-local lock is taken.
+    for path in (d.parent.parent / "worker.lock", d / "worker.lock"):
+        if path.exists():
+            with path.open("r") as fh:
+                try:
+                    fcntl.flock(fh, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    if path.parent == d or fh.read() == d.name:
+                        return True
+    return False
 
 
 def _recover_results(d: Path, spec: dict) -> list[int]:
@@ -818,7 +1084,7 @@ def _recover_results(d: Path, spec: dict) -> list[int]:
     for i, e in enumerate(spec.get("entries") or []):
         rp = d / "results" / f"{i:04d}.json"
         ident = paper_ident(e)
-        if rp.exists() or ident not in provs:
+        if ident not in provs or (rp.exists() and json.loads(rp.read_text()).get("ok")):
             continue
         pj, pv = provs[ident]
         raws = sorted((cache / "raw").glob(pj.stem + ".*")) if (cache / "raw").exists() else []
@@ -829,23 +1095,37 @@ def _recover_results(d: Path, spec: dict) -> list[int]:
     return rids
 
 
+EXPORT_MISSING = 44
+
+
 def cmd_export(workdir: str, job: str, stdout) -> int:
     d = _job_dir(workdir, job)
-    spec = json.loads((d / "spec.json").read_text())
-    st = {}
-    with contextlib.suppress(OSError, ValueError):
+    if (d / "status.json").exists():
         st = json.loads((d / "status.json").read_text())
-    if st.get("state") != "done":
-        rids = _recover_results(d, spec)
-        if rids:
-            # every text in the cache is a success: book its reservation (by id) as ok if the worker died before
-            # record(); idempotent, so an export interrupted after recovery is completed by the next one
-            db = sqlite3.connect(d / "ledger.sqlite", isolation_level=None)
-            db.execute("begin immediate")
+        if st.get("state") != "done" and _worker_alive(d):
+            return 1
+    else:
+        # Fence a delayed submit before confirming that there are no results to collect.
+        d.parent.parent.mkdir(parents=True, exist_ok=True)
+        with (d.parent.parent / "worker.lock").open("a+") as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return 1
+            if not (d / "spec.json").exists():
+                if any((d / "results").glob("*.json")) or (d / "cache").exists():
+                    return 1
+                d.mkdir(parents=True, exist_ok=True)
+                (d / "expired").touch()
+                return EXPORT_MISSING
+            if (d / "status.json").exists():
+                return 1  # submit won the race; check status again before exporting
+    spec = json.loads((d / "spec.json").read_text())
+    rids = _recover_results(d, spec)
+    if rids:
+        with sqlite3.connect(d / "ledger.sqlite") as db:
             db.executemany("update attempts set status='ok', note='recovered after worker crash' "
                            "where rowid=? and status='pending'", [(x,) for x in rids])
-            db.execute("commit")
-            db.close()
     marks = spec.get("marks") or {}
     db = sqlite3.connect(d / "ledger.sqlite")
     rows = {k: db.execute(f"select rowid, * from {k} where rowid > ?", (marks.get(k, 0),)).fetchall()

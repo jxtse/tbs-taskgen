@@ -931,12 +931,14 @@ def prepare(cfg: dict, item_dir: Path, task: Path, rnd: int, attempt: int, epoch
     p.write_text(json.dumps(conf, indent=1))
     p = p.resolve()
     root, launcher = c.get("teacher_harbor_root"), c.get("teacher_launcher")
-    command = f"cd {root} && ./{launcher} run {p}" if launcher and root else f"harbor run --config {p} --yes"
+    command = calib.manual_command(item_dir, name, attempt, cfg.get("config_path"))
     rec = dict(who="review", n=rnd, attempt=attempt, item=item_dir.name, model=c["teacher_model"], job_name=name,
                config=str(p), command=command, state="intent", remote_route=calib.is_remote_launcher(c, launcher),
                submitted=False, ts=time.time(),
                job_dir=str(Path(c["jobs_dir"]) / name), task=str(task.resolve()), outcome=None,
                ledger_stage="S9R", pkg_sha=calib.pkg_sha(item_dir / "pkg"), calib_epoch=epoch)
+    if cfg.get("config_path"):
+        rec["config_path"] = cfg["config_path"]
     contract = json.loads((task / "tests/review_contract.json").read_text())
     rec.update(review_prompt_version=REVIEW_PROMPT_VERSION, **contract)
     why = calib.network_problem(rc, task, conf) or route_problem(cfg)

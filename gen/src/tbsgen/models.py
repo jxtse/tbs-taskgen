@@ -105,7 +105,7 @@ class _Base:
              effort: str | None = None) -> ModelResult:
         """effort: per-call override of the teacher's reasoning effort (None: models.<alias>.effort_by_stage
         for this stage, else models.<alias>.effort)."""
-        cid = self.ledger.reserve(self.name, stage, item, self.real, _sha(system, user))
+        cid = self.ledger.reserve(self.name, stage, item, self.real, _sha(system, user), send=self.real)
         t0 = time.time()
         kw = {"effort": effort} if effort else {}
         try:

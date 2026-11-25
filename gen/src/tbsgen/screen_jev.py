@@ -385,7 +385,7 @@ class JevClient:
         qv = QUESTIONS_VERSION if questions is None else S4_QUESTIONS_VERSION if questions is S4_QUESTIONS else "custom"
         body = json.dumps({"model": self.name, "state": state, "questions": qs}).encode()
         est = float(self.j.get("est_usd_per_call", 0.001))
-        cid = self.ledger.reserve(self.name, stage, item, True, request_key(self.name, state, qv), est_usd=est)
+        cid = self.ledger.reserve(self.name, stage, item, True, request_key(self.name, state, qv), est_usd=est, send=True)
         t0 = time.time()
         hdr = {"Authorization": "Bearer " + key, "Content-Type": "application/json"}
         attempts, max_retries = 0, int(self.j.get("max_retries", 4))
@@ -506,7 +506,10 @@ def prefetch(client: JevClient, items: list, cfg: dict, concurrency: int | None 
     def one(pair):
         it, c = pair
         try:
-            cached_call(client, it, c, cfg, stage="S2")
+            with it.step_lock() as held:
+                if not held or it.load().state["stage"] != "S2" or it.state["status"] != "active":
+                    return 0
+                cached_call(client, it, c, cfg, stage="S2")
         except (ModelError, BudgetStop):
             return 0
         return 1

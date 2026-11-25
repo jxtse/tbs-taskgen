@@ -56,6 +56,8 @@ def s3b(P, it):
             try:
                 return codegate.jev_own(client, it, c, link)
             except (ModelError, BudgetStop) as e:
+                if isinstance(e, BudgetStop) and e.reason.startswith("window:"):
+                    raise
                 P.store.event("code_owner_jev_unavailable", item=it.item_id, err=str(e)[:200])
                 return None
     rec = codegate.s3b_record(txt, c, P.cfg, jev=jev)
@@ -80,6 +82,8 @@ def screen_paper(P, it, c: dict, stage: str, fulltext_head: str | None = None) -
     try:
         return screen_jev.cached_call(P.jev_client(), it, c, P.cfg, stage=stage, fulltext_head=fulltext_head)
     except (ModelError, BudgetStop) as e:
+        if isinstance(e, BudgetStop) and e.reason.startswith("window:"):
+            raise
         why = f"{getattr(e, 'cls', None) or 'budget'}:{getattr(e, 'reason', '') or ''}".rstrip(":")
         P.store.event("screen_jev_unavailable", item=it.item_id, stage=stage, why=why, err=str(e)[:200])
         if P.cfg["screen"]["jev"].get("on_unavailable", "rules") == "park":
@@ -93,15 +97,16 @@ def s2(P, it):
     c = read_json(it.p("S1_candidate.json")) or {}
     rules = P.cfg["screen"].get("blocklist")
     c.setdefault("item_id", it.item_id)
-    rule = blocklist.match(c, rules, blocklist.lifted_rules(blocklist.load_state(P.store)))
+    rule = blocklist.match(c, rules)
     if rule is not None:                    # full text unobtainable: drop before spending a screen call —
         d = blocklist.decide(P.store, P.cfg, c, rules, rule, P.store.event)  # unless it is a recheck trial
-        if d.get("action") != "trial":
-            rec = blocklist.screen_record(c, rule)
+        if d["action"] == "block":
+            rec = blocklist.screen_record(c, d["rule"])
             write_json(it.p("S2_screen.json"), rec)
             return it.finish("dropped", rec["reason"])
-        it.state["blocklist_trial"] = rule.get("name") or rule.get("doi_prefix")
-        it.save()
+        if d["action"] == "trial":
+            it.state["blocklist_trial"] = d["rule"].get("name") or d["rule"].get("doi_prefix")
+            it.save()
     rec = screen_paper(P, it, c, "S2")
     if rec is None:
         return
@@ -127,17 +132,13 @@ def s3(P, it):
         write_json(it.p("S3_queue.json"), dict(entry, route="tbsgen fetch", errors=rec.get("errors"),
                                                skipped=rec.get("skipped"), next_stage=codegate.after_s3(P.cfg)))
         it.finish("parked", "fulltext_unavailable")
-        if it.state.get("blocklist_trial"):
-            blocklist.resolve(P.store, it)        # trial decided: no full text (stays pending if still queued)
-            blocklist.reevaluate(P.store, P.cfg, P.store.event)
         if entry["ident"]:
             fulltext.enqueue(fulltext.queue_path(P.cfg), entry)
-        return None
-    it.p("fulltext.txt").write_text(txt)
+    else:
+        it.p("fulltext.txt").write_text(txt)
+        it.advance("S3", codegate.after_s3(P.cfg), source=rec.get("source"), chars=len(txt))
     if it.state.get("blocklist_trial"):
-        blocklist.resolve(P.store, it)            # trial decided: full text obtained
         blocklist.reevaluate(P.store, P.cfg, P.store.event)
-    it.advance("S3", codegate.after_s3(P.cfg), source=rec.get("source"), chars=len(txt))
 
 
 def failed_channels(rec: dict) -> set[str]:
@@ -160,6 +161,8 @@ def s4(P, it):
         try:
             j = screen_jev.s4_feasibility(P.jev_client(), it, c, fulltext, P.cfg)
         except (ModelError, BudgetStop) as e:
+            if isinstance(e, BudgetStop) and e.reason.startswith("window:"):
+                raise
             why = f"{getattr(e, 'cls', None) or 'budget'}:{getattr(e, 'reason', '') or ''}".rstrip(":")
             P.store.event("probe_jev_unavailable", item=it.item_id, stage="S4", why=why, err=str(e)[:200])
             if (P.cfg["probe"].get("jev") or {}).get("on_unavailable", "rules") == "park":
@@ -522,6 +525,34 @@ def s3c(P, it):
     it.advance("S3c", "S4", pin=r.get("pin"), size_mb=r.get("size_mb"), languages=r.get("languages"))
 
 
+def _observe_remote_agent(P, it, stage):
+    """Drain marker-backed work before any stage-specific preparation or terminal transition."""
+    from . import calib, codeagent
+    from .stages_b import finish_job_stage
+    path = it.p(stage, "run.json")
+    rec = codeagent.read_agent_run(P.cfg, it, stage) or {}
+    finish = it.state.get("pending_job_finish")
+    if rec.get("state") in ("intent", "reserved", "launched", "remote_unknown") and calib.remote_job(rec, P.ledger):
+        with _agent_slot_lock(P):
+            action = codeagent.reconcile_remote_agent(P.cfg, it, stage, rec, P.ledger)
+            _agent_admit(P, it, stage)
+        if action == "remote_unknown":
+            it.finish("parked", f"remote_unknown: {rec['job_name']}")
+            return True
+        if action == "waiting":
+            reason = f"{stage}:agent_running"
+            if it.state["status"] != "waiting" or it.state.get("reason") != reason:
+                it.finish("waiting", reason, job=rec["job_name"])
+            return True
+        calib.check_job_identity(Path(rec["job_dir"]), rec)
+        rec = codeagent.collect_agent(P.cfg, path, rec, P.ledger)
+    if finish and rec.get("state") in ("finished", "launch_failed"):
+        it.state.pop("pending_job_finish")
+        finish_job_stage(P, it, finish["status"], finish["reason"], **finish["info"])
+        return True
+    return False
+
+
 def _agent_stage(P, it, kind: str, instruction: str, need: list[str], timeout_s: float, max_usd: float | None,
                  est_usd: float, with_contract: bool, rnd: dict | None = None):
     """Shared S4c / S5G driver: build + launch the job once, then (later steps) poll it.  Returns the finished
@@ -539,6 +570,9 @@ def _agent_stage(P, it, kind: str, instruction: str, need: list[str], timeout_s:
         rec["retry"] = True                     # a finished job of another version never counts for this round
         write_json(recp, rec)
     if rec is not None and rec.get("state") in ("launch_failed", "cancelled_unstarted"):
+        if rec.get("not_started"):
+            with _agent_slot_lock(P):
+                _withdraw_admission(P, it, kind, job=rec.get("job_name"), why="not_launched")
         rec["retry"] = True                     # infrastructure: a resumed item launches a fresh job
         rec["state"] = "finished"
         if rec.get("not_started"):
@@ -607,6 +641,7 @@ def _agent_stage(P, it, kind: str, instruction: str, need: list[str], timeout_s:
         with _agent_slot_lock(P):
             # admission check, job number, intent, reservation and launch under one run-level lock: two processes
             # stepping different papers cannot both take the last slot / daily admission
+            checked_day = _cst_day()
             why = _agent_admission(P, it, kind)
             if why:
                 it.finish(_admission_status(why), why, paused_stage=kind)
@@ -624,38 +659,49 @@ def _agent_stage(P, it, kind: str, instruction: str, need: list[str], timeout_s:
                 extra["prompt_version"] = CODE_PROMPT_VERSION
             if rnd is not None:
                 extra["harden_round"] = rnd["round"]
-            rec = codeagent.launch_agent(P.cfg, it, kind, conf, P.ledger, est_usd, extra=extra)
+            rec = _launch_admitted_agent(P, it, kind, conf, est_usd, checked_day, extra=extra)
             rec.update(extra)
             write_json(recp, rec)
-            if rec.get("state") == "launched":
-                _agent_admit(P, it, kind)       # counted only once a job of this paper really started
+        if rec.get("state") == "remote_unknown":
+            it.finish("parked", f"remote_unknown: {rec['job_name']}")
+            return None
         if rec.get("state") == "launch_failed":
             if rec.get("not_started"):
                 _record_nostart(it, kind, rec.get("job_name"))   # tmux never started it (also in a hardening round)
             return _launch_failed(it, kind)
-        it.finish("waiting", f"{kind}:agent_running", job=rec["job_name"])
+        reason = "launch_grace" if "confirm_launch_after" in rec else f"{kind}:agent_running"
+        it.finish("waiting", reason, job=rec["job_name"])
         return None
-    if rec.get("state") in ("intent", "reserved"):
-        # resumed: reuse the persisted reservation amount (clamped to the paper cap when the job was set up); the
-        # record already holds its slot (intent / reserved count as running) and its admission is per paper
+    if rec.get("state") in ("intent", "reserved", "cancelled_unstarted"):
         with _agent_slot_lock(P):
             _settle_orphans(P, recp, rec, "diversity: reservation released before launch")
-            started = rec.get("launch_attempted") or (rec.get("job_dir") and
-                                                      (Path(rec["job_dir"]) / "config.json").exists())
-            if rec["state"] == "intent" or not started:
-                # never started (budget stop before the reservation, or a crash before the launch): no admission
-                # yet -> the same checks as a new job (a held reservation keeps its slot meanwhile)
+            started = codeagent.launch_evidence(P.cfg, rec)
+            if started is None:
+                it.finish("waiting", "launch_grace", job=rec.get("job_name"))
+                return None
+            checked_day = _cst_day()
+            if not started and not rec.get("launch_attempted"):
+                # Only this job's first-paper admission is provisional. An earlier successful job of the
+                # same paper still exempts its retries from the daily new-paper cap.
+                if rec.get("job_name") and any(
+                        row.get("job") == rec["job_name"] and row.get("item") == it.item_id and row.get("day") != checked_day
+                        for row in _admissions(P, kind)):
+                    _withdraw_admission(P, it, kind, job=rec["job_name"], why="unstarted_day_rollover")
                 why = _agent_admission(P, it, kind)
                 if why:
-                    if why.startswith("diversity:"):
-                        # A parked paper releases its unused money and its concurrent authoring slot.  Order: the
-                        # record goes back to intent first (a resume re-reserves through ledger.reserve), then the
-                        # old row is settled; a crash in between leaves the row in orphan_calls, settled below
-                        # on the next pass -- never a "reserved" record whose ledger row is already closed.
-                        if rec["state"] == "intent" and not rec.get("reservation_key") and rec.get("config"):
-                            conf = read_json(Path(rec["config"]), {})
-                            if conf:
-                                codeagent.recover_legacy_agent_call(it, kind, rec, conf, P.ledger)
+                    if (why.startswith(("budget:", "diversity:")) and rec["state"] == "intent"
+                            and not rec.get("reservation_key") and rec.get("config")):
+                        conf = read_json(Path(rec["config"]), {})
+                        if conf:
+                            codeagent.recover_legacy_agent_call(it, kind, rec, conf, P.ledger)
+                    if why.startswith("budget:"):
+                        P.ledger.cancel_unstarted(rec)
+                        rec.update(state="cancelled_unstarted", ledger_call=None)
+                        write_json(recp, rec)
+                    elif why.startswith("diversity:"):
+                        if rec.get("job_name"):
+                            _withdraw_admission(P, it, kind, job=rec["job_name"], why="diversity_parked")
+                        # Persist the orphan before releasing its reservation, so recovery can finish the release.
                         orphan = rec.get("ledger_call")
                         key = rec.pop("reservation_key", None)
                         if key and not orphan:  # DB commit survived, reserved run.json did not
@@ -666,29 +712,73 @@ def _agent_stage(P, it, kind: str, instruction: str, need: list[str], timeout_s:
                         _settle_orphans(P, recp, rec, why)
                     it.finish(_admission_status(why), why, paused_stage=kind)
                     return None
-            rec = codeagent.launch_agent(P.cfg, it, kind, json.loads(Path(rec["config"]).read_text()), P.ledger,
-                                         float(rec.get("est_usd", est_usd)))
-            if rec.get("state") == "launched":
-                _agent_admit(P, it, kind)
+            rec = _launch_admitted_agent(P, it, kind, read_json(Path(rec["config"])),
+                                         float(rec.get("est_usd", est_usd)), checked_day, started=started)
+        if rec.get("state") == "remote_unknown":
+            it.finish("parked", f"remote_unknown: {rec['job_name']}")
+            return None
         if rec.get("state") == "launch_failed":
             if rec.get("not_started"):
                 _record_nostart(it, kind, rec.get("job_name"))   # tmux never started it (also in a hardening round)
             return _launch_failed(it, kind)
-        it.finish("waiting", f"{kind}:agent_running", job=rec.get("job_name"))
+        reason = "launch_grace" if "confirm_launch_after" in rec else f"{kind}:agent_running"
+        it.finish("waiting", reason, job=rec.get("job_name"))
         return None
     if rec.get("state") == "launched":
         if codegate.ccfg(P.cfg).get({"S4c": "daily_new_runnability", "S5G": "daily_new_authoring"}[kind]) is not None:
             with _agent_slot_lock(P):
                 _agent_admit(P, it, kind)       # idempotent: a crash between "launched" and the admission line
         rec = codeagent.poll_agent(P.cfg, it, kind, P.ledger)
+        if rec and rec.get("state") == "remote_unknown":
+            it.finish("parked", f"remote_unknown: {rec['job_name']}")
+            return None
+        if rec and rec.get("not_started"):
+            with _agent_slot_lock(P):
+                _withdraw_admission(P, it, kind, job=rec["job_name"], why="not_launched")
+            _record_nostart(it, kind, rec["job_name"])
+            return _launch_failed(it, kind)
         if rec is None or rec.get("state") != "finished":
-            if it.state.get("status") != "waiting":
-                it.finish("waiting", f"{kind}:agent_running", job=(rec or {}).get("job_name"))
+            reason = "launch_grace" if "confirm_launch_after" in (rec or {}) else f"{kind}:agent_running"
+            if it.state.get("status") != "waiting" or it.state.get("reason") != reason:
+                it.finish("waiting", reason, job=(rec or {}).get("job_name"))
             return None
     if rec is not None and _account_refusal(P, it, kind, rec):
         from .calib import preflight_wait
         it.finish("waiting", preflight_wait(P.cfg, rec) or "relay_down: preflight refused", job=rec.get("job_name"))
         return None
+    return rec
+
+
+def _launch_admitted_agent(P, it, kind, conf, est_usd, checked_day, extra=None, started=None):
+    """Called under the admission lock, including the launch-intent write and any rollback."""
+    from . import codeagent
+    from .budget import BudgetStop
+
+    def record_intent(rec):
+        day = _cst_day(rec["launch_attempted"])
+        if day != checked_day:
+            # Preparation may span local midnight while we hold the admission lock.
+            _withdraw_admission(P, it, kind, job=rec["job_name"], why="unstarted_day_rollover")
+            why = _daily_paper_cap(P, it, kind, day)
+            if why:
+                P.ledger.cancel_unstarted(rec)
+                rec.pop("launch_attempted", None)  # admission refused before tmux
+                rec.update(state="cancelled_unstarted", ledger_call=None)
+                write_json(it.p(kind, "run.json"), rec)
+                raise BudgetStop(why.removeprefix("budget:"))
+        _agent_admit(P, it, kind)
+
+    try:
+        rec = codeagent.launch_agent(P.cfg, it, kind, conf, P.ledger, est_usd, extra=extra,
+                                     on_launch_intent=record_intent, started=started)
+    except BudgetStop as exc:
+        if exc.cancelled_unstarted:
+            _withdraw_admission(P, it, kind, job=conf["job_name"], why="budget_refused")
+        raise
+    if rec.get("not_started"):
+        _withdraw_admission(P, it, kind, job=conf["job_name"], why="not_launched")
+    elif rec["state"] in ("launched", "remote_unknown"):
+        _agent_admit(P, it, kind)  # backfill a recovered launch
     return rec
 
 
@@ -768,6 +858,8 @@ def s4c(P, it):
         it.load()
         if it.state.get("stage") != "S4c" or it.state.get("status") not in ("active", "waiting"):
             return None
+        if _observe_remote_agent(P, it, "S4c"):
+            return None
         return _s4c(P, it)
 
 
@@ -778,7 +870,7 @@ def _s4c(P, it):
     c = codegate.ccfg(P.cfg)
     tmo = float(c.get("runnability_timeout_s", 3600))
     rec = _agent_stage(P, it, "S4c", S4C_RUNNABILITY.format(item=it.item_id, minutes=int(tmo // 60)),
-                       ["runnability.json", "HOWTO.md"], tmo, c.get("runnability_max_usd", 8.0),
+                       codeagent.agent_output_files("S4c"), tmo, c.get("runnability_max_usd", 8.0),
                        float(c.get("runnability_est_usd", 6.0)), with_contract=False)
     if rec is None:
         return
@@ -795,13 +887,7 @@ def _s4c(P, it):
             res = None
     receipts = []
     if out:
-        for f in sorted((out / "runs").glob("*.json")) if (out / "runs").is_dir() else []:
-            try:
-                rr = json.loads(codeagent.safe_read(f, root=out) or "null")
-            except ValueError:
-                rr = None
-            if isinstance(rr, dict):
-                receipts.append(rr)
+        receipts = codeagent.run_receipts(out)
         write_json(it.p("S4c", "receipts.json"), receipts)
     if isinstance(res, dict) and res.get("runnable") is True:
         # a runnable verdict needs: reason "ok", the how-to, a verifier pass and a wrapper receipt with exit code 0
@@ -847,10 +933,6 @@ def _launch_failed(it, kind):
     return None
 
 
-S5G_FILES = ["_spec/spec.json", "_spec/author_code.json", "task/instruction.md", "task/generator/generate.py",
-             "task/solution/solve.py", "task/tests/measure.py", "task/baselines/mid.py", "task/baselines/naive.py"]
-
-
 def s5g(P, it):
     """Serialised per item (`run` and `calib watch` may both step it): the job number, inputs, launch and the
     acceptance of the result happen under the item lock, on a freshly loaded state."""
@@ -858,6 +940,8 @@ def s5g(P, it):
     with item_lock(it):
         it.load()
         if it.state.get("stage") != "S5G" or it.state.get("status") not in ("active", "waiting"):
+            return None
+        if _observe_remote_agent(P, it, "S5G"):
             return None
         return _s5g(P, it)
 
@@ -882,12 +966,11 @@ def _s5g(P, it):
     hkind = difficulty.round_kind(it) if hround else None
     instruction = S5G_AUTHOR.format(item=it.item_id, minutes=int(tmo // 60), forms=P.cfg["spec"]["allowed_forms"],
                                     hours_lo=lo, hours_hi=hi)
-    need = list(S5G_FILES)
+    need = codeagent.agent_output_files("S5G", with_profile=bool(prof))
     if prof:
         pref = ", ".join(prof.get("preferred") or [])
         instruction += S5G_DIFFICULTY.format(profile_id=prof["id"],
                                              preferred=S5G_PREFERRED.format(ids=pref) if pref else "")
-        need.append("_spec/" + difficulty.DESIGN_FILE)
     if hround:
         pref = ", ".join((prof or {}).get("preferred") or [])
         # the round as counted against its own depth (an infra-reverted attempt does not count)
@@ -1042,8 +1125,8 @@ def _admissions(P, kind: str) -> list[dict]:
     return [json.loads(x) for x in path.read_text().splitlines() if x.strip()] if path.exists() else []
 
 
-def _cst_day() -> str:
-    return time.strftime("%Y-%m-%d", time.gmtime(time.time() + 8 * 3600))
+def _cst_day(ts=None) -> str:
+    return time.strftime("%Y-%m-%d", time.gmtime((time.time() if ts is None else ts) + 8 * 3600))
 
 
 def _admission_status(why):
@@ -1054,10 +1137,10 @@ def _admission_status(why):
 
 def _agent_admission(P, it, kind: str) -> str | None:
     """Production throttles before a new S4c / S5G job (call under _agent_slot_lock): code.max_concurrent_agent_jobs
-    (S4c + S5G records of this run in intent / reserved / launched; "queued:" -> the item waits and is polled
-    again) and code.daily_new_runnability / daily_new_authoring (papers whose first job of that stage STARTED on
+    (S4c + S5G records of this run in reserved / launched; "queued:" -> the item waits and is polled
+    again) and code.daily_new_runnability / daily_new_authoring (papers whose first launch intent was recorded on
     this Asia/Shanghai day; "budget:daily_*" -> paused until the next day's `resume --reason budget:daily`).  A
-    paper is recorded when its job starts (_agent_admit); later jobs of the same paper (re-authoring, hardening
+    paper is recorded before starting the launcher (_agent_admit); later jobs of the same paper (re-authoring, hardening
     rounds) are not counted again."""
     if kind == "S5G":
         from . import diversity
@@ -1073,18 +1156,21 @@ def _agent_admission(P, it, kind: str) -> str | None:
                 continue
             for k in ("S4c", "S5G"):
                 r = read_json(other.p(k, "run.json"), None) or {}
-                if r.get("state") in ("reserved", "launched"):      # an intent holds no reservation / slot
+                if r.get("state") in ("reserved", "launched", "remote_unknown"):
                     running += 1
         if running >= int(cap):
             return f"{kind}:queued: agent slots full ({running}/{cap})"
-    lim = c.get({"S4c": "daily_new_runnability", "S5G": "daily_new_authoring"}[kind])
+    return _daily_paper_cap(P, it, kind, _cst_day())
+
+
+def _daily_paper_cap(P, it, kind, day):
+    lim = codegate.ccfg(P.cfg).get({"S4c": "daily_new_runnability", "S5G": "daily_new_authoring"}[kind])
     if lim is None:
         return None
     _backfill_admissions(P, kind)
     rows = _admissions(P, kind)
     if any(r.get("item") == it.item_id for r in rows):
         return None
-    day = _cst_day()
     today = [r for r in rows if r.get("day") == day]
     if len(today) >= int(lim):
         return f"budget:daily_{kind.lower()}_papers ({len(today)}/{lim} on {day})"
@@ -1100,23 +1186,23 @@ def _backfill_admissions(P, kind: str) -> None:
             continue
         r = read_json(other.p(kind, "run.json"), None) or {}
         if r.get("launch_attempted") and r.get("state") in ("launched", "finished") and not r.get("not_started"):
-            day = time.strftime("%Y-%m-%d", time.gmtime(float(r["launch_attempted"]) + 8 * 3600))
+            day = _cst_day(float(r["launch_attempted"]))
             with _admissions_path(P, kind).open("a") as f:
                 f.write(json.dumps(dict(day=day, item=other.item_id, ts=time.time(), backfilled=True)) + "\n")
 
 
-def _withdraw_admission(P, it, kind: str) -> None:
+def _withdraw_admission(P, it, kind: str, *, job=None, why="relay_preflight_refused") -> None:
     """Remove this paper's admission line of `kind` (call under _agent_slot_lock): its only job was refused by the
     relay preflight, so no job of the paper started and it must not use up a daily_new_* slot."""
     path = _admissions_path(P, kind)
     rows = _admissions(P, kind)
-    keep = [r for r in rows if r.get("item") != it.item_id]
+    keep = [r for r in rows if r.get("item") != it.item_id or (job and r.get("job") != job)]
     if len(keep) == len(rows):
         return
     tmp = path.with_suffix(".jsonl.tmp")
     tmp.write_text("".join(json.dumps(r) + "\n" for r in keep))
     tmp.replace(path)
-    P.store.event(f"{kind.lower()}_admission_withdrawn", item=it.item_id, why="relay_preflight_refused")
+    P.store.event(f"{kind.lower()}_admission_withdrawn", item=it.item_id, why=why)
 
 
 def _agent_admit(P, it, kind: str) -> None:
@@ -1126,9 +1212,9 @@ def _agent_admit(P, it, kind: str) -> None:
         return
     r = read_json(it.p(kind, "run.json"), None) or {}
     ts = float(r.get("launch_attempted") or time.time())
-    day = time.strftime("%Y-%m-%d", time.gmtime(ts + 8 * 3600))
+    day = _cst_day(ts)
     with _admissions_path(P, kind).open("a") as f:
-        f.write(json.dumps(dict(day=day, item=it.item_id, ts=time.time())) + "\n")
+        f.write(json.dumps(dict(day=day, item=it.item_id, job=r.get("job_name"), ts=time.time())) + "\n")
     P.store.event(f"{kind.lower()}_admitted", item=it.item_id, day=day)
 
 

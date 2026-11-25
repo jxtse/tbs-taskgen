@@ -88,8 +88,16 @@ class FakeLauncher:
         self.files, self.cost, self.calls = files, cost, []
 
     def __call__(self, args, **kw):
-        self.calls.append(args)
-        cfgp = Path(args[-1].split(" run ")[1].split(" >")[0].strip("'"))
+        preamble, command = args[-1].split("\n", 1)
+        rc = subprocess.Popen(["bash", "-c", preamble]).wait()
+        if rc:
+            return subprocess.CompletedProcess(args, rc, "", "")
+        self.finish(command)
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    def finish(self, command):
+        self.calls.append(command)
+        cfgp = Path(command.split(" run ")[1].split(" >")[0].strip("'"))
         conf = json.loads(cfgp.read_text())
         jd = Path(conf["jobs_dir"]) / conf["job_name"]
         tr = jd / (conf["job_name"] + "__x")
@@ -103,11 +111,11 @@ class FakeLauncher:
             "verifier_result": {"rewards": {"reward": 1}},
             "agent_execution": {"started_at": "2026-11-12T00:00:00Z", "finished_at": "2026-11-12T00:30:00Z"}}))
         (jd / "result.json").write_text(json.dumps({"finished_at": "2026-11-12T00:31:00Z"}))
-        return subprocess.CompletedProcess(args, 0, "", "")
 
 
 def _agent_item(tmp_path, monkeypatch, files, stage="S4c", **code):
     cfg = _cfg(tmp_path, agent_harbor_root=str(tmp_path), agent_launcher="x.sh", **code)
+    cfg["agent"]["remote_launchers"] = []  # FakeLauncher writes a local Harbor job.
     cfg["budget"]["daily_usd_total"] = 100.0
     P = Pipeline(cfg)
     [a] = P.ingest([{"doi": "10.1/a", "title": "Fast smoothing"}])

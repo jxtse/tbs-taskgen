@@ -36,6 +36,7 @@ instead of backing them off.  Nothing here reads secrets.
 """
 from __future__ import annotations
 
+import contextlib
 import random
 import re
 import sqlite3
@@ -134,12 +135,33 @@ def next_midnight(ts: float) -> float:
     return time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday + 1, 0, 0, 0, 0, 0, -1))
 
 
+ATTEMPT_COLUMNS = "ts, day, channel, host, doi, status, http, bytes, note"
+
 NOT_ENTITLED_NOTE = "not_entitled"
+
+
+def sqlite_wait(db, operation, deadline, resource):
+    """Bound one lock acquisition and leave the connection's usual timeout intact."""
+    if deadline is None:
+        return operation()
+    timeout, = db.execute("pragma busy_timeout").fetchone()
+    try:
+        while (remaining := deadline - time.monotonic()) > 0:
+            # SQLite busy waits may overrun under contention. Recheck the clock between short waits.
+            db.execute(f"pragma busy_timeout={min(10, int(remaining * 1000))}")
+            try:
+                return operation()
+            except sqlite3.OperationalError as exc:
+                if exc.sqlite_errorcode & 0xff not in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
+                    raise
+        raise TimeoutError(f"timed out waiting for the {resource}")
+    finally:
+        db.execute(f"pragma busy_timeout={timeout}")
 
 
 class DownloadLedger:
     def __init__(self, path: str | Path, limits: dict | None = None, global_limits: dict | None = None,
-                 host_caps: dict | None = None, clock=time.time, sleep=time.sleep):
+                 host_caps: dict | None = None, clock=time.time, sleep=time.sleep, *, init_deadline=None):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.limits = {k: dict(v) for k, v in DEFAULT_LIMITS.items()}
@@ -151,17 +173,35 @@ class DownloadLedger:
         self._exclude: int | None = None
         self.clock, self.sleep = clock, sleep
         self._local = threading.local()      # one sqlite connection per thread (browser workers run in threads)
-        self.db.executescript("""
+        db = self.db
+
+        def initialize():
+            with db:
+                self._initialize(db)
+
+        sqlite_wait(db, initialize, init_deadline, "download ledger")
+
+    @staticmethod
+    def _initialize(db):
+        db.executescript("""
+            begin immediate;
             create table if not exists attempts(ts real, day text, channel text, host text, doi text,
                                                 status text, http int, bytes int, note text);
             create table if not exists cooldown(host text primary key, until real, reason text);
             create table if not exists hosts(host text primary key, next_ts real);
+            create index if not exists a_open on attempts(doi collate nocase) where status='pending' or channel='lease';
             create index if not exists a_day on attempts(day, channel);
             create table if not exists blocks(ts real, day text, channel text, host text, reason text);
             create table if not exists meta_calls(ts real, day text, host text, status text, http int);
             create table if not exists not_entitled(channel text, doi text, ts real, note text,
                                                     primary key(channel, doi));
         """)
+
+        if "settled_day" not in {r[1] for r in db.execute("pragma table_info(attempts)")}:
+            db.execute("alter table attempts add column settled_day text")
+            # Earlier collectors overwrote day on successful cross-midnight imports.
+            db.execute("update attempts set settled_day=day, day=date(ts,'unixepoch','localtime') "
+                       "where status='ok' and day!=date(ts,'unixepoch','localtime')")
 
     @property
     def db(self) -> sqlite3.Connection:
@@ -171,21 +211,32 @@ class DownloadLedger:
         return c
 
     # ------------------------------------------------------------------ helpers
-    def _tx(self):
+    @contextlib.contextmanager
+    def _tx(self, deadline=None):
         db = self.db
-
-        class _T:
-            def __enter__(s):
-                db.execute("begin immediate")
-                return db
-
-            def __exit__(s, exc_type, *_):
-                db.execute("rollback" if exc_type else "commit")
-                return False
-        return _T()
+        sqlite_wait(db, lambda: db.execute("begin immediate"), deadline, "download ledger lease")
+        try:
+            yield db
+            sqlite_wait(db, lambda: db.execute("commit"), deadline, "download ledger lease")
+        except BaseException:
+            db.rollback()
+            raise
 
     def today(self) -> str:
         return local_day(self.clock())
+
+    def leased_papers(self) -> set[str]:
+        return {r[0] for r in self.db.execute("select doi from attempts where channel='lease'")}
+
+    def paper_held(self, ident: str) -> bool:
+        """Called inside admission's write transaction. A legacy anonymous lease may cover any DOI."""
+        if not ident:
+            return False
+        doi = ident.removeprefix("doi:")
+        return self.db.execute(
+            "select 1 from attempts where doi collate nocase in (?, ?, '') and "
+            "(channel='lease' or (doi!='' and status='pending' and ts>?)) limit 1",
+            (doi, 'doi:' + doi, self.clock() - PENDING_TTL_S)).fetchone() is not None
 
     def _n(self, where: str, args: tuple = ()) -> int:
         if self._exclude is not None:                       # the reservation being re-checked
@@ -199,9 +250,13 @@ class DownloadLedger:
     def _ok_or_pending(self, where: str, args: tuple, day: str | None = None, since_ts: float | None = None) -> int:
         """Successes plus live reservations (a pending row may still succeed) on `day` or since `since_ts`."""
         now = self.clock()
-        time_cond, targs = ("day=?", (day or self.today(),)) if since_ts is None else ("ts>?", (since_ts,))
+        if since_ts is None:
+            time_cond, targs = "coalesce(settled_day,day)=?", (day or self.today(),)
+        else:
+            time_cond, targs = "ts>?", (since_ts,)
         # remote-job leases (channel 'lease') hold quota until the job is collected, however long that takes
-        return self._n(f"{time_cond} and (status='ok' or (status='pending' and (ts>? or channel='lease'))) and {where}",
+        return self._n(f"(({time_cond} and (status='ok' or (status='pending' and ts>?))) "
+                       f"or (status='pending' and channel='lease')) and {where}",
                        (*targs, now - PENDING_TTL_S, *args))
 
     def cooling(self, host: str, *related: str) -> str | None:
@@ -247,7 +302,7 @@ class DownloadLedger:
         return None
 
     # ------------------------------------------------------------------ checks
-    def check(self, channel: str, host: str, related: tuple = (), slot: float | None = None, group: tuple = ()):
+    def check(self, channel: str, host: str | None = None, related: tuple = (), slot: float | None = None, group: tuple = ()):
         """Raise LimitReached unless one more request on (channel, host) fits, counting over the day of `slot`.
         `group`: further keys that share the host's caps and pacing (one publisher under several keys)."""
         if channel not in self.limits:
@@ -258,7 +313,7 @@ class DownloadLedger:
         mid = next_midnight(slot if slot is not None else now)
         if (msg := self.cooling(f"channel:{channel}")):
             raise LimitReached(msg, "cooldown", until=self.cooling_until(f"channel:{channel}"))
-        if (msg := self.cooling(host, *related, *group)):
+        if host is not None and (msg := self.cooling(host, *related, *group)):
             raise LimitReached(msg, "cooldown", "host", until=self.cooling_until(host, *related, *group))
         if (msg := self.breaker(channel)):                  # today's breaker resets at today's midnight
             raise LimitReached(msg, "breaker", until=next_midnight(now))
@@ -273,6 +328,8 @@ class DownloadLedger:
                                until=self._hour_reset("channel=? and status in ('ok','pending')", (channel,)))
         if self._n(f"day=? and channel=? and status!='hop' and {_SENT}", (day, channel)) >= lim["daily_attempts"]:
             raise LimitReached(f"{channel} daily attempt cap {lim['daily_attempts']} reached", until=mid)
+        if host is None:  # batch admission, before individual publisher URLs are resolved
+            return
         keys = (host, *group)
         host_day = self.host_caps.get(host, lim.get("host_daily_attempts") or self.g["per_host_daily_attempts"])
         if self._n(f"day=? and {self._in(keys)} and {_SENT}", (day, *keys)) >= host_day:
@@ -326,7 +383,8 @@ class DownloadLedger:
                                  "and note='booked'", keys).fetchone()[0] or 0.0
         return max(self.clock(), nxt, self._last_sent(keys) + gap, booked + gap if booked else 0.0)
 
-    def acquire(self, channel: str, host: str, doi: str = "", related: tuple = (), group: tuple = ()) -> int:
+    def acquire(self, channel: str, host: str, doi: str = "", related: tuple = (), group: tuple = (),
+                *, eligible=None) -> int:
         """Check caps, book a pending attempt and the next slot of `host` (+ `group`: keys sharing its caps and
         pacing), sleep until the slot, then — in a transaction — re-check cooldowns / breakers, the gap to the
         last real send on the group (another booking may have woken late) and, if the day changed while
@@ -337,6 +395,10 @@ class DownloadLedger:
         gap = float(lim["gap_s"])
         with self._tx():
             now = self.clock()
+            if eligible is not None and not eligible():
+                raise LimitReached(f"{doi}: already cached or no longer queued", scope="host")
+            if self.paper_held(doi):
+                raise LimitReached(f"{doi}: download in progress", scope="host")
             slot = self._next_slot(keys, gap)
             if slot - now > float(lim.get("max_wait_s", MAX_WAIT_S)):
                 raise LimitReached(f"{host}: next slot in {slot - now:.0f}s exceeds max_wait_s", "cap", "host",
@@ -344,7 +406,7 @@ class DownloadLedger:
             self.check(channel, host, related, slot, group)
             self.db.execute("insert or replace into hosts values(?,?)",
                             (host, slot + gap + random.uniform(0, lim["jitter_s"])))
-            rid = self.db.execute("insert into attempts values(?,?,?,?,?,?,?,?,?)",
+            rid = self.db.execute(f"insert into attempts({ATTEMPT_COLUMNS}) values(?,?,?,?,?,?,?,?,?)",
                                   (slot, local_day(slot), channel, host, doi, "pending", None, 0,
                                    "booked")).lastrowid
         booked_day = local_day(slot)
@@ -414,7 +476,7 @@ class DownloadLedger:
                                    until=self._hour_reset(f"host=? and {_SENT}", (host,)))
             self.db.execute("insert or replace into hosts values(?,?)",
                             (host, slot + gap + random.uniform(0, lim["jitter_s"])))
-            rid = self.db.execute("insert into attempts values(?,?,?,?,?,?,?,?,?)",
+            rid = self.db.execute(f"insert into attempts({ATTEMPT_COLUMNS}) values(?,?,?,?,?,?,?,?,?)",
                                   (slot, day, channel, host, doi, "pending", None, 0, "booked")).lastrowid
         for _ in range(20):
             if (wait := slot - self.clock()) > 0:
@@ -450,7 +512,7 @@ class DownloadLedger:
                 self.db.execute("update attempts set doi=?, status=?, http=?, bytes=?, note=? where rowid=?",
                                 (doi, status, http, nbytes, note[:300], reservation))
             else:
-                self.db.execute("insert into attempts values(?,?,?,?,?,?,?,?,?)",
+                self.db.execute(f"insert into attempts({ATTEMPT_COLUMNS}) values(?,?,?,?,?,?,?,?,?)",
                                 (self.clock(), self.today(), channel, host, doi, status, http, nbytes, note[:300]))
 
     def finalize_pending(self, reservation: int, channel: str, host: str, doi: str, note: str):
@@ -478,11 +540,11 @@ class DownloadLedger:
                                 (self.clock(), self.today(), ch, host, reason[:200]))
 
     # ------------------------------------------------------------------ not entitled
-    def mark_not_entitled(self, channel: str, doi: str, note: str = ""):
+    def mark_not_entitled(self, channel: str, doi: str, note: str = "", *, deadline=None):
         """The channel's API answered for `doi` with metadata / abstract only: never ask that channel again."""
         if not doi:
             return
-        with self._tx():
+        with self._tx(deadline):
             self.db.execute("insert into not_entitled values(?,?,?,?) on conflict(channel, doi) do update set "
                             "ts = excluded.ts, note = excluded.note", (channel, doi, self.clock(), note[:200]))
 
@@ -497,12 +559,12 @@ class DownloadLedger:
     def usage(self) -> dict:
         out = {}
         for ch, lim in self.limits.items():
-            ok = self._n("day=? and channel=? and status='ok'", (self.today(), ch))
+            ok = self._n("coalesce(settled_day,day)=? and channel=? and status='ok'", (self.today(), ch))
             att = self._n(f"day=? and channel=? and status!='hop' and {_SENT}", (self.today(), ch))
             out[ch] = dict(ok=ok, attempts=att, cap_ok=lim.get("daily_ok"), cap_attempts=lim.get("daily_attempts"),
                            breaker=self.breaker(ch))
         out["_meta_calls"] = self.db.execute("select count(*) from meta_calls where day=?", (self.today(),)).fetchone()[0]
-        out["_global_ok"] = self._n("day=? and status='ok'", (self.today(),))
+        out["_global_ok"] = self._n("coalesce(settled_day,day)=? and status='ok'", (self.today(),))
         out["_global_cap"] = self.g["daily_ok"]
         out["_cooldown"] = [dict(host=h, until=time.strftime("%F %T", time.localtime(u)), reason=r)
                             for h, u, r in self.db.execute("select host, until, reason from cooldown where until>?",

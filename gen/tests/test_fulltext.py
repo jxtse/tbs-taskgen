@@ -764,9 +764,9 @@ def test_wakeup_after_midnight_counts_on_new_day(tmp_path):
                          clock=clock, sleep=clock.sleep)
     db = sqlite3.connect(tmp_path / "l.sqlite")
     tomorrow = (dt.datetime(2026, 11, 8, 0, 0, 5)).timestamp()
-    db.execute("insert into attempts values(?,?,?,?,?,?,?,?,?)",
+    db.execute("insert into attempts values(?,?,?,?,?,?,?,?,?,null)",
                (tomorrow, "2026-11-08", "browser", "chrome:10.1093", "x", "ok", 200, 1, ""))
-    db.execute("insert into attempts values(?,?,?,?,?,?,?,?,?)",          # forces a wait before the next send
+    db.execute("insert into attempts values(?,?,?,?,?,?,?,?,?,null)",          # forces a wait before the next send
                (clock.t, "2026-11-07", "browser", "chrome:10.1021", "y", "fail", 404, 0, ""))
     db.commit()
     real_sleep = clock.sleep

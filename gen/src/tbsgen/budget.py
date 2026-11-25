@@ -25,6 +25,8 @@ import sqlite3
 import time
 from pathlib import Path
 
+from .dlledger import sqlite_wait
+
 CN = dt.timezone(dt.timedelta(hours=8))
 EXCLUDE_UNSTARTED_JOBS = "COALESCE(cost_kind,'') NOT IN ('probe_migration_cancelled','cancelled_unstarted','expired_unsent')"
 # hardening round of the item being stepped (Pipeline.step sets it while state.harden_active; 0 = not a hardening
@@ -78,8 +80,10 @@ def variant_scope(k):
 class BudgetStop(RuntimeError):
     """Raised instead of making a call; carries a machine-readable reason."""
 
-    def __init__(self, reason: str, detail: str = ""):
+    def __init__(self, reason: str, detail: str = "", **reservation):
         super().__init__(f"{reason}: {detail}" if detail else reason)
+        self.cancelled_unstarted = False
+        self.reservation = reservation
         self.reason = reason
         self.detail = detail
 
@@ -112,13 +116,12 @@ def price_usd(prices: dict, model: str, usage: dict) -> float:
 
 
 class Ledger:
-    def __init__(self, path: str | Path, cfg: dict):
+    def __init__(self, path: str | Path, cfg: dict, *, init_deadline=None):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.cfg = cfg
-        with self._db() as db:
-            db.executescript(SCHEMA)
-            db.execute("BEGIN IMMEDIATE")
+        with self._db(init_deadline) as db:
+            sqlite_wait(db, lambda: db.executescript("BEGIN IMMEDIATE;\n" + SCHEMA), init_deadline, "run ledger")
             cols = {r[1] for r in db.execute("PRAGMA table_info(calls)")}
             if "cost_kind" not in cols:     # added for S9 runs: reported / tokens / reservation (older ledgers: NULL)
                 db.execute("ALTER TABLE calls ADD COLUMN cost_kind TEXT")
@@ -128,14 +131,17 @@ class Ledger:
                 db.execute("ALTER TABLE calls ADD COLUMN variant INTEGER")
             if "reservation_key" not in cols:
                 db.execute("ALTER TABLE calls ADD COLUMN reservation_key TEXT")
-            # A cross-day replacement shares the key of the expired reservation.
+            # Older direct clients left real, possibly billed prompts marked reserved.
+            # Detached jobs have an empty prompt hash and a separate launch boundary.
+            db.execute("UPDATE calls SET status='sent' WHERE status='reserved' AND real=1 AND prompt_sha!=''")
+            # A settled attempt can be followed by a freshly budgeted retry of the same job.
             db.execute("DROP INDEX IF EXISTS calls_reservation")
             db.execute("CREATE UNIQUE INDEX IF NOT EXISTS calls_open_reservation ON calls(reservation_key) "
                        "WHERE reservation_key IS NOT NULL AND status='reserved'")
 
-    def _db(self):
+    def _db(self, deadline=None):
         db = sqlite3.connect(self.path, timeout=60, isolation_level=None)
-        db.execute("PRAGMA journal_mode=WAL")
+        sqlite_wait(db, lambda: db.execute("PRAGMA journal_mode=WAL"), deadline, "run ledger")
         return db
 
     # ------------------------------------------------------------------ reserve / finish
@@ -154,14 +160,14 @@ class Ledger:
                              "AND (reservation_key=? OR id=?) LIMIT 1", (item, stage, key, saved_id)).fetchone()
             return row is not None
 
-    def cancel_unstarted_job(self, item, stage, key, saved_id, kind):
+    def cancel_unstarted_job(self, item, stage, key, saved_id, kind, note=""):
         """Cancel all open calls for this launch, including a replacement missing from the job record."""
         with contextlib.closing(self._db()) as db, db:
             db.execute("BEGIN IMMEDIATE")
             rows = db.execute("SELECT id FROM calls WHERE item=? AND stage=? AND status IN ('reserved','sent') "
                               "AND (reservation_key=? OR id=?) ORDER BY id", (item, stage, key, saved_id)).fetchall()
             for (call,) in rows:
-                self._settle(db, call, 0.0, "error", "", kind, None)
+                self._settle(db, call, 0.0, "error", note, kind, None)
             if rows:
                 return rows[-1][0]
             # A previous cancellation may have committed before the replacement id reached runs.json.
@@ -207,21 +213,96 @@ class Ledger:
                 return call
             return None
 
+    def cancel_unstarted(self, rec):
+        """Release an unlaunched job refused by a paper cap, including a row committed before run.json."""
+        self._revoke_before_send(rec)
+        with self._db() as db:
+            db.execute("UPDATE calls SET status='cancelled', usd=0, ended=?, cost_kind='expired_unsent' "
+                       "WHERE (reservation_key=? OR id=?) AND status IN ('reserved','sent')",
+                       (time.time(), rec.get("reservation_key"), rec.get("ledger_call")))
+
+    @staticmethod
+    def _revoke_before_send(rec):
+        # Admission failed inside the controller, before tmux could receive this permit.
+        if permit := rec.get("launch_permit"):
+            Path(permit).rename(permit + ".revoked")
+            del rec["launch_permit"]
+
+    def reserve_job(self, rec, save, model, stage, item, est_usd, *, send=False, adopt_started=False):
+        try:
+            return self.reserve(model, stage, item, True, est_usd=est_usd, reservation_key=rec["reservation_key"],
+                                reserved_id=rec.get("ledger_call"), send=send, adopt_started=adopt_started)
+        except BudgetStop as exc:
+            if exc.cancelled_unstarted:
+                self._revoke_before_send(rec)
+                rec.pop("launch_attempted", None)  # send refused before tmux
+                rec.update(state="cancelled_unstarted", ledger_call=None)
+                save(rec)
+            raise
+
+    def window_usage(self, db=None, day=None):
+        if db is None:
+            with self._db() as conn:
+                return self.window_usage(conn, day)
+        end = dt.date.fromisoformat(day or today())
+        windows = []
+        for cap in self.cfg["budget"].get("window_caps", []):
+            start = dt.date.fromisoformat(str(cap["since"]))
+            if "days" in cap:
+                days = int(cap["days"])
+                if days < 1:
+                    raise ValueError("budget window days must be positive")
+                start = max(start, end - dt.timedelta(days=days - 1))
+            model = cap.get("model", "*")
+            used, = db.execute("SELECT COALESCE(SUM(COALESCE(usd, est_usd)),0) FROM calls "
+                               "WHERE real=1 AND day BETWEEN ? AND ? AND (?='*' OR model=?)",
+                               (start.isoformat(), end.isoformat(), model, model)).fetchone()
+            windows.append(dict(name=cap["name"], model=model, usd=float(cap["usd"]), used_usd=used,
+                                since=start.isoformat(), active=start <= end))
+        return windows
+
+    def window_allows(self, pause):
+        if not str(pause.get("reason", "")).startswith("budget:window:"):
+            return True
+        return all(w["used_usd"] + pause.get("est_usd", 0) <= w["usd"] + 1e-12
+                   for w in self.window_usage() if w["active"] and w["model"] in ("*", pause.get("model")))
+
     def reserve(self, model: str, stage: str, item: str, real: bool, prompt_sha: str = "",
-                est_usd: float | None = None, reservation_key: str | None = None) -> int:
+                est_usd: float | None = None, reservation_key: str | None = None, *, send: bool = False,
+                reserved_id: int | None = None, adopt_started: bool = False) -> int:
         b = self.cfg["budget"]
         est = (float(b.get("est_usd_per_call", 0.0)) if est_usd is None else float(est_usd)) if real else 0.0
         hk = harden_round_now()
         vk = variant_round_now()
-        day = today()
         db = self._db()
         try:
             db.execute("BEGIN IMMEDIATE")
+            day = today()
+            if reservation_key is None and prompt_sha and item and stage != "PING":
+                # Item steps retry the same request after a crash. Diagnostic pings are independent calls.
+                reservation_key = json.dumps([item, stage, model, prompt_sha, hk, vk])
+            job = reservation_key is not None and not prompt_sha
+            if reserved_id is not None and job:
+                # Older job records may have only the row id.
+                db.execute("UPDATE calls SET reservation_key=? WHERE id=? AND reservation_key IS NULL",
+                           (reservation_key, reserved_id))
             if reservation_key is not None:
-                held = self._reserved_call(db, reservation_key)
+                if send and not job:
+                    # An interrupted HTTP request may already have been billed.
+                    db.execute("UPDATE calls SET status='error', ended=?, usd=est_usd, cost_kind='reservation', "
+                               "error='interrupted after send' WHERE reservation_key=? AND status='sent'",
+                               (time.time(), reservation_key))
+                if not adopt_started:
+                    db.execute("UPDATE calls SET status='cancelled', usd=0, ended=?, cost_kind='expired_unsent' "
+                               "WHERE reservation_key=? AND day<? AND (status='reserved' OR (? AND status='sent'))",
+                               (time.time(), reservation_key, day, job))
+                held = db.execute("SELECT id FROM calls WHERE reservation_key=? AND "
+                                  "(status='reserved' OR (? AND status='sent'))", (reservation_key, job)).fetchone()
                 if held:
-                    db.execute("COMMIT")
-                    return held
+                    if send:
+                        db.execute("UPDATE calls SET status='sent' WHERE id=?", held)
+                    db.commit()
+                    return held[0]
             row = db.execute("SELECT open, reason FROM breaker WHERE model=?", (model,)).fetchone()
             if row and row[0]:
                 raise BudgetStop("breaker_open", f"{model}: {row[1]}")
@@ -246,6 +327,9 @@ class Ledger:
                 cap_s = (b.get("daily_usd_per_stage") or {}).get(stage)
                 if cap_s is not None and spent("AND stage=?", stage) + est > float(cap_s) + 1e-12:
                     raise BudgetStop("daily_stage", f"{stage} {cap_s} USD")
+                for w in self.window_usage(db, day):
+                    if w["active"] and w["model"] in ("*", model) and w["used_usd"] + est > w["usd"] + 1e-12:
+                        raise BudgetStop("window:" + w["name"], f"{model} {w['usd']} USD", model=model, est_usd=est)
             cap_r = (b.get("run_calls_per_model") or {}).get(model)
             # call-count caps count calls that were made: a reservation the model relay refused at its preflight
             # (cost_kind relay_refused, calib.relay_preflight_refused: no Harbor job, no model call) is no call
@@ -298,10 +382,17 @@ class Ledger:
             cur = db.execute(
                 "INSERT INTO calls(day,started,model,real,stage,item,status,est_usd,prompt_sha,harden,variant,reservation_key) "
                 "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-                (day, time.time(), model, int(real), stage, item, "reserved", est, prompt_sha, hk or None,
+                (day, time.time(), model, int(real), stage, item, "sent" if send else "reserved", est, prompt_sha, hk or None,
                  vk or None, reservation_key))
             db.execute("COMMIT")
             return cur.lastrowid
+        except BudgetStop as exc:
+            if job:
+                exc.cancelled_unstarted = bool(db.execute(
+                    "SELECT 1 FROM calls WHERE reservation_key=? AND status='cancelled' LIMIT 1",
+                    (reservation_key,)).fetchone())
+            db.commit()  # preserve any prior settlement or cancellation when admission is refused
+            raise
         except BaseException:
             db.execute("ROLLBACK") if db.in_transaction else None
             raise
@@ -316,7 +407,7 @@ class Ledger:
             db.execute("BEGIN IMMEDIATE")
             model, real = db.execute("SELECT model, real FROM calls WHERE id=?", (call_id,)).fetchone()
             usd = price_usd(self.cfg["models"].get("prices", {}), model, usage) if real else 0.0
-            db.execute("UPDATE calls SET ended=?,status=?,usd=?,in_tok=?,out_tok=?,cache_read=?,cache_write=?,"
+            db.execute("UPDATE calls SET ended=?,status=?,usd=?,cost_kind=NULL,in_tok=?,out_tok=?,cache_read=?,cache_write=?,"
                        "error_class=?,error=?,latency=?,resp_model=? WHERE id=?",
                        (time.time(), "error" if error_class else "ok", usd, usage.get("input_tokens", 0),
                         usage.get("output_tokens", 0), usage.get("cache_read_input_tokens", 0),
@@ -394,7 +485,7 @@ class Ledger:
         """USD split by how the cost is known: "token_priced" (model calls: tokens x prices), "reported" (S9: Harbor
         cost_usd), "tokens" (S9: estimated from the trial's token usage), "reservation" (S9: unknown, the reserved
         estimate stands in; an upper bound, not a bill), "in_flight" (still reserved)."""
-        q = ("SELECT CASE WHEN status='reserved' THEN 'in_flight' ELSE COALESCE(cost_kind, 'token_priced') END, "
+        q = ("SELECT CASE WHEN status IN ('reserved','sent') THEN 'in_flight' ELSE COALESCE(cost_kind, 'token_priced') END, "
              "SUM(COALESCE(usd, est_usd, 0)) FROM calls WHERE real=1 {} GROUP BY 1")
         with self._db() as db:
             rows = db.execute(q.format("AND day=?" if day else ""), (day,) if day else ()).fetchall()

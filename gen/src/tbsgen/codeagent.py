@@ -406,80 +406,233 @@ def recover_legacy_agent_call(it, kind, rec, conf, ledger):
         write_json(it.p(kind, "run.json"), rec)
 
 
-def launch_agent(cfg: dict, it, kind: str, conf: dict, ledger, est_usd: float, extra: dict | None = None) -> dict:
+def read_agent_run(cfg, it, kind):
+    """Supply ledger identity and the launcher route for records written by older workers."""
+    from . import calib
+    rec = read_json(it.p(kind, "run.json"))
+    if rec:
+        rec.update(item=it.item_id, ledger_stage=kind)
+        if "remote_route" not in rec:
+            launcher = _c(cfg).get("agent_launcher") or cfg["calib"].get("teacher_launcher")
+            rec["remote_route"] = calib.is_remote_launcher(cfg.get("agent", {}), launcher)
+    return rec
+
+
+def launch_evidence(cfg, rec):
+    """Revoke an outstanding permit or recognize its claim, falling back to legacy launch evidence."""
+    from .calib import reconcile_launch
+
+    def exists():
+        if rec.get("job_dir") and Path(rec["job_dir"]).is_dir():
+            return True
+        log = rec.get("log")
+        return bool(log and Path(log).name == f"{rec['job_name']}.launch.log" and
+                    (Path(log).exists() or Path(log + ".exit").exists()))
+
+    return reconcile_launch(cfg["calib"], rec, exists, time.time())
+
+
+def _fail_launch(cfg, it, kind, rec, ledger):
+    from . import calib
+    if calib.remote_job(rec):
+        reconcile_remote_agent(cfg, it, kind, rec, ledger)
+        return rec
+    recp = it.p(kind, "run.json")
+    rec.pop("confirm_launch_after", None)
+    rec.update(state="launch_failed", not_started=True, cost_usd=0.0, cost_kind="not_launched",
+               error=rec.get("launch_error") or "launch did not start")
+    if ledger is not None:
+        rec["ledger_call"] = ledger.cancel_unstarted_job(
+            recp.parent.parent.name, recp.parent.name, rec.get("reservation_key"), rec.get("ledger_call"),
+            "not_launched", rec["error"])
+    write_json(recp, rec)
+    return rec
+
+
+def _confirm_launch(cfg, it, kind, rec, ledger):
+    started = launch_evidence(cfg, rec)
+    if started is None:
+        return rec
+    if not started:
+        return _fail_launch(cfg, it, kind, rec, ledger)
+    del rec["confirm_launch_after"]
+    write_json(it.p(kind, "run.json"), rec)
+    return rec
+
+
+S5G_FILES = ["_spec/spec.json", "_spec/author_code.json", "task/instruction.md", "task/generator/generate.py",
+             "task/solution/solve.py", "task/tests/measure.py", "task/baselines/mid.py", "task/baselines/naive.py"]
+
+
+def agent_output_files(kind, *, with_profile=False):
+    from .difficulty import DESIGN_FILE
+    if kind == "S4c":
+        return ["runnability.json", "HOWTO.md"]
+    return S5G_FILES + (["_spec/" + DESIGN_FILE] if with_profile else [])
+
+
+def _agent_outputs_present(trial, kind, required):
+    out = deliverable(dict(trial=trial))
+    if not out or any(safe_read(out / name, root=trial) is None for name in required):
+        return False
+    if kind == "S4c":
+        try:
+            verdict = json.loads(safe_read(out / "runnability.json", root=trial) or "null")
+        except ValueError:
+            return True  # present but invalid; the stage classifies it
+        if isinstance(verdict, dict) and verdict.get("runnable") is True:
+            # Presence gates harvest. The stage still judges the commands and exit codes.
+            receipts = run_receipts(out)
+            for receipt in receipts:
+                log = receipt.get("log")
+                if isinstance(log, str) and (out / log).is_relative_to(out):
+                    if safe_read(out / log, root=out) is None:
+                        return False
+            return bool(receipts)
+    return True
+
+
+def run_receipts(out):
+    receipts = []
+    for path in sorted((out / "runs").glob("*.json")):
+        try:
+            receipt = json.loads(safe_read(path, root=out) or "null")
+        except ValueError:
+            continue
+        if isinstance(receipt, dict):
+            receipts.append(receipt)
+    return receipts
+
+
+def complete_remote_agent(cfg, rec):
+    from .calib import configured_trial_set
+    jd = Path(rec["job_dir"])
+    summary = read_json(jd / "result.json")
+    if not isinstance(summary, dict) or not summary.get("finished_at"):
+        return False
+    # The staged input preserves the original profile requirement when resolving without --config.
+    kind = rec["ledger_stage"]
+    has_profile = (cfg.get("difficulty", {}).get("profile_path")
+                   or (Path(rec["task"]) / "environment/work/weakness_profile.md").is_file())
+    required = agent_output_files(kind, with_profile=has_profile)
+    _, complete = configured_trial_set(jd, lambda trial: _agent_outputs_present(trial, kind, required))
+    return complete
+
+
+def reconcile_remote_agent(cfg, it, kind, rec, ledger):
+    from . import calib
+    conf = read_json(Path(rec["config"]), {}) if rec.get("config") else {}
+    rec.update(item=it.item_id, ledger_stage=kind)
+    if conf:
+        rec.update(model=conf["agents"][0]["model_name"], task=conf["tasks"][0]["path"])
+    rec.setdefault("model", _c(cfg).get("agent_model") or cfg["calib"]["teacher_model"])
+    rec.setdefault("task", str(it.p(kind, "task").resolve()))
+    rec.setdefault("reservation_key", json.dumps([it.item_id, kind, rec["job_name"]]))
+    return calib.reconcile_remote(cfg, rec, ledger, lambda r: write_json(it.p(kind, "run.json"), r))
+
+
+def launch_agent(cfg: dict, it, kind: str, conf: dict, ledger, est_usd: float, extra: dict | None = None,
+                 on_launch_intent=None, started=None) -> dict:
     """intent -> reserved -> launched, persisted in <item>/<kind>/run.json (one job per stage attempt).  extra:
     fields stored with the intent (e.g. budget, harden_round) so a resumed job keeps them."""
-    from .calib import is_remote_launcher
+    from . import calib
     launcher = _c(cfg).get("agent_launcher") or cfg["calib"].get("teacher_launcher")
-    remote_route = is_remote_launcher(cfg.get("agent", {}), launcher)
+    remote_route = calib.is_remote_launcher(cfg.get("agent", {}), launcher)
     d = it.p(kind)
     d.mkdir(parents=True, exist_ok=True)
     recp = d / "run.json"
-    rec = read_json(recp, None) or {}
+    rec = read_agent_run(cfg, it, kind) or {}
     if rec.get("job_name") != conf["job_name"]:
-        rec = dict(job_name=conf["job_name"], state="intent", ts=time.time(), kind=kind, remote_route=remote_route,
+        rec = dict(item=it.item_id, ledger_stage=kind, job_name=conf["job_name"], state="intent", ts=time.time(), kind=kind, remote_route=remote_route,
                    job_dir=str(Path(conf["jobs_dir"]) / conf["job_name"]), config=str((d / "job.json").resolve()),
-                   **(extra or {}))
+                   model=conf["agents"][0]["model_name"], task=conf["tasks"][0]["path"], **(extra or {}))
         (d / "job.json").write_text(json.dumps(conf, indent=1))
         if ledger is not None:
-            rec["reservation_key"] = uuid.uuid4().hex
+            rec["reservation_key"] = json.dumps([it.item_id, kind, conf["job_name"]])
         write_json(recp, rec)
     else:
         recover_legacy_agent_call(it, kind, rec, conf, ledger)
-    if rec["state"] == "intent":
-        model = conf["agents"][0]["model_name"]
-        if ledger is not None:
-            if not rec.get("reservation_key"):
-                rec["reservation_key"] = uuid.uuid4().hex
+    model = conf["agents"][0]["model_name"]
+
+    def reserve_job(send=False, adopt_started=False):
+        if ledger is None:
+            return None
+        if not rec.get("reservation_key"):
+            rec["reservation_key"] = json.dumps([it.item_id, kind, conf["job_name"]])
+            write_json(recp, rec)
+        return ledger.reserve_job(rec, lambda r: write_json(recp, r), model, kind, it.item_id, float(est_usd),
+                                  send=send, adopt_started=adopt_started)
+
+    if calib.remote_job(rec, ledger) and rec["state"] not in ("finished", "launch_failed"):
+        reconcile_remote_agent(cfg, it, kind, rec, ledger)
+        return rec
+    if rec["state"] in ("intent", "reserved", "cancelled_unstarted"):
+        if started is None:
+            started = launch_evidence(cfg, rec)
+        if started is None:
+            return rec
+        if started:
+            if not rec.get("ledger_call"):
+                rec["ledger_call"] = reserve_job(adopt_started=True)
+                rec["state"] = "reserved"
                 write_json(recp, rec)
-            rec["ledger_call"] = ledger.reserve(model, kind, it.item_id, True, est_usd=float(est_usd),
-                                                reservation_key=rec["reservation_key"])
-        else:
-            rec["ledger_call"] = None
+            rec.pop("confirm_launch_after", None)
+            rec["state"] = "launched"
+            write_json(recp, rec)
+            return rec
+        if rec.get("launch_attempted"):
+            return _fail_launch(cfg, it, kind, rec, ledger)
+    if rec["state"] in ("intent", "cancelled_unstarted"):
+        rec["ledger_call"] = reserve_job()
         rec["model"] = model
         rec["state"] = "reserved"
         write_json(recp, rec)
     if rec["state"] == "reserved":
-        if Path(rec["job_dir"], "config.json").exists():
-            rec["state"] = "launched"
-            write_json(recp, rec)
-            return rec
+        # one log / exit file per job: an earlier job's launcher (it may exit after its result.json appeared) can
+        # never write the exit status this job is judged by
+        log = d / f"{conf['job_name']}.launch.log"
+        tmux_bin = cfg["calib"].get("tmux_bin", "tmux")
         root = _c(cfg).get("agent_harbor_root") or cfg["calib"].get("teacher_harbor_root")
         if not (root and launcher):
+            if calib.remote_job(rec):
+                reconcile_remote_agent(cfg, it, kind, rec, ledger)
+                return rec
             rec.update(state="launch_failed", error="code.agent_harbor_root / agent_launcher not set")
             if ledger is not None and rec.get("ledger_call"):
                 ledger.settle(rec["ledger_call"], 0.0, status="error", kind="not_launched", note=rec["error"])
             write_json(recp, rec)
             return rec
-        # one log / exit file per job: an earlier job's launcher (it may exit after its result.json appeared) can
-        # never write the exit status this job is judged by
-        log = d / f"{conf['job_name']}.launch.log"
-        tmux_bin = cfg["calib"].get("tmux_bin", "tmux")
-        if rec.get("launch_attempted") and rec.get("tmux"):
-            # resumed after a crash between the tmux start and saving "launched": never start it twice
-            from .calib import session_alive
-            alive = session_alive(cfg["calib"], rec)
-            own_exit = rec.get("log") and Path(rec["log"]).name.startswith(conf["job_name"]) and \
-                Path(str(rec["log"]) + ".exit").exists()       # a shared (pre-fix) log's .exit proves nothing
-            if alive or own_exit:
-                rec["state"] = "launched"
-                write_json(recp, rec)
-                return rec
-            if alive is None:
-                return rec                      # cannot tell: keep the reservation, try again on the next step
         inner = (f"cd {shlex.quote(root)} && env -u PYTHONPATH -u VIRTUAL_ENV ./{launcher} run "
                  f"{shlex.quote(rec['config'])} > {shlex.quote(str(log))} 2>&1; echo $? > {shlex.quote(str(log))}.exit")
+        inner = calib.permit_command(rec, d, inner)
         rec.update(launch_attempted=time.time(), log=str(log), tmux=conf["job_name"][-60:], remote_route=remote_route)
         write_json(recp, rec)
-        r = subprocess.run([tmux_bin, "new-session", "-d", "-s", rec["tmux"], "bash", "-lc",
-                            inner], capture_output=True, text=True, timeout=60)
-        if r.returncode != 0:
-            # tmux could not create the session: the job never started (nothing spent)
-            rec.update(state="launch_failed", not_started=True, error=f"tmux rc={r.returncode}: {r.stderr[-300:]}")
-            if ledger is not None and rec.get("ledger_call"):
-                ledger.settle(rec["ledger_call"], 0.0, status="error", kind="not_launched", note=rec["error"])
-        else:
-            rec["state"] = "launched"
+        if on_launch_intent:
+            on_launch_intent(rec)
+        call = reserve_job(send=True)
+        if call != rec.get("ledger_call"):
+            rec["ledger_call"] = call
+        write_json(recp, rec)
+        try:
+            r = subprocess.run([tmux_bin, "new-session", "-d", "-s", rec["tmux"], "bash", "-lc",
+                                inner], capture_output=True, text=True, timeout=60)
+            error = f"tmux rc={r.returncode}: {r.stderr[-300:]}" if r.returncode else None
+        except subprocess.TimeoutExpired:
+            error = "tmux new-session timed out"
+        except OSError as exc:
+            error = str(exc)
+        if error:
+            rec["launch_error"] = error
+            if calib.remote_job(rec):
+                reconcile_remote_agent(cfg, it, kind, rec, ledger)
+                return rec
+            started = launch_evidence(cfg, rec)
+            if started is False:
+                return _fail_launch(cfg, it, kind, rec, ledger)
+            if started is None:
+                write_json(recp, rec)
+                return rec
+        rec["state"] = "launched"
         write_json(recp, rec)
     return rec
 
@@ -487,9 +640,18 @@ def launch_agent(cfg: dict, it, kind: str, conf: dict, ledger, est_usd: float, e
 def poll_agent(cfg: dict, it, kind: str, ledger) -> dict | None:
     """None while running; else the finished record with trial dir, cost, outcome (settled once)."""
     recp = it.p(kind, "run.json")
-    rec = read_json(recp, None)
-    if not rec or rec.get("state") not in ("launched",):
+    rec = read_agent_run(cfg, it, kind)
+    from . import calib
+    if rec and rec.get("state") in ("intent", "reserved", "launched", "remote_unknown") and calib.remote_job(rec, ledger):
+        if reconcile_remote_agent(cfg, it, kind, rec, ledger) != "awaiting_ingest":
+            return rec
+        calib.check_job_identity(Path(rec["job_dir"]), rec)
+    if not rec or rec.get("state") != "launched":
         return rec
+    if "confirm_launch_after" in rec:
+        _confirm_launch(cfg, it, kind, rec, ledger)
+        if "confirm_launch_after" in rec or rec["state"] == "launch_failed":
+            return rec
     jd = Path(rec["job_dir"])
     res = read_json(jd / "result.json", {}) or {}
     exitf = Path(str(rec.get("log", "")) + ".exit")
@@ -500,6 +662,13 @@ def poll_agent(cfg: dict, it, kind: str, ledger) -> dict | None:
         if session_alive(cfg["calib"], rec) is not False:
             return None
     if not res.get("finished_at"):
+        if rec.get("launch_permit") and not jd.exists() and not Path(rec["log"]).exists() and not exitf.exists():
+            from .calib import revoke_lost_session
+            if revoke_lost_session(cfg["calib"], rec):
+                return _fail_launch(cfg, it, kind, rec, ledger)
+        if exitf.exists() and calib.remote_job(rec):
+            reconcile_remote_agent(cfg, it, kind, rec, ledger)
+            return rec
         if exitf.exists() and not (jd / "config.json").exists():
             rec.update(state="finished", outcome="launcher_failed",
                        error=Path(rec["log"]).read_text(errors="replace")[-400:] if Path(rec["log"]).exists() else "")
@@ -514,20 +683,26 @@ def poll_agent(cfg: dict, it, kind: str, ledger) -> dict | None:
             write_json(recp, rec)
             return rec
         return None
-    from .calib import trial_cost
+    return collect_agent(cfg, recp, rec, ledger)
+
+
+def collect_agent(cfg, recp, rec, ledger):
+    from .calib import archive_run_marker, job_cost, trial_cost
+    jd = Path(rec["job_dir"])
     trials = [t for t in jd.iterdir() if t.is_dir() and (t / "result.json").exists()]
     trial = trials[0] if trials else None
-    cost = trial_cost(trial, rec.get("model"), cfg["models"].get("prices") or {}) if trial else \
-        dict(cost_usd=None, cost_kind="unknown", usage=None)
+    prices = cfg["models"].get("prices") or {}
+    usd, kind, usage = job_cost([trial_cost(t, rec.get("model"), prices) for t in trials])
     tr = read_json(trial / "result.json", {}) if trial else {}
     exc = ((tr or {}).get("exception_info") or {}).get("exception_type")
-    rec.update(state="finished", finished_ts=time.time(), trial=str(trial) if trial else None, cost_usd=cost["cost_usd"],
-               cost_kind=cost["cost_kind"], usage=cost.get("usage"), exception=exc,
+    rec.update(state="finished", finished_ts=time.time(), trial=str(trial) if trial else None, cost_usd=usd,
+               cost_kind=kind, usage=usage, exception=exc,
                reward=(((tr or {}).get("verifier_result") or {}).get("rewards") or {}).get("reward"),
                minutes=_minutes(tr))
     if ledger is not None and rec.get("ledger_call"):
-        ledger.settle(rec["ledger_call"], cost["cost_usd"], status="ok" if not exc else "error",
-                      kind=cost["cost_kind"], usage=cost.get("usage"), note=f"{kind} agent {rec['job_name']}")
+        ledger.settle(rec["ledger_call"], usd, status="ok" if not exc else "error",
+                      kind=kind, usage=usage, note=f"{recp.parent.name} agent {rec['job_name']}")
+    archive_run_marker(rec)
     write_json(recp, rec)
     return rec
 
