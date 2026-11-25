@@ -195,7 +195,11 @@ def _job_runs(cfg, it, stage):
     directory = "review" if stage == "S9R" else "calib"
     runs = read_json(it.p(directory, "runs.json"), [])
     for rec in runs:
-        if rec.get("outcome") is None and "remote_route" not in rec:
+        if rec.get("outcome") is not None:
+            continue
+        rec.setdefault("item", it.item_id)
+        rec.setdefault("ledger_stage", stage)
+        if "remote_route" not in rec:
             c = cfg["calib"]
             launcher = rec.get("launcher_script")
             if not launcher and stage == "S9R":
@@ -225,7 +229,7 @@ def migrate_probe_report(P, it):
                     _route_review(P, it, rec, rec["n"])
                     return True
                 if rec.get("outcome") is None:
-                    if calib.remote_job(rec):
+                    if calib.remote_job(rec, P.ledger):
                         _reconcile_remote(P, it, rec, save)
                     elif not (rec.get("state") == "launched" or rec.get("launch_attempted") or calib.job_started(rec)):
                         _cancel_probe_job(P, it, rec, save)
@@ -245,7 +249,7 @@ def migrate_probe_report(P, it):
 
 
 def _settle_not_launched(P, it, rec, save, why, *, confirmed=False):
-    if not confirmed and calib.remote_job(rec):
+    if not confirmed and calib.remote_job(rec, P.ledger):
         return _reconcile_remote(P, it, rec, save)
     stage = rec.get("ledger_stage") or ("S9R" if save is _save_review else "S9")
     rec["ledger_call"] = P.ledger.cancel_unstarted_job(
@@ -268,7 +272,7 @@ def _reconcile_remote(P, it, rec, save):
 
 
 def _cancel_probe_job(P, it, rec, save, kind="probe_migration_cancelled"):
-    if calib.remote_job(rec):
+    if calib.remote_job(rec, P.ledger):
         _reconcile_remote(P, it, rec, save)
         return
     stage = rec.get("ledger_stage") or ("S9R" if save is _save_review else "S9")
@@ -303,7 +307,7 @@ def finish_job_stage(P, it, status, reason, **info):
         for rec in _job_runs(P.cfg, it, job_stage_name):
             if _unstarted(rec):
                 _cancel_probe_job(P, it, rec, save, kind="cancelled_unstarted")
-            if rec.get("outcome") is None and calib.remote_job(rec):
+            if rec.get("outcome") is None and calib.remote_job(rec, P.ledger):
                 it.state["pending_job_finish"] = dict(stage=job_stage_name, status=status, reason=reason, info=info)
                 if _reconcile_remote(P, it, rec, save) == "remote_unknown":
                     return
@@ -661,11 +665,11 @@ def running_jobs(P) -> list[str]:
     out = []
     for it in P.store.items():
         st = job_stage(it)
-        rf = ("calib", "runs.json") if st == "S9" else ("review", "runs.json") if st == "S9R" else None
-        if rf is None:
+        if st not in ("S9", "S9R"):
             continue
-        for r in read_json(it.p(*rf), []) or []:
-            if r.get("outcome") is None and (r.get("state") in ("launched", "reserved") or calib.job_started(r)):
+        for r in _job_runs(P.cfg, it, st):
+            if r.get("outcome") is None and (r.get("state") in ("launched", "reserved") or calib.job_started(r)
+                                             or calib.remote_job(r, P.ledger)):
                 out.append(r.get("job_name") or "?")
     return out
 
@@ -749,7 +753,7 @@ def _s9(P, it):
             return None                     # waiting (sandbox trouble) or sent back to S9 to recalibrate
     runs = _job_runs(P.cfg, it, "S9")
     for rec in runs:                                         # reconcile interrupted submissions
-        if rec.get("outcome") is None and calib.remote_submission(rec):
+        if rec.get("outcome") is None and calib.remote_job(rec, P.ledger):
             if _reconcile_remote(P, it, rec, _save_run) == "remote_unknown":
                 return
             continue
@@ -761,7 +765,7 @@ def _s9(P, it):
                 # same gate as a new run: settled spend reached the run total -> do not start it; a held
                 # reservation is released and the record goes back to intent (reserved again on resume)
                 if rec["state"] == "reserved" and rec.get("ledger_call"):
-                    if calib.remote_job(rec):
+                    if calib.remote_job(rec, P.ledger):
                         return _reconcile_remote(P, it, rec, _save_run)
                     P.ledger.settle(rec["ledger_call"], 0.0, status="error", kind="not_launched",
                                     note="not launched: run_usd_total reached")
@@ -891,13 +895,13 @@ def ingest(P, it, job_dir: str | None = None) -> dict:
         it.load()
         stage = "S9R" if job_stage(it) == "S9R" else "S9"
         runs = _job_runs(P.cfg, it, stage)
-        rec = next((r for r in runs if calib.pending_launcher(r)), None)
+        rec = next((r for r in runs if calib.pending_launcher(r, P.ledger)), None)
         if rec is None:
             if runs and runs[-1].get("outcome") is not None and it.state.get("status") == "waiting":
                 _after_ingest(P, it, runs[-1], stage)
                 return dict(recovered=True, job_name=runs[-1]["job_name"])
             raise ValueError(f"no pending {'review' if stage == 'S9R' else 'calibration'} run for this item")
-        if calib.remote_job(rec):
+        if calib.remote_job(rec, P.ledger):
             if _remote_parked(it):
                 raise ValueError("remote_unknown requires calib resolve-remote")
             save = _save_review if stage == "S9R" else _save_run
@@ -906,7 +910,7 @@ def ingest(P, it, job_dir: str | None = None) -> dict:
         return _ingest_run(P, it, rec, stage, Path(job_dir or rec["job_dir"]))
 
 
-def resolve_remote(P, it, job, *, synced, died=False, remote_task=None):
+def resolve_remote(P, it, job, *, synced, ended_without_result=False, remote_task=None, force_local_gone=False):
     """Resolve one named parked run under the same lock as the watcher."""
     if not it.p("state.json").is_file():
         raise ValueError(f"unknown item: {it.item_id}")
@@ -926,18 +930,27 @@ def resolve_remote(P, it, job, *, synced, died=False, remote_task=None):
             raise ValueError(f"no remote_unknown run named {job} for this item")
         jd = Path(rec["job_dir"])
         save = _save_review if stage == "S9R" else _save_run
-        if synced or died:
-            finished = (read_json(jd / "result.json", {}) or {}).get("finished_at")
-            if synced and not finished:
-                raise ValueError("missing finished_at: use --died if the remote job ended")
-            if died and finished:
-                raise ValueError("job has finished_at: sync the full job and use --synced")
-            calib.restore_remote_marker(jd, rec, remote_task, review=stage == "S9R", partial=died)
+        if synced or ended_without_result:
+            if synced and not (read_json(jd / "result.json", {}) or {}).get("finished_at"):
+                raise ValueError("missing finished_at: use --ended-without-result (--died) if fully synced and ended")
+            if ended_without_result and calib.complete_remote_trials(
+                    jd, review=stage == "S9R", contract=review.job_contract(rec)):
+                raise ValueError("job has a complete result: use --synced")
+            calib.restore_remote_marker(jd, rec, remote_task, review=stage == "S9R", partial=ended_without_result)
             if synced:
                 return _ingest_run(P, it, rec, stage, jd)
             calib.check_job_identity(jd, rec, review=stage == "S9R", partial=True)
             _settle_dead_job(P, it, rec, save, confirmed=True)
         else:
+            exit_file = Path(rec["log"] + ".exit") if rec.get("log") else None
+            exited = exit_file and exit_file.exists()
+            alive = calib.session_alive(P.cfg["calib"], rec)
+            if alive is True:
+                raise ValueError("cannot confirm not-started while the local launcher is alive")
+            if alive is None and not force_local_gone:
+                raise ValueError("cannot determine local session status: confirm it is gone and use --force-local-gone")
+            if exit_file and not exited and exit_file.exists():
+                raise ValueError("launcher exited during the check: verify the remote job again")
             if (jd / "config.json").exists() or (jd / "result.json").exists() or any(jd.glob("*/result.json")):
                 raise ValueError("cannot confirm not-started with a job config, top-level result or trial results")
             _settle_not_launched(P, it, rec, save, "operator confirmed remote job did not start", confirmed=True)
@@ -952,7 +965,7 @@ def _after_ingest(P, it, rec, stage):
     if parked:
         it.state.pop("reason", None)
     # A drop from the parked job takes precedence over the deferred item transition.
-    if stage == "S9R" and (parked or migrating or finish and calib.remote_job(rec)) and _received_drop(it, rec):
+    if stage == "S9R" and (parked or migrating or finish and calib.remote_job(rec, P.ledger)) and _received_drop(it, rec):
         return _route_review(P, it, rec, rec["n"])
     if finish:
         return finish_job_stage(P, it, finish["status"], finish["reason"], **finish["info"])
@@ -961,7 +974,8 @@ def _after_ingest(P, it, rec, stage):
 
 
 def _ingest_run(P, it, rec, stage, jd):
-    if calib.remote_job(rec) and not calib.complete_remote_trials(jd, review=stage == "S9R"):
+    if calib.remote_job(rec, P.ledger) and not calib.complete_remote_trials(
+            jd, review=stage == "S9R", contract=review.job_contract(rec)):
         raise ValueError(f"incomplete remote trial set: {jd}")
     jr = read_json(jd / "result.json", {})
     if not jr.get("finished_at"):
@@ -980,7 +994,7 @@ def _ingest_run(P, it, rec, stage, jd):
     usd, kind, usage = calib.job_cost(trials)
     rec.update(outcome=t["outcome"], result_type=t["result_type"], minutes=t["minutes"], trial=t,
                cost_usd=usd, cost_kind=kind, n_trials=len(trials))
-    if calib.remote_job(rec):
+    if calib.remote_job(rec, P.ledger):
         calib.bind_started_call(P.cfg, rec, P.ledger)
         rec["state"] = "launched"
     if rec.get("ledger_call"):
@@ -1117,9 +1131,9 @@ def _release_reviewed(P, it, previous, scopes):
 
 
 def _settle_dead_job(P, it, rec: dict, save=_save_run, *, confirmed=False):
-    """The Harbor job of a launched run ended without finished_at (crash / kill): an infra run.  Its cost is what
+    """The Harbor job of a launched run ended without a complete result: an infra run. Its cost is what
     the trials written so far show (tokens), else unknown (reservation kept, not counted as actual spend)."""
-    if not confirmed and calib.remote_job(rec):
+    if not confirmed and calib.remote_job(rec, P.ledger):
         return _reconcile_remote(P, it, rec, save)
     jd = Path(rec["job_dir"])
     costs = []
@@ -1135,11 +1149,11 @@ def _settle_dead_job(P, it, rec: dict, save=_save_run, *, confirmed=False):
     usd, kind, usage = calib.job_cost(costs)
     if rec.get("ledger_call"):
         P.ledger.settle(rec["ledger_call"], usd, status="error", kind=kind, usage=usage,
-                        note="harbor job ended without finished_at")
+                        note="harbor job ended without a complete result")
     exf = Path(rec.get("log", "") + ".exit")
     ex = exf.read_text().strip() if exf.exists() else "none recorded"
     rec.update(state="died", outcome="infra", result_type="infra", cost_usd=usd, cost_kind=kind,
-               error=f"launcher exit {ex}; harbor job has no finished_at")
+               error=f"launcher exit {ex}; harbor job ended without a complete result")
     save(it, rec)
     P.store.event("calib_job_died", item=it.item_id, job=rec["job_name"], cost_kind=kind)
 
@@ -1186,7 +1200,7 @@ def watch_tick(P, only: list[str] | None = None, max_steps: int = 50) -> dict:
         if stage not in ("S9", "S9R") or not (it.state.get("status") == "waiting" or _remote_parked(it)):
             continue
         runs = _job_runs(P.cfg, it, stage)
-        pend = [r for r in runs if calib.pending_launcher(r)]
+        pend = [r for r in runs if calib.pending_launcher(r, P.ledger)]
         if not pend:
             if it.state.get("status") == "waiting" and (it.state.get("probe_migration_job_stage") or
                                                         it.state.get("pending_job_finish")):
@@ -1197,7 +1211,7 @@ def watch_tick(P, only: list[str] | None = None, max_steps: int = 50) -> dict:
             it.load()                   # re-check under the lock: another watcher / run may have moved it
             runs = _job_runs(P.cfg, it, stage)
             cur = next((r for r in runs if r.get("job_name") == rec["job_name"]), {})
-            if job_stage(it) != stage or not cur or not calib.pending_launcher(cur):
+            if job_stage(it) != stage or not cur or not calib.pending_launcher(cur, P.ledger):
                 continue
             if _remote_parked(it):
                 if cur.get("state") == "remote_unknown" and calib.remember_remote_marker(cur):
@@ -1205,7 +1219,7 @@ def watch_tick(P, only: list[str] | None = None, max_steps: int = 50) -> dict:
                 continue
             if it.state.get("status") != "waiting":
                 continue
-            if calib.remote_job(cur):
+            if calib.remote_job(cur, P.ledger):
                 save = _save_run if stage == "S9" else _save_review
                 action = _reconcile_remote(P, it, cur, save)
                 if action == "remote_unknown":
@@ -1303,7 +1317,7 @@ def _s9r(P, it):
     scopes = _probe_scopes(it)
     review_disabled = not rv.get("enabled")
     for rec in runs:                                     # reconcile interrupted submissions / dead launches
-        if rec.get("outcome") is None and calib.remote_submission(rec):
+        if rec.get("outcome") is None and calib.remote_job(rec, P.ledger):
             if _reconcile_remote(P, it, rec, _save_review) == "remote_unknown":
                 return
             continue
@@ -1332,7 +1346,7 @@ def _s9r(P, it):
             cap = None if calib.job_started(rec) else _cap_reached(P)
             if cap is not None:
                 if rec["state"] == "reserved" and rec.get("ledger_call"):
-                    if calib.remote_job(rec):
+                    if calib.remote_job(rec, P.ledger):
                         return _reconcile_remote(P, it, rec, _save_review)
                     P.ledger.settle(rec["ledger_call"], 0.0, status="error", kind="not_launched",
                                     note="not launched: run_usd_total reached")
@@ -1437,9 +1451,20 @@ def _s9r(P, it):
 
 def _ingest_review(P, it, rec, jd):
     assigned = rec.get("suspected_scopes", [])
-    res = review.classify(jd, rec.get("model"), P.cfg["models"].get("prices", {}),
-                          allowed_verdicts=rec.get("allowed_verdicts"), allow_human=True,
-                          suspected_scopes=assigned, contract=review.job_contract(rec))
+    remote = calib.remote_job(rec, P.ledger)
+    try:
+        res = review.classify(jd, rec.get("model"), P.cfg["models"].get("prices", {}),
+                              allowed_verdicts=rec.get("allowed_verdicts"), allow_human=True,
+                              suspected_scopes=assigned, contract=review.job_contract(rec), require_verified=remote)
+    except FileNotFoundError as e:
+        if not remote:
+            raise
+        # The synced directory can be replaced after the completeness check, during validation.
+        calib.bind_started_call(review.review_cfg(P.cfg), rec, P.ledger)
+        rec.update(state="remote_unknown", submitted=True)
+        _save_review(it, rec)
+        it.finish("parked", f"remote_unknown: {rec['job_name']}")
+        raise ValueError(f"incomplete remote trial set: missing {e.filename}") from e
     rec.update(outcome="invalid" if (res["outcome"] == "done" and (res["verdict"] or {}).get("verdict") is None)
                else res["outcome"],
                minutes=res["minutes"], cost_usd=res["cost_usd"], cost_kind=res["cost_kind"],
@@ -1460,7 +1485,7 @@ def _ingest_review(P, it, rec, jd):
         if rec["verdict"] not in (None, "drop") and _needs_new_review(
                 rec, body, _probe_scopes(it), P.cfg["review"]["enabled"]):
             rec.update(outcome="infra", obsolete_probe_review=True)
-    if calib.remote_job(rec):
+    if remote:
         calib.bind_started_call(review.review_cfg(P.cfg), rec, P.ledger)
         rec["state"] = "launched"
     if rec.get("ledger_call"):

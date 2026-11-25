@@ -203,14 +203,16 @@ classifies all configured scripts as local. A launcher's remote marker also iden
 
 Use `tbsgen calib resolve-remote --run RUN --config CFG --item ID --job NAME` with one of these outcomes.
 
-- `--synced` ingests a finished job after its full directory has been copied back. Every trial needs a result,
-  and each S9R trial also needs its verifier verdict.
-- `--died` confirms that the remote job ended without `finished_at`. Sync the available trials first. The
-  controller charges their readable costs, or the reservation when none is available, then applies the infra retry policy.
-- `--not-started` releases the reservation at zero after the operator verifies that the remote job never started.
-  A job config, top-level result, or trial result blocks this outcome.
+- `--synced` ingests a finished job after its full directory has been copied back. Every trial needs a result.
+  Each S9R trial also needs its formal verifier verdict and the reproduction journal if its review contract reads one.
+- `--ended-without-result` (alias `--died`) confirms that the directory is fully synced and the remote job
+  ended without a complete result, even if it recorded `finished_at`. The controller charges the readable trial
+  costs, or the reservation when none is available, then applies the infra retry policy.
+- `--not-started` settles at zero after the operator verifies that the remote job never started and the local
+  launcher is gone. If tmux cannot determine the session state, independently confirm it is gone and add
+  `--force-local-gone`. A job config, top-level result, or trial result blocks this outcome.
 
-Directory replacement can remove the local `tbsgen-remote.json`. Resolution restores the saved marker.
+Directory replacement can remove the local `tbsgen-remote.json`. Ingest uses the saved mapping and resolution restores the marker.
 If the controller never captured the mapping, supply the original remote task path with `--remote-task PATH`.
 `regate` requires all calibration and review runs for the item to be closed.
 

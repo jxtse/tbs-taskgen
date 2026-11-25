@@ -330,12 +330,14 @@ def stale_prepared(cfg: dict, item_dir: Path, who: str, epoch: int) -> str | Non
             "set calib.prepare_command (S9 re-prepares) or prepare it and run `tbsgen calib prepare --item ID`")
 
 
-def remote_alias(job_dir: Path) -> dict:
+def remote_alias(job_dir: Path, *, if_missing=None) -> dict:
     """Marker a remote launcher leaves in the local job dir (tbsgen-remote.json: host, local_task, remote_task,
     remote_job_dir): the job ran on another host from a synced copy of the task, so Harbor's config.json names the
     remote path.  ingest() accepts that path only when the marker maps it to the run's own local task."""
     try:
         m = json.loads((Path(job_dir) / "tbsgen-remote.json").read_text())
+    except FileNotFoundError:
+        return if_missing or {}
     except (OSError, ValueError):
         return {}
     return m if isinstance(m, dict) else {}
@@ -372,8 +374,19 @@ def has_remote_marker(rec: dict) -> bool:
     return bool(rec.get("job_dir") and (Path(rec["job_dir"]) / "tbsgen-remote.json").exists())
 
 
-def remote_job(rec: dict) -> bool:
-    return bool(rec.get("remote_route") or rec.get("state") == "remote_unknown" or has_remote_marker(rec))
+def remote_job(rec: dict, ledger=None) -> bool:
+    """A remote launcher is configured on intents too. Only protect a possible submission."""
+    if rec.get("state") == "remote_unknown" or rec.get("remote_marker") is not None or has_remote_marker(rec):
+        return True
+    if not rec.get("remote_route"):
+        return False
+    if (rec.get("launch_attempted") or rec.get("state") == "launched"
+            or rec.get("job_dir") and Path(rec["job_dir"]).is_dir()
+            or rec.get("log") and Path(rec["log"]).is_file()):
+        return True
+    stage = rec.get("ledger_stage", "S9")
+    return ledger is not None and ledger.job_was_sent(
+        rec["item"], stage, reservation_key(rec, rec["item"], stage), rec.get("ledger_call"))
 
 
 def job_started(rec: dict) -> bool:
@@ -384,12 +397,8 @@ def job_started(rec: dict) -> bool:
             or bool(rec.get("log") and Path(rec["log"]).exists()))
 
 
-def remote_submission(rec: dict) -> bool:
-    return remote_job(rec) and (rec.get("state") == "launched" or bool(rec.get("launch_attempted")) or job_started(rec))
-
-
-def pending_launcher(rec: dict) -> bool:
-    return rec.get("outcome") is None and (rec.get("state", "launched") == "launched" or remote_submission(rec))
+def pending_launcher(rec: dict, ledger=None) -> bool:
+    return rec.get("outcome") is None and (rec.get("state", "launched") == "launched" or remote_job(rec, ledger))
 
 
 def check_job_identity(jd, rec, *, review=False, marker=None, partial=False):
@@ -400,6 +409,8 @@ def check_job_identity(jd, rec, *, review=False, marker=None, partial=False):
     want = dict(job_name=rec["job_name"],
                 model=rec.get("model", None if review else ident["model"]),
                 task=rec.get("task", None if review else ident["task"]))
+    if marker is None:
+        marker = remote_alias(jd, if_missing=rec.get("remote_marker"))
     if task_matches(jd, ident["task"], want["task"], marker=marker):
         ident["task"] = want["task"]                  # a remote launcher's synced copy of the run's own task
     if any(got != want[key] for key, got in ident.items() if not partial or got is not None):
@@ -436,7 +447,7 @@ def bind_started_call(cfg, rec, ledger, cost=None):
 
 def adopt_started(cfg, rec, ledger, save):
     """Recover an existing Harbor job with its original identity and without a new submission."""
-    if remote_job(rec):
+    if remote_job(rec, ledger):
         reconcile_remote(cfg, rec, ledger, save)
         return rec
     if ledger is not None:
@@ -463,7 +474,7 @@ def launch(cfg: dict, rec: dict, ledger, save) -> dict:
     c = cfg["calib"]
     launcher = rec.get("launcher_script") or c.get("student_launcher" if rec["who"] == "glm" else "teacher_launcher")
     rec.setdefault("remote_route", is_remote_launcher(c, launcher))
-    if remote_submission(rec) or (rec["state"] == "intent" and job_started(rec)):
+    if remote_job(rec, ledger) or (rec["state"] == "intent" and job_started(rec)):
         return adopt_started(cfg, rec, ledger, save)
     if rec["state"] == "intent":
         # an intent has no side effect outside item_dir.  It may have been written while submit was off, before
@@ -634,7 +645,7 @@ def preflight_wait(cfg: dict, rec: dict | None) -> str | None:
     return f"relay_down: preflight refused, retry after {time.strftime('%H:%M', time.localtime(time.time() + left))}"
 
 
-def complete_remote_trials(jd: Path, *, review=False) -> bool:
+def complete_remote_trials(jd: Path, *, review=False, contract=None) -> bool:
     """A synced Harbor job has a final summary and a result for every configured trial."""
     summary = _load(jd / "result.json")
     config = _load(jd / "config.json")
@@ -647,9 +658,14 @@ def complete_remote_trials(jd: Path, *, review=False) -> bool:
         return False
     expected = len(tasks) * len(agents) * attempts
     trials = [p for p in jd.iterdir() if p.is_dir()]
-    from .review import VERIFIED_VERDICT
+    from .review import CURRENT_CONTRACT, JOURNAL_CONTRACTS, REPRO_JOURNAL, VERIFIED_VERDICT
+    required = []
+    if review:
+        required.append(VERIFIED_VERDICT)
+        if (contract or CURRENT_CONTRACT) in JOURNAL_CONTRACTS:
+            required.append(REPRO_JOURNAL)
     return len(trials) >= expected and all(
-        isinstance(_load(p / "result.json"), dict) and (not review or (p / VERIFIED_VERDICT).is_file())
+        isinstance(_load(p / "result.json"), dict) and all((p / name).is_file() for name in required)
         for p in trials)
 
 
@@ -660,13 +676,15 @@ def reconcile_remote(cfg, rec, ledger, save):
     remembered = remember_remote_marker(rec)
     if state == "remote_unknown":
         action = "remote_unknown"
-    elif complete_remote_trials(jd, review=rec.get("ledger_stage") == "S9R"):
-        action = "awaiting_ingest"
     else:
+        from .review import job_contract
         rec.setdefault("tmux", rec["job_name"][-60:])
         exited = rec.get("log") and Path(rec["log"] + ".exit").exists()
         observing = not exited and session_alive(cfg["calib"], rec) is True
-        action = "waiting" if observing else "remote_unknown"
+        if complete_remote_trials(jd, review=rec.get("ledger_stage") == "S9R", contract=job_contract(rec)):
+            action = "awaiting_ingest"
+        else:
+            action = "waiting" if observing else "remote_unknown"
     remembered = remembered or remember_remote_marker(rec)
     new_state = "remote_unknown" if action == "remote_unknown" else "launched"
     if state != new_state or not rec.get("ledger_call"):

@@ -148,6 +148,12 @@ class Ledger:
         row = db.execute("SELECT id FROM calls WHERE reservation_key=? AND status='reserved'", (key,)).fetchone()
         return row[0] if row else None
 
+    def job_was_sent(self, item, stage, key, saved_id):
+        with contextlib.closing(self._db()) as db:
+            row = db.execute("SELECT 1 FROM calls WHERE item=? AND stage=? AND status='sent' "
+                             "AND (reservation_key=? OR id=?) LIMIT 1", (item, stage, key, saved_id)).fetchone()
+            return row is not None
+
     def cancel_unstarted_job(self, item, stage, key, saved_id, kind):
         """Cancel all open calls for this launch, including a replacement missing from the job record."""
         with contextlib.closing(self._db()) as db, db:

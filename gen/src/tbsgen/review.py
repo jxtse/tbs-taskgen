@@ -72,6 +72,7 @@ CATEGORIES = {"a": "consistency", "b": "missing_conditions", "c": "thresholds", 
 REVIEW_PROMPT_VERSION = CURRENT_CONTRACT
 VERDICT_PATH = "/app/review_out/verdict.json"
 VERIFIED_VERDICT = Path("verifier/verdict.json")
+REPRO_JOURNAL = Path("verifier/repro.jsonl")
 # files a review revision (S8) may change: the statement, the data format notes (written by the generator), the
 # test / scoring scripts, and the exploit baselines.  Never the reference solution, the baselines' mid / naive,
 # _spec/ or thresholds.json.
@@ -459,7 +460,7 @@ cp -f /app/review_out/report.md /logs/verifier/report.md 2>/dev/null || true
 if [ -f /logs/review/repro.jsonl ]; then
   cp /logs/review/repro.jsonl /logs/verifier/repro.jsonl || exit 1
 else
-  rm -f /logs/verifier/repro.jsonl
+  : > /logs/verifier/repro.jsonl || exit 1
 fi
 if python3 /tests/s9r_validate.py /app/review_out/verdict.json /logs/verifier/verdict.json /logs/verifier/repro.jsonl; then
   echo 1 > /logs/verifier/reward.txt
@@ -854,15 +855,20 @@ def _obj(v) -> dict:
     return v if isinstance(v, dict) else {}
 
 
-def read_verdict(trial: Path) -> dict | None:
+def read_verdict(trial: Path, *, require_verified=False) -> dict | None:
     paths = (trial / VERIFIED_VERDICT, trial / "verifier/verdict.raw.json")
+    if require_verified:
+        paths = paths[:1]
     for p in paths:
-        if p.exists():
-            try:
-                v = json.loads(p.read_text())
-            except (ValueError, UnicodeDecodeError, OSError):
-                continue
-            return v if v is not None else {"_corrupt": "verdict file holds JSON null"}
+        try:
+            v = json.loads(p.read_text())
+        except FileNotFoundError:
+            if require_verified:
+                raise
+            continue
+        except (ValueError, OSError):
+            continue
+        return v if v is not None else {"_corrupt": "verdict file holds JSON null"}
     if any(p.is_file() for p in paths):
         # a verdict file was written but cannot be parsed: a (broken) judgment, not missing infrastructure ->
         # normalize() makes it invalid and the review is re-run, then dropped
@@ -871,14 +877,14 @@ def read_verdict(trial: Path) -> dict | None:
 
 
 def classify(job_dir: Path, model: str | None, prices: dict, allow_human: bool = False, suspected_scopes=(),
-              contract=CURRENT_CONTRACT, allowed_verdicts=None) -> dict:
+              contract=CURRENT_CONTRACT, allowed_verdicts=None, *, require_verified=False) -> dict:
     """A finished review job: outcome "done" (a verdict file came back; verdict may still be None = invalid,
     retried by routing) or "infra"; cost as for calibration."""
     trials = calib.collect(job_dir, model, prices)
     usd, kind, usage = calib.job_cost(trials)
     raw, trial = None, None
     for t in sorted(p for p in Path(job_dir).iterdir() if (p / "result.json").exists()):
-        v = read_verdict(t)
+        v = read_verdict(t, require_verified=require_verified)
         if v is not None:
             raw, trial = v, t
     last = trials[-1] if trials else {}
@@ -887,7 +893,7 @@ def classify(job_dir: Path, model: str | None, prices: dict, allow_human: bool =
         rw = ((json.loads((trial / "result.json").read_text()).get("verifier_result") or {}).get("rewards") or {})
         reward = rw.get("reward")
         reward = float(reward) if isinstance(reward, (int, float)) else 0.0
-    repros = read_repros(trial / "verifier/repro.jsonl") if trial and contract in JOURNAL_CONTRACTS else {}
+    repros = read_repros(trial / REPRO_JOURNAL, required=require_verified) if trial and contract in JOURNAL_CONTRACTS else {}
     return dict(outcome="done" if raw is not None else "infra", verdict_raw=raw, verifier_reward=reward, repros=repros,
                 verdict=normalize(raw, reward, allow_human, suspected_scopes, contract, allowed_verdicts, repros)
                 if raw is not None else None,

@@ -25,7 +25,7 @@ def has_evidence(ev) -> bool:
     return False
 
 
-def read_repros(path):
+def read_repros(path, *, required=False):
     """Index the trial's helper records. A duplicate identifier cannot identify a run."""
     records = {}
     skipped = 0
@@ -42,6 +42,8 @@ def read_repros(path):
                 key = row["repro_id"]
                 records[key] = None if key in records else row
     except FileNotFoundError:
+        if required:
+            raise
         return {}
     if skipped:
         logging.warning("Skipped %d unparseable reproduction journal lines in %s", skipped, path)

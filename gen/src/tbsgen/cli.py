@@ -13,7 +13,8 @@
   tbsgen breaker --run DIR --model M --reset
   tbsgen calib-ingest --run DIR --item ID --job-dir JOBDIR      attach Harbor results to the pending S9 run (or the
                                                                  pending S9R review run of an item at S9R)
-  tbsgen calib resolve-remote --run DIR --item ID --job NAME (--synced | --died | --not-started) [--remote-task PATH]
+  tbsgen calib resolve-remote --run DIR --item ID --job NAME
+                             (--synced | --ended-without-result | --not-started) [--remote-task PATH] [--force-local-gone]
   tbsgen calib watch --run DIR [--only ID,..] [--once] [--interval S] [--max-hours H]
                                                                  poll submitted S9 / S9R jobs: ingest finished ones,
                                                                  step S9 (label, or launch the next run GLM ->
@@ -109,9 +110,12 @@ def main(argv=None):
             s.add_argument("--job", help="resolve-remote: parked job name")
             resolution = s.add_mutually_exclusive_group()
             resolution.add_argument("--synced", action="store_true")
-            resolution.add_argument("--died", action="store_true", help="confirm job ended without finished_at")
+            resolution.add_argument("--ended-without-result", "--died", action="store_true",
+                                    help="confirm the directory is fully synced and the remote job ended without a result")
             s.add_argument("--remote-task", metavar="PATH", help="remote task path when the launcher marker was lost")
             resolution.add_argument("--not-started", action="store_true")
+            s.add_argument("--force-local-gone", action="store_true",
+                           help="confirm the local launcher is gone when tmux cannot determine its status")
             s.add_argument("--who", default="glm", choices=["glm", "teacher"])
         if name == "review":
             s.add_argument("action", choices=["build", "summary", "deliverable"])
@@ -303,19 +307,22 @@ def _calib(P: Pipeline, a) -> int:
     import time
     from .stages_b import resolve_remote, watch_tick
     if a.action == "resolve-remote":
-        if not (a.item and a.job and (a.synced or a.died or a.not_started)):
-            sys.exit("resolve-remote requires --item ID --job NAME and one of --synced, --died or --not-started")
+        if not (a.item and a.job and (a.synced or a.ended_without_result or a.not_started)):
+            sys.exit("resolve-remote requires --item ID --job NAME and one of --synced, --ended-without-result or --not-started")
         if a.not_started and a.remote_task:
-            sys.exit("--remote-task requires --synced or --died")
+            sys.exit("--remote-task requires --synced or --ended-without-result")
+        if a.force_local_gone and not a.not_started:
+            sys.exit("--force-local-gone requires --not-started")
         try:
             result = resolve_remote(P, P.store.item(a.item), a.job, synced=a.synced,
-                                    died=a.died, remote_task=a.remote_task)
+                                    ended_without_result=a.ended_without_result, remote_task=a.remote_task,
+                                    force_local_gone=a.force_local_gone)
         except ValueError as e:
             sys.exit(str(e))
         print(json.dumps(result, ensure_ascii=False))
         return 0
-    if a.job or a.synced or a.not_started or a.died or a.remote_task:
-        sys.exit("--job, --synced, --not-started, --died and --remote-task require calib resolve-remote")
+    if a.job or a.synced or a.not_started or a.ended_without_result or a.remote_task or a.force_local_gone:
+        sys.exit("remote resolution options require calib resolve-remote")
     if a.action == "prepare":
         if not a.item:
             sys.exit("tbsgen calib prepare: --item is required")

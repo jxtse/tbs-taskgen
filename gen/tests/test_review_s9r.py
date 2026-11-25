@@ -105,8 +105,7 @@ def _finish(jobs, job_name, reward=None, cost=5.0, verdict=None, name="trial__a"
         json.dumps({"type": "assistant", "message": {"id": "m1", "content": [
             {"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "ls /app/data"}}]}}) + "\n" +
         json.dumps({"type": "result", "subtype": "success", "result": "done"}) + "\n")
-    if repros:
-        (t / "verifier/repro.jsonl").write_text("".join(json.dumps(row) + "\n" for row in repros))
+    (t / "verifier/repro.jsonl").write_text("".join(json.dumps(row) + "\n" for row in repros))
     if verdict is not None:
         (t / "verifier" / "verdict.json").write_text(json.dumps(verdict))
     (jd / "result.json").write_text(json.dumps({"finished_at": "2026-11-09T01:31:00Z"}))
@@ -2070,7 +2069,7 @@ def test_remote_sync_before_recovery_settles_current_reservation(tmp_path):
 
 
 @pytest.mark.parametrize("evidence", ["marker", "config", "trial", "summary"])
-def test_resolve_remote_not_started_checks_evidence(tmp_path, evidence):
+def test_resolve_remote_not_started_checks_evidence(tmp_path, monkeypatch, evidence):
     from tbsgen.cli import main
 
     P, iid, jobs = _env(tmp_path, review_kw={"launcher": "remote.sh"})
@@ -2102,6 +2101,7 @@ exit 5
     held, = _runs(P, iid, "review")
     assert held["state"] == "remote_unknown" and held["outcome"] is None
     command = ["calib", "resolve-remote", "--run", str(P.store.root), "--item", iid, "--job", name]
+    monkeypatch.setattr("tbsgen.calib.session_alive", lambda c, r: False)
     if evidence == "marker":
         assert main(command + ["--not-started"]) == 0
         assert _runs(P, iid, "review")[0]["cost_kind"] == "not_launched"
@@ -2183,6 +2183,168 @@ def _remote_launch(tmp_path, stage):
     return P, it, directory, rec, jobs / rec["job_name"], cmd
 
 
+def test_migration_of_eight_unsubmitted_intents_holds_no_slots(tmp_path):
+    from tbsgen import calib, stages_b
+
+    P, _, jobs = _env(tmp_path, remote_launchers=None, max_concurrent_jobs=8)
+    ids = P.ingest([dict(doi=f"10.1/intent-{i}", title=f"Intent {i}", abstract="algorithm") for i in range(8)])
+    assert len(ids) == 8
+    for i, iid in enumerate(ids):
+        it = P.store.item(iid)
+        stage, directory = ("S9R", "review") if i < 2 else ("S9", "calib")
+        it.state.update(stage=stage, status="paused", reason="budget:daily_model", review_round=1)
+        it.save()
+        name = f"pending-{i}"
+        rec = dict(job_name=name, state="intent", submitted=False, n=1, who="teacher", model="synthetic",
+                   job_dir=str(jobs / name), outcome=None)
+        write_json(it.p(directory, "runs.json"), [rec])
+        write_json(it.p("thresholds.json"), {})
+        write_json(it.p("gates/attempt-1.json"), {})
+        assert not calib.remote_job(dict(rec, remote_route=True))
+    assert not stages_b.running_jobs(P)
+    for iid in ids:
+        it = P.store.item(iid)
+        directory = "review" if it.state["stage"] == "S9R" else "calib"
+        assert stages_b.migrate_probe_report(P, it)
+        assert it.state["stage"] == "S6A_run" and it.state["status"] == "active"
+        assert _runs(P, iid, directory)[0]["state"] == "cancelled_unstarted"
+    assert not stages_b.running_jobs(P) and not list(jobs.iterdir())
+    with P.ledger._db() as db:
+        assert db.execute("SELECT COUNT(*) FROM calls").fetchone() == (0,)
+
+
+def test_migration_recovers_sent_call_before_run_record_update(tmp_path, monkeypatch):
+    from tbsgen import calib, stages_b
+
+    P, iid, _ = _env(tmp_path, allow_submit=False, remote_launchers=None)
+    it = P.store.item(iid)
+    P.run(only=[iid])
+    rec, = _runs(P, iid)
+    key = calib.reservation_key(rec, iid, "S9")
+    call = P.ledger.reserve(rec["model"], "S9", iid, True, est_usd=12, reservation_key=key)
+    with P.ledger._db() as db:
+        db.execute("UPDATE calls SET status='sent' WHERE id=?", (call,))
+    monkeypatch.setattr(calib, "session_alive", lambda c, r: False)
+    write_json(it.p("gates/attempt-1.json"), {})
+    assert stages_b.migrate_probe_report(P, it.load())
+    held, = _runs(P, iid)
+    assert held["state"] == "remote_unknown" and held["ledger_call"] == call
+    assert stages_b.running_jobs(P) == [rec["job_name"]]
+
+
+@pytest.mark.parametrize("during_validation", [False, True])
+def test_late_repro_journal_parks_then_honors_drop(tmp_path, monkeypatch, during_validation):
+    from tbsgen import stages_b
+    from tbsgen.cli import main
+
+    P, it, directory, rec, jd, cmd = _remote_launch(tmp_path, "S9R")
+    write_json(jd / "config.json", read_json(Path(rec["config"])))
+    scope = "one_confident/public"
+    receipt = _receipt(scope, "run-1")
+    finding = dict(classification="grader_gap", issue_id="I1", reason="A shortcut earned full reward.",
+                   repro_id="run-1", observed_reward=1, observation="The shortcut earned full reward on the public split.")
+    write_json(it.p(directory, "runs.json"), [dict(rec, suspected_scopes=[scope])])
+    _finish(jd.parent, jd.name, cost=7, verdict=dict(V("drop", [BLOCK]), probe_findings={scope: finding}),
+            repros=[receipt])
+    journal = jd / "trial__a" / review.REPRO_JOURNAL
+    Path(rec["log"] + ".exit").write_text("0")
+    with monkeypatch.context() as m:
+        if during_validation:
+            classify = review.classify
+            def lose_journal(*args, **kwargs):
+                journal.unlink()
+                return classify(*args, **kwargs)
+            m.setattr(review, "classify", lose_journal)
+        else:
+            journal.unlink()
+        watch_tick(P, max_steps=0)
+    held, = _runs(P, it.item_id, directory)
+    assert held["state"] == "remote_unknown" and held["outcome"] is None
+    assert stages_b.running_jobs(P) == [jd.name]
+    with P.ledger._db() as db:
+        assert db.execute("SELECT status,usd FROM calls WHERE id=?", (rec["ledger_call"],)).fetchone() == ("reserved", None)
+    with pytest.raises(SystemExit, match="incomplete remote trial set"):
+        main(cmd + ["--synced"])
+    journal.write_text(json.dumps(receipt) + "\n")
+    assert main(cmd + ["--synced"]) == 0
+    settled, = _runs(P, it.item_id, directory)
+    assert settled["verdict"] == "drop" and settled["cost_usd"] == 7
+    assert it.load().state["status"] == "dropped"
+
+
+def test_complete_remote_wrong_verdict_stays_invalid(tmp_path):
+    P, it, directory, rec, jd, _ = _remote_launch(tmp_path, "S9R")
+    write_json(jd / "config.json", read_json(Path(rec["config"])))
+    _finish(jd.parent, jd.name, verdict=V("wrong"), cost=7)
+    watch_tick(P, max_steps=0)
+    settled, = _runs(P, it.item_id, directory)
+    assert settled["outcome"] == "invalid" and settled["cost_usd"] == 7
+
+
+@pytest.mark.parametrize("resolution", ["sync", "forced", "gone"])
+def test_not_started_rechecks_launcher_after_unknown_probe(tmp_path, monkeypatch, resolution):
+    from tbsgen import calib, stages_b
+    from tbsgen.cli import main
+
+    P, it, directory, rec, jd, cmd = _remote_launch(tmp_path, "S9R")
+    with P.ledger._db() as db:
+        db.execute("UPDATE calls SET status='sent' WHERE id=?", (rec["ledger_call"],))
+    write_json(jd / "tbsgen-remote.json", {})
+    alive = None
+    monkeypatch.setattr(calib, "session_alive", lambda c, r: alive)
+    watch_tick(P, max_steps=0)
+    held, = _runs(P, it.item_id, directory)
+    assert held["state"] == "remote_unknown"
+    with pytest.raises(SystemExit, match="force-local-gone"):
+        main(cmd + ["--not-started"])
+    alive = True
+    for flags in ([], ["--force-local-gone"]):
+        with pytest.raises(SystemExit, match="launcher is alive"):
+            main(cmd + ["--not-started", *flags])
+    with P.ledger._db() as db:
+        assert db.execute("SELECT status,usd FROM calls WHERE id=?", (rec["ledger_call"],)).fetchone() == ("sent", None)
+    assert _runs(P, it.item_id, directory) == [held] and stages_b.running_jobs(P) == [jd.name]
+    if resolution == "sync":
+        write_json(jd / "config.json", read_json(Path(rec["config"])))
+        _finish(jd.parent, jd.name, verdict=V("drop", [BLOCK]), cost=7)
+        assert main(cmd + ["--synced"]) == 0
+        assert P.item_cost(it.item_id)["usd"] == 7 and it.load().state["status"] == "dropped"
+    else:
+        def exit_during_probe(c, r):
+            Path(r["log"] + ".exit").write_text("1")
+            return False
+        with monkeypatch.context() as m:
+            m.setattr(calib, "session_alive", exit_during_probe)
+            with pytest.raises(SystemExit, match="exited during the check"):
+                main(cmd + ["--not-started"])
+        alive = None if resolution == "forced" else False
+        flags = ["--force-local-gone"] if resolution == "forced" else []
+        assert main(cmd + ["--not-started", *flags]) == 0
+        assert _runs(P, it.item_id, directory)[0]["cost_kind"] == "not_launched"
+    assert not stages_b.running_jobs(P)
+
+
+@pytest.mark.parametrize("stage", ["S9", "S9R"])
+def test_ordinary_ingest_uses_saved_remote_marker(tmp_path, stage):
+    P, it, directory, rec, jd, _ = _remote_launch(tmp_path, stage)
+    remote = str(tmp_path / "worker" / "task")
+    marker = dict(local_task=rec["task"], remote_task=remote)
+    write_json(jd / "tbsgen-remote.json", marker)
+    watch_tick(P, max_steps=0)
+    waiting, = _runs(P, it.item_id, directory)
+    assert waiting["state"] == "launched" and waiting["remote_marker"] == marker
+    (jd / "tbsgen-remote.json").unlink()
+    conf = read_json(Path(rec["config"]))
+    conf["tasks"][0]["path"] = remote
+    write_json(jd / "config.json", conf)
+    _finish(jd.parent, jd.name, verdict=V("drop", [BLOCK]) if stage == "S9R" else None, cost=7)
+    watch_tick(P, max_steps=0)
+    settled, = _runs(P, it.item_id, directory)
+    assert settled["cost_usd"] == 7 and settled["ledger_call"] == rec["ledger_call"]
+    if stage == "S9R":
+        assert settled["verdict"] == "drop"
+
+
 @pytest.mark.parametrize("stage", ["S9", "S9R"])
 def test_remote_route_precedes_marker_and_exit_143(tmp_path, monkeypatch, stage):
     from tbsgen import calib, stages_b
@@ -2244,9 +2406,9 @@ def test_remote_review_result_waits_for_verdict_and_restores_alias(tmp_path, obs
     cached = observed != "never"
     with pytest.raises(SystemExit, match="incomplete remote trial set"):
         main(cmd + ["--synced"])
-    with pytest.raises(SystemExit, match="has finished_at"):
-        main(cmd + ["--died"])
     write_json(jd / "trial__a/verifier/verdict.json", V("drop", [BLOCK]))
+    with pytest.raises(SystemExit, match="complete result"):
+        main(cmd + ["--ended-without-result"])
     args = [] if cached else ["--remote-task", remote]
     if not cached:
         with pytest.raises(SystemExit, match="identity mismatch"):
@@ -2260,14 +2422,20 @@ def test_remote_review_result_waits_for_verdict_and_restores_alias(tmp_path, obs
     assert it.load().state["status"] == "dropped" and it.state["reason"].startswith("review:drop")
 
 
-def test_live_remote_sync_finishes_without_operator(tmp_path):
+def test_final_sync_at_launcher_exit_ingests_drop(tmp_path, monkeypatch):
     P, it, directory, rec, jd, _ = _remote_launch(tmp_path, "S9R")
     write_json(jd / "config.json", read_json(Path(rec["config"])))
     _finish(jd.parent, jd.name, reward=1, cost=7)
     watch_tick(P, max_steps=0)
     assert _runs(P, it.item_id, directory)[0]["state"] == "launched"
-    write_json(jd / "trial__a/verifier/verdict.json", V("drop", [BLOCK]))
-    Path(rec["log"] + ".exit").write_text("0")
+    exit_file = Path(rec["log"] + ".exit")
+    exists = Path.exists
+    def final_sync(path):
+        if path == exit_file and not exists(path):
+            write_json(jd / "trial__a/verifier/verdict.json", V("drop", [BLOCK]))
+            exit_file.write_text("0")
+        return exists(path)
+    monkeypatch.setattr(Path, "exists", final_sync)
     watch_tick(P, only=[it.item_id])
     settled, = _runs(P, it.item_id, directory)
     assert settled["verdict"] == "drop" and settled["cost_usd"] == 7
@@ -2276,7 +2444,8 @@ def test_live_remote_sync_finishes_without_operator(tmp_path):
 
 @pytest.mark.parametrize("stage", ["S9", "S9R"])
 @pytest.mark.parametrize("cost", [None, 7])
-def test_resolve_remote_died_charges_and_retries(tmp_path, stage, cost):
+@pytest.mark.parametrize("finished", [False, True])
+def test_ended_without_result_charges_and_retries(tmp_path, stage, cost, finished):
     from tbsgen import stages_b
     from tbsgen.cli import main
 
@@ -2284,14 +2453,17 @@ def test_resolve_remote_died_charges_and_retries(tmp_path, stage, cost):
     Path(rec["log"] + ".exit").write_text("143")
     watch_tick(P, max_steps=0)
     write_json(jd / "config.json", read_json(Path(rec["config"])) if cost is not None else {})
-    write_json(jd / "result.json", {"finished_at": None})
+    write_json(jd / "result.json", {"finished_at": "done" if finished else None})
     write_json(jd / "partial/result.json", {})
     if cost is not None:
         write_json(jd / "trial/result.json", {"agent_result": {"cost_usd": cost}})
-    with pytest.raises(SystemExit, match="--died"):
+    if stage == "S9" and finished and cost is not None:
+        # A configured trial is absent from the fully synced directory.
+        write_json(jd / "config.json", dict(read_json(Path(rec["config"])), n_attempts=3))
+    with pytest.raises(SystemExit, match="incomplete remote trial set" if finished else "--ended-without-result"):
         main(cmd + ["--synced"])
     assert stages_b.running_jobs(P) == [jd.name]
-    assert main(cmd + ["--died"]) == 0
+    assert main(cmd + ["--ended-without-result" if finished else "--died"]) == 0
     dead, = _runs(P, it.item_id, directory)
     assert (dead["state"], dead["outcome"], dead["cost_usd"]) == ("died", "infra", cost)
     assert not stages_b.running_jobs(P)
