@@ -123,6 +123,20 @@ def _q(s) -> str:
 
 
 def package(cfg: dict, item_dir: Path, gen0: Path, spec: dict, provenance: dict) -> Path:
+    from . import taskimage
+    from .state import read_json
+    state = read_json(item_dir / "state.json", {})
+    if taskimage.is_task(state) or taskimage.is_task(spec):
+        receipt = read_json(item_dir / "S6I_image.json", {})
+        if not receipt.get("ok") or any(not state.get(k) or state[k] != receipt.get(k)
+                                        for k in ("image_digest", "image_tag", "image_manifest")):
+            raise taskimage.ImageUnavailable("package requires a matching verified S6I receipt")
+        alias = taskimage.harbor_tag(item_dir, state["image_digest"])
+        recipe = taskimage.data_recipe(alias)
+        provenance = dict(provenance, base=receipt["base"], **{k: state[k] for k in
+                          ("image_kind", "image_tag", "image_digest", "image_manifest", "inventory_hash")})
+    else:
+        recipe = dockerfile(cfg, extra_pip=spec.get("extra_pip", []))
     task = item_dir / "task"
     out = item_dir / "pkg"
     if out.exists():
@@ -143,7 +157,7 @@ def package(cfg: dict, item_dir: Path, gen0: Path, spec: dict, provenance: dict)
     (out / "solution" / "solve.sh").write_text(SOLVE_SH)
     (out / "instruction.md").write_text(instruction_text(cfg, spec, (task / "instruction.md").read_text()))
     pk = cfg["package"]
-    (out / "environment" / "Dockerfile").write_text(dockerfile(cfg, extra_pip=spec.get("extra_pip", [])))
+    (out / "environment/Dockerfile").write_text(recipe)
     (out / "task.toml").write_text(TASK_TOML.format(
         task_id=item_dir.name, desc=_q(spec.get("title", item_dir.name)),
         keywords=json.dumps(spec.get("competencies", [])[:8], ensure_ascii=False),
@@ -366,7 +380,7 @@ def network_errors(t: dict, mode: str) -> tuple[list, list]:
     return errors, warnings
 
 
-def sandbox_pin_errors(cfg: dict, pins: list) -> list[str]:
+def sandbox_pin_errors(cfg: dict, pins: list, image: str | None = None) -> list[str]:
     if not pins:
         return []
     if not valid_pins(pins):
@@ -377,11 +391,12 @@ def sandbox_pin_errors(cfg: dict, pins: list) -> list[str]:
             "    name, wanted = pin.split('==')\n"
             "    if version(name) != wanted: raise SystemExit(pin)\n")
     try:
-        result = sandbox.run(cfg, [], "python -c " + shlex.quote(code), 30, "tbsgen-check-pins")
+        kwargs = {"image": image} if image else {}
+        result = sandbox.run(cfg, [], "python -c " + shlex.quote(code), 30, "tbsgen-check-pins", **kwargs)
     except (OSError, ValueError) as e:
         return [f"extra_pip_unsupported: cannot verify {pins} in the configured sandbox: {e}"]
     if result["rc"]:
-        return [f"extra_pip_unsupported: {pins} in {cfg['sandbox']['image']}: {result['err'][-300:]}"]
+        return [f"extra_pip_unsupported: {pins} in {image or cfg['sandbox']['image']}: {result['err'][-300:]}"]
     return []
 
 
@@ -411,7 +426,7 @@ def validate_pkg(pkg: Path, cfg: dict | None = None) -> dict:
         errs.append(f"task.toml: {e}")
     if cfg is not None and not missing:
         pins = provenance.get("extra_pip", [])
-        errs.extend(sandbox_pin_errors(cfg, pins))
+        errs.extend(sandbox_pin_errors(cfg, pins, image=provenance.get("image_digest")))
         errs += verifier_time_errors(pkg, float((cfg.get("package") or {}).get("verifier_overhead_sec", 120)))
     leaked = [str(p.relative_to(pkg)) for p in (pkg / "environment").rglob("*")
               if p.is_file() and any(s in p.parts for s in ("tests", "truth", "generator", "solution"))]

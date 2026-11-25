@@ -650,7 +650,8 @@ def test_wrapper_requires_dropped_privileges(tmp_path, monkeypatch):
 
 @pytest.mark.parametrize("version,enforced,per_set", [
     ("v2.7", False, False), ("v2.8", True, False), ("v2.9", True, False), (PROMPT_VERSION, True, True),
-    ("cg-v3", False, False), ("cg-v4", True, False), ("cg-v5", True, False), (CODE_PROMPT_VERSION, True, True),
+    ("cg-v3", False, False), ("cg-v4", True, False), ("cg-v5", True, False), ("cg-v6", True, True),
+    (CODE_PROMPT_VERSION, True, True),
 ])
 @pytest.mark.parametrize("has_bias", [True, False])
 def test_runtime_parity_by_hidden_set(tmp_path, monkeypatch, wired_gates, version, enforced, per_set, has_bias):
@@ -765,10 +766,12 @@ def test_hidden_scope_named_public(tmp_path, monkeypatch):
 
 @pytest.mark.parametrize("version", [PROMPT_VERSION, CODE_PROMPT_VERSION])
 def test_spec_quote_length_after_normalization(version):
+    image = dict(base="python:3.12@sha256:" + "a" * 64, packages=[], notes="test image")
     def errors(where, v):
         entry = dict(assumption="noise", stated=True, where=where)
-        return validate_spec(dict(SPEC, generator_assumptions=[entry]), load_config(), v)
-    assert errors("  A   Gaussian\n", version)
+        return validate_spec(dict(SPEC, image=image, data_formats=["csv"], generator_assumptions=[entry]), load_config(), v)
+    assert errors("  A   Gaussian\n", version) == [
+        "stated generator_assumptions.where needs at least 12 characters after normalization"]
     assert not errors("  A   Gaussian\n", "cg-v3")
     assert not errors("  12345\n  678901", version)  # 12 normalized characters
 

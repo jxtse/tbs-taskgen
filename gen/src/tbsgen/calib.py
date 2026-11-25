@@ -31,6 +31,7 @@ from collections.abc import Callable
 import uuid
 from pathlib import Path
 
+from . import taskimage
 from .state import item_lock, read_json, write_json
 
 INFRA_EXC = {"NetworkConnectionError", "EnvironmentStartTimeoutError", "AgentSetupTimeoutError", "CancelledError",
@@ -164,7 +165,10 @@ def pkg_sha(pkg: Path) -> str:
     import hashlib
     h = hashlib.sha256()
     for f in sorted(p for p in Path(pkg).rglob("*") if p.is_file()):
-        h.update(str(f.relative_to(pkg)).encode() + b"\0" + f.read_bytes() + b"\0")
+        h.update(str(f.relative_to(pkg)).encode() + b"\0")
+        with f.open("rb") as source:
+            hashlib.file_digest(source, lambda: h)
+        h.update(b"\0")
     return h.hexdigest()[:16]
 
 
@@ -191,8 +195,9 @@ def ensure_prepared(cfg: dict, item_dir: Path, who: str = "glm", force: bool = F
         prev = json.loads(recp.read_text())
     except (OSError, ValueError):
         pass
+    image = taskimage.package_identity(item_dir)
     if prev.get("pkg_sha") == sha and not force:
-        if prev.get("ok") and (out / "task.toml").exists():
+        if prev.get("ok") and (out / "task.toml").exists() and (not image or _push_matches(item_dir, prev)):
             return dict(prev, reused=True)
         if not prev.get("ok"):
             return dict(prev, reused=True)          # same pkg failed before: needs `tbsgen calib prepare`
@@ -203,8 +208,13 @@ def ensure_prepared(cfg: dict, item_dir: Path, who: str = "glm", force: bool = F
     log.parent.mkdir(parents=True, exist_ok=True)
     env = dict(os.environ, TBSGEN_ITEM_ID=vals["item_id"], TBSGEN_PKG=vals["pkg"], TBSGEN_PREPARED_DIR=vals["out"],
                TBSGEN_WHO=who)
+    for key in ("TBSGEN_IMAGE_OCI", "TBSGEN_IMAGE_TAG", "TBSGEN_IMAGE_DIGEST"):
+        env.pop(key, None)
     t0 = time.time()
     try:
+        if image:
+            env["TBSGEN_PKG_SHA"] = sha
+            env.update(taskimage.publish(cfg, item_dir))
         with log.open("w") as fh:
             r = subprocess.run(["bash", "-c", line], cwd=cwd, env=env, stdout=fh, stderr=subprocess.STDOUT,
                                timeout=float(c.get("prepare_timeout_s") or 3600))
@@ -217,6 +227,10 @@ def ensure_prepared(cfg: dict, item_dir: Path, who: str = "glm", force: bool = F
         err = f"exit {rc}" + ("" if (out / "task.toml").exists() else f"; no {out}/task.toml") + f": {tail}"
     res = dict(ok=ok, pkg_sha=sha, out=str(out), rc=rc, error=err, sec=round(time.time() - t0, 1), ts=time.time(),
                log=str(log))
+    if ok and image:
+        res["published_digest"] = env.get("TBSGEN_IMAGE_DIGEST")
+        if not _push_matches(item_dir, res):
+            res.update(ok=False, error="prepare_command did not record the verified OCI digest for this package")
     recp.write_text(json.dumps(res, indent=1))
     return res
 
@@ -357,16 +371,27 @@ def _unprepared(cfg: dict, who: str, task: str) -> bool:
     return bool(d) and not Path(task).resolve().is_relative_to(Path(d).resolve())
 
 
+def _push_matches(item_dir, prepared):
+    push = read_json(item_dir / "calib/image-push.json", {})
+    return bool(prepared.get("published_digest") and push.get("digest") == prepared["published_digest"]
+                and push.get("pkg_sha") == prepared.get("pkg_sha"))
+
+
 def stale_prepared(cfg: dict, item_dir: Path, who: str, epoch: int) -> str | None:
     """After a review revision (epoch > 0) a prepared copy must be one made from the current pkg/ (recorded by
     ensure_prepared with the pkg hash); a copy prepared by hand before the revision would calibrate the old task."""
-    if not epoch or not prepared_dir(cfg, who):
+    if not prepared_dir(cfg, who):
+        return None
+    image = taskimage.package_identity(item_dir)
+    if not epoch and not image:
         return None
     recp = item_dir / "calib" / ("prepare.json" if who == "glm" else f"prepare-{who}.json")
     try:
         prev = json.loads(recp.read_text())
     except (OSError, ValueError):
         prev = {}
+    if image and not _push_matches(item_dir, prev):
+        return "prepared task has no matching verified OCI digest; run calib prepare"
     if prev.get("ok") and prev.get("pkg_sha") == pkg_sha(item_dir / "pkg"):
         return None
     return (f"the prepared {who} copy may predate the review revision (no calib/{recp.name} for the current pkg/): "

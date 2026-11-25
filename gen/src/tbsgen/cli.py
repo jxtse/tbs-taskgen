@@ -84,7 +84,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser(prog="tbsgen")
     sub = ap.add_subparsers(dest="cmd", required=True)
     for name in ("ingest", "run", "resume", "status", "report", "ledger", "diversity", "breaker", "calib-ingest", "ping", "reset",
-                 "harbor-local", "fetch", "remote", "fulltext", "calib", "review", "regate", "harden", "variant"):
+                 "harbor-local", "fetch", "remote", "fulltext", "calib", "taskimage", "review", "regate", "harden", "variant"):
         s = sub.add_parser(name)
         s.add_argument("--run", required=True)
         s.add_argument("--config", default=None)
@@ -106,6 +106,9 @@ def main(argv=None):
             s.add_argument("--only", default="", help="ID[,ID]: just these items")
             s.add_argument("--stage", default="", help="STAGE[,STAGE]: just items paused at these stages")
             s.add_argument("--reason", default="budget:,model:,parked:probe_unreviewed", help="reason prefixes (comma-separated)")
+        if name == "taskimage":
+            s.add_argument("action", choices=["gc"])
+            s.add_argument("--dry-run", action="store_true")
         if name == "calib":
             s.add_argument("action", choices=["watch", "prepare", "launch", "resolve-remote"])
             s.add_argument("--only", default="", help="watch: ID[,ID]")
@@ -201,6 +204,11 @@ def main(argv=None):
         from . import diversity
         result = diversity.report(Path(a.run), a.runs_root)
         print(json.dumps(result, indent=2) if a.json else diversity.format_report(result))
+        return 0
+    if a.cmd == "taskimage":
+        from . import taskimage
+        cfg = load_config(a.config or Path(a.run) / "config.toml", {"run": {"root": a.run}})
+        print(json.dumps(taskimage.gc(cfg, dry_run=a.dry_run), indent=2))
         return 0
     if a.cmd == "fetch":
         return _fetch_command(a, ap)

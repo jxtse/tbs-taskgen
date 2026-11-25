@@ -2,8 +2,7 @@
 
     tbsgen harbor-local --run DIR --item ID [--harbor BIN]
 
-Copies items/<id>/pkg to <run>/harbor-local/tasks/<id> with the "local_base" Dockerfile (FROM the sandbox
-image, so no pip download), runs `harbor run -a oracle` and `-a nop`, and records rewards in
+Copies items/<id>/pkg to <run>/harbor-local/tasks/<id> using the verified task recipe or the legacy local_base, runs `harbor run -a oracle` and `-a nop`, and records rewards in
 items/<id>/harbor_local.json.  Expected: oracle reward 1, nop reward 0.  The task's network policy is kept
 (oracle and nop need no network; the agent phase allowlist is enforced by Harbor's Docker egress sidecar).
 """
@@ -47,7 +46,16 @@ def check(cfg: dict, run_root: Path, item_dir: Path, harbor: str | None = None, 
     if tdir.exists():
         shutil.rmtree(tdir)
     shutil.copytree(item_dir / "pkg", tdir)
-    (tdir / "environment" / "Dockerfile").write_text(dockerfile(cfg, "local_base"))
+    from . import taskimage
+    prov = taskimage.package_identity(item_dir)
+    if prov:
+        local = dict(cfg, sandbox=dict(cfg["sandbox"], backend="docker", docker_config=None),
+                     taskimage=dict(cfg["taskimage"], docker_config=None))
+        alias = taskimage.harbor_tag(item_dir, prov["image_digest"])
+        if not taskimage.package_matches(item_dir) or not taskimage.check_tag(local, alias, prov["image_digest"]):
+            return dict(ok=False, error=f"local Harbor needs packaged recipe and verified image {alias}")
+    else:
+        (tdir / "environment" / "Dockerfile").write_text(dockerfile(cfg, "local_base"))
     res = dict(item=item_dir.name, task=str(tdir), ts=time.time())
     for agent in ("oracle", "nop"):
         job = f"{item_dir.name}-{agent}-{time.strftime('%Y%m%d%H%M%S')}"

@@ -340,8 +340,17 @@ sys.exit(1 if miss else 0)
 """
 
 
+# Recorded on the authoring host so a partial sync cannot look like the no-Dockerfile fallback.
+IMAGE_OUTPUT_RECEIPT = """import json
+from pathlib import Path
+env = Path("/app/out/task/environment")
+files = sorted(p.name for p in env.iterdir() if p.is_file()) if env.is_dir() else []
+Path("/logs/verifier/image-files.json").write_text(json.dumps(files))
+"""
+
+
 def build_agent_task(cfg: dict, kind: str, item_id: str, work: Path, out: Path, instruction: str, need: list[str],
-                     timeout_s: float, image: str | None = None) -> Path:
+                     timeout_s: float, image: str | None = None, *, image_outputs: bool = False) -> Path:
     """A Harbor task whose environment has /work (inputs: paper, repo, contract) and whose agent writes /app/out."""
     if out.exists():
         shutil.rmtree(out)
@@ -360,7 +369,10 @@ def build_agent_task(cfg: dict, kind: str, item_id: str, work: Path, out: Path, 
     (out / "tests").mkdir()
     (out / "tests" / "test.sh").write_text(VERIFY_SH)
     (out / "tests" / "test.sh").chmod(0o755)
-    (out / "tests" / "check.py").write_text(CHECK_PY.format(need=json.dumps(need)))
+    check = CHECK_PY.format(need=json.dumps(need))
+    if image_outputs:
+        check = IMAGE_OUTPUT_RECEIPT + check
+    (out / "tests" / "check.py").write_text(check)
     (out / "solution").mkdir()
     (out / "solution" / "solve.sh").write_text("#!/bin/bash\ntrue\n")
     hint = str(_c(cfg).get("agent_hints") or "").strip()
@@ -471,10 +483,22 @@ def agent_output_files(kind, *, with_profile=False):
     return S5G_FILES + (["_spec/" + DESIGN_FILE] if with_profile else [])
 
 
-def _agent_outputs_present(trial, kind, required):
+def _agent_outputs_present(trial, kind, required, image_outputs=False):
     out = deliverable(dict(trial=trial))
     if not out or any(safe_read(out / name, root=trial) is None for name in required):
         return False
+    if image_outputs:
+        try:
+            files = json.loads(safe_read(trial / "verifier/image-files.json", root=trial) or "null")
+        except ValueError:
+            return False
+        if not isinstance(files, list) or any(not isinstance(name, str) or Path(name).name != name
+                                              or name in ("", ".", "..") for name in files):
+            return False
+        if any(safe_read(out / "task/environment" / name, root=trial) is None for name in files):
+            return False
+        if "Dockerfile" in files and safe_read(out / "report.md", root=trial) is None:
+            return False
     if kind == "S4c":
         try:
             verdict = json.loads(safe_read(out / "runnability.json", root=trial) or "null")
@@ -515,7 +539,8 @@ def complete_remote_agent(cfg, rec):
     has_profile = (cfg.get("difficulty", {}).get("profile_path")
                    or (Path(rec["task"]) / "environment/work/weakness_profile.md").is_file())
     required = agent_output_files(kind, with_profile=has_profile)
-    _, complete = configured_trial_set(jd, lambda trial: _agent_outputs_present(trial, kind, required))
+    _, complete = configured_trial_set(jd, lambda trial: _agent_outputs_present(
+        trial, kind, required, rec.get("image_outputs", False)))
     return complete
 
 
@@ -760,13 +785,16 @@ def stage_inputs(cfg: dict, it, work: Path, with_contract: bool) -> dict:
     if with_contract:
         _stage_difficulty(cfg, it, work)
     if with_contract:
-        from .prompts import METRICS_API, S5_SPEC, S6A_GEN
+        from .prompts import METRICS_API, author_contract
+        from .taskimage import author_images
+        images = author_images(cfg, it.state)
+        spec, gen = author_contract(images)
         (work / "contract").mkdir()
-        (work / "contract" / "S5_SPEC.txt").write_text(S5_SPEC)
-        (work / "contract" / "S6A_GEN.txt").write_text(S6A_GEN)
+        (work / "contract" / "S5_SPEC.txt").write_text(spec)
+        (work / "contract" / "S6A_GEN.txt").write_text(gen)
         (work / "contract" / "METRICS_API.txt").write_text(METRICS_API)
-        from .runner import METRICS_HELPER
-        shutil.copy(METRICS_HELPER, work / "contract" / "_metrics_template.py")
+        from .runner import metrics_template
+        (work / "contract" / "_metrics_template.py").write_text(metrics_template(images))
     return dict(work=str(work))
 
 

@@ -785,6 +785,10 @@ def _s9(P, it):
                     return it.finish("waiting", f"calib blocked: prepare_command failed "
                                                 f"({(prep.get('error') or '')[:120]}); fix and run "
                                                 "`tbsgen calib prepare --item ID`")
+            if needs_launch and it.state.get("image_tag") and calib.prepared_dir(P.cfg, rec["who"]):
+                stale = calib.stale_prepared(P.cfg, it.dir, rec["who"], int(it.state.get("calib_epoch", 0)))
+                if stale:
+                    return it.finish("waiting", f"calib blocked: {stale}")
             with slot_lock(P):
                 full = _slots_full(P, rec["job_name"], rec["who"]) if rec["state"] == "intent" and needs_launch else None
                 if not full:
@@ -1246,7 +1250,14 @@ def s10(P, it):
         if why:
             withdraw(P, it.item_id, why)
             return finish_job_stage(P, it, "parked", why)
-        return _release_reviewed(P, it, previous, scopes)
+        released = _release_reviewed(P, it, previous, scopes)
+    if it.state.get("status") == "done" and it.state.get("image_tag"):
+        from . import taskimage
+        try:
+            taskimage.gc(P.cfg, item_id=it.item_id, step_locked=True)
+        except (OSError, ValueError) as e:
+            P.store.event("taskimage_gc_failed", item=it.item_id, error=str(e))
+    return released
 
 
 def _release_reviewed(P, it, previous, scopes):
@@ -2138,7 +2149,7 @@ def start_hardening(P, it, operator: str | None = None, kind: str = "harden"):
     return None
 
 
-HARDEN_REVERT_STAGES = {"S5", "S5G", "S6A", "S6A_run", "S6B", "S6M", "S6C", "S7", "S8", "PKG"}
+HARDEN_REVERT_STAGES = {"S5", "S5G", "S6I", "S6A", "S6A_run", "S6B", "S6M", "S6C", "S7", "S8", "PKG"}
 
 
 def _review_of_version(it) -> list[dict]:
@@ -2212,6 +2223,15 @@ def harden_revert(P, it, locked: bool = False) -> bool:
         st["gates_attempt"] = record["prev_gates_attempt"]
     else:
         st.pop("gates_attempt", None)  # An older snapshot uses its passing history entry.
+    from . import taskimage
+    restored = read_json(it.p("S6I_image.json"), {})
+    restored_spec = read_json(it.p("_spec", "spec.json"), {})
+    for key in taskimage.STATE_FIELDS:
+        st.pop(key, None)
+    if restored_spec.get("image_kind"):
+        st["image_kind"] = restored_spec["image_kind"]
+    if restored.get("ok"):
+        st.update({key: restored[key] for key in taskimage.STATE_FIELDS if key in restored})
     if not pend.get("failed_archived"):
         if int(st.get("calib_epoch", 0)) == pend["failed_epoch"]:
             _archive_calibration(it)                    # the failed version's own records (normally none)

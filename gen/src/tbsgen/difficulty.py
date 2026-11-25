@@ -557,7 +557,7 @@ def _inside_trial(trial: Path, p: Path) -> bool:
 
 VERSION_FILES = ("task", "_spec", "pkg", "gates", "thresholds.json", "S6A_measure.json", "S6B_decisions.json",
                  "S6C_calls.json", "S6_failure.json", "S5G_result.json", "PKG_check.json", "S5G/report.md",
-                 "S5G/run.json")
+                 "S5G/run.json", "S6I_image.json", "calib/image-push.json")
 # files of the old version that must not look like the new version's (removed after the snapshot)
 STALE_FILES = ("S6A_measure.json", "S6B_decisions.json", "S6_failure.json", "PKG_check.json")
 

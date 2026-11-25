@@ -442,7 +442,13 @@ DEFAULTS: dict[str, Any] = {
         "tdm_verbatim_unknown": False,      # True: a full text of unknown channel is checked too
     },
     "diversity": {"max_area_share": 0.25, "max_per_template": 2, "min_released": 20, "enforce": False},
+    "taskimage": {
+        "enabled": False, "host": None, "docker_config": None, "builder": None,
+        "build_timeout_s": 2400, "build_args": {}, "max_gb": 5, "keep_days": 7, "catalog": None,
+        "registry_prefix": None,
+    },
     "sandbox": {
+        "cleanup_image": None,
         "backend": "docker",                # "docker" (local) | "ssh" (docker on `host`; code-grounded runs: the
                                             # authors' code runs on the build host only)
         "host": None, "remote_dir": None,   # ssh backend: host and per-call work directory there
@@ -603,13 +609,18 @@ def _merge(a: dict, b: dict) -> dict:
 
 def load_config(path: str | Path | None = None, overrides: dict | None = None) -> dict:
     cfg = copy.deepcopy(DEFAULTS)
+    settings = {}
     if path:
         p = Path(path)
         if p.exists():
-            cfg = _merge(cfg, tomllib.loads(p.read_text()))
+            settings = tomllib.loads(p.read_text())
+            cfg = _merge(cfg, settings)
             cfg["config_path"] = str(p.resolve())
     if overrides:
         cfg = _merge(cfg, overrides)
+    if (cfg["taskimage"]["enabled"] and "max_public_mb" not in settings.get("gen", {})
+            and "max_public_mb" not in (overrides or {}).get("gen", {})):
+        cfg["gen"]["max_public_mb"] = 500
     if remote := cfg.get("fetch", {}).get("remote"):
         cfg["fulltext"]["remote"] = _merge(cfg["fulltext"]["remote"], remote)
     if "hosts" in cfg["fulltext"]["remote"]:

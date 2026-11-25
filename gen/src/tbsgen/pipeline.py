@@ -14,14 +14,14 @@ import time
 import traceback
 from pathlib import Path
 
-from . import blocklist, intake, screen_jev, stages_a as A, stages_b as B
+from . import blocklist, intake, screen_jev, stages_a as A, stages_b as B, taskimage
 from .budget import EXCLUDE_UNSTARTED_JOBS, BudgetStop, Ledger, harden_scope, today, variant_scope
-from .calib import migrate_manual_commands
+from .calib import migrate_manual_commands, pending_launcher
 from .config import resolve_role
 from .models import ModelError, get_client
 from .state import STAGES, Store, read_json, write_json
 
-HANDLERS = {"S1": A.s1, "S2a": A.s2a, "S3b": A.s3b, "S3c": A.s3c, "S4c": A.s4c, "S5G": A.s5g, "S2": A.s2, "S3": A.s3, "S4": A.s4, "S5": A.s5, "S6A": A.s6a, "S6A_run": A.s6a_run, "S6M": A.s6m,
+HANDLERS = {"S1": A.s1, "S2a": A.s2a, "S3b": A.s3b, "S3c": A.s3c, "S4c": A.s4c, "S5G": A.s5g, "S2": A.s2, "S3": A.s3, "S4": A.s4, "S5": A.s5, "S6I": A.s6i, "S6A": A.s6a, "S6A_run": A.s6a_run, "S6M": A.s6m,
             "S6B": A.s6b, "S6C": B.s6c, "S7": B.s7, "S8": B.s8, "PKG": B.pkg, "S9": B.s9, "S9R": B.s9r, "S10": B.s10}
 AGENT_STAGES = ("S4c", "S5G")     # code-grounded Harbor agent jobs: the item waits while its job runs
 MODEL_STAGES = {"S5": "spec", "S6A": "gen", "S6M": "gen", "S6C": "tests", "S8": "repair"}
@@ -36,7 +36,7 @@ STAGE_GROUPS = {
     "intake": {"S1", "S2a", "S2", "S3", "S4"},
     "code": {"S3b", "S3c"},
     "agent": set(AGENT_STAGES),
-    "build": {"S6I"} & HANDLERS.keys(),
+    "build": {"S6I"},
     "sandbox": {"S6A_run", "S6B", "S6C", "S7", "S8", "PKG"},
     "calib": {"S9", "S9R", "S10"},
     "harden": {"harden"},
@@ -215,6 +215,34 @@ class Pipeline:
                     it.finish("paused", f"probe migration: {exc}", paused_stage=stage)
             return "paused"
 
+    def _restore_task_image(self, it, stage):
+        if stage in ("S5G", "S6I") or not taskimage.is_task(it.state):
+            return False
+        if stage in ("S9", "S9R") and any(pending_launcher(run, self.ledger)
+                                          for run in B._job_runs(self.cfg, it, stage)):
+            # The submitted job owns its reservation and stage until reconciliation.
+            return False
+        if taskimage.needs_restore(self.cfg, it.dir, it.state):
+            it.state["image_resume_stage"] = stage
+            it.goto("S6I", "restore or reverify task image before " + stage)
+            return True
+        if stage not in ("S9", "S9R", "S10"):
+            return False
+        prov = read_json(it.p("pkg/provenance.json"), {})
+        if (not prov.get("image_manifest") and prov.get("image_digest") == it.state["image_digest"]
+                and prov.get("image_tag") == it.state["image_tag"]):
+            # Pre-OCI calibration builds did not attest the dependency layers used by the teacher/student.
+            if any(r.get("outcome") is None for role_dir in ("calib", "review")
+                   for r in read_json(it.p(role_dir, "runs.json"), [])):
+                raise taskimage.ImageUnavailable("pre-OCI package has outstanding jobs; reconcile before regate")
+            # Pipeline.step already holds the outer step lock.
+            with B.item_lock(it):
+                B._regate(self, it, "migrate package to verified S6I base", recalibrate=True)
+            return True
+        if not taskimage.package_matches(it.dir):
+            raise taskimage.ImageUnavailable("package Dockerfile differs from verified S6I recipe")
+        return False
+
     def _step(self, it) -> str:
         migrated = self._migrate_probe_report(it)
         if migrated:
@@ -231,10 +259,13 @@ class Pipeline:
         try:
             if B.harden_needs_step(it):
                 B.harden_step(self, it)         # finish an interrupted hardening start / revert first
-            else:
+            elif not self._restore_task_image(it, st):
                 HANDLERS[st](self, it)
                 if B.harden_needs_step(it):
                     B.harden_step(self, it)     # a hardened version that failed to build: back to the old one
+        except taskimage.ImageUnavailable as e:
+            it.finish("paused", f"task image unavailable: {e}", paused_stage=st)
+            return "paused"
         except BudgetStop as e:
             if not e.cancelled_unstarted and e.reason in ("item_usd", "item_harden_usd", "item_variant_usd"):
                 # this paper's authoring allowance (budget.item_usd_cap, item_harden_usd_cap in a hardening round,
