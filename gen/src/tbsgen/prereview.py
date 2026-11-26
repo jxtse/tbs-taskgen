@@ -13,6 +13,7 @@ import os
 import re
 import time
 import zipfile
+from bisect import bisect_left
 from decimal import Decimal
 from pathlib import Path
 
@@ -264,7 +265,17 @@ def _data_scalars(path, *, schema=False):
                         yield from extract(json.loads(line, parse_float=Decimal))
         else:
             for line in stream:
-                yield from line.split()
+                line = line.strip()
+                if line.startswith('"') and line.endswith('"'):
+                    try:
+                        yield json.loads(line)
+                        continue
+                    except json.JSONDecodeError:
+                        pass  # Plain text can also contain several quoted tokens.
+                if len(line) >= 2 and line[0] + line[-1] in {"''", '""', "‘’", "“”"}:
+                    yield line[1:-1]
+                for token in line.split():
+                    yield token.strip("\"'“”‘’")
 
 
 def _grader_atoms(source):
@@ -288,9 +299,19 @@ def _grader_atoms(source):
 
 
 _DIGITS = r"\d(?:_?\d)*"
-_DECIMAL = rf"(?:{_DIGITS}(?:\.(?:{_DIGITS})?)?|\.{_DIGITS})(?:e[+\-]?{_DIGITS})?"
+_GROUP_SEPARATOR = r"(?:[,\u2009\u202f\u00a0]|\\,)"
+_WHOLE = rf"(?:\d{{1,3}}(?:{_GROUP_SEPARATOR}\d{{3}})+|{_DIGITS})"
+_MANTISSA = rf"(?:{_WHOLE}(?:\.(?:{_DIGITS})?)?|\.{_DIGITS})"
+_SIGNED_DIGITS = rf"[+\-−]?{_DIGITS}"
+_SUPERSCRIPT = str.maketrans("⁺⁻⁰¹²³⁴⁵⁶⁷⁸⁹", "+-0123456789")
+_EXPONENT = rf"(?:\^\s*(?:\{{\s*{_SIGNED_DIGITS}\s*\}}|{_SIGNED_DIGITS})|[⁺⁻]?[⁰¹²³⁴⁵⁶⁷⁸⁹]+)"
+_MULTIPLY = r"(?:[×x·]|\\times|\\cdot)"
+_POWER = rf"10\s*{_EXPONENT}"
+_DECIMAL = rf"(?:{_POWER}|{_MANTISSA}(?:e{_SIGNED_DIGITS}|\s*{_MULTIPLY}\s*{_POWER})?)"
+_POWER_SUFFIX = re.compile(rf"(?P<factor>\s*{_MULTIPLY}\s*)?10\s*(?P<exp>{_EXPONENT})$")
 _BASED_INT = r"(?:0x(?:_?[0-9a-f])+|0b(?:_?[01])+|0o(?:_?[0-7])+)"
-_NUMBER = re.compile(rf"(?<![\w.])[+\-−]?(?:{_BASED_INT}|{_DECIMAL})(?!\w|\.\d)", re.I)
+_NUMBER = re.compile(rf"(?<![\w.])(?P<em>_{{0,3}})[+\-−]?(?:{_BASED_INT}|{_DECIMAL})(?P=em)(?!\w|\.\d)", re.I)
+_BRACKETED = re.compile(r"[\[({][^\[\](){}]*[])}]")
 _SHORT_WORDS = set("""
     a add all am an and any are as ask at be big but by can did do end far few fit for get go got had
     has he her him his how i if in is it its key let low may me my new no non nor not now of off old
@@ -303,14 +324,50 @@ def _decimal_spelling(token):
     token = token.lower().replace("_", "").replace("−", "-")
     if token.lstrip("+-").startswith(("0x", "0b", "0o")):
         return str(int(token, 0))
-    return token
+    power = _POWER_SUFFIX.search(token)
+    if power:
+        exponent = re.sub(r"[\s^{}]", "", power["exp"]).translate(_SUPERSCRIPT)
+        mantissa = token[:power.start()] + ("" if power["factor"] else "1")
+        token = f"{mantissa}e{exponent}"
+    return re.sub(_GROUP_SEPARATOR, "", token)
 
 
 def _numbers(body):
     return {Decimal(_decimal_spelling(m[0])) for m in _NUMBER.finditer(body)}
 
 
-def _answer_atoms(pkg):
+def _delimit_numeric_list(match):
+    text = match[0]
+    cells = text[1:-1].split(",")
+    if len(cells) > 1 and all(_NUMBER.fullmatch(cell.strip()) for cell in cells):
+        return text.replace(",", ", ")
+    return text
+
+
+def _added_numbers(original, revised):
+    added = _numbers(revised) - _numbers(original)
+    # In [8,173.625] the comma could separate two elements or group thousands.
+    # Compare like readings so a vector in the original cannot excuse a new scalar.
+    old_lists = _BRACKETED.sub(_delimit_numeric_list, original)
+    new_lists = _BRACKETED.sub(_delimit_numeric_list, revised)
+    if old_lists != original or new_lists != revised:
+        added.update(_numbers(new_lists) - _numbers(old_lists))
+    return added
+
+
+def _matches_added_number(answers, added):
+    if not added:
+        return False
+    candidates = sorted(added)
+    for value, tolerance in answers:
+        i = bisect_left(candidates, value)
+        # Only the nearest newly added value on either side can be a match.
+        if any(abs(v - value) <= tolerance for v in candidates[max(0, i - 1):i + 1]):
+            return True
+    return False
+
+
+def _truth_atoms(pkg):
     for path in _files_under(pkg, "tests/truth"):
         for value in _data_scalars(path):
             if isinstance(value, bytes):
@@ -319,20 +376,70 @@ def _answer_atoms(pkg):
                 yield format(value, "e")  # Preserve explicit precision, e.g. JSON 1.00e2.
             else:
                 yield str(value) if value is not None else "null"
+
+
+def _grader_literals(pkg):
     for rel in (Path("tests/measure.py"), Path("tests/test_outputs.py")):
         if _safe_file(pkg, rel):
             yield from _grader_atoms((pkg / rel).read_text())
 
 
-def edit_adds_answer(pkg: Path, patch: dict[str, str]) -> bool:
+def _public_names(pkg, truth, generator_dir):
+    from .gates import stated_csv_headers
+    from .statement import FILE_TOKEN
+
+    data = pkg / "environment/data"
+    paths = list(_files_under(pkg, "environment/data"))
+    names = set()
+    tables = {}
+    for path in paths:
+        cells = [name.strip().casefold() for name in _data_scalars(path, schema=True)]
+        if path.name.lower().removesuffix(".gz").endswith((".csv", ".tsv")):
+            tables[path.relative_to(data).as_posix()] = cells
+        else:
+            names.update(cells)
+
+    if not tables:
+        return names - truth
+    notes = [path for path in paths if path.parent == data and is_format_note(path)]
+    generator = generator_dir if generator_dir is not None else pkg / "generator"
+    if generator.resolve() == generator.absolute() and generator.is_dir():
+        notes.extend(path for path in generator.iterdir()
+                     if is_format_note(path) and _safe_file(generator, Path(path.name)))
+    headerless = set()
+    declared = set()
+    infer_headers = True
+    for path in notes:
+        doc = _text(path).replace("/app/data/", "").replace("environment/data/", "")
+        if doc.endswith(TRUNCATED):  # An unread part could identify a headerless table.
+            return names - truth
+        for line in doc.splitlines():
+            if re.search(r"\b(?:header[- ]?less|no headers?|without (?:a )?headers?)\b", line, re.I):
+                refs = {m[0].removeprefix("./") for m in FILE_TOKEN.finditer(line)}
+                headerless.update(t for t in tables if t in refs or Path(t).name in refs)
+                if not refs:  # An unattributed warning makes inferred headers uncertain.
+                    infer_headers = False
+                    if len(tables) == 1:
+                        headerless.update(tables)
+        for table, declarations in stated_csv_headers(doc, list(tables)).items():
+            if all([col.casefold() for col in d["cols"]] == tables[table] for d in declarations):
+                declared.add(table)
+    for table, cells in tables.items():
+        if table in headerless or not all(cell and not _NUMBER.fullmatch(cell) for cell in cells):
+            continue
+        if table in declared or (infer_headers and truth.isdisjoint(cells)):
+            names.update(cells)
+    return names - truth
+
+
+def edit_adds_answer(pkg: Path, patch: dict[str, str], *, generator_dir: Path | None = None) -> bool:
     """Test added tokens per document against the complete original graders and truth tree."""
     pkg = pkg.resolve()
-    public_names = {name.strip().casefold() for path in _files_under(pkg, "environment/data")
-                    for name in _data_scalars(path, schema=True)}
+    truth = {atom.strip().casefold() for atom in _truth_atoms(pkg)}
+    public_names = _public_names(pkg, truth, generator_dir)
     numbers = set()
     words = set()
-    for atom in _answer_atoms(pkg):
-        token = atom.strip().casefold()
+    for token in truth.union(atom.strip().casefold() for atom in _grader_literals(pkg)):
         if len(token) <= 1 or token in public_names or token in _SHORT_WORDS:
             continue
         if _NUMBER.fullmatch(token):
@@ -342,18 +449,22 @@ def edit_adds_answer(pkg: Path, patch: dict[str, str]) -> bool:
             if "." not in mantissa and "e" not in token:
                 digits = digits.rstrip("0")
             if len(digits) > 2:
-                numbers.add(Decimal(token))
+                value = Decimal(token)
+                # Relative tolerance for an answer given to p significant digits: 0.5 * 10^(1-p).
+                tolerance = value.copy_abs() * Decimal(f"5e{-len(digits)}")
+                numbers.add((value, tolerance))
         else:
             words.add(token)
 
     for rel, revised in patch.items():
         original = (pkg / rel).read_text().casefold()
         revised = revised.casefold()
-        if numbers & (_numbers(revised) - _numbers(original)):
+        if numbers and _matches_added_number(numbers, _added_numbers(original, revised)):
             return True
         for word in words:
             if word in revised:
-                pattern = r"(?<!\w)" + re.escape(word) + r"(?!\w)"
+                # Quotes, brackets and Markdown delimiters (including _) can wrap a label.
+                pattern = r"(?<![^\W_])" + re.escape(word) + r"(?![^\W_])"
                 if re.search(pattern, revised) and not re.search(pattern, original):
                     return True
     return False

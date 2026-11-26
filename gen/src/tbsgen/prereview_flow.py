@@ -219,7 +219,7 @@ def revise(P, it, request_patch):
                 if (not regular_file(pkg, rel) or dest.resolve() != it.dir.resolve() / dest.relative_to(it.dir)
                         or (dest.exists() and dest.stat().st_nlink > 1) or (pkg / rel).stat().st_nlink > 1):
                     return reject(it, "linked document")
-            if edit_adds_answer(pkg, patch):
+            if edit_adds_answer(pkg, patch, generator_dir=task / "generator"):
                 return reject(it, "edit_leak")
             spec = read_json(it.p("_spec", "spec.json"))
             chk = repair.review(pkg, patch, spec["depgraph"])
@@ -325,7 +325,7 @@ def resume_edit(it, ledger=None):
             return True
         reason = None
         try:
-            if edit_adds_answer(pkg, rec["approved"]):
+            if edit_adds_answer(pkg, rec["approved"], generator_dir=it.p("task/generator")):
                 reason = "edit_leak"
         except Exception as exc:
             reason = f"output check: {type(exc).__name__}"

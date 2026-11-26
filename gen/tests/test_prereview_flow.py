@@ -29,7 +29,7 @@ def flow(tmp_path, monkeypatch):
         (out / "environment/data/readmeasurements.txt").write_text("7\n")
         (out / "environment/data/ReadMe.md").write_text("Sample format notes.\n")
         (out / "tests/hidden/example.json").write_text('{"rows": 2}')
-        (out / "tests/truth/expected.json").write_text('[1758.125, "profile_id"]')
+        (out / "tests/truth/expected.json").write_text('[1758.125, "reference-phase"]')
         return dict(rc=0, err="")
 
     def run_gates(cfg, item_dir, spec, th, attempt):
@@ -40,6 +40,7 @@ def flow(tmp_path, monkeypatch):
 
     monkeypatch.setattr(runner.taskimage, "run", synthetic_generator)
     monkeypatch.setattr(gates, "run_gates", run_gates)
+    it.p("task/tests/measure.py").write_text("COL = 'profile_id'\n")
     it.goto("S7", "synthetic package")
     P.step(it)
     assert it.load().state["stage"] == "PKG"
@@ -71,9 +72,62 @@ def _review_history(P, it):
     return read_json(task / "environment/review/records/pipeline_history.json")["history"]
 
 
+@pytest.mark.parametrize("document", ["instruction.md", "environment/data/FORMAT.md"])
+def test_headerless_candidate_is_protected_in_enforce(flow, document):
+    P, it, _ = flow
+    it.p("pkg/environment/data/candidates.csv").write_text("ochre-sample\nsilver-sample\n")
+    it.p("pkg/environment/data/FORMAT.md").write_text("candidates.csv has no header.\n")
+    it.p("pkg/tests/truth/phase.json").write_text('{"phase": "ochre-sample"}')
+    _repair(P, {document: 'The expected phase for the supplied signals is "ochre-sample".'})
+    original = calib.pkg_sha(it.p("pkg")), calib.pkg_sha(it.p("task"))
+    _expect_step(P, it, "S8")
+    _expect_step(P, it, "S9")
+    record = read_json(it.p("prereview/e0-r1.json"))
+    assert record["revision_error"] == "edit_leak" and not record["revision_applied"]
+    assert (calib.pkg_sha(it.p("pkg")), calib.pkg_sha(it.p("task"))) == original
+
+
+@pytest.mark.parametrize("description", ["is headerless", "has no header"])
+def test_documented_headerless_table_cannot_exempt_grader_literal(tmp_path, description):
+    data = tmp_path / "environment/data"
+    data.mkdir(parents=True)
+    (data / "candidates.csv").write_text("ochre-sample\nsilver-sample\n")
+    (data / "signals.csv").write_text("signal_id,value\nblue,7\n")
+    (data / "FORMAT.md").write_text(
+        f"candidates.csv {description}.\nsignals.csv header: `signal_id,value`\n")
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests/measure.py").write_text("PHASE = 'ochre-sample'\nFIELD = 'signal_id'\n")
+    (tmp_path / "instruction.md").write_text("Choose a phase.")
+    assert prereview.edit_adds_answer(tmp_path, {"instruction.md": "Use ochre-sample."})
+    assert not prereview.edit_adds_answer(tmp_path, {"instruction.md": "Read signal_id."})
+
+
+def test_public_schema_exemptions_respect_row_and_truth(tmp_path):
+    data = tmp_path / "environment/data"
+    data.mkdir(parents=True)
+    truth = tmp_path / "tests/truth"
+    truth.mkdir(parents=True)
+    (truth / "labels.json").write_text('["ochre-sample"]')
+    (tmp_path / "tests/measure.py").write_text("FIELD = 'signal_id'\n")
+    (tmp_path / "instruction.md").write_text("Choose a phase.")
+    table = data / "signals.tsv"
+    generator = tmp_path / "generator"
+    generator.mkdir()
+    notes = generator / "README.md"
+    patch = {"instruction.md": "Read signal_id."}
+    table.write_text("signal_id\tochre-sample\n")
+    assert prereview.edit_adds_answer(tmp_path, patch)
+    notes.write_text("signals.tsv header: `signal_id,ochre-sample`")
+    assert not prereview.edit_adds_answer(tmp_path, patch)
+    assert prereview.edit_adds_answer(tmp_path, {"instruction.md": "Use ochre-sample."})
+    table.write_text("signal_id\t8173.625\n")
+    notes.write_text("signals.tsv header: `signal_id,8173.625`")
+    assert prereview.edit_adds_answer(tmp_path, patch)
+
+
 def test_enforce_regates_then_calibrates_and_keeps_review_blind(flow):
     P, it, _ = flow
-    # A public column is safe to introduce even when its name is also a truth value.
+    # The grader's column reference agrees with the public header.
     edits = {"instruction.md": "Read the profile_id column.", "environment/data/ReadMe.md": "Column: profile_id."}
     client = _repair(P, edits)
     protected = calib.pkg_sha(it.p("pkg"), exclude=set(edits))
@@ -105,18 +159,25 @@ def test_enforce_regates_then_calibrates_and_keeps_review_blind(flow):
 
 
 @pytest.mark.parametrize(("file", "source", "answer", "document"), [
-    ("tests/measure.py", "expected = 8173.625", "8173.625", "instruction.md"),
-    ("tests/test_outputs.py", "label = 'ochre-sample'", "ochre-sample", "instruction.md"),
-    ("tests/truth/phase.csv", "ochre-sample", "ochre-sample", "environment/data/ReadMe.md"),
+    ("tests/measure.py", "expected = 8173.625", "`8173.625`", "instruction.md"),
+    ("tests/test_outputs.py", "label = 'ochre-sample'", "`ochre-sample`", "instruction.md"),
+    ("tests/truth/phase.csv", "ochre-sample", "`ochre-sample`", "environment/data/ReadMe.md"),
+    ("tests/measure.py", "expected = 8173.625", "8,173.625", "instruction.md"),
+    ("tests/truth/mass.json", "8173.625", "8.173625 × 10^3", "environment/data/FORMAT.md"),
+    ("tests/test_outputs.py", "label = 'ochre-sample'", "_ochre-sample_", "instruction.md"),
+    ("tests/truth/phase.csv", "ochre-sample", "_ochre-sample_", "environment/data/FORMAT.md"),
+    ("tests/truth/phase.txt", '"ochre-sample"', "ochre-sample", "environment/data/FORMAT.md"),
 ])
 def test_enforce_discards_answer_added_by_validated_finding(flow, file, source, answer, document):
     P, it, _ = flow
     with it.p("pkg", file).open("a") as f:
         f.write(source + "\n")
+    if document == "environment/data/FORMAT.md":
+        it.p("pkg", document).write_text("Sample format notes.\n")
     finding = dict(FINDING, fix=f"Include {answer}. advisory-sentinel")
     P._clients["prereview"] = FakeClient(P.ledger, P.cfg, [
         {"stage": "S9P", "text": json.dumps({"findings": [finding]})}])
-    client = _repair(P, {document: f"Use `{answer}`."})
+    client = _repair(P, {document: f"Use {answer}."})
     original = calib.pkg_sha(it.p("pkg")), calib.pkg_sha(it.p("task"))
     _expect_step(P, it, "S8")
     _expect_step(P, it, "S9")
@@ -126,6 +187,19 @@ def test_enforce_discards_answer_added_by_validated_finding(flow, file, source, 
     assert (calib.pkg_sha(it.p("pkg")), calib.pkg_sha(it.p("task"))) == original
     _expect_step(P, it, "S9")
     assert [r["who"] for r in read_json(it.p("calib/runs.json"))] == ["glm"]
+
+
+def test_edit_compares_labels_across_markup(tmp_path):
+    truth = tmp_path / "tests/truth"
+    truth.mkdir(parents=True)
+    (truth / "phase.txt").write_text(r'"ochre\u002dsample"' + "\n'green phase'\n")
+    statement = tmp_path / "instruction.md"
+    statement.write_text("Compare ochre-samples.")
+    for body in ("_ochre-sample_", "*ochre-sample*", "**ochre-sample**", "`ochre-sample`",
+                 "~~ochre-sample~~", "[‘ochre-sample’]", "green phase"):
+        assert prereview.edit_adds_answer(tmp_path, {"instruction.md": f"Use {body}."}), body
+    statement.write_text("Use _ochre-sample_.")
+    assert not prereview.edit_adds_answer(tmp_path, {"instruction.md": 'Use "ochre-sample".'})
 
 
 def test_edit_compares_answer_tokens_per_document(tmp_path):
@@ -148,17 +222,65 @@ def test_edit_compares_answer_tokens_per_document(tmp_path):
     })
 
 
-def test_enforce_compares_rendered_statement_before_install(flow, monkeypatch):
+@pytest.mark.parametrize("rendered_answer", ["1758.125", r"1.758125\times10^{3}"])
+def test_enforce_compares_rendered_statement_before_install(flow, monkeypatch, rendered_answer):
     P, it, _ = flow
     _repair(P, {"instruction.md": "Read the profile_id column."})
     original = calib.pkg_sha(it.p("pkg")), calib.pkg_sha(it.p("task"))
     for stage in ["S8", "S7", "PKG"]:
         _expect_step(P, it, stage)
     render = package.instruction_text
-    monkeypatch.setattr(package, "instruction_text", lambda *args: render(*args) + "Use 1758.125.\n")
+    monkeypatch.setattr(package, "instruction_text", lambda *args: render(*args) + f"Use {rendered_answer}.\n")
     _expect_step(P, it, "S9")
     assert read_json(it.p("prereview/e0-r1.json"))["revision_error"] == "edit_leak"
     assert (calib.pkg_sha(it.p("pkg")), calib.pkg_sha(it.p("task"))) == original
+
+
+@pytest.mark.parametrize("spelling", [
+    "8,173.625", "8\u2009173.625", "8\u202f173.625", r"8\,173.625",
+    "8.173625 × 10^3", "8.173625x 10^3", "8.173625·10³", "8.173625 × 10^{3}",
+    "8.173625e3", "8.173625E+03", r"\(8.173625\times10^{3}\)",
+])
+def test_numeric_edit_compares_normalized_values_in_each_document(tmp_path, spelling):
+    truth = tmp_path / "tests/truth"
+    truth.mkdir(parents=True)
+    (truth / "mass.json").write_text('{"mass": 8173.625}')
+    doc = tmp_path / "instruction.md"
+    doc.write_text("Estimate the mass.")
+    assert prereview.edit_adds_answer(tmp_path, {doc.name: f"Use {spelling}."})
+    doc.write_text(f"The measured mass is {spelling}.")
+    assert not prereview.edit_adds_answer(tmp_path, {doc.name: "Use 8173.625."})
+
+
+def test_numeric_edit_uses_answer_sign_and_precision(tmp_path):
+    truth = tmp_path / "tests/truth"
+    truth.mkdir(parents=True)
+    mass = truth / "mass.json"
+    mass.write_text("-0.00817")
+    doc = tmp_path / "instruction.md"
+    doc.write_text("Estimate the mass.")
+    for spelling in ("−8.17 × 10^{−3}", "−8.17·10⁻³", "−8.17E−03", "-0.008171"):
+        assert prereview.edit_adds_answer(tmp_path, {doc.name: f"Use {spelling}."})
+    assert not prereview.edit_adds_answer(tmp_path, {doc.name: "Use 0.00817."})
+    mass.write_text("-0.00817000")
+    assert not prereview.edit_adds_answer(tmp_path, {doc.name: "Use -0.008171."})
+
+
+@pytest.mark.parametrize(("answer", "original", "revised"), [
+    ("8173.625", "Vector [8,173.625].", "Use 8173.625."),
+    ("8173.625", "Estimate the mass.", "Use [8,173.625]."),
+    ("173.625", "Estimate the mass.", "Use [8,173.625]."),
+    ("8173.625", "Read id_8173.625.", "Use 8173.625."),
+    ("8173.625", "Read id_8173.625.", "Use __8173.625__."),
+])
+def test_numeric_edit_keeps_ambiguous_readings_separate(tmp_path, answer, original, revised):
+    truth = tmp_path / "tests/truth"
+    truth.mkdir(parents=True)
+    (truth / "mass.json").write_text(answer)
+    doc = tmp_path / "instruction.md"
+    doc.write_text(original)
+    assert not prereview.edit_adds_answer(tmp_path, {doc.name: original + " Report the mass."})
+    assert prereview.edit_adds_answer(tmp_path, {doc.name: revised})
 
 
 def test_legacy_partial_install_cannot_supply_its_own_baseline(flow):
