@@ -14,7 +14,7 @@ import time
 import traceback
 from pathlib import Path
 
-from . import blocklist, intake, screen_jev, stages_a as A, stages_b as B, taskimage
+from . import blocklist, intake, prereview_flow, screen_jev, stages_a as A, stages_b as B, taskimage
 from .budget import EXCLUDE_UNSTARTED_JOBS, BudgetStop, Ledger, harden_scope, today, variant_scope
 from .calib import migrate_manual_commands, pending_launcher
 from .config import resolve_role
@@ -250,17 +250,30 @@ class Pipeline:
         st = it.state["stage"]
         role = MODEL_STAGES.get(st)
         alias = resolve_role(self.cfg, role) if role else None
+        advisory = bool(it.state.get("prereview_pending")) and st in {"S7", "S8", "PKG"}
+        stopped = False
         if role:
             name = getattr(self._clients.get(role) or self._clients.get(alias), "name", alias)
-            if name in self.stopped_models or alias in self.stopped_models:
+            stopped = name in self.stopped_models or alias in self.stopped_models
+            if stopped and not advisory:
                 return "skipped"
         self.store.event("stage_start", item=it.item_id, stage=st)
         t0 = time.time()
         try:
-            if B.harden_needs_step(it):
+            if advisory and prereview_flow.resume_edit(it):
+                return "ok"
+            if stopped:
+                prereview_flow.reject(it, "S8 repair model unavailable")
+            elif B.harden_needs_step(it):
                 B.harden_step(self, it)         # finish an interrupted hardening start / revert first
             elif not self._restore_task_image(it, st):
-                HANDLERS[st](self, it)
+                if advisory:
+                    try:
+                        HANDLERS[st](self, it)
+                    except Exception as exc:
+                        prereview_flow.reject(it, f"{st}: {type(exc).__name__}")
+                else:
+                    HANDLERS[st](self, it)
                 if B.harden_needs_step(it):
                     B.harden_step(self, it)     # a hardened version that failed to build: back to the old one
         except taskimage.ImageUnavailable as e:

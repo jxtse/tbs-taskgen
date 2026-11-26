@@ -67,6 +67,24 @@ Crossref · arXiv · Europe PMC              → S5 spec (teacher) → S6 genera
    reference and the baselines must not use the paper's own published implementation, and public
    task files must not copy long passages of a TDM full text. Blocking failures go to a local repair
    loop (S8, at most two rounds).
+   At PKG, `package.autofix_verifier_timeout` (default `true`) repairs an otherwise valid package when
+   the sum of its static `run_solution` timeouts reaches the verifier budget. It raises the timeout in the source
+   and package, reserving at least 300 seconds for overhead. Dynamic timeouts or a required timeout above
+   `package.max_verifier_timeout_s` (default 7200) park the item. A repaired reviewed package needs fresh S9R
+   approval. A verifier timeout recorded in the current calibration epoch also triggers recalibration.
+
+   Before calibration, `prereview.mode` defaults to `"off"`. In `"shadow"`, one S9P call records evidenced
+   statement inconsistencies and missing conditions. In `"enforce"`, S8 can edit the statement and public
+   README format notes once, followed by S7 and PKG. Call or packet errors and rejected edits continue with the
+   original package. S9 and independent S9R still run normally. Set `models.prereview.model`,
+   `models.prereview.url` (Messages endpoint), optional `key_env`, and the model's entry in `models.prices`.
+   `prereview.allowed_contexts` defaults to `["base", "review_revision"]`.
+   Use `tbsgen report --run RUN --prereview` for per-mode S9P and repair spend and later a/b blocker counts.
+   To replay archived packages, run
+   `python gen/scripts/prereview_backtest.py --run RUN --out RESULTS --round 1`. Add
+   `--items sample-a sample-b --repeat 3` to compare repeated decisions. The output directory holds the
+   replay ledger, per-item records, a comparison CSV for adjudication and a summary of blocking-decision flips.
+
 5. **Difficulty calibration** (S9). A student agent runs the packaged task in Harbor; if it fails, a
    teacher agent tries. Two kinds of task are released:
    - **Student-boundary tasks** (channel `main`): *unstable* (the student passes one of two runs) or *hard*

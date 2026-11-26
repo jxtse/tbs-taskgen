@@ -5,11 +5,12 @@ import contextlib
 import hashlib
 import json
 import time
+import tomllib
 from pathlib import Path
 
 import shutil
 
-from . import calib, difficulty, gates, package, repair, review
+from . import calib, difficulty, gates, package, prereview_flow, repair, review
 from .models import parse_files
 from .prompts import METRICS_API, S6C_TESTS, S8_EXPLOIT, S8_REPAIR, S8_REVIEW, SYSTEM
 from .stages_a import _write_files, chat_files, save_raw
@@ -47,6 +48,8 @@ def s7(P, it):
         from . import codeagent
         why = codeagent.env_ok(P.cfg)
         if why:
+            if it.state.get("prereview_pending"):
+                return prereview_flow.reject(it, "S7: " + why)
             return it.finish("paused", f"code:config:{why}", paused_stage="S7")
     spec = read_json(it.p("_spec", "spec.json"))
     th = read_json(it.p("thresholds.json"))["thresholds"]
@@ -71,6 +74,8 @@ def s7(P, it):
             chk = dict(chk, ok=chk["ok"] and not hp, problems=list(chk["problems"]) + hp, hardening=hp)
             write_json(it.p("gates", "difficulty.json"), dict(chk, mode=mode, ts=time.time()))
             if not chk["ok"] and (mode == "block" or hp):
+                if it.state.get("prereview_pending"):
+                    return prereview_flow.reject(it, "S7: difficulty_design")
                 P.store.event("difficulty_design_failed", item=it.item_id, problems=chk["problems"][:5],
                               harden_round=it.state.get("harden_round", 0))
                 write_json(it.p("S6_failure.json"), dict(why="difficulty_design", info=chk))
@@ -91,6 +96,8 @@ def s7(P, it):
     if rep["ok"]:
         it.state["gates_attempt"] = n
         return it.advance("S7", "PKG", attempt=n)
+    if it.state.get("prereview_pending"):
+        return prereview_flow.reject(it, "S7: " + ", ".join(rep["blocking"] + rep["nonblocking"]))
     if rep["blocking"]:
         it.state["repair_from"] = "gates:" + ",".join(rep["blocking"])
         it.save()
@@ -112,6 +119,8 @@ def s7(P, it):
 
 
 def s8(P, it):
+    if it.state.get("prereview_pending"):
+        return prereview_flow.revise(P, it, _request_revision_patch)
     if str(it.state.get("repair_from", "")).startswith("review:") or it.state.get("review_revision_pending"):
         return _s8_review(P, it)
     reason = str(it.state.get("repair_from", ""))
@@ -377,7 +386,10 @@ def _regate(P, it, reason, recalibrate, report_id=None):
         st["revision_data_hash"] = review.pkg_data_hash(it.p("pkg")) if packaged else None
     st["thresholds_locked"] = True
     st["post_regate"] = True
-    if packaged and (recalibrate or not (P.cfg.get("review") or {}).get("rescore_scoring_only", True)):
+    rescore = (P.cfg.get("review") or {}).get("rescore_scoring_only", True)
+    defer_archive = (packaged and not recalibrate and not rescore
+                     and _regate_timeout_candidate(P.cfg, it.p("pkg")))
+    if packaged and (recalibrate or not rescore) and not defer_archive:
         # re-scoring switched off: the kept calibration cannot be checked against the new grader -> redo it
         if st.get("probe_migration_job_stage"):
             st["rescore_pending"] = dict(recalibrate=True)
@@ -387,7 +399,11 @@ def _regate(P, it, reason, recalibrate, report_id=None):
     elif packaged and not st.get("rescore_pending"):
         # the shared verifier template changed: the kept calibration stands until S9 re-scores the saved
         # deliverables with the new grader (review.rescore_item), as the reference re-measurement does
-        st["rescore_pending"] = dict(reason="regate", files=["tests/_metrics.py", "tests/test.sh"], ts=time.time())
+        st["rescore_pending"] = dict(reason="regate", files=["tests/_metrics.py", "tests/test.sh"],
+                                    inputs_sha=_timeout_independent_sha(it.p("pkg")), ts=time.time())
+        if defer_archive:
+            # PKG clears this only if the repaired task is otherwise the calibrated version.
+            st["rescore_pending"]["recalibrate"] = True
     st.setdefault("history", []).append(dict(stage=st.get("stage"), result="regate", to="S6A_run", reason=reason,
                                              ts=time.time()))
     st.update(stage="S6A_run", status="waiting" if st.get("probe_migration_job_stage") else "active")
@@ -488,6 +504,78 @@ def _slim(g):
     return out
 
 
+def _regate_timeout_candidate(cfg, pkg):
+    if not cfg["package"].get("autofix_verifier_timeout", True):
+        return False
+    try:
+        timeout = tomllib.loads((pkg / "task.toml").read_text())["verifier"]["timeout_sec"]
+        overhead = cfg["package"].get("verifier_overhead_sec", 120)
+        check = package.verifier_timeout_check(pkg / "tests", float(timeout), overhead)
+    except (OSError, TypeError, KeyError, ValueError):
+        return False
+    return bool(check["errors"] or check["unknown"])
+
+
+def _timeout_independent_sha(pkg):
+    """Identify the calibrated task across rebuilds that only refresh provenance and the verifier timeout."""
+    try:
+        meta = tomllib.loads((pkg / "task.toml").read_text())
+    except (OSError, ValueError):
+        return None
+    verifier = meta.get("verifier")
+    if isinstance(verifier, dict):
+        verifier.pop("timeout_sec", None)
+    files = calib.pkg_sha(pkg, exclude={"provenance.json", "task.toml"})
+    return hashlib.sha256((files + json.dumps(meta, sort_keys=True, default=str)).encode()).hexdigest()
+
+
+def _repair_pkg_timeout(P, it, out, validation):
+    """Persist the decision before its source override, so a PKG retry can finish the same repair."""
+    check = validation.get("run_solution_timeouts") or {}
+    failures = set(check.get("errors", [])) | set(check.get("unknown", []))
+    timeout_only = bool(failures and not validation.get("missing") and failures == set(validation["errors"]))
+    pending = it.state.get("verifier_timeout_pending")
+    if validation["ok"] and pending and check.get("current") == pending["new"]:
+        return dict(validation, verifier_timeout_fix=pending), False
+    if not timeout_only:
+        return validation, False
+    cfg = P.cfg["package"]
+    required = check.get("required")
+    if (not cfg.get("autofix_verifier_timeout", True) or check["unknown"] or required is None
+            or max(check["current"], required) > cfg.get("max_verifier_timeout_s", 7200)):
+        return validation, True
+    new = max(check["current"], required)
+    package.set_verifier_timeout(out / "task.toml", new)
+    checked = package.validate_pkg(out, P.cfg)
+    if not checked["ok"]:
+        package.set_verifier_timeout(out / "task.toml", check["current"])
+        return validation, True
+    fix = dict(old=check["current"], new=new)
+    if _verifier_timed_out(it):
+        fix["archive_epoch"] = int(it.state.get("calib_epoch", 0))
+    it.state["verifier_timeout_pending"] = fix
+    it.save()
+    try:
+        package.set_verifier_timeout(it.p("task", "task.toml"), new)
+    except (ValueError, OSError) as exc:
+        package.set_verifier_timeout(out / "task.toml", check["current"])
+        it.state.pop("verifier_timeout_pending", None)
+        return dict(validation, verifier_timeout_fix_error=str(exc)), True
+    return dict(checked, verifier_timeout_fix=fix), False
+
+
+def _verifier_timed_out(it):
+    epoch = int(it.state.get("calib_epoch", 0))
+    for run in read_json(it.p("calib", "runs.json"), []):
+        if run.get("epoch", epoch) != epoch or not run.get("outcome"):
+            continue
+        trial = run.get("trial") or {}
+        if (trial.get("exception") in ("VerifierTimeoutError", "VerifierTimeout")
+                or run.get("result_type") == "verifier_timeout"):
+            return True
+    return False
+
+
 def pkg(P, it):
     spec = read_json(it.p("_spec", "spec.json"))
     attempt = passed_gate_attempt(it.state)
@@ -512,13 +600,26 @@ def pkg(P, it):
         except OSError:
             pass
     old_sha = it.state.get("pkg_statement_sha")
+    pending = it.state.get("rescore_pending") or {}
+    if pending.get("reason") == "regate" and "inputs_sha" not in pending:
+        # A regate started by an older version may already have overwritten pkg/. Bind only to
+        # the package recorded when it was withdrawn, or its byte-identical review snapshot.
+        regates = it.state.get("regates") or []
+        original_sha = regates[-1].get("pkg_sha") if regates else None
+        rnd = it.state.get("review_round")
+        for prior in (it.p("pkg"), it.p("review", f"r{rnd}", "task/environment/review/pkg")):
+            if original_sha and prior.is_dir() and calib.pkg_sha(prior) == original_sha:
+                pending["inputs_sha"] = _timeout_independent_sha(prior)
+                it.save()
+                break
     if "legacy_release_sha" not in it.state:
         previous = _live_release(P, it.item_id)
         if previous and "pkg_sha" not in previous and previous.get("pkg"):
             previous_pkg = Path(previous["pkg"])
             it.state["legacy_release_sha"] = calib.pkg_sha(previous_pkg) if previous_pkg.is_dir() else None
             it.save()  # Keep the original hash even if PKG is interrupted and retried.
-    out = package.package(P.cfg, it.dir, gen0, spec, prov)
+    extra = {"out": prereview_flow.candidate_dir(it)} if it.state.get("prereview_pending") else {}
+    out = package.package(P.cfg, it.dir, gen0, spec, prov, **extra)
     v = package.validate_pkg(out, P.cfg)
     new_sha = hashlib.sha256((out / "instruction.md").read_bytes()).hexdigest()
     if it.state.get("rescore_pending") and old_sha and new_sha != old_sha:
@@ -547,18 +648,38 @@ def pkg(P, it):
                                         read_json(it.p("_spec", difficulty.DESIGN_FILE), None))
         if tl:
             v = dict(v, ok=False, errors=list(v.get("errors") or []) + [f"targeting_leak: {tl[:3]}"])
+    if it.state.get("prereview_pending"):
+        return prereview_flow.finish_package(it, out, v)
+    if it.state.get("thresholds_locked") and (v["ok"] or v.get("run_solution_timeouts", {}).get("errors")):
+        why = _revision_pkg_problem(it, gate)
+        if why:
+            v = dict(v, ok=False, errors=[*v.get("errors", []), why])
+    v, timeout_only = _repair_pkg_timeout(P, it, out, v)
     write_json(it.p("PKG_check.json"), v)
     if not v["ok"]:
         raw = v.get("errors")
         errs = [str(x) for x in (raw if isinstance(raw, (list, tuple)) else []) if x]
-        if it.state.get("thresholds_locked"):
+        if it.state.get("thresholds_locked") and not timeout_only:
             # the package the review revision produced is broken: retry the revision (feedback) / drop
             return _revision_retry(P, it, "package_invalid: " + "; ".join(errs)[:200])
         return it.finish("parked", "package_invalid")
-    if it.state.get("thresholds_locked"):
-        why = _revision_pkg_problem(it, gate)
-        if why:
-            return _revision_retry(P, it, why)
+    repaired = v.get("verifier_timeout_fix")
+    it.state.pop("verifier_timeout_pending", None)
+    if repaired:
+        it.state["require_prepared_receipt"] = True
+        P.store.event("verifier_timeout_fixed", item=it.item_id, **repaired)
+    reviewed = any(it.state.get(k) for k in ("thresholds_locked", "post_revision", "post_regate", "review_round"))
+    if repaired and reviewed:
+        it.state["timeout_fix_requires_review"] = True
+    if repaired and repaired.get("archive_epoch") == int(it.state.get("calib_epoch", 0)):
+        epoch = _archive_calibration(it)
+        it.state.pop("rescore_pending", None)
+        P.store.event("calib_archived", item=it.item_id, epoch=epoch, reason="verifier timeout")
+    pending = it.state.get("rescore_pending") or {}
+    if (repaired and pending.get("reason") == "regate" and pending.get("inputs_sha")
+            and pending["inputs_sha"] == _timeout_independent_sha(out)):
+        # The calibrated inputs survived this regate. The harness timeout alone needs a fresh review.
+        it.state.pop("rescore_pending", None)
     it.state.pop("thresholds_locked", None)     # a review revision's lock ends with the new package
     it.state.pop("post_revision", None)
     it.state.pop("post_regate", None)
@@ -570,6 +691,9 @@ def pkg(P, it):
             it.state.pop(key, None)
         difficulty.write_round(it, k, packaged=time.time(), pkg_sha=calib.pkg_sha(it.p("pkg")))
         P.store.event("harden_packaged", item=it.item_id, round=k, rkind=kind)
+    if repaired and reviewed and it.state.get("calib_label") and not it.state.get("rescore_pending"):
+        it.state["review_round"] = review.next_round(it.dir, it.state)
+        return it.advance("PKG", "S9R", reason="verifier timeout fixed")
     it.advance("PKG", "S9")
 
 
@@ -753,6 +877,8 @@ def _s9(P, it):
         if _rescore_pending(P, it) is not None:
             return None                     # waiting (sandbox trouble) or sent back to S9 to recalibrate
     runs = _job_runs(P.cfg, it, "S9")
+    if not runs and prereview_flow.start(P, it):
+        return
     for rec in runs:                                         # reconcile interrupted submissions
         if rec.get("outcome") is None and calib.remote_job(rec, P.ledger):
             if _reconcile_remote(P, it, rec, _save_run) == "remote_unknown":
@@ -785,7 +911,7 @@ def _s9(P, it):
                     return it.finish("waiting", f"calib blocked: prepare_command failed "
                                                 f"({(prep.get('error') or '')[:120]}); fix and run "
                                                 "`tbsgen calib prepare --item ID`")
-            if needs_launch and it.state.get("image_tag") and calib.prepared_dir(P.cfg, rec["who"]):
+            if needs_launch and (it.state.get("image_tag") or it.state.get("require_prepared_receipt")):
                 stale = calib.stale_prepared(P.cfg, it.dir, rec["who"], int(it.state.get("calib_epoch", 0)))
                 if stale:
                     return it.finish("waiting", f"calib blocked: {stale}")
@@ -825,6 +951,9 @@ def _s9(P, it):
             # S9b: the student passed both decisive runs -> re-author a harder variant of this task and re-calibrate
             # it instead of discarding the version (difficulty.start_hardening, kind="variant"; own depth + budget)
             return start_hardening(P, it, kind=difficulty.KIND_VARIANT)
+        if it.state.get("timeout_fix_requires_review"):
+            it.state["review_round"] = review.next_round(it.dir, it.state)
+            return it.goto("S9R", f"label:{what}; verifier timeout fixed")
         if not P.cfg.get("review", {}).get("enabled"):
             scopes = _probe_scopes(it)
             if scopes or what == "frontier":
@@ -944,6 +1073,10 @@ def manual_launch(P, it, job, attempt):
         if review_job and (not P.cfg["review"]["enabled"] or rec["n"] != (it.state.get("review_round") or 1)
                            or rec["pkg_sha"] != calib.pkg_sha(it.p("pkg"))):
             raise ValueError("review is no longer current")
+        if not review_job and it.state.get("require_prepared_receipt"):
+            stale = calib.stale_prepared(P.cfg, it.dir, rec["who"], int(it.state.get("calib_epoch", 0)))
+            if stale:
+                raise ValueError(stale)
         if legacy_report_id(it) or (review_job and (review.job_contract(rec) != review.CURRENT_CONTRACT
                 or set(_probe_scopes(it)) - set(rec.get("suspected_scopes", [])))):
             raise ValueError("attempt requires an updated gate or review")
@@ -1209,7 +1342,8 @@ def review_gate(P, it, scopes=None, current=None) -> str | None:
     current package, calibration epoch and review round need a recorded pass.  Frontier tasks also need a confirmed reference."""
     scopes = _probe_scopes(it) if scopes is None else scopes
     frontier = it.state.get("calib_label") == "frontier"
-    if not frontier and not scopes and not review.reviewable(P.cfg, it.state.get("calib_label")):
+    if not (frontier or scopes or it.state.get("timeout_fix_requires_review")
+            or review.reviewable(P.cfg, it.state.get("calib_label"))):
         return None
     v, why = current or _current_review(it, calib.pkg_sha(it.p("pkg")))
     if why:
@@ -1311,6 +1445,7 @@ def _release_reviewed(P, it, previous, scopes):
     rel.mkdir(exist_ok=True)
     _append_manifest(rel / "manifest.jsonl", dict(record, ts=time.time()))
     it.state.pop("legacy_release_sha", None)
+    it.state.pop("timeout_fix_requires_review", None)
     it.advance("S10", None, status="done")
 
 
@@ -1595,6 +1730,8 @@ def _s9r(P, it):
     if done:
         return _route_review(P, it, done[-1], rnd)
     if review_disabled:
+        if it.state.get("timeout_fix_requires_review"):
+            return finish_job_stage(P, it, "parked", "verifier timeout fixed: fresh review required")
         if scopes:
             return _park_unreviewed(P, it, scopes)
         label = it.state.get("calib_label") or ""
@@ -1924,6 +2061,18 @@ def _s8_review(P, it):
         return _s8_review_locked_(P, it)
 
 
+def _request_revision_patch(P, it, user, *, record_cost=None):
+    options = {"retry_thinking": False} if record_cost else {}
+    r = P.client("repair").chat(SYSTEM, user, stage="S8", item=it.item_id,
+                                max_tokens=P.cfg["gen"].get("s6a_max_tokens"), **options)
+    if record_cost:
+        record_cost(r.usd)
+    save_raw(it, "S8", r)
+    if it.state.get("prereview_pending") and r.stop_reason in ("max_tokens", "refusal"):
+        return {}
+    return parse_files(r.text, truncated=r.stop_reason == "max_tokens")
+
+
 def _s8_review_locked_(P, it):
     rv = P.cfg.get("review") or {}
     if it.state.get("review_revision_pending"):
@@ -1956,10 +2105,7 @@ def _s8_review_locked_(P, it):
                                                                      + ", baselines/exploit_*.py, "
                                                                      + review.GATING_PATH,
                             gating=json.dumps(bool(spec.get("resource_metric_gating"))))
-    r = P.client("repair").chat(SYSTEM, user, stage="S8", item=it.item_id,
-                                max_tokens=P.cfg["gen"].get("s6a_max_tokens"))
-    save_raw(it, "S8", r)
-    patch = parse_files(r.text, truncated=r.stop_reason == "max_tokens")
+    patch = _request_revision_patch(P, it, user)
     chk = review.revision_review(task, patch, spec["depgraph"], th)
     d = it.p("repair", f"review-{n + 1}")
     d.mkdir(parents=True, exist_ok=True)

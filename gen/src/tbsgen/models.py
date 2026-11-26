@@ -102,9 +102,11 @@ class _Base:
         self.ledger, self.cfg = ledger, cfg
 
     def chat(self, system: str, user: str, *, stage: str, item: str = "", max_tokens: int | None = None,
-             effort: str | None = None) -> ModelResult:
+             effort: str | None = None, retry_thinking: bool = True) -> ModelResult:
         """effort: per-call override of the teacher's reasoning effort (None: models.<alias>.effort_by_stage
         for this stage, else models.<alias>.effort)."""
+        if stage == "S9P" and self.real and self.name not in self.cfg["models"].get("prices", {}):
+            raise ModelError("config", f"missing models.prices entry for {self.name}")
         cid = self.ledger.reserve(self.name, stage, item, self.real, _sha(system, user), send=self.real)
         t0 = time.time()
         kw = {"effort": effort} if effort else {}
@@ -114,7 +116,7 @@ class _Base:
             # a call that reached the model is billed even when it failed (empty answer after thinking)
             e.usd = self.ledger.finish(cid, e.usage or None, error_class=e.cls, error=_redact(str(e)),
                                        latency=time.time() - t0)
-            low = self._fallback_effort(stage, effort) if e.thinking_exhausted else None
+            low = self._fallback_effort(stage, effort) if retry_thinking and e.thinking_exhausted and stage != "S9P" else None
             if low is None:
                 raise
             # adaptive thinking used the whole max_tokens budget without writing any answer: one retry at a lower
@@ -127,10 +129,11 @@ class _Base:
                                latency=time.time() - t0)
             raise ModelError("other", f"{type(e).__name__}: {e}") from e
         if resp_model and self.real and not (resp_model.startswith(self.name) or resp_model == "dev-" + self.name):
-            self.ledger.finish(cid, usage, "model_mismatch", f"asked {self.name} got {resp_model}", time.time() - t0,
-                               resp_model)
+            err = ModelError("model_mismatch", resp_model)
+            err.usd = self.ledger.finish(cid, usage, err.cls, f"asked {self.name} got {resp_model}", time.time() - t0,
+                                         resp_model)
             self.ledger.open_breaker(self.name, f"responding model {resp_model}")
-            raise ModelError("model_mismatch", resp_model)
+            raise err
         usd = self.ledger.finish(cid, usage, latency=time.time() - t0, resp_model=resp_model)
         return ModelResult(text, resp_model or self.name, usage, usd, stop, round(time.time() - t0, 2), cid)
 
@@ -212,7 +215,8 @@ class TeacherClient(_Base):
         self.m = cfg["models"][alias]
         self.name = self.m["model"]
         if not self.m.get("url"):
-            raise ModelError("config", f"models.{alias}.url is not set (set models.{alias}.url or TBS_TEACHER_URL)")
+            hint = " or TBS_TEACHER_URL" if alias == "teacher" else ""
+            raise ModelError("config", f"models.{alias}.url is not set (set models.{alias}.url{hint})")
 
     def _teacher_cfg(self) -> dict:
         return self.m
@@ -223,8 +227,11 @@ class TeacherClient(_Base):
         stream = mt > 8000
         body = {"model": m["model"], "max_tokens": mt,
                 "system": [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
-                "messages": [{"role": "user", "content": user}], "stream": stream,
-                "output_config": {"effort": self.effort_for(stage, effort)}, "thinking": {"type": "adaptive"}}
+                "messages": [{"role": "user", "content": user}], "stream": stream}
+        if stage == "S9P":
+            body["system"] = system  # plain Messages API, including endpoints without adaptive thinking/cache control
+        else:
+            body.update(output_config={"effort": self.effort_for(stage, effort)}, thinking={"type": "adaptive"})
         hdr = {"content-type": "application/json", "anthropic-version": "2023-06-01"}
         if m.get("key_env"):
             k = os.environ.get(m["key_env"])

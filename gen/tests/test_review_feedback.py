@@ -1377,13 +1377,12 @@ def test_audit_and_pkg_use_same_timeout_budget(tmp_path, custom_overhead):
         assert any("700s >= verifier budget 660s" in err for err in report["errors"])
     else:
         report = package.validate_pkg(pkg)
-        assert report["warnings"] == ["test_outputs.py: line 1: run_solution timeout unknown"]
-        assert not report["errors"]
+        assert report["errors"] == ["test_outputs.py: line 1: run_solution timeout unknown"]
     script = Path(__file__).resolve().parents[1] / "scripts/audit_share.py"
     result = subprocess.run([sys.executable, script, pkg.parent], check=True, capture_output=True, text=True)
     headers, row, summary = result.stdout.splitlines()
-    assert dict(zip(headers.split("\t"), row.split("\t")))["run_solution_timeout"] == ("FAIL" if custom_overhead else "WARN")
-    assert json.loads(summary)["flagged"]["run_solution_timeout"] == int(custom_overhead)
+    assert dict(zip(headers.split("\t"), row.split("\t")))["run_solution_timeout"] == "FAIL"
+    assert json.loads(summary)["flagged"]["run_solution_timeout"] == 1
 
 
 @pytest.mark.parametrize("attempt", [3, 4, 5])

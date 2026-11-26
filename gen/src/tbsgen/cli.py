@@ -8,7 +8,7 @@
                                                                  re-activate paused items (default reasons budget:/model:);
                                                                  --only / --stage / --reason narrow which ones
   tbsgen status  --run DIR
-  tbsgen report  --run DIR [--day YYYY-MM-DD | --throughput [--days N]]
+  tbsgen report  --run DIR [--day YYYY-MM-DD | --throughput [--days N] | --prereview]
   tbsgen ledger  --run DIR                                       spend summary (all days)
   tbsgen breaker --run DIR --model M --reset
   tbsgen calib-ingest --run DIR --item ID --job-dir JOBDIR      attach Harbor results to the pending S9 run (or the
@@ -142,6 +142,7 @@ def main(argv=None):
         if name == "report":
             s.add_argument("--day", default=None)
             s.add_argument("--throughput", action="store_true")
+            s.add_argument("--prereview", action="store_true", help="aggregate pre-review records by mode")
             s.add_argument("--days", type=int)
         if name == "breaker":
             s.add_argument("--model", required=True)
@@ -202,6 +203,12 @@ def main(argv=None):
         ap.error("--max-wait requires a finite non-negative interval")
     if a.cmd == "ping":
         return _ping(a)
+    if a.cmd == "report" and a.prereview:
+        if a.day or a.throughput:
+            ap.error("--prereview cannot be combined with --day or --throughput")
+        from .report import prereview_summary
+        print(json.dumps(prereview_summary(Path(a.run)), indent=2))
+        return 0
     if a.cmd == "diversity":
         from . import diversity
         result = diversity.report(Path(a.run), a.runs_root)

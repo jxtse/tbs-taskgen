@@ -63,6 +63,7 @@ DEFAULTS: dict[str, Any] = {
             "gen": "teacher",               # S6A
             "tests": "teacher",             # S6C
             "repair": "teacher",            # S8
+            "prereview": "prereview",       # S9P, only when prereview.mode is enabled
             "review": "rules",              # S8 preservation review (mechanical diff; cheap model 待定)
             "code_owner": "rules",          # S3b ambiguous code links: "rules" (keep as own) | "jev" (cheap; never
                                             # the teacher model)
@@ -77,8 +78,11 @@ DEFAULTS: dict[str, Any] = {
                  # empty answer with stop_reason=max_tokens (adaptive thinking used the whole output budget, seen on
                  # S6A at 64k with effort medium): one retry at this effort if it is lower than the call's; None -> no retry
                  "effort_on_thinking_exhausted": "low"},
+        "prereview": {"model": "deepseek-chat", "url": None, "key_env": None,
+                      "max_tokens": 6000, "timeout": 90},
         # USD per million tokens.  PLACEHOLDERS: set real prices for your model.
         "prices": {"claude-opus-5-5": {"in": 5.0, "out": 25.0, "cache_read": 0.5},
+                   "deepseek-chat": {"in": 0.3, "out": 0.5, "cache_read": 0.03},
                    # TypeSafe list price: input tokens only, $0.042 per million (output not billed)
                    "jev-1.14.0": {"in": 0.042, "out": 0.0, "cache_read": 0.0},
                    "jev-latest": {"in": 0.042, "out": 0.0, "cache_read": 0.0},
@@ -542,6 +546,7 @@ DEFAULTS: dict[str, Any] = {
         "harden_authoring_max_usd": None,   # extra S5G spend per round (None = code.authoring_max_usd)
         "harden_exclude": [],               # item ids never hardened
     },
+    "prereview": {"mode": "off", "allowed_contexts": ["base", "review_revision"]},
     "review": {
         # A Claude Code agent (fresh context, inside the task's own image, model endpoint only) audits every task
         # S9 would keep (calib.keep_labels) and, as a diagnosis, the labels in review_parked.  Verdicts pass /
@@ -580,6 +585,8 @@ DEFAULTS: dict[str, Any] = {
         "dockerfile_mode": "selfcontained",  # "selfcontained" (pip in Dockerfile, portable) | "local_base"
         "agent_hours": 2,
         "verifier_timeout": 900,
+        "autofix_verifier_timeout": True,
+        "max_verifier_timeout_s": 7200,
         # verifier seconds kept for everything but the agent program's scored runs (image start, pytest, speed
         # benchmark, metric computation).  The scored runs of one verifier session get at most
         # min(verifier_timeout, gen.test_timeout) - verifier_overhead_sec in total (_metrics.SCORED_BUDGET_SEC),

@@ -160,11 +160,13 @@ def task_path(cfg: dict, item_dir: Path, who: str = "glm") -> Path:
     return item_dir / "pkg"
 
 
-def pkg_sha(pkg: Path) -> str:
+def pkg_sha(pkg: Path, *, exclude=()) -> str:
     """Content hash of a packaged task (paths + bytes): a prepared copy made from another pkg/ is stale."""
     import hashlib
     h = hashlib.sha256()
     for f in sorted(p for p in Path(pkg).rglob("*") if p.is_file()):
+        if f.relative_to(pkg).as_posix() in exclude:
+            continue
         h.update(str(f.relative_to(pkg)).encode() + b"\0")
         with f.open("rb") as source:
             hashlib.file_digest(source, lambda: h)
@@ -384,7 +386,9 @@ def stale_prepared(cfg: dict, item_dir: Path, who: str, epoch: int) -> str | Non
         return None
     image = taskimage.package_identity(item_dir)
     if not epoch and not image:
-        return None
+        if (task_path(cfg, item_dir, who) == item_dir / "pkg"
+                or not read_json(item_dir / "state.json", {}).get("require_prepared_receipt")):
+            return None
     recp = item_dir / "calib" / ("prepare.json" if who == "glm" else f"prepare-{who}.json")
     try:
         prev = json.loads(recp.read_text())
@@ -394,7 +398,7 @@ def stale_prepared(cfg: dict, item_dir: Path, who: str, epoch: int) -> str | Non
         return "prepared task has no matching verified OCI digest; run calib prepare"
     if prev.get("ok") and prev.get("pkg_sha") == pkg_sha(item_dir / "pkg"):
         return None
-    return (f"the prepared {who} copy may predate the review revision (no calib/{recp.name} for the current pkg/): "
+    return (f"the prepared {who} copy may predate the current package (no calib/{recp.name} for the current pkg/): "
             "set calib.prepare_command (S9 re-prepares) or prepare it and run `tbsgen calib prepare --item ID`")
 
 
