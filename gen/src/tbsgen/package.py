@@ -493,6 +493,15 @@ def _timeout_calls(src: str) -> tuple[list, list[str]]:
             for branch in (node.body, node.orelse):
                 visit_branch(branch, after_test, deferred, class_parent, class_parent is not visible)
             return
+        if isinstance(node, (ast.With, ast.AsyncWith)):
+            entering = dict(visible)
+            for item in node.items:
+                visit(item.context_expr, entering, deferred, class_parent)
+                if item.optional_vars:
+                    visit(item.optional_vars, entering, deferred, class_parent)
+                    invalidate_block(item.optional_vars, entering)
+            visit_branch(node.body, entering, deferred, class_parent, class_parent is not visible)
+            return
         if isinstance(node, (ast.Try, ast.TryStar)):
             visit_branch(node.body, visible, deferred, class_parent, class_parent is not visible)
             normal = dict(visible)

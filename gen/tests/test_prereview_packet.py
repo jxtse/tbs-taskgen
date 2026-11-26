@@ -2,15 +2,19 @@
 import gzip
 import io
 import json
+import shutil
+import subprocess
+import sys
 import urllib.request
+from pathlib import Path
 
 import numpy as np
 import pytest
 
-from tbsgen import prereview
+from tbsgen import package, prereview
 from tbsgen.budget import Ledger
 from tbsgen.config import load_config
-from tbsgen.models import get_client
+from tbsgen.models import FakeClient, get_client
 
 
 def put(root, path, text):
@@ -20,7 +24,7 @@ def put(root, path, text):
     return dest
 
 
-def test_packet_is_deterministic_bounded_and_excludes_answers(tmp_path):
+def test_packet_is_deterministic_bounded_and_excludes_private_files(tmp_path):
     put(tmp_path, "instruction.md", "Group samples by profile.")
     put(tmp_path, "generator/README.md", "Data sections.")
     put(tmp_path, "environment/data/README.txt", "Tabular fields.")
@@ -122,6 +126,21 @@ def test_packet_rejects_unbounded_or_out_of_scope_content_before_model(tmp_path,
     assert call["error"] == "ValueError" and call["packet_hash"] is None
 
 
+def capture_messages(monkeypatch, output, stop="end_turn"):
+    sent = []
+
+    class Transport:
+        def open(self, req, timeout):
+            sent.append((json.loads(req.data), req.get_header("X-api-key")))
+            return io.BytesIO(json.dumps({"model": "synthetic-reviewer", "content": [{"type": "text", "text": output}],
+                                          "usage": {"input_tokens": 200, "output_tokens": 100},
+                                          "stop_reason": stop}).encode())
+
+    monkeypatch.setenv("TEST_REVIEW_KEY", "test-only")
+    monkeypatch.setattr(urllib.request, "build_opener", lambda *args: Transport())
+    return sent
+
+
 @pytest.mark.parametrize(("output", "stop", "failure"), [
     ('{"findings":[]}', "end_turn", None), ("not JSON", "end_turn", "JSONDecodeError"),
     ('{"findings":["\\ud800"]}', "end_turn", "UnicodeEncodeError"),
@@ -136,17 +155,7 @@ def test_prereview_uses_one_plain_authenticated_model_call_and_its_own_price(
                                                           "max_tokens": 1000, "effort_on_thinking_exhausted": "low"},
                                             "prices": {"synthetic-reviewer": {"in": 2, "out": 3}}}})
     ledger = Ledger(tmp_path / "cost.sqlite", cfg)
-    sent = []
-
-    class Transport:
-        def open(self, req, timeout):
-            sent.append((json.loads(req.data), req.get_header("X-api-key")))
-            return io.BytesIO(json.dumps({"model": "synthetic-reviewer", "content": [{"type": "text", "text": output}],
-                                          "usage": {"input_tokens": 200, "output_tokens": 100},
-                                          "stop_reason": stop}).encode())
-
-    monkeypatch.setenv("TEST_REVIEW_KEY", "test-only")
-    monkeypatch.setattr(urllib.request, "build_opener", lambda *args: Transport())
+    sent = capture_messages(monkeypatch, output, stop)
     call = prereview.run_prereview(tmp_path, lambda: get_client("prereview", cfg, ledger), item="sample")
     assert call["error"] == failure
     assert call["raw"] == call["validated"] == []
@@ -215,61 +224,108 @@ def test_grader_may_read_truth_field_name(tmp_path, name, truth):
     assert prereview.build_packet(tmp_path)["files"]["tests/measure.py"]["text"] == source
 
 
-@pytest.mark.parametrize("carrier", [
-    "task/generator/README.md", "pkg/instruction.md", "pkg/generator/FORMAT.md",
-    "pkg/environment/data/sample.csv", "pkg/tests/hidden/schema.json", "pkg/tests/measure.py",
-])
-def test_answer_boundary_checks_whole_request(tmp_path, carrier):
-    pkg = tmp_path / "pkg"
-    put(pkg, "instruction.md", "Report the labels.")
-    put(pkg, "tests/measure.py", "def measure(stream): return len(stream)")
-    if carrier == "pkg/tests/measure.py":
-        # No matching truth-file value: this scalar *is* the grader's expected answer.
-        put(tmp_path, carrier, 'def measure(output): return output["value"] == "ochre-sample"')
-        truth = "other-result"
-    else:
-        truth = "ochre-sample"
-        text = {"pkg/environment/data/sample.csv": "group\nochre-sample\n",
-                "pkg/tests/hidden/schema.json": '{"ochre-sample": 12}'}.get(carrier, truth)
-        put(tmp_path, carrier, text)
-    put(pkg, "tests/truth/data.json", json.dumps({"result": truth}))
-    result = prereview.run_prereview(pkg, lambda: pytest.fail("unexpected client"),
-                                     item="sample", generator_dir=tmp_path / "task/generator")
-    assert result["error"] == "UnsafeGraderPacket"
-    assert result["packet_hash"] is None and result["usd"] == 0
+@pytest.mark.parametrize("grader", ["toy", "generated"])
+def test_grader_control_constants_allow_prereview_call(tmp_path, grader):
+    source = (Path(__file__).parent / "fixtures/toy_task/tests/measure.py").read_text() if grader == "toy" else """
+import json, sys
 
+def compute(row):
+    dims = row.shape
+    argc = len(sys.argv)
+    max_args = 3
+    expected_shape = (4, 2)
+    expected_columns = ["mass", "label"]
+    out_dir, elapsed, rc = metrics.run_solution(600)
+    if argc > max_args or dims != expected_shape or rc != 0:
+        return {}
+    if out_dir is None or out_dir == "unused" or out_dir is False:
+        return {}
+    if row.columns != expected_columns or row.mode == "invalid" or row.status_code != 200:
+        return {}
+    if row["flag"] is False or row["label"] == "ignored":
+        return {}
+    return {"mass": row[-1]["mass"]}
 
-@pytest.mark.parametrize(("source", "truth"), [
-    ("EXPECTED = ['cobalt', 'ochre']", None),
-    ("def expected(): return 'co\\x62alt'", '["cobalt"]'),
-    ("def expected(): return 1.25e2", '{"answer": 125}'),
-    ("# mapped to cobalt", '{"answer": "cobalt"}'),
-    ("label = 'ochre-sample'\ndef test_label(row): assert row['label'] == label", None),
-    ("def measure(row): return np.isclose(row['mass'], 1.25e2)", None),
-    ("def expected(): return 'ochre-sample'\ndef measure(row): return row['label'] == expected()", None),
-    ("def matches(actual, target='ochre-sample'): return actual == target", None),
-    ("def test_label(row): assert row.get('label') == str('ochre-sample')", None),
-])
-def test_answer_bearing_grader_skips_model_call(tmp_path, source, truth):
-    put(tmp_path, "instruction.md", "Compute the labels.")
+if __name__ == "__main__":
+    print(json.dumps(compute(load())))
+"""
+    put(tmp_path, "instruction.md", "Report the measured mass.")
     put(tmp_path, "tests/measure.py", source)
-    if truth:
-        put(tmp_path, "tests/truth/results.json", truth)
-    result = prereview.run_prereview(tmp_path, lambda: pytest.fail("answer leaked to client"), item="sample")
-    assert result["error"] == "UnsafeGraderPacket"
-    assert result["packet_hash"] is None and result["usd"] == 0
+    put(tmp_path, "tests/truth/mass.json", '{"mass": 8173.625}')
+    cfg = load_config()
+    client = FakeClient(Ledger(tmp_path / "cost.sqlite", cfg), cfg, [{"stage": "S9P", "text": '{"findings":[]}'}])
+    result = prereview.run_prereview(tmp_path, lambda: client, item="sample")
+    assert result["error"] is None
+    assert [call["stage"] for call in client.log] == ["S9P"]
 
 
-@pytest.mark.parametrize("path", [
-    "pkg/instruction.md", "task/generator/FORMAT.md", "pkg/tests/hidden/sample.csv",
-])
-def test_explicit_answer_in_notes_or_schema_skips_without_truth_file(tmp_path, path):
-    pkg = tmp_path / "pkg"
-    put(pkg, "instruction.md", "Describe the experiment.")
-    put(tmp_path, path, "The correct answer is ochre.\n")
-    result = prereview.run_prereview(pkg, lambda: pytest.fail("unexpected client"),
-                                     item="sample", generator_dir=tmp_path / "task/generator")
-    assert result["error"] == "UnsafeGraderPacket" and result["packet_hash"] is None
+def make_review_package(P, it, case):
+    task = it.p("task")
+    generated = it.p("generated")
+    generated.mkdir()
+    if case == "toy":
+        fixture = Path(__file__).parent / "fixtures/toy_task"
+        shutil.copytree(fixture, task, dirs_exist_ok=True)
+        subprocess.run([sys.executable, task / "generator/generate.py", "1"], cwd=generated, check=True)
+        put(task, "instruction.md", "Estimate amp and rate for each series_id in series.csv.")
+        put(task, "tests/test_outputs.py",
+            'from measure import metrics\n\ndef test_coverage():\n    assert metrics()["coverage"] == 1\n')
+    else:
+        put(generated, "environment/data/samples.csv", "sample_id,signal\nalpha,1.25\n")
+        put(generated, "tests/truth/other.json", '{"sample_id": "alpha"}')
+        if case == "shape":
+            np.save(generated / "tests/truth/matrix.npy", np.array([[73.4, 95.6]]))
+            body = ('    a = np.load("/app/output/matrix.npy")\n'
+                    '    t = np.load("/tests/truth/matrix.npy")\n'
+                    '    if a.shape != (len(t), 2):\n        return 1.0\n'
+                    '    return float(np.mean(np.abs(a - t)))')
+        else:
+            read_row = '    with open("/app/output/report.csv") as f:\n        row = next(csv.DictReader(f))\n'
+            if case == "numeric":
+                body = read_row + '    expected = 8173.625\n    return abs(float(row["value"]) - expected)'
+            elif case == "label":
+                body = read_row + '    return float(row["phase"] == "ochre-sample")'
+            else:
+                put(generated, "tests/truth/phase.csv", "ochre-sample\n")
+                put(task, "generator/README.md", "Example output label: ochre-sample.")
+                body = read_row + ('    with open("/tests/truth/phase.csv") as f:\n'
+                                   '        return float(row["phase"] == next(csv.reader(f))[0])')
+        put(task, "tests/measure.py", 'import csv, json\nimport numpy as np\n\ndef compute():\n' + body
+            + '\n\nif __name__ == "__main__":\n    print(json.dumps(compute()))\n')
+        target = 0 if case in {"numeric", "shape"} else 1
+        put(task, "tests/test_outputs.py", f"from measure import compute\n\ndef test_score():\n    assert compute() == {target}\n")
+    pkg = package.package(P.cfg, it.dir, generated, {}, {})
+    validation = package.validate_pkg(pkg, P.cfg)
+    assert validation["ok"], validation
+    return pkg
+
+
+@pytest.mark.parametrize("mode", ["shadow", "enforce"])
+@pytest.mark.parametrize("case", ["toy", "shape", "numeric", "label", "headerless"])
+def test_review_packages_each_send_one_request(tmp_path, monkeypatch, mode, case):
+    from test_review_s9r import _env
+
+    P, item_id, _ = _env(tmp_path, allow_submit=False)
+    it = P.store.item(item_id)
+    pkg = make_review_package(P, it, case)
+    P.cfg["prereview"]["mode"] = mode
+    P.cfg["models"]["prereview"].update(url="https://example.invalid/v1/messages", model="synthetic-reviewer",
+                                        key_env="TEST_REVIEW_KEY", max_tokens=1000)
+    P.cfg["models"]["prices"]["synthetic-reviewer"] = {"in": 2, "out": 3}
+    sent = capture_messages(monkeypatch, '{"findings":[]}')
+
+    P.step(it)
+    [(request, _key)] = sent
+    assert request["system"] == prereview.PROMPT
+    packet = json.loads(request["messages"][0]["content"])
+    files = packet["files"]
+    assert not any(rel.startswith(("solution/", "tests/truth/")) for rel in files)
+    assert files["tests/measure.py"]["text"] == (pkg / "tests/measure.py").read_text()
+    if case == "toy":
+        assert "S000" in files["environment/data/series.csv"]["sample"]
+        assert "S000" in (pkg / "tests/truth/params.csv").read_text()
+    if case == "headerless":
+        assert packet["format_notes"]["generator/README.md"] == "Example output label: ochre-sample."
 
 
 @pytest.mark.parametrize("header", ["signal,signal", "123,0.75", 'signal,"unterminated', '"signal\nvalue",label'])

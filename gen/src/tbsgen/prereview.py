@@ -12,17 +12,15 @@ import math
 import os
 import re
 import time
-import tokenize
 import zipfile
+from decimal import Decimal
 from pathlib import Path
 
-from .leaves import file_leaves
 from .runner import is_format_note
 
 TEXT_BYTES = 24_000
 JSON_INPUT_BYTES = 32 * 1024 * 1024
 NPZ_INDEX_BYTES = 2 * 1024 * 1024
-TRUTH_SCAN_BYTES = 2 * 1024 * 1024
 PACKET_BYTES = 256_000
 TRUNCATED = "\n[truncated]"
 
@@ -57,7 +55,7 @@ def _json_type(value) -> str:
             int: "number", float: "number", type(None): "null"}[type(value)]
 
 
-def _shape(stream) -> tuple:
+def _array_header(stream) -> dict:
     """Read only the NPY header, including for compressed or object arrays. Never deserialize data."""
     import numpy as np
     major, minor = np.lib.format.read_magic(stream)
@@ -70,7 +68,7 @@ def _shape(stream) -> tuple:
     shape = header["shape"]
     if not isinstance(shape, tuple) or not all(type(n) is int and n >= 0 for n in shape):
         raise ValueError("invalid NPY shape")
-    return shape
+    return header
 
 
 def _bounded_json(stream):
@@ -126,7 +124,7 @@ def _data_entry(path: Path, *, format_note: bool, hidden: bool) -> dict:
         if hidden and (not columns or len(set(columns)) != len(columns)
                        or not all(re.fullmatch(r"[^\W\d][\w .-]*", col.strip()) for col in columns)
                        or any("\n" in col or "\r" in col for col in columns)):
-            raise UnsafeGraderPacket("ambiguous hidden CSV header")
+            raise ValueError("ambiguous hidden CSV header")
         entry.update(columns=columns, sample=text[:end])
         if not hidden and truncated and row_count < 4:
             entry["truncated"] = True
@@ -139,7 +137,7 @@ def _data_entry(path: Path, *, format_note: bool, hidden: bool) -> dict:
             entry["keys"] = {k: _json_type(v) for k, v in value.items()}
     elif ext == ".npy":
         with open_data(path, "rb") as f:
-            entry["arrays"] = {inner.stem: list(_shape(f))}
+            entry["arrays"] = {inner.stem: list(_array_header(f)["shape"])}
     elif ext == ".npz" and not compressed:
         with _ZipHeaderReader(path.open("rb", buffering=0)) as stream, zipfile.ZipFile(stream) as z:
             arrays = {}
@@ -148,7 +146,7 @@ def _data_entry(path: Path, *, format_note: bool, hidden: bool) -> dict:
                 if member.filename.endswith(".npy"):
                     key = member.filename[:-4]
                     with z.open(member) as f:
-                        shape = list(_shape(f))
+                        shape = list(_array_header(f)["shape"])
                     size += len(_json({key: shape}).encode())
                     if size > PACKET_BYTES or key in arrays:
                         raise ValueError("oversized or ambiguous array inventory")
@@ -164,10 +162,6 @@ def _safe_file(root: Path, rel: Path) -> bool:
     return p.is_file()
 
 
-class UnsafeGraderPacket(ValueError):
-    """The packet could carry answers, or its comparison with truth was inconclusive."""
-
-
 def _json_atoms(obj):
     if isinstance(obj, dict):
         for value in obj.values():
@@ -179,176 +173,190 @@ def _json_atoms(obj):
         yield obj
 
 
-def _truth_atoms(path, remaining):
-    # Limit total decompressed bytes across the tree. Unknown encodings skip this advisory call.
+def _files_under(pkg, dirname):
+    root = pkg / dirname
+    if root.resolve() != root:
+        raise ValueError(f"linked directory: {dirname}")
+    for path in root.rglob("*"):
+        if _safe_file(pkg, path.relative_to(pkg)):
+            yield path
+
+
+def _json_keys(value):
+    if isinstance(value, dict):
+        yield from value
+        for member in value.values():
+            yield from _json_keys(member)
+    elif isinstance(value, list):
+        for member in value:
+            yield from _json_keys(member)
+
+
+def _array_scalars(stream, *, schema):
+    import numpy as np
+
+    header = _array_header(stream)
+    dtype = np.lib.format.descr_to_dtype(header["descr"])
+    if schema:
+        yield from dtype.names or ()
+        return
+    count = math.prod(header["shape"])
+    if count > 64:
+        return
+    if dtype.hasobject:
+        raise ValueError("object arrays require pickle")
+    if not dtype.itemsize:
+        return
+    # Only allocate for bytes actually present. A small shape can still claim a huge string dtype.
+    size = count * dtype.itemsize
+    payload = bytearray()
+    while len(payload) < size:
+        chunk = stream.read(min(65536, size - len(payload)))
+        if not chunk:
+            raise ValueError("incomplete truth array")
+        payload.extend(chunk)
+    pending = list(np.frombuffer(payload, dtype=dtype, count=count))
+    while pending:
+        value = pending.pop()
+        if isinstance(value, np.ndarray):
+            pending.extend(value.flat)
+        elif value.dtype.names:
+            pending.extend(value[name] for name in value.dtype.names)
+        else:
+            yield value
+
+
+def _data_scalars(path, *, schema=False):
+    """Yield private scalar values, or just public column/member names."""
     compressed = path.suffix.lower() == ".gz"
     ext = (path.with_suffix("") if compressed else path).suffix.lower()
-    if ext == ".npy" and not compressed:
-        size = path.stat().st_size
-        if size > remaining:
-            raise UnsafeGraderPacket("truth exceeds scan budget")
-        import numpy as np
-        # Validate the complete numeric payload without allocating from an untrusted header.
-        array = np.load(path, allow_pickle=False, mmap_mode="r")
-        if not isinstance(array, np.ndarray) or array.dtype.kind not in "fiub" or array.nbytes > size:
-            raise UnsafeGraderPacket("unsupported truth array")
-        count = array.size
-        leaves = file_leaves(path, path.name)
-        if not leaves or leaves[0].values.size != count:
-            raise UnsafeGraderPacket("unreadable numeric truth array")
-        return size, leaves[0].values
-    if ext not in {".csv", ".tsv", ".json", ".jsonl"}:
-        raise UnsafeGraderPacket("unsupported truth format")
-    with (gzip.open if compressed else open)(path, "rb") as f:
-        data = f.read(remaining + 1)
-    if len(data) > remaining:
-        raise UnsafeGraderPacket("truth exceeds scan budget")
-    content = data.decode("utf-8-sig")
-    if ext == ".json":
-        atoms = _json_atoms(json.loads(content))
-    elif ext == ".jsonl":
-        atoms = (atom for line in content.splitlines() if line.strip() for atom in _json_atoms(json.loads(line)))
-    else:
-        rows = csv.reader(io.StringIO(content, newline=""), delimiter="," if ext == ".csv" else "\t", strict=True)
-        next(rows, None)  # Truth tables use their first row for field names.
-        atoms = (cell for row in rows for cell in row)
-    return len(data), atoms
-
-
-_ANSWER_DECLARATION = re.compile(
-    r"\b(?:answer(?:[ _-]key)?|(?:expected|correct|gold)\s+(?:answer|value|label|result|output)|ground[ _-]truth)"
-    r"\s*(?:[*_`]*\s*[:=]|\bis\b)\s*\S", re.I)
-_EXPECTED_NAME = re.compile(r"(?:^|_)(?:answer|expected|truth|gold|oracle)(?:_|$)", re.I)
-
-
-def _check_declaration(text):
-    if _ANSWER_DECLARATION.search(text):
-        raise UnsafeGraderPacket("explicit answer declaration")
-
-
-def _grader_literals(sources):
-    """Check possible embedded grader answers, including scalars with no on-disk truth counterpart."""
-    literals = []
-    # Names can cross the two grader files. If any definition supplies a literal, a later
-    # comparison using that name is ambiguous and we skip this advisory request.
-    definitions = {}
-    comparisons = []
-    for source in sources:
-        for token in tokenize.generate_tokens(io.StringIO(source).readline):
-            if token.type == tokenize.COMMENT:
-                _check_declaration(token.string)
-        for node in ast.walk(ast.parse(source)):
-            if isinstance(node, ast.Constant):
-                literal = str(node.value)
-                _check_declaration(literal)
-                literals.append(literal)
-            if isinstance(node, (ast.List, ast.Tuple, ast.Set, ast.Dict)):
-                try:
-                    values = ast.literal_eval(node)
-                except (TypeError, ValueError):
-                    continue
-                if values:
-                    raise UnsafeGraderPacket("embedded literal table")
-            if isinstance(node, (ast.Assign, ast.AnnAssign)) and node.value is not None:
-                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-                for target in targets:
-                    for name in ast.walk(target):
-                        if isinstance(name, ast.Name):
-                            definitions.setdefault(name.id, []).append(node.value)
-                            if _EXPECTED_NAME.search(name.id):
-                                comparisons.append(node.value)
-            if isinstance(node, ast.arguments):
-                positional = [*node.posonlyargs, *node.args]
-                defaults = zip(reversed(positional), reversed(node.defaults))
-                for param, default in (*defaults, *zip(node.kwonlyargs, node.kw_defaults)):
-                    if default is not None:
-                        definitions.setdefault(param.arg, []).append(default)
-            if isinstance(node, ast.Return) and node.value is not None:
-                comparisons.append(node.value)
-            if isinstance(node, ast.Assert):
-                comparisons.append(node.test)
-            if isinstance(node, ast.Compare):
-                comparisons.extend([node.left, *node.comparators])
-            if isinstance(node, ast.Call) and getattr(node.func, "attr", getattr(node.func, "id", "")) in {
-                    "assertEqual", "assertAlmostEqual", "assert_equal", "assert_array_equal",
-                    "assert_allclose", "isclose", "allclose", "array_equal", "approx"}:
-                comparisons.extend(node.args)
-                comparisons.extend(kw.value for kw in node.keywords)
-
-    seen = set()
-    while comparisons:
-        node = comparisons.pop()
-        if node in seen:
-            continue
-        seen.add(node)
-        if isinstance(node, ast.Constant) and node.value is not None:
-            raise UnsafeGraderPacket("embedded comparison value")
-        if isinstance(node, ast.Name):
-            comparisons.extend(definitions.get(node.id, ()))
-        elif isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "get":
-            # Mapping lookup keys are schema. A default value can supply a hardcoded answer.
-            comparisons.extend([node.func.value, *node.args[1:], *(kw.value for kw in node.keywords)])
-        elif isinstance(node, ast.Subscript):
-            # A field name locates a value. The answer comes from the indexed object.
-            comparisons.append(node.value)
-        else:
-            comparisons.extend(ast.iter_child_nodes(node))
-    return literals
-
-
-def _check_packet(pkg, packet, graders):
-    # Include every visible field and its decoded spelling, including source notes outside pkg.
-    # JSON escaping otherwise hides e.g. a multiline answer in the statement from the scan.
-    def fields(value):
-        if isinstance(value, dict):
-            for key, member in value.items():
-                yield key
-                yield from fields(member)
-        elif isinstance(value, list):
-            for member in value:
-                yield from fields(member)
-        else:
-            yield str(value)
-
-    for path, entry in packet["files"].items():
-        if path not in ("tests/measure.py", "tests/test_outputs.py"):
-            _check_declaration(path)
-            for field in fields(entry):
-                _check_declaration(field)
-    for field in fields(packet.get("format_notes", {})):
-        _check_declaration(field)
-    haystack = "\n".join([*fields(packet), *_grader_literals(graders)]).casefold()
-    # Also catch alternate numeric spellings, including exponential notation in comments.
-    number_pattern = r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[-+]?\d+)?"
-    numbers = {format(float(m[0]), ".6g") for m in re.finditer(number_pattern, haystack)}
-    # Python and JSON spell Boolean and non-finite values as words.
-    for spelling, value in (("true", "1"), ("false", "0"), ("nan", "nan"), ("inf", "inf"), ("-inf", "-inf")):
-        if spelling in haystack:
-            numbers.add(value)
-    # Bound substring comparisons even for millions of distinct short labels.
-    string_scans_left = 250_000_000 // max(1, len(haystack))
-    remaining = TRUTH_SCAN_BYTES
-    truth = pkg / "tests/truth"
-    if truth.resolve() != truth:
-        raise UnsafeGraderPacket("linked truth directory")
-    for path in truth.rglob("*"):
-        if not _safe_file(pkg, path.relative_to(pkg)):
-            continue
-        size, atoms = _truth_atoms(path, remaining)
-        remaining -= size
-        for atom in atoms:
-            try:
-                number = float(atom)
-            except (ValueError, TypeError):
-                string_scans_left -= 1
-                if string_scans_left < 0:
-                    raise UnsafeGraderPacket("truth comparison exceeds scan budget")
-                word = str(atom).strip().casefold()
-                if word and word in haystack:
-                    raise UnsafeGraderPacket("packet overlaps truth")
+    opener = gzip.open if compressed else open
+    if ext in (".npz", ".npy"):
+        with opener(path, "rb") as stream:
+            if ext == ".npy":
+                yield from _array_scalars(stream, schema=schema)
             else:
-                if format(number, ".6g") in numbers:
-                    raise UnsafeGraderPacket("packet overlaps numeric truth")
+                with zipfile.ZipFile(stream) as archive:
+                    for member in archive.infolist():
+                        if member.filename.endswith(".npy"):
+                            if schema:
+                                yield member.filename[:-4]
+                            with archive.open(member) as data:
+                                yield from _array_scalars(data, schema=schema)
+        return
+    if schema and ext not in (".csv", ".tsv", ".json", ".jsonl"):
+        return
+    with opener(path, "rt", encoding="utf-8-sig", newline="") as stream:
+        if ext in (".csv", ".tsv"):
+            rows = csv.reader(stream, delimiter="\t" if ext == ".tsv" else ",", strict=True)
+            if schema:
+                yield from next(rows, [])
+            else:
+                for row in rows:  # A headerless first row can contain only text.
+                    yield from row
+        elif ext in (".json", ".jsonl"):
+            extract = _json_keys if schema else _json_atoms
+            if ext == ".json":
+                yield from extract(json.load(stream, parse_float=Decimal))
+            else:
+                for line in stream:
+                    if line.strip():
+                        yield from extract(json.loads(line, parse_float=Decimal))
+        else:
+            for line in stream:
+                yield from line.split()
+
+
+def _grader_atoms(source):
+    lines = source.encode("utf-8").splitlines()
+    pending = [ast.parse(source)]
+    while pending:
+        node = pending.pop()
+        sign = ""
+        if (isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd))
+                and isinstance(node.operand, ast.Constant) and type(node.operand.value) in (int, float, complex)):
+            sign = "-" if isinstance(node.op, ast.USub) else ""
+            node = node.operand
+        if isinstance(node, ast.Constant) and type(node.value) in (int, float, complex):
+            # AST column offsets are UTF-8 byte offsets. Preserve significant trailing zeros and exact decimals.
+            spelling = lines[node.lineno - 1][node.col_offset:node.end_col_offset].decode().replace("_", "")
+            yield sign + spelling
+        elif isinstance(node, ast.Constant) and isinstance(node.value, str):
+            yield node.value
+        else:
+            pending.extend(ast.iter_child_nodes(node))
+
+
+_DIGITS = r"\d(?:_?\d)*"
+_DECIMAL = rf"(?:{_DIGITS}(?:\.(?:{_DIGITS})?)?|\.{_DIGITS})(?:e[+\-]?{_DIGITS})?"
+_BASED_INT = r"(?:0x(?:_?[0-9a-f])+|0b(?:_?[01])+|0o(?:_?[0-7])+)"
+_NUMBER = re.compile(rf"(?<![\w.])[+\-−]?(?:{_BASED_INT}|{_DECIMAL})(?!\w|\.\d)", re.I)
+_SHORT_WORDS = set("""
+    a add all am an and any are as ask at be big but by can did do end far few fit for get go got had
+    has he her him his how i if in is it its key let low may me my new no non nor not now of off old
+    on one or our out own per put row run say see set she so sum the to too top try two up us use via
+    was way we who why yes yet you
+""".split())
+
+
+def _decimal_spelling(token):
+    token = token.lower().replace("_", "").replace("−", "-")
+    if token.lstrip("+-").startswith(("0x", "0b", "0o")):
+        return str(int(token, 0))
+    return token
+
+
+def _numbers(body):
+    return {Decimal(_decimal_spelling(m[0])) for m in _NUMBER.finditer(body)}
+
+
+def _answer_atoms(pkg):
+    for path in _files_under(pkg, "tests/truth"):
+        for value in _data_scalars(path):
+            if isinstance(value, bytes):
+                value = value.decode()
+            if isinstance(value, Decimal):
+                yield format(value, "e")  # Preserve explicit precision, e.g. JSON 1.00e2.
+            else:
+                yield str(value) if value is not None else "null"
+    for rel in (Path("tests/measure.py"), Path("tests/test_outputs.py")):
+        if _safe_file(pkg, rel):
+            yield from _grader_atoms((pkg / rel).read_text())
+
+
+def edit_adds_answer(pkg: Path, patch: dict[str, str]) -> bool:
+    """Test added tokens per document against the complete original graders and truth tree."""
+    pkg = pkg.resolve()
+    public_names = {name.strip().casefold() for path in _files_under(pkg, "environment/data")
+                    for name in _data_scalars(path, schema=True)}
+    numbers = set()
+    words = set()
+    for atom in _answer_atoms(pkg):
+        token = atom.strip().casefold()
+        if len(token) <= 1 or token in public_names or token in _SHORT_WORDS:
+            continue
+        if _NUMBER.fullmatch(token):
+            token = _decimal_spelling(token)
+            mantissa = token.split("e", 1)[0].lstrip("-+−")
+            digits = mantissa.replace(".", "").lstrip("0")
+            if "." not in mantissa and "e" not in token:
+                digits = digits.rstrip("0")
+            if len(digits) > 2:
+                numbers.add(Decimal(token))
+        else:
+            words.add(token)
+
+    for rel, revised in patch.items():
+        original = (pkg / rel).read_text().casefold()
+        revised = revised.casefold()
+        if numbers & (_numbers(revised) - _numbers(original)):
+            return True
+        for word in words:
+            if word in revised:
+                pattern = r"(?<!\w)" + re.escape(word) + r"(?!\w)"
+                if re.search(pattern, revised) and not re.search(pattern, original):
+                    return True
+    return False
 
 
 def build_packet(pkg: Path, *, generator_dir: Path | None = None) -> dict:
@@ -371,20 +379,10 @@ def build_packet(pkg: Path, *, generator_dir: Path | None = None) -> dict:
             raise ValueError("pre-review packet exceeds byte limit")
         target[path] = entry
 
-    graders = []
     for name in ("instruction.md", "tests/test_outputs.py", "tests/measure.py"):
         rel = Path(name)
         if _safe_file(pkg, rel):
-            if name == "instruction.md":
-                add(rel, {"text": _text(pkg / rel)})
-                continue
-            with (pkg / rel).open("rb") as f:
-                data = f.read(TRUTH_SCAN_BYTES + 1)
-            if len(data) > TRUTH_SCAN_BYTES:
-                raise UnsafeGraderPacket("grader exceeds scan budget")
-            graders.append(data.decode("utf-8"))
-            visible = data[:TEXT_BYTES].decode("utf-8", errors="ignore")
-            add(rel, {"text": visible + (TRUNCATED if len(data) > TEXT_BYTES else "")})
+            add(rel, {"text": _text(pkg / rel)})
     if "instruction.md" not in files:
         raise ValueError("missing instruction.md")
 
@@ -426,7 +424,6 @@ def build_packet(pkg: Path, *, generator_dir: Path | None = None) -> dict:
             packet["format_notes"] = notes
     if len(_json(packet).encode()) > PACKET_BYTES:
         raise ValueError("pre-review packet exceeds byte limit")
-    _check_packet(pkg, packet, graders)
     return packet
 
 

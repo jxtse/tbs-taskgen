@@ -450,9 +450,11 @@ def test_prepare_receives_layout(tmp_path, monkeypatch):
                  image_manifest="sha256:" + "a"*64)
     write_json(tmp_path / "state.json", state)
     write_json(pkg / "provenance.json", state)
+    (pkg / "task.toml").write_text("[verifier]\ntimeout_sec = 900\n")
     cfg = load_config(overrides=dict(taskimage={"enabled": False}, calib=dict(
         prepared_tasks_dir=str(tmp_path / "prepared"), prepare_cwd=str(tmp_path),
-        prepare_command='mkdir -p {out} && echo "$TBSGEN_IMAGE_OCI $TBSGEN_IMAGE_TAG" > {out}/task.toml')))
+        prepare_command='mkdir -p {out} && cp {pkg}/task.toml {out}/ && '
+                        'echo "$TBSGEN_IMAGE_OCI $TBSGEN_IMAGE_TAG" > {out}/image-layout')))
     calls = []
     def publish(cfg, item):
         calls.append(item)
@@ -461,7 +463,7 @@ def test_prepare_receives_layout(tmp_path, monkeypatch):
         return dict(TBSGEN_IMAGE_OCI="builder:/layout", TBSGEN_IMAGE_TAG="acr:tag", TBSGEN_IMAGE_DIGEST=digest)
     monkeypatch.setattr(ti, "publish", publish)
     rec = calib.ensure_prepared(cfg, tmp_path)
-    assert rec["ok"] and (Path(rec["out"]) / "task.toml").read_text().strip() == "builder:/layout acr:tag"
+    assert rec["ok"] and (Path(rec["out"]) / "image-layout").read_text().strip() == "builder:/layout acr:tag"
     assert calib.ensure_prepared(cfg, tmp_path)["reused"] and calls == [tmp_path]
 
 

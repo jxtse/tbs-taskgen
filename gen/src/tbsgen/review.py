@@ -44,6 +44,7 @@ from . import calib
 from .gates import current_probe_report
 from .probe_findings import CURRENT_CONTRACT, JOURNAL_CONTRACTS, finding_errors, has_evidence, read_repros, repro_command
 from .state import passed_gate_attempt, passed_gate_report, read_json, write_json
+from .taskhash import REVIEW_HASH_ENV
 
 VERDICTS = ("pass", "revise", "drop")
 ALLOWED_HUMAN = ("human",)          # accepted only behind review.allow_human (legacy verdicts stay readable)
@@ -968,6 +969,8 @@ def snapshot_problem(rec: dict) -> str | None:
 
 
 def bind_launch_snapshot(item_dir: Path, rec: dict, conf: dict) -> str | None:
+    if rec.get("launch_attempted") or rec.get("submitted") or rec.get("state") == "launched" or calib.job_started(rec):
+        return "review job already started or launch attempted"
     if rec["pkg_sha"] != calib.pkg_sha(item_dir / "pkg"):
         return "package in the review task differs from the current package"
     agents = conf.get("agents") or []
@@ -977,10 +980,45 @@ def bind_launch_snapshot(item_dir: Path, rec: dict, conf: dict) -> str | None:
     if len(tasks) != 1 or tasks[0].get("path") != rec["task"]:
         return "job config differs from the prepared review task"
     why = snapshot_problem(rec)
-    if not why and not rec.get("review_task_sha"):
+    if why:
+        return why
+    if not rec.get("review_task_sha"):
         # An unstarted intent issued before snapshots were recorded can still bind its verified task.
         rec["review_task_sha"] = calib.pkg_sha(Path(rec["task"]))
-    return why
+    env = agents[0].setdefault("env", {})
+    if REVIEW_HASH_ENV not in env:
+        # Upgrade unsubmitted configs, including reserved and manually launched jobs.
+        env[REVIEW_HASH_ENV] = rec["review_task_sha"]
+        write_json(Path(rec["config"]), conf)
+    elif env[REVIEW_HASH_ENV] != rec["review_task_sha"]:
+        return "job config differs from the prepared review task hash"
+    return None
+
+
+LAUNCHER_NO_HASH = "review:launcher_no_hash"
+
+
+def remote_hash_problem(rec: dict, trial_dirs: list[Path]) -> str | None:
+    """Only the submitted config determines whether the launcher owes a hash for each trial."""
+    try:
+        conf = json.loads(Path(rec["config"]).read_text())
+        agent, = conf["agents"]
+        env = agent.get("env", {})
+        if not isinstance(env, dict):
+            raise ValueError("invalid agent env")
+    except (AttributeError, KeyError, OSError, TypeError, ValueError):
+        return "could not read the submitted review job config"
+    if REVIEW_HASH_ENV not in env:
+        return None
+    expected = env[REVIEW_HASH_ENV]
+    if not expected or expected != rec.get("review_task_sha"):
+        return "job config differs from the prepared review task hash"
+    echoes = [json.loads((trial / "result.json").read_text()).get("review_task_sha") for trial in trial_dirs]
+    if not all(echoes):
+        return LAUNCHER_NO_HASH
+    if any(echo != expected for echo in echoes):
+        return "remote review task hash differs from the submitted task"
+    return None
 
 
 def prepare(cfg: dict, item_dir: Path, task: Path, rnd: int, attempt: int, epoch: int = 0) -> dict:
@@ -989,6 +1027,8 @@ def prepare(cfg: dict, item_dir: Path, task: Path, rnd: int, attempt: int, epoch
     c = rc["calib"]
     name = job_name(item_dir.name, rnd, attempt)
     conf = calib.job_config(rc, task, "review", name)
+    review_task_sha = calib.pkg_sha(task)
+    conf["agents"][0]["env"][REVIEW_HASH_ENV] = review_task_sha
     p = item_dir / "review" / f"{name}.json"
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(json.dumps(conf, indent=1))
@@ -1000,7 +1040,7 @@ def prepare(cfg: dict, item_dir: Path, task: Path, rnd: int, attempt: int, epoch
                submitted=False, ts=time.time(),
                job_dir=str(Path(c["jobs_dir"]) / name), task=str(task.resolve()), outcome=None,
                ledger_stage="S9R", pkg_sha=calib.pkg_sha(task / "environment/review/pkg"),
-               review_task_sha=calib.pkg_sha(task), calib_epoch=epoch)
+               review_task_sha=review_task_sha, calib_epoch=epoch)
     if rec["pkg_sha"] != calib.pkg_sha(item_dir / "pkg"):
         rec["blocked"] = "package in the review task differs from the current package"
     if cfg.get("config_path"):

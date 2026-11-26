@@ -6,6 +6,7 @@ import json
 import shutil
 
 from . import calib, repair, review
+from .prereview import edit_adds_answer
 from .runner import format_note_bindings, format_notes, regular_file, tree_hash
 from .state import passed_gate_attempt, read_json, write_json
 
@@ -218,6 +219,8 @@ def revise(P, it, request_patch):
                 if (not regular_file(pkg, rel) or dest.resolve() != it.dir.resolve() / dest.relative_to(it.dir)
                         or (dest.exists() and dest.stat().st_nlink > 1) or (pkg / rel).stat().st_nlink > 1):
                     return reject(it, "linked document")
+            if edit_adds_answer(pkg, patch):
+                return reject(it, "edit_leak")
             spec = read_json(it.p("_spec", "spec.json"))
             chk = repair.review(pkg, patch, spec["depgraph"])
             if not chk["ok"]:
@@ -310,6 +313,29 @@ def resume_edit(it, ledger=None):
         return True
     if rec["status"] != "committing":
         return False
+    # The packager renders the final statement. Check the exact texts before the
+    # first write, including for edits prepared by an earlier version.
+    if not rec.get("output_checked"):
+        pkg = it.p("pkg")
+        # In a legacy interrupted commit a destination may already contain the
+        # edit. Only the original package is a valid baseline for that comparison.
+        if (any((pkg / rel).read_bytes() == body.encode() for rel, body in rec["approved"].items())
+                and calib.pkg_sha(pkg) != it.state.get("requires_formal_review_sha")):
+            it.finish("parked", "legacy pre-review transaction needs original package restoration")
+            return True
+        reason = None
+        try:
+            if edit_adds_answer(pkg, rec["approved"]):
+                reason = "edit_leak"
+        except Exception as exc:
+            reason = f"output check: {type(exc).__name__}"
+        if reason:
+            rec.update(status="rejecting", revision_error=reason)
+            write_json(_record(it), rec)
+            _rollback(it, rec)
+            return True
+        rec["output_checked"] = True
+        write_json(_record(it), rec)
     for rel, body in rec["approved"].items():
         it.p("pkg", rel).write_bytes(body.encode())
     write_json(it.p("PKG_check.json"), rec["package_check"])

@@ -73,10 +73,13 @@ Crossref · arXiv · Europe PMC              → S5 spec (teacher) → S6 genera
    `package.max_verifier_timeout_s` (default 7200) park the item. Every repaired package needs S9R approval of its final bytes before release. A verifier timeout recorded in the current calibration epoch also triggers recalibration.
 
    Before calibration, `prereview.mode` defaults to `"off"`. In `"shadow"`, one S9P call records evidenced
-   statement inconsistencies and missing conditions. Hidden inputs contribute paths, sizes, headers, keys and shapes only. The packet builder checks the statement,
-   grader, format notes and schema digests for answer content before contacting the model.
+   statement inconsistencies and missing conditions. The packet includes grader source and generator format notes.
+   It excludes truth files and the reference solution. Hidden inputs contribute paths, sizes, headers, keys and shapes only.
    In `"enforce"`, S8 can edit the statement and generator-authored `README.md`, `README.txt` or `FORMAT.md`
-   directly under `environment/data/` (case-insensitive) once, followed by S7 and PKG. Call or packet errors
+   directly under `environment/data/` (case-insensitive) once. If an edit adds a truth value or a grader literal
+   to a document that did not already contain it, S8 discards the edit and records `edit_leak`. The check ignores
+   numbers with at most two significant digits, single characters, common words of up to three letters and public
+   schema names. Accepted edits go through S7 and PKG. Call or packet errors
    and rejected edits continue with the original package. S10 parks a pre-reviewed version until its final
    package has a passing S9R verdict. The release manifest records the reviewer model. Set `models.prereview.model`,
    `models.prereview.url` (Messages endpoint), optional `key_env`, and the model's entry in `models.prices`.
@@ -211,6 +214,12 @@ budget in `my.toml` (see below), `tbsgen run` continues into the model stages. T
 are documented in [`gen/README.md`](gen/README.md) §3; calibrating only some items, the environment-preparation hook
 (`calib.prepare_command`), teacher-only routing (`calib.teacher_*`) and the S9R review settings (`review.*`, on by
 default; routed like the teacher unless set) are in §4–§5b there.
+
+Calibration preparation hooks may rewrite image settings but must preserve `[verifier].timeout_sec`.
+When an S9R config includes `TBSGEN_REVIEW_TASK_SHA` in the agent environment, sync the task and rewrite its path,
+then run `sha=$(python3 taskhash.py "$worker_config") || exit 1` on the build host before starting Harbor
+(use `gen/src/tbsgen/taskhash.py`). Write `$sha` to `review_task_sha` in each trial's `result.json`.
+A missing hash counts toward `review.infra_retries`. Jobs submitted without the env key follow the legacy protocol.
 
 ### Resolving a parked remote job
 
