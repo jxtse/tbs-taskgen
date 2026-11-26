@@ -2424,8 +2424,35 @@ def test_remote_legacy_review_without_hash_ingests_drop(tmp_path):
     assert read_json(config) == conf
 
 
-def test_remote_review_missing_launcher_hash_exhausts_retries(tmp_path):
-    P, it, directory, _, _, _ = _remote_launch(tmp_path, "S9R")
+def test_remote_review_hash_in_final_sync_ingests_original_drop_once(tmp_path):
+    P, it, directory, rec, jd, _ = _remote_launch(tmp_path, "S9R")
+    write_json(jd / "config.json", read_json(Path(rec["config"])))
+    _finish(jd.parent, jd.name, verdict=V("drop", [BLOCK]), cost=7)
+    result_path = jd / "trial__a/result.json"
+    result = read_json(result_path)
+    digest = result.pop("review_task_sha")
+    write_json(result_path, result)
+
+    watch_tick(P, only=[it.item_id])
+    waiting, = _runs(P, it.item_id, directory)
+    assert waiting["outcome"] is None and it.load().state["status"] == "waiting"
+    with pytest.raises(ValueError, match="incomplete remote trial set"):
+        ingest(P, it)
+
+    write_json(result_path, dict(result, review_task_sha=digest))
+    Path(rec["log"] + ".exit").write_text("0")
+    watch_tick(P, only=[it.item_id])
+    settled, = _runs(P, it.item_id, directory)
+    assert (settled["job_name"], settled["outcome"], settled["verdict"]) == (jd.name, "done", "drop")
+    assert settled["ledger_call"] == rec["ledger_call"] and P.item_cost(it.item_id)["usd"] == 7
+    assert it.load().state["status"] == "dropped"
+
+
+@pytest.mark.parametrize("operator_sync", [False, True])
+def test_remote_review_missing_launcher_hash_exhausts_retries(tmp_path, monkeypatch, operator_sync):
+    from tbsgen.cli import main
+
+    P, it, directory, _, _, cmd = _remote_launch(tmp_path, "S9R")
     P.cfg["review"]["infra_retries"] = 1
     for attempt in (1, 2):
         rec = _runs(P, it.item_id, directory)[-1]
@@ -2436,6 +2463,14 @@ def test_remote_review_missing_launcher_hash_exhausts_retries(tmp_path):
         jd = Path(rec["job_dir"])
         write_json(jd / "config.json", remote_conf)
         _finish(jd.parent, jd.name, verdict=V("pass"), cost=7)
+        if operator_sync:
+            with monkeypatch.context() as m:
+                m.setattr("tbsgen.calib.session_alive", lambda *_: False)
+                watch_tick(P, max_steps=0)
+            assert _runs(P, it.item_id, directory)[-1]["state"] == "remote_unknown"
+            assert main(cmd[:-1] + [jd.name, "--synced"]) == 0
+        else:
+            Path(rec["log"] + ".exit").write_text("0")
         watch_tick(P, only=[it.item_id])
         settled = _runs(P, it.item_id, directory)[attempt - 1]
         assert (settled["outcome"], settled["cost_usd"]) == ("infra", 7)

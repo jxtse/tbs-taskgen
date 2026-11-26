@@ -1266,7 +1266,7 @@ def resolve_remote(P, it, job, *, synced, ended_without_result=False, remote_tas
             calib.restore_remote_marker(jd, rec, remote_task, review=stage == "S9R", partial=not trials)
             if trials:
                 settlement = None if complete else _unfinished_job_cost(P, rec, jd, confirmed=True)
-                return _ingest_run(P, it, rec, stage, jd, trial_dirs=trials, settlement=settlement)
+                return _ingest_run(P, it, rec, stage, jd, trial_dirs=trials, settlement=settlement, confirmed_sync=True)
             calib.check_job_identity(jd, rec, review=stage == "S9R", partial=True)
             _settle_dead_job(P, it, rec, save, confirmed=True)
         else:
@@ -1344,7 +1344,7 @@ def _after_ingest(P, it, rec, stage):
     it.save()
 
 
-def _ingest_run(P, it, rec, stage, jd, *, trial_dirs=None, settlement=None):
+def _ingest_run(P, it, rec, stage, jd, *, trial_dirs=None, settlement=None, confirmed_sync=False):
     remote = calib.remote_job(rec, P.ledger)
     if stage == "S9R" and (jd / "tbsgen-remote.json").is_file():
         remote = True  # --job-dir can supply a synced directory outside the launcher's default location.
@@ -1356,7 +1356,9 @@ def _ingest_run(P, it, rec, stage, jd, *, trial_dirs=None, settlement=None):
         raise ValueError(f"job not finished yet: {jd}")
     calib.check_job_identity(jd, rec, review=stage == "S9R")
     if stage == "S9R":
-        return _ingest_review(P, it, rec, jd, remote=remote, trial_dirs=trial_dirs, settlement=settlement)
+        final_sync = confirmed_sync or bool(rec.get("log") and Path(rec["log"] + ".exit").exists())
+        return _ingest_review(P, it, rec, jd, remote=remote, trial_dirs=trial_dirs, settlement=settlement,
+                              final_sync=final_sync)
     runs = read_json(it.p("calib", "runs.json"), [])
     used = {r.get("trial", {}).get("job_dir") for r in runs if r.get("outcome") is not None}
     if str(jd.resolve()) in used:
@@ -1898,8 +1900,8 @@ def _s9r(P, it):
                 return finish_job_stage(P, it, "parked", f"review:human ({why})")
             return finish_job_stage(P, it, "dropped", f"review:invalid {why}")
         why = f"review:infra ({n_infra} infra, {n_invalid} invalid verdicts)"
-        if runs[-1].get("error") == "review:launcher_no_hash":
-            why += " review:launcher_no_hash"
+        if runs[-1].get("error") == review.LAUNCHER_NO_HASH:
+            why += " " + review.LAUNCHER_NO_HASH
         return finish_job_stage(P, it, "parked", why)
     wait = calib.preflight_wait(P.cfg, all_rnd[-1] if all_rnd else None)
     if wait:                            # the relay refused the last review run: wait, then launch the next attempt
@@ -1949,7 +1951,7 @@ def _park_missing_trial(P, it, rec, save, error):
     raise ValueError(f"incomplete remote trial set: missing {error.filename}") from error
 
 
-def _ingest_review(P, it, rec, jd, *, remote, trial_dirs=None, settlement=None):
+def _ingest_review(P, it, rec, jd, *, remote, trial_dirs=None, settlement=None, final_sync=False):
     assigned = rec.get("suspected_scopes", [])
     try:
         res = review.classify(jd, rec.get("model"), P.cfg["models"].get("prices", {}),
@@ -1957,6 +1959,8 @@ def _ingest_review(P, it, rec, jd, *, remote, trial_dirs=None, settlement=None):
                               suspected_scopes=assigned, contract=review.job_contract(rec), require_verified=remote,
                               trial_dirs=trial_dirs)
         remote_problem = review.remote_hash_problem(rec, trial_dirs) if remote else None
+        if remote_problem == review.LAUNCHER_NO_HASH and not final_sync:
+            raise ValueError(f"incomplete remote trial set: waiting for launcher hash: {jd}")
     except FileNotFoundError as e:
         if not remote:
             raise

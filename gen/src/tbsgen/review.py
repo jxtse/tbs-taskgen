@@ -995,6 +995,9 @@ def bind_launch_snapshot(item_dir: Path, rec: dict, conf: dict) -> str | None:
     return None
 
 
+LAUNCHER_NO_HASH = "review:launcher_no_hash"
+
+
 def remote_hash_problem(rec: dict, trial_dirs: list[Path]) -> str | None:
     """Only the submitted config determines whether the launcher owes a hash for each trial."""
     try:
@@ -1010,12 +1013,11 @@ def remote_hash_problem(rec: dict, trial_dirs: list[Path]) -> str | None:
     expected = env[REVIEW_HASH_ENV]
     if not expected or expected != rec.get("review_task_sha"):
         return "job config differs from the prepared review task hash"
-    for trial in trial_dirs:
-        echo = json.loads((trial / "result.json").read_text()).get("review_task_sha")
-        if not echo:
-            return "review:launcher_no_hash"
-        if echo != expected:
-            return "remote review task hash differs from the submitted task"
+    echoes = [json.loads((trial / "result.json").read_text()).get("review_task_sha") for trial in trial_dirs]
+    if not all(echoes):
+        return LAUNCHER_NO_HASH
+    if any(echo != expected for echo in echoes):
+        return "remote review task hash differs from the submitted task"
     return None
 
 

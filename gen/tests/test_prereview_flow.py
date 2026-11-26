@@ -2,9 +2,10 @@
 import json
 import shutil
 
+import numpy as np
 import pytest
 
-from tbsgen import calib, gates, package, review, runner, stages_b
+from tbsgen import calib, gates, package, prereview, review, runner, stages_b
 from tbsgen.models import FakeClient
 from tbsgen.state import read_json, write_json
 
@@ -28,7 +29,7 @@ def flow(tmp_path, monkeypatch):
         (out / "environment/data/readmeasurements.txt").write_text("7\n")
         (out / "environment/data/ReadMe.md").write_text("Sample format notes.\n")
         (out / "tests/hidden/example.json").write_text('{"rows": 2}')
-        (out / "tests/truth/expected.json").write_text("[1758.125]")
+        (out / "tests/truth/expected.json").write_text('[1758.125, "profile_id"]')
         return dict(rc=0, err="")
 
     def run_gates(cfg, item_dir, spec, th, attempt):
@@ -72,6 +73,7 @@ def _review_history(P, it):
 
 def test_enforce_regates_then_calibrates_and_keeps_review_blind(flow):
     P, it, _ = flow
+    # A public column is safe to introduce even when its name is also a truth value.
     edits = {"instruction.md": "Read the profile_id column.", "environment/data/ReadMe.md": "Column: profile_id."}
     client = _repair(P, edits)
     protected = calib.pkg_sha(it.p("pkg"), exclude=set(edits))
@@ -100,6 +102,75 @@ def test_enforce_regates_then_calibrates_and_keeps_review_blind(flow):
     output = it.p("runs/later-version")
     runner.generate(P.cfg, it.p("task"), 1, output)
     assert (output / "environment/data/ReadMe.md").read_text() == "Sample format notes.\n"
+
+
+@pytest.mark.parametrize(("file", "source", "answer", "document"), [
+    ("tests/measure.py", "expected = 8173.625", "8173.625", "instruction.md"),
+    ("tests/test_outputs.py", "label = 'ochre-sample'", "ochre-sample", "instruction.md"),
+    ("tests/truth/phase.csv", "ochre-sample", "ochre-sample", "environment/data/ReadMe.md"),
+])
+def test_enforce_discards_answer_added_by_validated_finding(flow, file, source, answer, document):
+    P, it, _ = flow
+    with it.p("pkg", file).open("a") as f:
+        f.write(source + "\n")
+    finding = dict(FINDING, fix=f"Include {answer}. advisory-sentinel")
+    P._clients["prereview"] = FakeClient(P.ledger, P.cfg, [
+        {"stage": "S9P", "text": json.dumps({"findings": [finding]})}])
+    client = _repair(P, {document: f"Use `{answer}`."})
+    original = calib.pkg_sha(it.p("pkg")), calib.pkg_sha(it.p("task"))
+    _expect_step(P, it, "S8")
+    _expect_step(P, it, "S9")
+    rec = read_json(it.p("prereview/e0-r1.json"))
+    assert rec["validated"] == [finding] and rec["revision_error"] == "edit_leak"
+    assert not rec["revision_applied"] and len(client.log) == len(P.client("prereview").log) == 1
+    assert (calib.pkg_sha(it.p("pkg")), calib.pkg_sha(it.p("task"))) == original
+    _expect_step(P, it, "S9")
+    assert [r["who"] for r in read_json(it.p("calib/runs.json"))] == ["glm"]
+
+
+def test_edit_compares_answer_tokens_per_document(tmp_path):
+    truth = tmp_path / "tests/truth"
+    truth.mkdir(parents=True)
+    (truth / "values.tsv").write_text("first-label\t-12.345\t1.20\n")
+    (truth / "values.json").write_text('{"nested": [{"label": "second label"}]}')
+    (truth / "labels.txt").write_text("third-label QXZ\nthe R 0.012 2300")
+    np.save(truth / "label.npy", np.array("scalar-label"))
+    np.savez_compressed(truth / "arrays.npz", small=np.full(64, "small-label"), large=np.full(65, "large-label"))
+    (tmp_path / "instruction.md").write_text("Report first-label at -12.345.")
+    notes = "environment/data/FORMAT.md"
+    (tmp_path / notes).parent.mkdir(parents=True)
+    (tmp_path / notes).write_text("Note the format.")
+    for token in ("first-label", "-1.2345e1", "1.2", "second label", "third-label", "QXZ", "scalar-label", "small-label"):
+        assert prereview.edit_adds_answer(tmp_path, {notes: f"Use `{token}`."}), token
+    assert not prereview.edit_adds_answer(tmp_path, {
+        "instruction.md": "Use first-label and -1.2345e1.",
+        notes: "Use the R column at 0.012 or 2300. Compare large-label with third-labels.",
+    })
+
+
+def test_enforce_compares_rendered_statement_before_install(flow, monkeypatch):
+    P, it, _ = flow
+    _repair(P, {"instruction.md": "Read the profile_id column."})
+    original = calib.pkg_sha(it.p("pkg")), calib.pkg_sha(it.p("task"))
+    for stage in ["S8", "S7", "PKG"]:
+        _expect_step(P, it, stage)
+    render = package.instruction_text
+    monkeypatch.setattr(package, "instruction_text", lambda *args: render(*args) + "Use 1758.125.\n")
+    _expect_step(P, it, "S9")
+    assert read_json(it.p("prereview/e0-r1.json"))["revision_error"] == "edit_leak"
+    assert (calib.pkg_sha(it.p("pkg")), calib.pkg_sha(it.p("task"))) == original
+
+
+def test_legacy_partial_install_cannot_supply_its_own_baseline(flow):
+    P, it, _ = flow
+    _expect_step(P, it, "S8")
+    record = it.p("prereview/e0-r1.json")
+    approved = {"instruction.md": "Use 1758.125.", "environment/data/ReadMe.md": "Use profile_id."}
+    write_json(record, dict(read_json(record), status="committing", approved=approved, patch=approved))
+    it.p("pkg/instruction.md").write_text(approved["instruction.md"])
+    P.step(it)
+    assert it.load().state["status"] == "parked" and "restoration" in it.state["reason"]
+    assert it.p("pkg/environment/data/ReadMe.md").read_text() == "Sample format notes.\n"
 
 
 @pytest.mark.parametrize("failure", ["forbidden_patch", "gate_failure", "changed_data"])

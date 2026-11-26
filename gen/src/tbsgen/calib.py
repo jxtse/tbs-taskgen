@@ -943,8 +943,16 @@ def _remote_results_ready(cfg, rec, final=False):
     if stage in ("S4c", "S5G"):
         from .codeagent import complete_remote_agent
         return complete_remote_agent(cfg, rec, final=final)
-    from .review import job_contract
-    return complete_remote_trials(Path(rec["job_dir"]), stage or "S9", contract=job_contract(rec))
+    from . import review
+    jd = Path(rec["job_dir"])
+    contract = review.job_contract(rec)
+    if stage == "S9R" and not final:
+        trials, complete = remote_trial_set(jd, stage, contract=contract)
+        try:
+            return complete and review.remote_hash_problem(rec, trials) != review.LAUNCHER_NO_HASH
+        except (FileNotFoundError, ValueError):
+            return False  # the sync replaced a trial result since the completeness check
+    return complete_remote_trials(jd, stage or "S9", contract=contract)
 
 
 def reconcile_remote(cfg, rec, ledger, save):
