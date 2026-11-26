@@ -1,5 +1,6 @@
 """Synthetic packages and an in-process Messages transport for advisory review."""
 import gzip
+import http.client
 import io
 import json
 import shutil
@@ -75,10 +76,64 @@ def test_validator_binds_statement_file_quote_and_exact_locator(tmp_path):
     top_level = dict(omission, evidence={"file": "environment/data/batch.json", "key": "type", "quote": "array"})
     bad = [dict(good, statement_quote="Sort by score."), dict(good, evidence=dict(evidence, quote="not-a-header")),
            dict(good, evidence=dict(evidence, column="profile")), dict(good, evidence=dict(evidence, file="absent")),
-           dict(omission, evidence=dict(omission["evidence"], line=1)), dict(key, evidence=dict(key["evidence"], key="cut")),
+           dict(omission, evidence=dict(omission["evidence"], line=5)), dict(key, evidence=dict(key["evidence"], key="cut")),
            {"category": "a"}, None]
     assert prereview.validate_findings(packet, [good, *bad, omission, key, top_level]) == (
         [good, omission, key, top_level], len(bad))
+
+
+@pytest.mark.parametrize(("file", "locator", "quote", "expected"), [
+    ("tests/measure.py", {"column": " line  2 "}, "sum(values)", {"line": 2}),
+    ("environment/data/schema.json", {"column": "units"}, '"units":"string"', {"key": "units"}),
+    ("tests/measure.py", {"column": ""}, "return total", {"line": 3}),
+    ("tests/measure.py", {}, "sum(values)\n    return", {"line": 2}),
+])
+def test_validator_normalizes_model_locators(tmp_path, file, locator, quote, expected):
+    put(tmp_path, "instruction.md", "Inspect the readings.")
+    put(tmp_path, "tests/measure.py", "def score(values):\n    total = sum(values)\n    return total\n")
+    put(tmp_path, "environment/data/schema.json", '{"units": "seconds"}')
+    packet = prereview.build_packet(tmp_path)
+    evidence = dict(file=file, quote=quote)
+    finding = dict(category="a", statement_quote="Inspect the readings.", fix="Report the units.",
+                   evidence=evidence | locator)
+    assert prereview.validate_findings(packet, [finding]) == ([dict(finding, evidence=evidence | expected)], 0)
+    assert finding["evidence"] == evidence | locator
+
+
+def test_statement_quote_can_come_from_each_editable_format_note(tmp_path):
+    put(tmp_path, "instruction.md", "Inspect the readings.")
+    names = ["README.md", "README.txt", "FORMAT.md"]
+    for name in names:
+        put(tmp_path, f"environment/data/{name}", f"Units in {name} are unknown.")
+    source = put(tmp_path, "source/generator/README.md", "Source-only text.")
+    put(tmp_path, "tests/measure.py", "expected_unit = 'seconds'")
+    packet = prereview.build_packet(tmp_path, generator_dir=source.parent)
+    base = dict(category="a", fix="Specify seconds.", evidence=dict(file="tests/measure.py", line=1, quote="seconds"))
+    accepted = [dict(base, statement_quote=f"Units in {name} are unknown.") for name in names]
+    rejected = [dict(base, statement_quote=q) for q in ["Source-only text.", "expected_unit", "fabricated"]]
+    assert prereview.validate_findings(packet, accepted + rejected) == (accepted, len(rejected))
+
+
+def test_normalization_discards_unsupported_or_ambiguous_evidence(tmp_path):
+    put(tmp_path, "instruction.md", "Inspect the readings.")
+    put(tmp_path, "tests/measure.py", "# repeated repeated\nunit = 'seconds'\n")
+    put(tmp_path, "environment/data/schema.json", '{"units": "seconds", "count": 1}')
+    put(tmp_path, "environment/data/records.csv", "name\nsingle\n")
+    put(tmp_path, "environment/data/FORMAT.md", "visible once\n" + "x" * prereview.TEXT_BYTES)
+    packet = prereview.build_packet(tmp_path)
+    source = "tests/measure.py"
+    unsupported = [
+        dict(file=source, column="", quote="repeated"),
+        dict(file=source, quote="absent"),
+        dict(file=source, column="line 3", quote="seconds"),
+        dict(file=source, column="line 2", line=2, quote="seconds"),
+        dict(file="environment/data/schema.json", column="count", quote='"units":"string"'),
+        dict(file="environment/data/records.csv", quote="single"),
+        dict(file="environment/data/FORMAT.md", quote="visible once"),
+        dict(file="unknown.py", quote="seconds"),
+    ]
+    findings = [dict(category="b", statement_quote="", fix="Document the units.", evidence=e) for e in unsupported]
+    assert prereview.validate_findings(packet, findings) == ([], len(unsupported))
 
 
 def test_compressed_schemas_format_notes_and_partial_csv(tmp_path):
@@ -167,6 +222,79 @@ def test_prereview_uses_one_plain_authenticated_model_call_and_its_own_price(
     with ledger._db() as db:
         assert tuple(db.execute("SELECT model, stage, item, usd FROM calls").fetchone()) == (
             "synthetic-reviewer", "S9P", "sample", pytest.approx(.0007))
+
+
+@pytest.mark.parametrize(("errors", "limits", "final_error", "backoffs"), [
+    (["stream", "timeout"], {}, None, [10, 30]),
+    (["server", "rate"], {}, None, [10, 30]),
+    (["overload"] * 3, {}, "overload", [10, 30]),
+    (["stream"], {"breaker_consecutive_errors": 1}, "BudgetStop", [10]),
+    (["rate"], {"daily_calls_per_model": {"synthetic-reviewer": 1}}, "BudgetStop", [10]),
+    (["quota"], {}, "quota", []),
+])
+def test_prereview_retries_transient_errors_with_a_fresh_ledger_call(
+        tmp_path, monkeypatch, errors, limits, final_error, backoffs):
+    put(tmp_path, "instruction.md", "Inspect the samples.")
+    model = "synthetic-reviewer"
+    cfg = load_config(overrides={"budget": {"daily_usd_total": 30, **limits},
+                                 "models": {"prices": {model: {"out": 2}}}})
+    ledger = Ledger(tmp_path / "cost.sqlite", cfg)
+    script = [dict(stage="S9P", error=error, usage={"output_tokens": 100}) for error in errors]
+    script.append(dict(stage="S9P", text='{"findings":[]}', usage={"output_tokens": 200}))
+    client = FakeClient(ledger, cfg, script, name=model)
+    client.real = True  # charge the scripted usage
+    waits, reservations = [], []
+    monkeypatch.setattr(prereview.time, "sleep", waits.append)
+
+    call = prereview.run_prereview(tmp_path, lambda: client, item="sample", on_reserved=reservations.append)
+
+    assert call["error"] == final_error and waits == backoffs
+    with ledger._db() as db:
+        rows = db.execute("SELECT id, error_class, usd FROM calls WHERE item='sample' AND stage='S9P' "
+                          "ORDER BY id").fetchall()
+    assert reservations == [row[0] for row in rows]
+    assert [row[1] for row in rows] == errors + ([None] if final_error is None else [])
+    assert len(client.log) == len(rows)
+    assert call["usd"] == pytest.approx(sum(row[2] for row in rows))
+    assert call["usd"] > 0
+
+
+@pytest.mark.parametrize(("status", "read_error", "expected"), [
+    (None, TimeoutError("test timeout"), None),
+    (503, TimeoutError("error body timed out"), None),
+    (429, http.client.IncompleteRead(b"slow down"), None),
+    (429, http.client.IncompleteRead(b"quota exceeded"), "quota"),
+])
+def test_prereview_transport_retry(tmp_path, monkeypatch, status, read_error, expected):
+    put(tmp_path, "instruction.md", "Inspect the samples.")
+    cfg = load_config(overrides={"budget": {"daily_usd_total": 30},
+                                 "models": {"prereview": {"url": "https://example.invalid", "model": "synthetic-reviewer",
+                                                          "key_env": "TEST_REVIEW_KEY", "max_tokens": 1000},
+                                            "prices": {"synthetic-reviewer": {"out": 2}}}})
+    ledger = Ledger(tmp_path / "cost.sqlite", cfg)
+    sent = capture_messages(monkeypatch, '{"findings":[]}')
+    transport = urllib.request.build_opener()
+    class BrokenBody(io.BytesIO):
+        def read(self, *args):
+            raise read_error
+
+    error = (urllib.error.HTTPError("https://example.invalid", status, "test error", {}, BrokenBody())
+             if status else urllib.error.URLError(read_error))
+    responses = iter([error, None])
+
+    class Transport:
+        def open(self, req, timeout):
+            if error := next(responses):
+                raise error
+            return transport.open(req, timeout)
+
+    monkeypatch.setattr(urllib.request, "build_opener", lambda *args: Transport())
+    waits = []
+    monkeypatch.setattr(prereview.time, "sleep", waits.append)
+    call = prereview.run_prereview(tmp_path, lambda: get_client("prereview", cfg, ledger), item="sample")
+    assert call["error"] == expected
+    assert waits == ([] if expected else [10])
+    assert len(sent) == (0 if expected else 1)
 
 
 def test_prereview_rejects_link_before_reading(tmp_path):
@@ -355,3 +483,26 @@ def test_evidence_must_match_named_member_or_cell(tmp_path):
            dict(base, evidence=dict(key, quote='"label":"string"'))]
     good = [dict(base, evidence=dict(csv, quote="8")), dict(base, evidence=dict(key, quote='"count":"number"'))]
     assert prereview.validate_findings(packet, bad + good) == (good, len(bad))
+
+
+def test_line_evidence_tolerates_small_offsets_and_indentation():
+    from tbsgen import prereview
+    text = "def run():\n    x = 1\n    out_dir, sec, rc = run_solution(1200, d)\n    return x\n"
+    entry = {"text": text}
+    quote = "        out_dir, sec, rc = run_solution(1200, d)"
+    assert prereview._supported(entry, {"file": "tests/measure.py", "line": 2, "quote": quote})
+    assert prereview._supported(entry, {"file": "tests/measure.py", "line": 4, "quote": quote})
+    assert not prereview._supported(entry, {"file": "tests/measure.py", "line": 1, "quote": "return y"})
+    far = "\n".join(f"pad{i}" for i in range(10)) + "\n" + text
+    assert not prereview._supported({"text": far}, {"file": "tests/measure.py", "line": 1, "quote": quote})
+
+
+def test_statement_quote_is_matched_after_stripping_indentation():
+    from tbsgen import prereview
+    packet = {"files": {"instruction.md": {"text": "Outputs:\n   `<out>/<exp>/c.csv` for every experiment found, in the\n"},
+                        "tests/measure.py": {"text": "a = 1\nb = 2\n"}}}
+    raw = [{"category": "b", "statement_quote": "    `<out>/<exp>/c.csv` for every experiment found, in the",
+            "evidence": {"file": "tests/measure.py", "line": 2, "quote": "b = 2"}, "fix": "State the order."}]
+    kept, dropped = prereview.validate_findings(packet, raw)
+    assert len(kept) == 1 and dropped == 0
+    assert kept[0]["statement_quote"] == "`<out>/<exp>/c.csv` for every experiment found, in the"

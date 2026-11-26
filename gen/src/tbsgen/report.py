@@ -89,10 +89,11 @@ def _prereview_summary(run, db):
         row["findings_raw"] += len(record.get("raw") or [])
         row["findings_validated"] += len(record.get("validated") or [])
         row["revisions_applied"] += bool(record.get("revision_applied"))
-        for stage, id_field, saved_field, column in (
-            ("S9P", "call_id", "usd", "prereview_usd"), ("S8", "revision_call_id", "revision_usd", "revision_usd")
+        for stage, call_ids, saved_field, column in (
+            ("S9P", record.get("call_ids") or record.get("call_id"), "usd", "prereview_usd"),
+            ("S8", record.get("revision_call_id"), "revision_usd", "revision_usd")
         ):
-            usd = settled_call_usd(db, record[id_field], item.name, stage) if db and record.get(id_field) else None
+            usd = settled_call_usd(db, call_ids, item.name, stage) if db and call_ids else None
             row[column] += (record.get(saved_field) or 0.) if usd is None else usd
         row["errors"] += bool(record.get("error"))
         result = round_verdict(item / "review" / f"r{record.get('round')}")

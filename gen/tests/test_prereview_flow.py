@@ -1,6 +1,9 @@
 """Advisory statement revisions through the normal stage handlers, using synthetic data and model replies."""
 import json
 import shutil
+import subprocess
+import sys
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -17,14 +20,18 @@ FINDING = dict(category="a", statement_quote="spec", fix="Use profile_id. adviso
 
 
 @pytest.fixture
-def flow(tmp_path, monkeypatch):
+def flow(tmp_path, monkeypatch, request):
     P, item_id, _ = _env(tmp_path, allow_submit=False)
     it = P.store.item(item_id)
     P.cfg["prereview"] = dict(mode="enforce", allowed_contexts=["base", "review_revision"])
     state = {"change_data": False}
+    toy = getattr(request, "param", None) == "toy"
 
     def synthetic_generator(cfg, item_dir, mounts, *args):
         out = mounts[0][0]
+        if toy:
+            subprocess.run([sys.executable, "generator/generate.py", "1"], cwd=out, check=True)
+            return dict(rc=0, err="")
         (out / "environment/data/table.csv").write_text("profile_id\n" + ("8" if state["change_data"] else "7"))
         (out / "environment/data/readmeasurements.txt").write_text("7\n")
         (out / "environment/data/ReadMe.md").write_text("Sample format notes.\n")
@@ -40,7 +47,11 @@ def flow(tmp_path, monkeypatch):
 
     monkeypatch.setattr(runner.taskimage, "run", synthetic_generator)
     monkeypatch.setattr(gates, "run_gates", run_gates)
-    it.p("task/tests/measure.py").write_text("COL = 'profile_id'\n")
+    if toy:
+        shutil.copytree(Path(__file__).parent / "fixtures/toy_task", it.p("task"), dirs_exist_ok=True)
+        it.p("task/instruction.md").write_text("Estimate amp and rate for each id in series.csv.")
+    else:
+        it.p("task/tests/measure.py").write_text("COL = 'profile_id'\n")
     it.goto("S7", "synthetic package")
     P.step(it)
     assert it.load().state["stage"] == "PKG"
@@ -70,6 +81,23 @@ def _expect_step(P, it, stage):
 def _review_history(P, it):
     task = review.build_task(P.cfg, it.dir, it.state, 1)
     return read_json(task / "environment/review/records/pipeline_history.json")["history"]
+
+
+@pytest.mark.parametrize("flow", ["toy"], indirect=True)
+def test_toy_column_correction_is_installed(flow):
+    P, it, _ = flow
+    corrected = "Estimate amp and rate for each series_id in series.csv."
+    finding = dict(FINDING, statement_quote="each id", fix="Use series_id. advisory-sentinel",
+                   evidence=dict(file="environment/data/series.csv", column="series_id", quote="series_id"))
+    P._clients["prereview"] = FakeClient(P.ledger, P.cfg, [
+        {"stage": "S9P", "text": json.dumps({"findings": [finding]})}])
+    _repair(P, {"instruction.md": corrected})
+    for stage in ["S8", "S7", "PKG", "S9", "S9"]:
+        _expect_step(P, it, stage)
+    record = read_json(it.p("prereview/e0-r1.json"))
+    assert record["validated"] == [finding] and record["revision_applied"]
+    assert it.p("pkg/instruction.md").read_text().strip() == corrected
+    assert [r["who"] for r in read_json(it.p("calib/runs.json"))] == ["glm"]
 
 
 @pytest.mark.parametrize("document", ["instruction.md", "environment/data/FORMAT.md"])
@@ -107,7 +135,7 @@ def test_public_schema_exemptions_respect_row_and_truth(tmp_path):
     data.mkdir(parents=True)
     truth = tmp_path / "tests/truth"
     truth.mkdir(parents=True)
-    (truth / "labels.json").write_text('["ochre-sample"]')
+    (truth / "labels.json").write_text('["ochre-sample", "silver-sample"]')
     (tmp_path / "tests/measure.py").write_text("FIELD = 'signal_id'\n")
     (tmp_path / "instruction.md").write_text("Choose a phase.")
     table = data / "signals.tsv"
@@ -119,10 +147,32 @@ def test_public_schema_exemptions_respect_row_and_truth(tmp_path):
     assert prereview.edit_adds_answer(tmp_path, patch)
     notes.write_text("signals.tsv header: `signal_id,ochre-sample`")
     assert not prereview.edit_adds_answer(tmp_path, patch)
-    assert prereview.edit_adds_answer(tmp_path, {"instruction.md": "Use ochre-sample."})
+    assert not prereview.edit_adds_answer(tmp_path, {"instruction.md": "Use ochre-sample."})
+    assert prereview.edit_adds_answer(tmp_path, {"instruction.md": "Use silver-sample."})
     table.write_text("signal_id\t8173.625\n")
     notes.write_text("signals.tsv header: `signal_id,8173.625`")
     assert prereview.edit_adds_answer(tmp_path, patch)
+
+
+@pytest.mark.parametrize("suffix", ["csv", "tsv"])
+def test_private_table_headers_are_schema_and_data_remain_protected(tmp_path, suffix):
+    truth = tmp_path / "tests/truth"
+    truth.mkdir(parents=True)
+    (truth / f"labels.{suffix}").write_text("phase\nstable\n")
+    (truth / f"empty.{suffix}").write_text("series_id\n")
+    data = tmp_path / "environment/data"
+    data.mkdir(parents=True)
+    (data / "series.csv").write_text("series_id,value\n")
+    (data / "FORMAT.md").write_text("series.csv header: `series_id,value`")
+    doc = tmp_path / "instruction.md"
+    doc.write_text("Estimate the result.")
+    assert not prereview.edit_adds_answer(tmp_path, {doc.name: "Read phase for each series_id."})
+    assert prereview.edit_adds_answer(tmp_path, {doc.name: "The result is stable."})
+    (data / "FORMAT.md").unlink()
+    (data / "series.csv").write_text("series_id,value\nS01,1\n")
+    assert not prereview.edit_adds_answer(tmp_path, {doc.name: "Read series_id."})
+    (data / "FORMAT.md").write_text("series.csv has no header.")
+    assert prereview.edit_adds_answer(tmp_path, {doc.name: "Read series_id."})
 
 
 def test_enforce_regates_then_calibrates_and_keeps_review_blind(flow):
@@ -202,6 +252,19 @@ def test_edit_compares_labels_across_markup(tmp_path):
     assert not prereview.edit_adds_answer(tmp_path, {"instruction.md": 'Use "ochre-sample".'})
 
 
+def test_edit_distinguishes_identifiers_from_wrapped_labels(tmp_path):
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests/measure.py").write_text("LABEL = 'stable'\nFIELD = 'rate'\n")
+    doc = tmp_path / "instruction.md"
+    original = "Read stable_signal."
+    doc.write_text(original)
+    for token in ("stable", "_stable_", "**stable**", "`stable`"):
+        assert prereview.edit_adds_answer(tmp_path, {doc.name: original + f" The regime is {token}."})
+    assert not prereview.edit_adds_answer(tmp_path, {doc.name: "Read /app/data/decay_rate_series.csv."})
+    doc.write_text("The regime is _stable_.")
+    assert not prereview.edit_adds_answer(tmp_path, {doc.name: "The regime is stable."})
+
+
 def test_edit_compares_answer_tokens_per_document(tmp_path):
     truth = tmp_path / "tests/truth"
     truth.mkdir(parents=True)
@@ -272,6 +335,13 @@ def test_numeric_edit_uses_answer_sign_and_precision(tmp_path):
     ("173.625", "Estimate the mass.", "Use [8,173.625]."),
     ("8173.625", "Read id_8173.625.", "Use 8173.625."),
     ("8173.625", "Read id_8173.625.", "Use __8173.625__."),
+    ("173.625", "Estimate the mass.", "```csv\nid,mass_mg\n7,173.625\n```"),
+    ("173.625", "Estimate the mass.", "id,mass_mg\n7,173.625"),
+    ("173.625", "Estimate the mass.", "trial A,7,173.625"),
+    ("173.625", "Estimate the mass.", "7,173.625"),
+    ("7173.625", "Estimate the mass.", "7,173.625"),
+    ("7173.625", "Estimate the mass.", "Please, read carefully.\n7,173.625"),
+    ("7173.625", "id,mass_mg\n7,173.625", "Use 7173.625."),
 ])
 def test_numeric_edit_keeps_ambiguous_readings_separate(tmp_path, answer, original, revised):
     truth = tmp_path / "tests/truth"
@@ -559,16 +629,17 @@ def test_revision_cost_includes_rejected_and_billed_failed_calls(flow, reply):
     assert rec["revision_applied"] == (reply == "applied") and len(client.log) == 1
 
 
-@pytest.mark.parametrize("stage", ["S9P", "S8"])
-def test_resume_recovers_settled_cost_by_call_id(flow, monkeypatch, stage):
+@pytest.mark.parametrize(("stage", "retry"), [("S9P", True), ("S9P", False), ("S8", False)])
+def test_resume_recovers_settled_cost_by_call_id(flow, monkeypatch, stage, retry):
     from tbsgen.report import prereview_summary
 
     P, it, _ = flow
     role = "repair" if stage == "S8" else "prereview"
     model = f"fixture-{role}"
     P.cfg["models"]["prices"][model] = {"out": 4}
-    client = FakeClient(P.ledger, P.cfg, [dict(stage=stage, text='{"findings":[]}', usage={"output_tokens": 500})],
-                        name=model)
+    reply = dict(stage=stage, text='{"findings":[]}', usage={"output_tokens": 500})
+    script = [dict(reply, error="stream"), reply] if retry else [reply]
+    client = FakeClient(P.ledger, P.cfg, script, name=model)
     client.real = True
     P._clients[role] = client
     if stage == "S8":
@@ -576,21 +647,28 @@ def test_resume_recovers_settled_cost_by_call_id(flow, monkeypatch, stage):
     finish = P.ledger.finish
 
     def crash_after_settlement(*args, **kwargs):
-        finish(*args, **kwargs)
-        raise KeyboardInterrupt
+        usd = finish(*args, **kwargs)
+        if len(client.log) == len(script):
+            raise KeyboardInterrupt
+        return usd
 
     with monkeypatch.context() as m:
         m.setattr(P.ledger, "finish", crash_after_settlement)
+        m.setattr(prereview.time, "sleep", lambda _: None)
         with pytest.raises(KeyboardInterrupt):
             P.step(it)
     record_path = it.p("prereview/e0-r1.json")
     field = "revision_usd" if stage == "S8" else "usd"
-    assert read_json(record_path)[field] == 0
+    rec = read_json(record_path)
+    assert rec[field] == 0
+    if stage == "S9P" and not retry:
+        rec.pop("call_ids")  # Legacy interruptions only persisted call_id.
+        write_json(record_path, rec)
     P.cfg["prereview"]["mode"] = "off"  # disabling future calls still settles the in-flight check/edit
     _expect_step(P, it, "S9")
-    assert read_json(record_path)[field] == pytest.approx(.002)
-    assert prereview_summary(it.root)["enforce"]["usd"] == pytest.approx(.002)
-    assert len(client.log) == 1
+    assert read_json(record_path)[field] == pytest.approx(.002 * len(script))
+    assert prereview_summary(it.root)["enforce"]["usd"] == pytest.approx(.002 * len(script))
+    assert len(client.log) == len(script)
 
 
 def test_unpriced_restricted_reviser_is_refused(flow):

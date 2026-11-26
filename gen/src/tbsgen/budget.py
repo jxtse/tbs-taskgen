@@ -116,9 +116,13 @@ def price_usd(prices: dict, model: str, usage: dict) -> float:
 
 
 def settled_call_usd(db, call_id, item, stage):
-    row = db.execute("SELECT usd FROM calls WHERE id=? AND item=? AND stage=? AND ended IS NOT NULL",
-                     (call_id, item, stage)).fetchone()
-    return row[0] if row else None
+    """Sum settled reservations for an attempt, including legacy single-call records."""
+    ids = call_id if isinstance(call_id, list) else [call_id]
+    if not ids:
+        return None
+    slots = ",".join("?" for _ in ids)
+    return db.execute(f"SELECT SUM(usd) FROM calls WHERE id IN ({slots}) AND item=? AND stage=? "
+                      "AND ended IS NOT NULL", (*ids, item, stage)).fetchone()[0]
 
 
 class Ledger:
@@ -151,7 +155,7 @@ class Ledger:
         return db
 
     # ------------------------------------------------------------------ reserve / finish
-    def settled_usd(self, call_id: int, item: str, stage: str) -> float | None:
+    def settled_usd(self, call_id: int | list[int], item: str, stage: str) -> float | None:
         with contextlib.closing(self._db()) as db:
             return settled_call_usd(db, call_id, item, stage)
 

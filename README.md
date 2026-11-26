@@ -72,8 +72,10 @@ Crossref · arXiv · Europe PMC              → S5 spec (teacher) → S6 genera
    and package, reserving at least 300 seconds for overhead. Dynamic timeouts or a required timeout above
    `package.max_verifier_timeout_s` (default 7200) park the item. Every repaired package needs S9R approval of its final bytes before release. A verifier timeout recorded in the current calibration epoch also triggers recalibration.
 
-   Before calibration, `prereview.mode` defaults to `"off"`. In `"shadow"`, one S9P call records evidenced
-   statement inconsistencies and missing conditions. The packet includes grader source and generator format notes.
+   Before calibration, `prereview.mode` defaults to `"off"`. In `"shadow"`, S9P records evidenced
+   statement inconsistencies and missing conditions. In both enabled modes, S9P retries transient model errors
+   after 10 and 30 seconds. Each call counts against the applicable ledger limits.
+   The packet includes grader source and generator format notes.
    It excludes truth files and the reference solution. Hidden inputs contribute paths, sizes, headers, keys and shapes only.
    In `"enforce"`, S8 can edit the statement and generator-authored `README.md`, `README.txt` or `FORMAT.md`
    directly under `environment/data/` (case-insensitive) once. If an edit adds a truth value or a grader literal

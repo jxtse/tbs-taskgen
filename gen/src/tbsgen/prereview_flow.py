@@ -87,6 +87,7 @@ def _check_once(P, it, key, mode, epoch, rnd, context):
 
             def bind(call_id):
                 rec["call_id"] = call_id
+                rec.setdefault("call_ids", []).append(call_id)
                 write_json(path, rec)
 
             rec.update(run_prereview(it.p("pkg"), lambda: P.client("prereview"), item=it.item_id,
@@ -103,8 +104,9 @@ def _check_once(P, it, key, mode, epoch, rnd, context):
 
 
 def _interrupt_check(P, it, path, rec):
-    if rec.get("call_id"):
-        rec["usd"] = P.ledger.settled_usd(rec["call_id"], it.item_id, "S9P") or 0.
+    call_ids = rec.get("call_ids") or rec.get("call_id")
+    if call_ids:
+        rec["usd"] = P.ledger.settled_usd(call_ids, it.item_id, "S9P") or 0.
     rec.update(status="done", error="interrupted pre-review")
     write_json(path, rec)
 

@@ -49,9 +49,11 @@ class ModelResult:
 
 
 class ModelError(RuntimeError):
-    def __init__(self, cls: str, msg: str, usage: dict | None = None, stop_reason: str | None = None):
+    def __init__(self, cls: str, msg: str, usage: dict | None = None, stop_reason: str | None = None,
+                 *, timed_out: bool = False):
         super().__init__(f"{cls}: {msg}")
         self.cls = cls
+        self.timed_out = timed_out
         # usage of a call that did reach the model (e.g. an empty answer after all output tokens went to
         # thinking): billed and recorded in the ledger like a successful call
         self.usage = usage or {}
@@ -173,7 +175,8 @@ def _read_sse(r):
     except (AttributeError, TypeError, ValueError) as e:     # malformed event (e.g. "delta": null)
         raise ModelError("stream", f"malformed SSE event: {type(e).__name__}: {e}", usage=dict(usage)) from None
     except (TimeoutError, ConnectionError, OSError, http.client.HTTPException) as e:
-        raise ModelError("network", f"{type(e).__name__} mid-stream: {e}", usage=dict(usage)) from None
+        raise ModelError("network", f"{type(e).__name__} mid-stream: {e}", usage=dict(usage),
+                         timed_out=isinstance(e, TimeoutError)) from None
     if stop is None:
         raise ModelError("stream", "stream ended without message_delta/stop_reason", usage=dict(usage))
     return "".join(text), model, usage, stop      # every element is a str (checked per event)
@@ -252,10 +255,18 @@ class TeacherClient(_Base):
                     txt = "".join(c.get("text", "") for c in d.get("content", []) if c.get("type") == "text")
                     mresp, usage, stop = d.get("model"), d.get("usage") or {}, d.get("stop_reason")
         except urllib.error.HTTPError as e:
-            body_txt = e.read().decode("utf-8", "replace")[:600]
-            raise ModelError(classify_http(e.code, body_txt), f"HTTP {e.code} {_redact(body_txt)}") from None
+            try:
+                error_body = e.read()
+            except http.client.IncompleteRead as partial:
+                error_body = partial.partial
+            except (OSError, http.client.HTTPException):
+                error_body = b""  # the HTTP status is still authoritative
+            body_txt = error_body.decode("utf-8", "replace")[:600]
+            raise ModelError(classify_http(e.code, body_txt), f"HTTP {e.code} {_redact(body_txt)}",
+                             timed_out=e.code == 408) from None
         except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
-            raise ModelError("network", f"{type(e).__name__}: {e}") from None
+            raise ModelError("network", f"{type(e).__name__}: {e}",
+                             timed_out=isinstance(getattr(e, "reason", e), TimeoutError)) from None
         if not txt and stop != "refusal":
             raise ModelError("empty", f"empty response stop_reason={stop} output_tokens={usage.get('output_tokens')}",
                              usage=usage, stop_reason=stop)
