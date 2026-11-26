@@ -68,7 +68,7 @@ from . import calib
 from .budget import BudgetStop
 from .config import load_config
 from .models import ModelError, TeacherClient
-from .pipeline import Pipeline, parse_stages
+from .pipeline import DEFAULT_RESUME_REASONS, Pipeline, parse_stages
 from .report import daily_report, throughput
 from .state import STAGES, read_json, write_json
 
@@ -105,7 +105,8 @@ def main(argv=None):
         if name == "resume":
             s.add_argument("--only", default="", help="ID[,ID]: just these items")
             s.add_argument("--stage", default="", help="STAGE[,STAGE]: just items paused at these stages")
-            s.add_argument("--reason", default="budget:,model:,parked:probe_unreviewed", help="reason prefixes (comma-separated)")
+            s.add_argument("--reason", default=",".join(DEFAULT_RESUME_REASONS),
+                           help="reason prefixes (comma-separated)")
         if name == "taskimage":
             s.add_argument("action", choices=["gc"])
             s.add_argument("--dry-run", action="store_true")

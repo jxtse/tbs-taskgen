@@ -183,13 +183,60 @@ def test_missing_prereview_price_fails_open_before_transport(tmp_path, monkeypat
         assert db.execute("SELECT COUNT(*) FROM calls").fetchone()[0] == 0
 
 
-def test_packet_omits_private_readmes_and_inventory(tmp_path):
+def test_hidden_input_schema_supports_evidence_without_rows(tmp_path):
     put(tmp_path, "instruction.md", "Read the public inputs.")
-    for root in ("tests/hidden", "tests/truth"):
-        put(tmp_path, root + "/README.md", "private answer for sample three")
-        put(tmp_path, root + "/sample.csv", "answer\ncobalt")
-    payload = json.dumps(prereview.build_packet(tmp_path))
-    assert all(token not in payload for token in ("tests/hidden", "tests/truth", "private answer", "cobalt"))
+    put(tmp_path, "tests/hidden/README.md", "private format notes")
+    put(tmp_path, "tests/truth/sample.csv", "answer\ncobalt")
+    put(tmp_path, "tests/hidden/nested/sample.csv", "signal,strength\nprivate-row,854321")
+    put(tmp_path, "tests/hidden/types.json", '{"samples": ["hidden-value"]}')
+    np.savez(tmp_path / "tests/hidden/arrays.npz", field=np.zeros((2, 3)))
+    packet = prereview.build_packet(tmp_path)
+    payload = json.dumps(packet)
+    assert all(token not in payload for token in ("README.md", "tests/truth", "private", "854321", "hidden-value", "cobalt"))
+    files = packet["files"]
+    assert files["tests/hidden/types.json"]["keys"] == {"samples": "array"}
+    assert files["tests/hidden/arrays.npz"]["arrays"] == {"field": [2, 3]}
+    path = "tests/hidden/nested/sample.csv"
+    assert files[path]["columns"] == ["signal", "strength"]
+    good = dict(category="b", statement_quote="", fix="Describe strength.",
+                evidence=dict(file=path, column="strength", quote="strength"))
+    bad = dict(good, evidence=dict(file=path, column="strength", quote="854321"))
+    assert prereview.validate_findings(packet, [good, bad]) == ([good], 1)
+
+
+@pytest.mark.parametrize(("name", "truth"), [
+    ("data.json", '{"mass": 1758.125}'), ("data.csv", "mass\n1758.125"),
+])
+def test_grader_may_read_truth_field_name(tmp_path, name, truth):
+    put(tmp_path, "instruction.md", "Compute the measurement.")
+    put(tmp_path, "tests/truth/" + name, truth)
+    source = 'def measure(stream): return json.load(stream)["mass"]'
+    put(tmp_path, "tests/measure.py", source)
+    assert prereview.build_packet(tmp_path)["files"]["tests/measure.py"]["text"] == source
+
+
+@pytest.mark.parametrize("carrier", [
+    "task/generator/README.md", "pkg/instruction.md", "pkg/generator/FORMAT.md",
+    "pkg/environment/data/sample.csv", "pkg/tests/hidden/schema.json", "pkg/tests/measure.py",
+])
+def test_answer_boundary_checks_whole_request(tmp_path, carrier):
+    pkg = tmp_path / "pkg"
+    put(pkg, "instruction.md", "Report the labels.")
+    put(pkg, "tests/measure.py", "def measure(stream): return len(stream)")
+    if carrier == "pkg/tests/measure.py":
+        # No matching truth-file value: this scalar *is* the grader's expected answer.
+        put(tmp_path, carrier, 'def measure(output): return output["value"] == "ochre-sample"')
+        truth = "other-result"
+    else:
+        truth = "ochre-sample"
+        text = {"pkg/environment/data/sample.csv": "group\nochre-sample\n",
+                "pkg/tests/hidden/schema.json": '{"ochre-sample": 12}'}.get(carrier, truth)
+        put(tmp_path, carrier, text)
+    put(pkg, "tests/truth/data.json", json.dumps({"result": truth}))
+    result = prereview.run_prereview(pkg, lambda: pytest.fail("unexpected client"),
+                                     item="sample", generator_dir=tmp_path / "task/generator")
+    assert result["error"] == "UnsafeGraderPacket"
+    assert result["packet_hash"] is None and result["usd"] == 0
 
 
 @pytest.mark.parametrize(("source", "truth"), [
@@ -197,6 +244,11 @@ def test_packet_omits_private_readmes_and_inventory(tmp_path):
     ("def expected(): return 'co\\x62alt'", '["cobalt"]'),
     ("def expected(): return 1.25e2", '{"answer": 125}'),
     ("# mapped to cobalt", '{"answer": "cobalt"}'),
+    ("label = 'ochre-sample'\ndef test_label(row): assert row['label'] == label", None),
+    ("def measure(row): return np.isclose(row['mass'], 1.25e2)", None),
+    ("def expected(): return 'ochre-sample'\ndef measure(row): return row['label'] == expected()", None),
+    ("def matches(actual, target='ochre-sample'): return actual == target", None),
+    ("def test_label(row): assert row.get('label') == str('ochre-sample')", None),
 ])
 def test_answer_bearing_grader_skips_model_call(tmp_path, source, truth):
     put(tmp_path, "instruction.md", "Compute the labels.")
@@ -206,6 +258,33 @@ def test_answer_bearing_grader_skips_model_call(tmp_path, source, truth):
     result = prereview.run_prereview(tmp_path, lambda: pytest.fail("answer leaked to client"), item="sample")
     assert result["error"] == "UnsafeGraderPacket"
     assert result["packet_hash"] is None and result["usd"] == 0
+
+
+@pytest.mark.parametrize("path", [
+    "pkg/instruction.md", "task/generator/FORMAT.md", "pkg/tests/hidden/sample.csv",
+])
+def test_explicit_answer_in_notes_or_schema_skips_without_truth_file(tmp_path, path):
+    pkg = tmp_path / "pkg"
+    put(pkg, "instruction.md", "Describe the experiment.")
+    put(tmp_path, path, "The correct answer is ochre.\n")
+    result = prereview.run_prereview(pkg, lambda: pytest.fail("unexpected client"),
+                                     item="sample", generator_dir=tmp_path / "task/generator")
+    assert result["error"] == "UnsafeGraderPacket" and result["packet_hash"] is None
+
+
+@pytest.mark.parametrize("header", ["signal,signal", "123,0.75", 'signal,"unterminated', '"signal\nvalue",label'])
+def test_uncertain_hidden_header_skips_before_call(tmp_path, header):
+    put(tmp_path, "instruction.md", "Read the inputs.")
+    put(tmp_path, "tests/hidden/inputs.csv", header + "\n")
+    result = prereview.run_prereview(tmp_path, lambda: pytest.fail("unexpected client"), item="sample")
+    assert result["error"] and result["packet_hash"] is None
+
+
+def test_header_only_hidden_csv(tmp_path):
+    put(tmp_path, "instruction.md", "Read the inputs.")
+    put(tmp_path, "tests/hidden/inputs.csv", "signal,strength\n")
+    entry = prereview.build_packet(tmp_path)["files"]["tests/hidden/inputs.csv"]
+    assert entry["columns"] == ["signal", "strength"]
 
 
 def test_evidence_must_match_named_member_or_cell(tmp_path):

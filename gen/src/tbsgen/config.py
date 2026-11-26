@@ -559,6 +559,7 @@ DEFAULTS: dict[str, Any] = {
         # the new grader (calib/deliverables/<job>/) instead of archiving it.
         "enabled": True,
         "model": None,                      # None = calib.teacher_model (Opus)
+        "release_models": None,             # None accepts the model recorded when the review was prepared
         "agent": None,                      # None = calib.teacher_agent
         "environment": None,                # None = the teacher's (calib.teacher_environment or environment)
         "agent_allowed_hosts": None,        # None = the teacher's
@@ -630,6 +631,10 @@ def load_config(path: str | Path | None = None, overrides: dict | None = None) -
         cfg["gen"]["max_public_mb"] = 500
     if remote := cfg.get("fetch", {}).get("remote"):
         cfg["fulltext"]["remote"] = _merge(cfg["fulltext"]["remote"], remote)
+    release_models = cfg["review"].get("release_models")
+    if release_models is not None and (not isinstance(release_models, list)
+                                       or not all(isinstance(m, str) and m for m in release_models)):
+        raise ValueError("review.release_models must be a list of model names")
     if "hosts" in cfg["fulltext"]["remote"]:
         raise ValueError("fetch.remote.hosts is unsupported: configure a single remote host with remote.host")
     return cfg

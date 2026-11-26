@@ -332,6 +332,19 @@ def _timeout_calls(src: str) -> tuple[list, list[str]]:
             bindings[name] = possible_solver if any(x in (solver, possible_solver)
                                                     for x in (bindings.get(name), candidate)) else None
 
+    def assignment_pairs(target, value):
+        """Pair literal unpacking positions; keep opaque unpacked callables uncertain."""
+        if isinstance(target, ast.Name):
+            yield target.id, value
+        elif isinstance(target, (ast.Tuple, ast.List)):
+            if (isinstance(value, (ast.Tuple, ast.List)) and len(target.elts) == len(value.elts)
+                    and not any(isinstance(x, ast.Starred) for x in (*target.elts, *value.elts))):
+                for dest, src in zip(target.elts, value.elts):
+                    yield from assignment_pairs(dest, src)
+            else:
+                for name in local_names(target):
+                    yield name, possible_solver
+
     def invalidate_block(node, bindings):
         # Loops and exceptional control flow can leave any of their assignments visible.
         # Keep possible aliases (including chains) when forgetting a precise binding.
@@ -344,14 +357,16 @@ def _timeout_calls(src: str) -> tuple[list, list[str]]:
                 continue
             if isinstance(child, (ast.Assign, ast.AnnAssign, ast.NamedExpr)):
                 targets = child.targets if isinstance(child, ast.Assign) else [child.target]
-                aliases.update((target.id, child.value) for target in targets if isinstance(target, ast.Name))
+                for target in targets:
+                    aliases.update(assignment_pairs(target, child.value))
             if isinstance(child, ast.ImportFrom):
                 for part in child.names:
                     if part.name == "run_solution":
                         bindings[part.asname or part.name] = possible_solver
             pending.extend(ast.iter_child_nodes(child))
         while aliases:
-            found = {(name, value) for name, value in aliases if binding(value, bindings) in (solver, possible_solver)}
+            found = {(name, value) for name, value in aliases
+                     if value is possible_solver or binding(value, bindings) in (solver, possible_solver)}
             if not found:
                 break
             bindings.update({name: possible_solver for name, _ in found})
@@ -366,13 +381,11 @@ def _timeout_calls(src: str) -> tuple[list, list[str]]:
     def bind(node, bindings):
         invalidate_walrus(node, bindings)
         if isinstance(node, (ast.Assign, ast.AnnAssign)):
-            value = binding(node.value, bindings)
-            for target in (node.targets if isinstance(node, ast.Assign) else [node.target]):
-                if isinstance(target, ast.Name):
-                    bindings[target.id] = value
-                else:
-                    for name in local_names(target):
-                        bindings[name] = None
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            # Evaluate every RHS against the old bindings before updating the LHS (including swaps).
+            resolved = {name: possible_solver if value is possible_solver else binding(value, bindings)
+                        for target in targets for name, value in assignment_pairs(target, node.value)}
+            bindings.update(resolved)
         elif isinstance(node, ast.AugAssign) and isinstance(node.target, ast.Name):
             name = node.target.id
             bindings[name] = arithmetic(bindings.get(name), node.op, numeric(node.value, bindings))
@@ -391,6 +404,10 @@ def _timeout_calls(src: str) -> tuple[list, list[str]]:
                 arms.append(values)
             for name in set(arms[0]) | set(arms[1]):
                 bindings[name] = merged(arms[0].get(name), arms[1].get(name))
+        elif isinstance(node, ast.Try) and not node.handlers:
+            # Execution reaches the following statement only after normal completion.
+            for stmt in (*node.body, *node.finalbody):
+                bind(stmt, bindings)
         elif isinstance(node, (ast.For, ast.AsyncFor, ast.While, ast.Try, ast.TryStar, ast.Match, ast.With, ast.AsyncWith)):
             invalidate_block(node, bindings)
         else:
@@ -475,6 +492,36 @@ def _timeout_calls(src: str) -> tuple[list, list[str]]:
             visit(node.test, after_test, deferred, class_parent)
             for branch in (node.body, node.orelse):
                 visit_branch(branch, after_test, deferred, class_parent, class_parent is not visible)
+            return
+        if isinstance(node, (ast.Try, ast.TryStar)):
+            visit_branch(node.body, visible, deferred, class_parent, class_parent is not visible)
+            normal = dict(visible)
+            for stmt in node.body:
+                bind(stmt, normal)
+            visit_branch(node.orelse, normal, deferred, class_parent, class_parent is not visible)
+            # Handlers and finally may run after a partially completed body. Forget the
+            # bindings it may have changed, then visit each suite in its own source order.
+            uncertain = dict(visible)
+            may_have_exited = False
+            for stmt in (*node.body, *node.orelse):
+                # Leading assignments of literals to names complete before any later
+                # exception can enter finally. After a possible exception, join conservatively.
+                if (not may_have_exited and isinstance(stmt, ast.Assign) and isinstance(stmt.value, ast.Constant)
+                        and all(isinstance(target, ast.Name) for target in stmt.targets)):
+                    bind(stmt, uncertain)
+                else:
+                    may_have_exited = True
+                    invalidate_block(stmt, uncertain)
+            for handler in node.handlers:
+                local = dict(uncertain)
+                if handler.type:
+                    visit(handler.type, local, deferred, class_parent)
+                if handler.name:
+                    local[handler.name] = None
+                visit_branch(handler.body, local, deferred, class_parent, class_parent is not visible)
+            for handler in node.handlers:
+                invalidate_block(handler, uncertain)
+            visit_branch(node.finalbody, uncertain, deferred, class_parent, class_parent is not visible)
             return
         if isinstance(node, (ast.For, ast.AsyncFor, ast.While)):
             # An iteration may inherit values from earlier iterations. Within the body,

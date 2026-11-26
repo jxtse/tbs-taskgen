@@ -28,7 +28,7 @@ def flow(tmp_path, monkeypatch):
         (out / "environment/data/readmeasurements.txt").write_text("7\n")
         (out / "environment/data/ReadMe.md").write_text("Sample format notes.\n")
         (out / "tests/hidden/example.json").write_text('{"rows": 2}')
-        (out / "tests/truth/expected.json").write_text("[7]")
+        (out / "tests/truth/expected.json").write_text("[1758.125]")
         return dict(rc=0, err="")
 
     def run_gates(cfg, item_dir, spec, th, attempt):
@@ -380,6 +380,40 @@ def test_unpriced_restricted_reviser_is_refused(flow):
     rec = read_json(it.p("prereview/e0-r1.json"))
     assert rec["revision_error"] == "S8: config" and not rec["revision_applied"]
     assert not client.log and "revision_call_id" not in rec
+
+
+@pytest.mark.parametrize("stage", ["S9P", "S8"])
+def test_report_counts_settled_call_after_record_write_error(flow, monkeypatch, stage):
+    from tbsgen import prereview_flow
+    from tbsgen.report import prereview_summary
+
+    P, it, _ = flow
+    role = "repair" if stage == "S8" else "prereview"
+    if stage == "S8":
+        _expect_step(P, it, "S8")
+    model = f"fixture-{role}"
+    P.cfg["models"]["prices"][model] = {"out": 4}
+    client = FakeClient(P.ledger, P.cfg, [dict(stage=stage, text='{"findings":[]}', usage={"output_tokens": 500})],
+                        name=model)
+    client.real = True
+    P._clients[role] = client
+    field = "revision_usd" if stage == "S8" else "usd"
+    failed = False
+
+    def fail_once(path, record):
+        nonlocal failed
+        if not failed and record.get(field):
+            failed = True
+            raise OSError("synthetic record write failure")
+        write_json(path, record)
+
+    monkeypatch.setattr(prereview_flow, "write_json", fail_once)
+    _expect_step(P, it, "S9")
+    if stage == "S8":
+        _expect_step(P, it, "S9")
+    assert failed and it.state["status"] == "waiting" and it.p("calib/runs.json").exists()
+    assert len(client.log) == 1
+    assert prereview_summary(it.root)["enforce"]["usd"] == pytest.approx(.002)
 
 
 def test_prereview_rejects_readme_prefix_data_edit(flow):

@@ -602,9 +602,9 @@ _VERIFIER_TIMEOUT_EXCEPTIONS = {"VerifierTimeoutError", "VerifierTimeout"}
 
 
 def _verifier_timed_out(it):
-    epoch = int(it.state.get("calib_epoch", 0))
+    # runs.json is the active calibration. A hardening revert restores rows with their original epochs.
     for run in read_json(it.p("calib", "runs.json"), []):
-        if run.get("epoch", epoch) != epoch or not run.get("outcome"):
+        if not run.get("outcome") or run.get("obsolete_probe_job") or run.get("preflight_refused"):
             continue
         trial = run.get("trial") or {}
         if (trial.get("exception") in _VERIFIER_TIMEOUT_EXCEPTIONS
@@ -653,11 +653,11 @@ def pkg(P, it):
             pass
     old_sha = it.state.get("pkg_statement_sha")
     pending = it.state.get("rescore_pending") or {}
+    regates = it.state.get("regates") or []
+    original_sha = regates[-1].get("pkg_sha") if regates else None
     if pending.get("reason") == "regate" and "inputs_sha" not in pending:
         # A regate started by an older version may already have overwritten pkg/. Bind only to
         # the package recorded when it was withdrawn, or its byte-identical review snapshot.
-        regates = it.state.get("regates") or []
-        original_sha = regates[-1].get("pkg_sha") if regates else None
         rnd = it.state.get("review_round")
         for prior in (it.p("pkg"), it.p("review", f"r{rnd}", "task/environment/review/pkg")):
             if original_sha and prior.is_dir() and calib.pkg_sha(prior) == original_sha:
@@ -670,9 +670,13 @@ def pkg(P, it):
             previous_pkg = Path(previous["pkg"])
             it.state["legacy_release_sha"] = calib.pkg_sha(previous_pkg) if previous_pkg.is_dir() else None
             it.save()  # Keep the original hash even if PKG is interrupted and retried.
-    if it.state.get("thresholds_locked") and not it.state.get("locked_tree_sha"):
-        regates = it.state.get("regates") or []
-        it.state["locked_tree_sha"] = _baseline_locked_tree_sha(it, regates[-1].get("pkg_sha") if regates else None)
+    # Probe migration can lock the thresholds before a task has ever had a package.
+    # In that case only the runtime threshold comparison has a baseline.
+    locked_package = it.state.get("thresholds_locked") and (
+        original_sha or it.state.get("revision_data_hash") or it.state.get("post_revision")
+        or it.state.get("locked_tree_sha") or it.p("review/verdict.json").is_file())
+    if locked_package and not it.state.get("locked_tree_sha"):
+        it.state["locked_tree_sha"] = _baseline_locked_tree_sha(it, original_sha)
         it.save()  # retain a verified legacy baseline before rebuilding pkg/
     extra = {"out": prereview_flow.candidate_dir(it)} if it.state.get("prereview_pending") else {}
     out = package.package(P.cfg, it.dir, gen0, spec, prov, **extra)
@@ -708,9 +712,7 @@ def pkg(P, it):
         return prereview_flow.finish_package(it, out, v)
     if it.state.get("thresholds_locked") and (v["ok"] or v.get("run_solution_timeouts", {}).get("errors")):
         why = _revision_pkg_problem(it, gate)
-        if not why and not it.state.get("locked_tree_sha") and (
-                it.state.get("revision_data_hash") or it.state.get("verifier_timeout_pending")
-                or v.get("run_solution_timeouts", {}).get("errors")):
+        if not why and locked_package and not it.state.get("locked_tree_sha"):
             why = "cannot verify the reviewed reference and hidden/truth trees"
         if why:
             v = dict(v, ok=False, errors=[*v.get("errors", []), why])
@@ -730,7 +732,7 @@ def pkg(P, it):
         it.state["approved_verifier_timeout"] = repaired["new"]
         it.state["require_prepared_receipt"] = True
         P.store.event("verifier_timeout_fixed", item=it.item_id, **repaired)
-    reviewed = any(it.state.get(k) for k in ("thresholds_locked", "post_revision", "post_regate", "review_round"))
+    reviewed = locked_package or it.state.get("review_round")
     if repaired and reviewed:
         it.state["timeout_fix_requires_review"] = True
     if repaired and repaired.get("archive_epoch") == int(it.state.get("calib_epoch", 0)):
@@ -1141,8 +1143,7 @@ def manual_launch(P, it, job, attempt):
                 or rec.get("launch_attempted") or calib.job_started(rec) or calib.remote_job(rec, P.ledger)
                 or it.state.get("calib_epoch", 0) != rec.get("calib_epoch" if review_job else "epoch", 0)):
             raise ValueError("job is not the current open attempt")
-        if review_job and (not P.cfg["review"]["enabled"] or rec["n"] != (it.state.get("review_round") or 1)
-                           or rec["pkg_sha"] != calib.pkg_sha(it.p("pkg"))):
+        if review_job and (not P.cfg["review"]["enabled"] or rec["n"] != (it.state.get("review_round") or 1)):
             raise ValueError("review is no longer current")
         if legacy_report_id(it) or (review_job and (review.job_contract(rec) != review.CURRENT_CONTRACT
                 or set(_probe_scopes(it)) - set(rec.get("suspected_scopes", [])))):
@@ -1155,10 +1156,12 @@ def manual_launch(P, it, job, attempt):
         conf = read_json(Path(rec["config"]))
         if not isinstance(conf, dict):
             raise ValueError("prepared job config is missing or unreadable")
-        if not review_job:
+        if review_job:
+            stale = review.bind_launch_snapshot(it.dir, rec, conf)
+        else:
             stale = calib.bind_launch_task(cfg, it.dir, rec, conf)
-            if stale:
-                raise ValueError(stale)
+        if stale:
+            raise ValueError(stale)
         why = calib.network_problem(cfg, Path(rec["task"]), conf) or _slots_full(P, job, rec["who"])
         if why or _cap_reached(P) is not None:
             raise ValueError(why or "run budget exhausted")
@@ -1397,6 +1400,30 @@ def _park_unreviewed(P, it, scopes):
     return finish_job_stage(P, it, "parked", why, detail={"suspected_scopes": scopes})
 
 
+FORMAL_REVIEW_REASONS = ("formal review required", "verifier timeout fixed: fresh review required")
+
+
+def formal_review_park(it):
+    return (it.state["status"] == "parked" and it.state["stage"] in ("S9R", "S10")
+            and str(it.state.get("reason", "")).startswith(FORMAL_REVIEW_REASONS))
+
+
+def resume_formal_review(cfg, it):
+    """Resume a parked release only when a fresh round can review the package it must release."""
+    if not cfg["review"]["enabled"] or not formal_review_park(it):
+        return False
+    required = it.state.get("requires_formal_review_sha")
+    models = cfg["review"].get("release_models")
+    if required and required != calib.pkg_sha(it.p("pkg")):
+        return False
+    if models is not None and review.review_cfg(cfg)["calib"]["teacher_model"] not in models:
+        return False
+    if it.state["stage"] == "S10":
+        it.state["review_round"] = review.next_round(it.dir, it.state)
+    it.goto("S9R", "resuming formal review")
+    return True
+
+
 def _current_review(it, sha):
     v = read_json(it.p("review", "verdict.json"), None)
     if not v:
@@ -1441,8 +1468,15 @@ def review_gate(P, it, scopes=None, current=None) -> str | None:
             return "verdict of another review job" if required else "probe verdict of another review job"
         if required:
             bound = _bound_verdict(it, job, v["round"])
-            if not bound or not job.get("model") or v.get("model", job["model"]) != job["model"]:
+            if (not bound or not job.get("model") or bound.get("model") != job["model"]
+                    or v.get("model") != job["model"]):
                 return "formal verdict missing its completed review job or reviewer model"
+            if (not job.get("review_task_sha") or bound.get("review_task_sha") != job["review_task_sha"]
+                    or v.get("review_task_sha") != job["review_task_sha"]):
+                return "formal verdict lacks a verified review task snapshot"
+            models = P.cfg["review"].get("release_models")
+            if models is not None and job["model"] not in models:
+                return f"review model {job['model']} is not in review.release_models"
             if _job_judgment(bound, job)["verdict"] != "pass":
                 return "completed formal review did not pass"
         if _job_judgment(v, job)["verdict"] != "pass":
@@ -1519,8 +1553,6 @@ def _release_reviewed(P, it, previous, scopes):
         job = _completed_review_job(it, rv)
         if job and job.get("model"):
             rev["model"] = job["model"]
-            if it.state.get("requires_formal_review_sha") and "model" not in rv:
-                write_json(it.p("review/verdict.json"), dict(rv, model=job["model"]))
     if rv is None and not P.cfg["review"]["enabled"]:
         rev = dict(status="not_reviewed", reason="review_disabled")
     label = it.state.get("calib_label")
@@ -1681,10 +1713,15 @@ def watch_tick(P, only: list[str] | None = None, max_steps: int = 50) -> dict:
         if only and it.item_id not in only:
             continue
         stage = job_stage(it)
-        if stage not in ("S9", "S9R") or not (it.state.get("status") == "waiting" or _remote_parked(it)):
+        formal = formal_review_park(it) and P.cfg["review"]["enabled"]
+        if not formal and not (stage in ("S9", "S9R") and (it.state.get("status") == "waiting" or _remote_parked(it))):
             continue
         try:
             with it.step_lock(timeout=60):
+                if formal:
+                    if resume_formal_review(P.cfg, it.load()):
+                        did.append(dict(item=it.item_id, action="resume_formal_review"))
+                    continue
                 action = poll_calibration(P, it)
         except StepLockTimeout as exc:
             P.store.event("calib_watch_busy", item=it.item_id, reason=str(exc))
@@ -1802,7 +1839,7 @@ def _s9r(P, it):
                     rec = calib.launch(rcfg, rec, P.ledger, save, started=started)
             if full:
                 return it.finish("waiting", f"review {rec['job_name']} queued: {full}")
-            if rec.get("blocked") and rec["state"] == "intent":
+            if rec.get("blocked") and rec["state"] in ("intent", "reserved"):
                 return it.finish("waiting", f"review blocked: {rec['blocked']}")
         elif rec.get("outcome") is None and rec.get("state") == "launched":
             why = calib.launcher_failed(rec, c)
@@ -1924,13 +1961,19 @@ def _ingest_review(P, it, rec, jd, *, trial_dirs=None, settlement=None):
                else res["outcome"],
                minutes=res["minutes"], cost_usd=usd, cost_kind=kind,
                trial=res["trial"], n_trials=res["n_trials"], usage=usage, repros=res["repros"])
-    if res["verdict"] is not None:
+    # In-flight legacy jobs can verify the embedded package against their recorded package hash.
+    # New jobs also verify the complete review task, which is required for a new-flow release.
+    why = review.snapshot_problem(rec)
+    if why:
+        rec.update(outcome="infra", error=why)
+    elif res["verdict"] is not None:
         d = it.p("review", f"r{rec['n']}")
         d.mkdir(parents=True, exist_ok=True)
         raw = res["verdict_raw"]
         write_json(d / "verdict.raw.json", raw)
         body = dict(raw if isinstance(raw, dict) else {"_raw": raw}, _normalized=res["verdict"],
                     verifier_reward=res["verifier_reward"], model=rec.get("model"),
+                    review_task_sha=rec.get("review_task_sha"),
                     pkg_sha=rec.get("pkg_sha"), calib_epoch=rec.get("calib_epoch", 0), job=rec["job_name"])
         jf = d / f"{rec['job_name']}.verdict.json"           # one immutable verdict per job
         if not jf.exists():
@@ -1948,7 +1991,7 @@ def _ingest_review(P, it, rec, jd, *, trial_dirs=None, settlement=None):
                         note=f"S9R review r{rec['n']} outcome={rec['outcome']} verdict={rec.get('verdict')}")
     _save_review(it, rec)
     _after_ingest(P, it, rec, "S9R")
-    outcome = "infra" if rec.get("obsolete_probe_review") else res["outcome"]
+    outcome = "infra" if why or rec.get("obsolete_probe_review") else res["outcome"]
     return dict(outcome=outcome, verdict=rec.get("verdict"), job_name=rec["job_name"])
 
 

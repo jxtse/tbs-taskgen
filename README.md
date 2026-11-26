@@ -73,7 +73,8 @@ Crossref · arXiv · Europe PMC              → S5 spec (teacher) → S6 genera
    `package.max_verifier_timeout_s` (default 7200) park the item. Every repaired package needs S9R approval of its final bytes before release. A verifier timeout recorded in the current calibration epoch also triggers recalibration.
 
    Before calibration, `prereview.mode` defaults to `"off"`. In `"shadow"`, one S9P call records evidenced
-   statement inconsistencies and missing conditions. Its packet excludes hidden inputs and truth files.
+   statement inconsistencies and missing conditions. Hidden inputs contribute paths, sizes, headers, keys and shapes only. The packet builder checks the statement,
+   grader, format notes and schema digests for answer content before contacting the model.
    In `"enforce"`, S8 can edit the statement and generator-authored `README.md`, `README.txt` or `FORMAT.md`
    directly under `environment/data/` (case-insensitive) once, followed by S7 and PKG. Call or packet errors
    and rejected edits continue with the original package. S10 parks a pre-reviewed version until its final

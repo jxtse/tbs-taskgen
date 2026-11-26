@@ -182,9 +182,42 @@ def _prepare_receipt(path: Path) -> dict:
     return prev if isinstance(prev, dict) else {}
 
 
-def _prepared_matches(receipt: dict, out: Path) -> bool:
-    return (receipt.get("ok") and receipt.get("out") == str(out.resolve())
-            and (out / "task.toml").is_file() and receipt.get("prepared_sha") == pkg_sha(out))
+def _copied_contents(root: Path) -> dict:
+    """Files and directories the preparation hook copies verbatim; task.toml is hook-owned."""
+    import hashlib
+    contents = {}
+    for name in ("instruction.md", "tests", "solution"):
+        base = root / name
+        for path in (base, *base.rglob("*")):
+            rel = path.relative_to(root)
+            if path.is_symlink():
+                raise OSError(f"cannot verify a symlink in the copied task: {rel}")
+            if path.is_dir():
+                contents[rel] = None
+            elif path.is_file():
+                with path.open("rb") as stream:
+                    contents[rel] = hashlib.file_digest(stream, "sha256").digest()
+            elif path.exists():
+                raise OSError(f"cannot verify a non-regular file in the copied task: {rel}")
+    return contents
+
+
+def _prepared_matches(receipt: dict, out: Path, pkg: Path, recp: Path) -> bool:
+    """The caller checks the source hash and OCI receipt. Upgrade a matching pre-hash receipt in place."""
+    if not (receipt.get("ok") and receipt.get("out") == str(out) and (out / "task.toml").is_file()):
+        return False
+    try:
+        digest = pkg_sha(out)
+        if "prepared_sha" in receipt and receipt["prepared_sha"] != digest:
+            return False
+        if _copied_contents(pkg) != _copied_contents(out):
+            return False
+    except OSError:
+        return False
+    if "prepared_sha" not in receipt:
+        receipt["prepared_sha"] = digest
+        write_json(recp, receipt)
+    return True
 
 
 def ensure_prepared(cfg: dict, item_dir: Path, who: str = "glm", force: bool = False) -> dict:
@@ -213,7 +246,7 @@ def ensure_prepared(cfg: dict, item_dir: Path, who: str = "glm", force: bool = F
     prev = _prepare_receipt(recp)
     image = taskimage.package_identity(item_dir)
     if prev.get("pkg_sha") == sha and prev.get("out") == str(out) and not force:
-        if _prepared_matches(prev, out) and (not image or _push_matches(item_dir, prev)):
+        if (not image or _push_matches(item_dir, prev)) and _prepared_matches(prev, out, pkg, recp):
             return dict(prev, reused=True)
         if not prev.get("ok"):
             return dict(prev, reused=True)          # same pkg failed before: needs `tbsgen calib prepare`
@@ -237,14 +270,21 @@ def ensure_prepared(cfg: dict, item_dir: Path, who: str = "glm", force: bool = F
         rc, err = r.returncode, None
     except Exception as e:  # noqa: BLE001  (timeout, missing cwd ...)
         rc, err = None, f"{type(e).__name__}: {e}"
-    ok = rc == 0 and (out / "task.toml").exists()
+    ok = rc == 0 and (out / "task.toml").is_file()
+    if ok:
+        try:
+            prepared_sha = pkg_sha(out)
+            if _copied_contents(pkg) != _copied_contents(out):
+                ok, err = False, "prepared instruction.md, tests/ or solution/ differs from the source package"
+        except OSError as exc:
+            ok, err = False, f"could not verify prepared copy: {exc}"
     if not ok and err is None:
         tail = log.read_text(errors="replace")[-300:] if log.exists() else ""
         err = f"exit {rc}" + ("" if (out / "task.toml").exists() else f"; no {out}/task.toml") + f": {tail}"
     res = dict(ok=ok, pkg_sha=sha, out=str(out), rc=rc, error=err, sec=round(time.time() - t0, 1), ts=time.time(),
                log=str(log))
     if ok:
-        res["prepared_sha"] = pkg_sha(out)
+        res["prepared_sha"] = prepared_sha
     if ok and image:
         res["published_digest"] = env.get("TBSGEN_IMAGE_DIGEST")
         if not _push_matches(item_dir, res):
@@ -410,7 +450,8 @@ def stale_prepared(cfg: dict, item_dir: Path, who: str, epoch: int) -> str | Non
         return None
     if image and not _push_matches(item_dir, prev):
         return "prepared task has no matching verified OCI digest; run calib prepare"
-    if prev.get("pkg_sha") == pkg_sha(item_dir / "pkg") and _prepared_matches(prev, out):
+    pkg = item_dir / "pkg"
+    if prev.get("pkg_sha") == pkg_sha(pkg) and _prepared_matches(prev, out, pkg, recp):
         return None
     return (f"the prepared {who} copy may predate the current package (no calib/{recp.name} for the current pkg/): "
             "set calib.prepare_command so S9 can rebuild it, or retry the configured hook with `tbsgen calib prepare --item ID`")
@@ -538,6 +579,8 @@ def check_job_identity(jd, rec, *, review=False, marker=None, partial=False):
     conf = read_json(jd / "config.json", {})
     agents = conf.get("agents") or [{}]
     tasks = conf.get("tasks") or [{}]
+    if review and (len(agents) != 1 or len(tasks) != 1):
+        raise ValueError("job identity mismatch: review requires one recorded model and task")
     ident = dict(job_name=conf.get("job_name"), model=agents[0].get("model_name"), task=tasks[0].get("path"))
     want = dict(job_name=rec["job_name"],
                 model=rec.get("model", None if review else ident["model"]),
@@ -710,12 +753,16 @@ def launch(cfg: dict, rec: dict, ledger, save, *, started=None) -> dict:
         rec["blocked"] = f"job config {rec['config']} unreadable ({type(e).__name__}); run prepare again"
         save(rec)
         return rec
-    if rec["who"] != "review":
-        why = bind_launch_task(cfg, Path(rec["config"]).parent.parent, rec, conf)
-        if why:
-            rec["blocked"] = why
-            save(rec)
-            return rec
+    item_dir = Path(rec["config"]).parent.parent
+    if rec["who"] == "review":
+        from .review import bind_launch_snapshot
+        why = bind_launch_snapshot(item_dir, rec, conf)
+    else:
+        why = bind_launch_task(cfg, item_dir, rec, conf)
+    if why:
+        rec["blocked"] = why
+        save(rec)
+        return rec
     if rec["state"] in ("intent", "cancelled_unstarted"):
         hosts = [str(h) for h in role(c, rec["who"], "agent_allowed_hosts") or []]
         for a in conf.get("agents") or []:

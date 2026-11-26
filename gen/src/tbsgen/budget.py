@@ -115,6 +115,12 @@ def price_usd(prices: dict, model: str, usage: dict) -> float:
             + cw * p.get("cache_write", p.get("in", 0) * 1.25)) / 1e6
 
 
+def settled_call_usd(db, call_id, item, stage):
+    row = db.execute("SELECT usd FROM calls WHERE id=? AND item=? AND stage=? AND ended IS NOT NULL",
+                     (call_id, item, stage)).fetchone()
+    return row[0] if row else None
+
+
 class Ledger:
     def __init__(self, path: str | Path, cfg: dict, *, init_deadline=None):
         self.path = Path(path)
@@ -147,9 +153,7 @@ class Ledger:
     # ------------------------------------------------------------------ reserve / finish
     def settled_usd(self, call_id: int, item: str, stage: str) -> float | None:
         with contextlib.closing(self._db()) as db:
-            row = db.execute("SELECT usd FROM calls WHERE id=? AND item=? AND stage=? AND ended IS NOT NULL",
-                             (call_id, item, stage)).fetchone()
-        return row[0] if row else None
+            return settled_call_usd(db, call_id, item, stage)
 
     def reserved_call(self, key: str) -> int | None:
         with self._db() as db:

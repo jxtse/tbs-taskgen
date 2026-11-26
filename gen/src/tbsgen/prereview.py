@@ -12,6 +12,7 @@ import math
 import os
 import re
 import time
+import tokenize
 import zipfile
 from pathlib import Path
 
@@ -89,7 +90,7 @@ class _ZipHeaderReader(io.BufferedReader):
         return super().read(size)
 
 
-def _data_entry(path: Path, *, format_note: bool) -> dict:
+def _data_entry(path: Path, *, format_note: bool, hidden: bool) -> dict:
     entry = {"size": path.stat().st_size}
     compressed = path.suffix.lower() == ".gz"
     inner = path.with_suffix("") if compressed else path
@@ -109,7 +110,7 @@ def _data_entry(path: Path, *, format_note: bool) -> dict:
         stream = io.StringIO(text, newline="")
         rows = csv.reader(stream, delimiter="\t" if ext == ".tsv" else ",", strict=True)
         columns, end, row_count = [], 0, 0
-        for i in range(4):
+        for i in range(1 if hidden else 4):
             try:
                 row = next(rows)
             except StopIteration:
@@ -122,8 +123,12 @@ def _data_entry(path: Path, *, format_note: bool) -> dict:
                 columns = row
             end = stream.tell()
             row_count += 1
+        if hidden and (not columns or len(set(columns)) != len(columns)
+                       or not all(re.fullmatch(r"[^\W\d][\w .-]*", col.strip()) for col in columns)
+                       or any("\n" in col or "\r" in col for col in columns)):
+            raise UnsafeGraderPacket("ambiguous hidden CSV header")
         entry.update(columns=columns, sample=text[:end])
-        if truncated and row_count < 4:
+        if not hidden and truncated and row_count < 4:
             entry["truncated"] = True
     elif ext == ".json":
         # Bound decompression and decoding. An oversized schema is an auditable fail-open.
@@ -160,13 +165,12 @@ def _safe_file(root: Path, rel: Path) -> bool:
 
 
 class UnsafeGraderPacket(ValueError):
-    """The grader could carry answers, or its comparison with truth was inconclusive."""
+    """The packet could carry answers, or its comparison with truth was inconclusive."""
 
 
 def _json_atoms(obj):
     if isinstance(obj, dict):
-        for key, value in obj.items():
-            yield key
+        for value in obj.values():
             yield from _json_atoms(value)
     elif isinstance(obj, list):
         for value in obj:
@@ -206,20 +210,38 @@ def _truth_atoms(path, remaining):
         atoms = (atom for line in content.splitlines() if line.strip() for atom in _json_atoms(json.loads(line)))
     else:
         rows = csv.reader(io.StringIO(content, newline=""), delimiter="," if ext == ".csv" else "\t", strict=True)
+        next(rows, None)  # Truth tables use their first row for field names.
         atoms = (cell for row in rows for cell in row)
     return len(data), atoms
 
 
-def _check_graders(pkg, sources):
-    if not sources:
-        return
-    # Compare decoded constants as well as source text (including comments). A self-contained
-    # literal table can supply its own answers, with no corresponding file under tests/truth.
+_ANSWER_DECLARATION = re.compile(
+    r"\b(?:answer(?:[ _-]key)?|(?:expected|correct|gold)\s+(?:answer|value|label|result|output)|ground[ _-]truth)"
+    r"\s*(?:[*_`]*\s*[:=]|\bis\b)\s*\S", re.I)
+_EXPECTED_NAME = re.compile(r"(?:^|_)(?:answer|expected|truth|gold|oracle)(?:_|$)", re.I)
+
+
+def _check_declaration(text):
+    if _ANSWER_DECLARATION.search(text):
+        raise UnsafeGraderPacket("explicit answer declaration")
+
+
+def _grader_literals(sources):
+    """Check possible embedded grader answers, including scalars with no on-disk truth counterpart."""
     literals = []
+    # Names can cross the two grader files. If any definition supplies a literal, a later
+    # comparison using that name is ambiguous and we skip this advisory request.
+    definitions = {}
+    comparisons = []
     for source in sources:
+        for token in tokenize.generate_tokens(io.StringIO(source).readline):
+            if token.type == tokenize.COMMENT:
+                _check_declaration(token.string)
         for node in ast.walk(ast.parse(source)):
             if isinstance(node, ast.Constant):
-                literals.append(str(node.value))
+                literal = str(node.value)
+                _check_declaration(literal)
+                literals.append(literal)
             if isinstance(node, (ast.List, ast.Tuple, ast.Set, ast.Dict)):
                 try:
                     values = ast.literal_eval(node)
@@ -227,7 +249,75 @@ def _check_graders(pkg, sources):
                     continue
                 if values:
                     raise UnsafeGraderPacket("embedded literal table")
-    haystack = "\n".join([*sources, *literals]).casefold()
+            if isinstance(node, (ast.Assign, ast.AnnAssign)) and node.value is not None:
+                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                for target in targets:
+                    for name in ast.walk(target):
+                        if isinstance(name, ast.Name):
+                            definitions.setdefault(name.id, []).append(node.value)
+                            if _EXPECTED_NAME.search(name.id):
+                                comparisons.append(node.value)
+            if isinstance(node, ast.arguments):
+                positional = [*node.posonlyargs, *node.args]
+                defaults = zip(reversed(positional), reversed(node.defaults))
+                for param, default in (*defaults, *zip(node.kwonlyargs, node.kw_defaults)):
+                    if default is not None:
+                        definitions.setdefault(param.arg, []).append(default)
+            if isinstance(node, ast.Return) and node.value is not None:
+                comparisons.append(node.value)
+            if isinstance(node, ast.Assert):
+                comparisons.append(node.test)
+            if isinstance(node, ast.Compare):
+                comparisons.extend([node.left, *node.comparators])
+            if isinstance(node, ast.Call) and getattr(node.func, "attr", getattr(node.func, "id", "")) in {
+                    "assertEqual", "assertAlmostEqual", "assert_equal", "assert_array_equal",
+                    "assert_allclose", "isclose", "allclose", "array_equal", "approx"}:
+                comparisons.extend(node.args)
+                comparisons.extend(kw.value for kw in node.keywords)
+
+    seen = set()
+    while comparisons:
+        node = comparisons.pop()
+        if node in seen:
+            continue
+        seen.add(node)
+        if isinstance(node, ast.Constant) and node.value is not None:
+            raise UnsafeGraderPacket("embedded comparison value")
+        if isinstance(node, ast.Name):
+            comparisons.extend(definitions.get(node.id, ()))
+        elif isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "get":
+            # Mapping lookup keys are schema. A default value can supply a hardcoded answer.
+            comparisons.extend([node.func.value, *node.args[1:], *(kw.value for kw in node.keywords)])
+        elif isinstance(node, ast.Subscript):
+            # A field name locates a value. The answer comes from the indexed object.
+            comparisons.append(node.value)
+        else:
+            comparisons.extend(ast.iter_child_nodes(node))
+    return literals
+
+
+def _check_packet(pkg, packet, graders):
+    # Include every visible field and its decoded spelling, including source notes outside pkg.
+    # JSON escaping otherwise hides e.g. a multiline answer in the statement from the scan.
+    def fields(value):
+        if isinstance(value, dict):
+            for key, member in value.items():
+                yield key
+                yield from fields(member)
+        elif isinstance(value, list):
+            for member in value:
+                yield from fields(member)
+        else:
+            yield str(value)
+
+    for path, entry in packet["files"].items():
+        if path not in ("tests/measure.py", "tests/test_outputs.py"):
+            _check_declaration(path)
+            for field in fields(entry):
+                _check_declaration(field)
+    for field in fields(packet.get("format_notes", {})):
+        _check_declaration(field)
+    haystack = "\n".join([*fields(packet), *_grader_literals(graders)]).casefold()
     # Also catch alternate numeric spellings, including exponential notation in comments.
     number_pattern = r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[-+]?\d+)?"
     numbers = {format(float(m[0]), ".6g") for m in re.finditer(number_pattern, haystack)}
@@ -255,10 +345,10 @@ def _check_graders(pkg, sources):
                     raise UnsafeGraderPacket("truth comparison exceeds scan budget")
                 word = str(atom).strip().casefold()
                 if word and word in haystack:
-                    raise UnsafeGraderPacket("grader overlaps truth")
+                    raise UnsafeGraderPacket("packet overlaps truth")
             else:
                 if format(number, ".6g") in numbers:
-                    raise UnsafeGraderPacket("grader overlaps numeric truth")
+                    raise UnsafeGraderPacket("packet overlaps numeric truth")
 
 
 def build_packet(pkg: Path, *, generator_dir: Path | None = None) -> dict:
@@ -295,11 +385,10 @@ def build_packet(pkg: Path, *, generator_dir: Path | None = None) -> dict:
             graders.append(data.decode("utf-8"))
             visible = data[:TEXT_BYTES].decode("utf-8", errors="ignore")
             add(rel, {"text": visible + (TRUNCATED if len(data) > TEXT_BYTES else "")})
-    _check_graders(pkg, graders)
     if "instruction.md" not in files:
         raise ValueError("missing instruction.md")
 
-    for dirname in ("generator", "environment/data"):
+    for dirname in ("generator", "environment/data", "tests/hidden"):
         root = pkg / dirname
         if root.resolve() != root:
             raise ValueError(f"linked directory outside packet scope: {dirname}")
@@ -308,8 +397,12 @@ def build_packet(pkg: Path, *, generator_dir: Path | None = None) -> dict:
             rel = path.relative_to(pkg)
             if dirname == "generator" and not is_format_note(path):
                 continue
+            hidden = dirname == "tests/hidden"
+            if hidden and (path.name.split(".")[0].casefold() == "readme" or is_format_note(path)):
+                continue
             if _safe_file(pkg, rel):
-                add(rel, _data_entry(path, format_note=path.parent == root and is_format_note(path)))
+                add(rel, _data_entry(path, format_note=not hidden and path.parent == root and is_format_note(path),
+                                     hidden=hidden))
 
     if _safe_file(pkg, Path("provenance.json")):
         with (pkg / "provenance.json").open("rb") as f:
@@ -333,6 +426,7 @@ def build_packet(pkg: Path, *, generator_dir: Path | None = None) -> dict:
             packet["format_notes"] = notes
     if len(_json(packet).encode()) > PACKET_BYTES:
         raise ValueError("pre-review packet exceeds byte limit")
+    _check_packet(pkg, packet, graders)
     return packet
 
 

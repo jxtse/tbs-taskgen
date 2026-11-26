@@ -2,12 +2,14 @@
 breakers, calibration queue.  Written to <run>/reports/daily-<day>.md."""
 from __future__ import annotations
 
+import sqlite3
 import time
 from collections import Counter, defaultdict
+from contextlib import closing
 from pathlib import Path
 
 from .calib import manual_command
-from .budget import today
+from .budget import settled_call_usd, today
 from .state import read_json
 
 
@@ -62,6 +64,14 @@ def round_verdict(directory: Path) -> tuple[dict, list] | None:
 
 def prereview_summary(run: Path) -> dict:
     """Count distinct items per mode. Compare records only with the verdict of their own epoch and round."""
+    path = run / "ledger.sqlite"
+    if path.is_file():
+        with closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)) as db:
+            return _prereview_summary(run, db)
+    return _prereview_summary(run, None)
+
+
+def _prereview_summary(run, db):
     rows = {mode: dict(items_checked=0, checks=0, findings_raw=0, findings_validated=0,
                        revisions_applied=0, prereview_usd=0., revision_usd=0., usd=0.,
                        errors=0, opus_verdicts=0, opus_blocking_ab=0, unverified_verdicts=0)
@@ -79,8 +89,11 @@ def prereview_summary(run: Path) -> dict:
         row["findings_raw"] += len(record.get("raw") or [])
         row["findings_validated"] += len(record.get("validated") or [])
         row["revisions_applied"] += bool(record.get("revision_applied"))
-        row["prereview_usd"] += record.get("usd") or 0.
-        row["revision_usd"] += record.get("revision_usd") or 0.
+        for stage, id_field, saved_field, column in (
+            ("S9P", "call_id", "usd", "prereview_usd"), ("S8", "revision_call_id", "revision_usd", "revision_usd")
+        ):
+            usd = settled_call_usd(db, record[id_field], item.name, stage) if db and record.get(id_field) else None
+            row[column] += (record.get(saved_field) or 0.) if usd is None else usd
         row["errors"] += bool(record.get("error"))
         result = round_verdict(item / "review" / f"r{record.get('round')}")
         if not result or result[0]["epoch"] not in (None, record.get("epoch")):

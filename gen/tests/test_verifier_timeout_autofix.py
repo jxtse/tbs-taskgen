@@ -215,6 +215,29 @@ def test_timeout_bindings_and_call_forms(tmp_path, source, total, unknown):
     assert bool(result["errors"] or result["unknown"])
 
 
+@pytest.mark.parametrize("body", [
+    "    program, timeout = run_solution, 900\n    program(timeout)",
+    "    try:\n        timeout = 900\n        run_solution(timeout)\n    finally:\n        pass",
+    "    try:\n        prepare()\n    finally:\n        timeout = 900\n        run_solution(timeout)",
+    "    try:\n        timeout = 900\n        prepare()\n    finally:\n        run_solution(timeout)",
+])
+def test_package_repairs_unpacked_and_try_suite_timeouts(tmp_path, body):
+    pipeline, it, _ = _setup(tmp_path, "def check():\n" + body)
+    stages_b.pkg(pipeline, it)
+    check = read_json(it.p("PKG_check.json"))
+    assert it.state["stage"] == "S9" and check["ok"]
+    assert check["run_solution_timeouts"]["sum_sec"] == 900
+    assert check["verifier_timeout_fix"]["new"] == 1200
+
+
+def test_finally_with_partial_assignment_stays_dynamic(tmp_path):
+    source = "t = 30\ntry:\n    prepare()\n    t = 900\nfinally:\n    run_solution(t)"
+    pipeline, it, _ = _setup(tmp_path, source)
+    stages_b.pkg(pipeline, it)
+    assert it.state["status"] == "parked"
+    assert read_json(it.p("PKG_check.json"))["run_solution_timeouts"]["unknown"]
+
+
 def test_s7_timeout_projection_matches_packaged_sources(tmp_path):
     pipeline, it, _ = _setup(tmp_path, "run_solution(900)")
     # The pipeline injects the metrics helper and copies the authored measure and output tests.
@@ -293,6 +316,33 @@ def test_later_trial_timeout_archives_calibration(tmp_path, legacy):
     it.save()
     stages_b.pkg(pipeline, it)
     assert it.state["stage"] == "S9" and it.state["calib_epoch"] == 3
+
+
+def test_timeout_fix_archives_restored_hardening_runs(tmp_path):
+    pipeline, it, _ = _setup(tmp_path, "run_solution(900)", locked=True)
+    first = dict(epoch=2, who="glm", outcome="pass", job_name="sample-first", minutes=30,
+                 n_trials=2, trial_verifier_timeouts={"first": False, "retry": True})
+    write_json(it.p("calib/runs.json"), [first])
+    generated = it.p("runs/s7-1")
+    saved = shutil.copytree(generated, tmp_path / "synthetic-generator-output")
+    stages_b.start_hardening(pipeline, it)
+    it.finish("dropped", "not_separable")
+    assert stages_b.harden_revert(pipeline, it)
+    active = read_json(it.p("calib/runs.json"))
+    assert active == [first] and it.state["calib_epoch"] == 4
+    active.append(dict(epoch=4, who="glm", outcome="fail", job_name="sample-next", minutes=30))
+    write_json(it.p("calib/runs.json"), active)
+    action, label = calib.next_action(active, pipeline.cfg)
+    assert (action, label) == ("label", "unstable")
+    it.state.update(calib_label=label)
+    it.save()
+    stages_b.regate(pipeline, it, "updated verifier")
+    shutil.copytree(saved, generated)
+    it.goto("PKG", "passing synthetic gate")
+    stages_b.pkg(pipeline, it)
+    assert read_json(it.p("PKG_check.json"))["verifier_timeout_fix"]["new"] == 1200
+    assert it.state["stage"] == "S9" and it.state["calib_epoch"] == 5
+    assert read_json(it.p("calib/epoch-4/runs.json")) == active
 
 
 @pytest.mark.parametrize("enabled", [True, False])

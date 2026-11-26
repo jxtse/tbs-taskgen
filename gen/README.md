@@ -413,7 +413,7 @@ allow_submit = false
 | `calib.est_usd_per_run` | 20 | 每次校准作业的预留额，`calib-ingest` 冲销：Harbor 报了 `cost_usd` 用实报（`reported`）；没报（如超时）用 trial 的 token 用量 × `models.prices[模型]` 估算（`tokens`，来源依次为 agent_result、trajectory.json、Claude Code stream-json）；都没有则保留预留额并标 `reservation`——它仍占用预留额度，但不算进 `run_usd_total` 的实际花费门。`tbsgen ledger` 的 `usd_by_cost_kind` 分开列出 |
 | `calib.teacher_available` | True | False：GLM 首次失败直接记 `parked:teacher_unavailable` |
 | `calib.prepared_tasks_dir` | None | 远端沙箱已注册模板的任务副本目录；设置后缺模板的条目不提交 |
-| `calib.prepare_command / prepare_cwd / prepare_timeout_s` | None / harbor_root / 3600 | 环境准备钩子：S9 写作业配置前对每题运行一次（bash），把 `pkg/` 变成 `<prepared_tasks_dir>/<item_id>`（如建镜像、注册沙箱模板、改写 task.toml）。占位符 `{item_id} {pkg} {out} {who}`（已 shell 转义），环境变量 `TBSGEN_ITEM_ID / TBSGEN_PKG / TBSGEN_PREPARED_DIR / TBSGEN_WHO`。回执 `calib/prepare.json` 记录源包哈希、目标绝对路径和准备产物哈希。三者匹配才复用，失败不自动重试（`tbsgen calib prepare` 重试），失败时条目 waiting 且不提交 |
+| `calib.prepare_command / prepare_cwd / prepare_timeout_s` | None / harbor_root / 3600 | 环境准备钩子：S9 写作业配置前对每题运行一次（bash），把 `pkg/` 变成 `<prepared_tasks_dir>/<item_id>`（如建镜像、注册沙箱模板、改写 task.toml）。占位符 `{item_id} {pkg} {out} {who}`（已 shell 转义），环境变量 `TBSGEN_ITEM_ID / TBSGEN_PKG / TBSGEN_PREPARED_DIR / TBSGEN_WHO`。签发回执前逐项比对 `instruction.md`、`tests/` 和 `solution/`。回执 `calib/prepare.json` 记录源包哈希、目标绝对路径和准备产物哈希。自动和人工启动均核验副本，旧回执通过核验后原位补记产物哈希。准备失败时条目进入 waiting，可运行 `tbsgen calib prepare` 重试 |
 | `calib.teacher_environment / teacher_agent_allowed_hosts / teacher_harbor_root / teacher_prepared_tasks_dir` | None（沿用共享项） | 教师独立路由：教师作业用自己的 Harbor 环境、agent 阶段放行主机、启动脚本目录和准备副本目录；未设置时与学生共用 `environment / agent_allowed_hosts / harbor_root / prepared_tasks_dir` |
 | `calib.timeout_no_output / timeout_no_output_retries` | fail / 1 | 学生运行“超时且未交付”（`timeout_no_output`）的处理：`fail` 按普通失败（默认，标签规则不变）；`retry` 不计入决策、重跑学生（最多 N 次，用完后按失败计）；`park` 暂存 `parked:timeout_no_output` |
 | `calib.watch_interval_s` | 120 | `tbsgen calib watch` 轮询间隔 |
@@ -480,6 +480,7 @@ S9 打出标签后，**hard / unstable**（`calib.keep_labels`）必须先过审
 |---|---|---|
 | `review.enabled` | true | 关闭后有可疑探针范围的题暂存为 `parked:probe_unreviewed`，开启后可用 `tbsgen resume` 恢复 |
 | `review.model / agent / environment / agent_allowed_hosts / harbor_root / launcher / jobs_dir` | None（沿用教师路由） | 审核作业的模型、agent、Harbor 环境、agent 阶段放行主机、启动脚本目录与脚本、作业目录 |
+| `review.release_models` | 未设 | 经过预审或 verifier 超时修复的版本默认接受作业准备时记录的审核模型。设置列表后，S10 只接受列表内模型对同一包快照的通过裁决。重新开启审核后，`resume` 或 `calib watch` 会恢复因缺少正式审核而暂存的版本。 |
 | `review.est_usd_per_run` | None（= `calib.est_usd_per_run`） | 账本预留 |
 | `review.timeout_sec` | 3600 | 审核任务的 agent 超时 |
 | `review.max_revisions` | 3 | 每题最多修订轮数，用完 → dropped |

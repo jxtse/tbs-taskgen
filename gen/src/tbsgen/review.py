@@ -956,6 +956,33 @@ def job_name(item_id: str, rnd: int, attempt: int) -> str:
     return f"tbsgen-{item_id}-review{rnd}" + (f"-a{attempt}" if attempt > 1 else "")
 
 
+def snapshot_problem(rec: dict) -> str | None:
+    """Verify the package embedded in /review and the task that supplies its build context."""
+    task = Path(rec["task"])
+    pkg = task / "environment/review/pkg"
+    if not pkg.is_dir() or calib.pkg_sha(pkg) != rec["pkg_sha"]:
+        return "package in the review task differs from the prepared package"
+    if rec.get("review_task_sha") and calib.pkg_sha(task) != rec["review_task_sha"]:
+        return "review task changed after preparation"
+    return None
+
+
+def bind_launch_snapshot(item_dir: Path, rec: dict, conf: dict) -> str | None:
+    if rec["pkg_sha"] != calib.pkg_sha(item_dir / "pkg"):
+        return "package in the review task differs from the current package"
+    agents = conf.get("agents") or []
+    if len(agents) != 1 or agents[0].get("model_name") != rec["model"]:
+        return "job config differs from the prepared review model"
+    tasks = conf.get("tasks") or []
+    if len(tasks) != 1 or tasks[0].get("path") != rec["task"]:
+        return "job config differs from the prepared review task"
+    why = snapshot_problem(rec)
+    if not why and not rec.get("review_task_sha"):
+        # An unstarted intent issued before snapshots were recorded can still bind its verified task.
+        rec["review_task_sha"] = calib.pkg_sha(Path(rec["task"]))
+    return why
+
+
 def prepare(cfg: dict, item_dir: Path, task: Path, rnd: int, attempt: int, epoch: int = 0) -> dict:
     """Intent record for one review run (job config written next to the review task)."""
     rc = review_cfg(cfg)
@@ -972,7 +999,10 @@ def prepare(cfg: dict, item_dir: Path, task: Path, rnd: int, attempt: int, epoch
                config=str(p), command=command, state="intent", remote_route=calib.is_remote_launcher(c, launcher),
                submitted=False, ts=time.time(),
                job_dir=str(Path(c["jobs_dir"]) / name), task=str(task.resolve()), outcome=None,
-               ledger_stage="S9R", pkg_sha=calib.pkg_sha(item_dir / "pkg"), calib_epoch=epoch)
+               ledger_stage="S9R", pkg_sha=calib.pkg_sha(task / "environment/review/pkg"),
+               review_task_sha=calib.pkg_sha(task), calib_epoch=epoch)
+    if rec["pkg_sha"] != calib.pkg_sha(item_dir / "pkg"):
+        rec["blocked"] = "package in the review task differs from the current package"
     if cfg.get("config_path"):
         rec["config_path"] = cfg["config_path"]
     contract = json.loads((task / "tests/review_contract.json").read_text())

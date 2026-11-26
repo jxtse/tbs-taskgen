@@ -23,6 +23,7 @@ from .state import STAGES, Store, read_json, write_json
 
 HANDLERS = {"S1": A.s1, "S2a": A.s2a, "S3b": A.s3b, "S3c": A.s3c, "S4c": A.s4c, "S5G": A.s5g, "S2": A.s2, "S3": A.s3, "S4": A.s4, "S5": A.s5, "S6I": A.s6i, "S6A": A.s6a, "S6A_run": A.s6a_run, "S6M": A.s6m,
             "S6B": A.s6b, "S6C": B.s6c, "S7": B.s7, "S8": B.s8, "PKG": B.pkg, "S9": B.s9, "S9R": B.s9r, "S10": B.s10}
+DEFAULT_RESUME_REASONS = ("budget:", "model:", "parked:probe_unreviewed", *B.FORMAL_REVIEW_REASONS)
 AGENT_STAGES = ("S4c", "S5G")     # code-grounded Harbor agent jobs: the item waits while its job runs
 MODEL_STAGES = {"S5": "spec", "S6A": "gen", "S6M": "gen", "S6C": "tests", "S8": "repair"}
 # sub-stages that are not in state.STAGES (for `run --until`): S6A_run is part of S6A; S6M (a model call) comes
@@ -467,7 +468,7 @@ class Pipeline:
             it.goto("S6I", "operator requeued image infrastructure failure")
             return True
 
-    def resume(self, reasons_prefix: tuple[str, ...] = ("budget:", "model:", "parked:probe_unreviewed"), only: list[str] | None = None,
+    def resume(self, reasons_prefix: tuple[str, ...] = DEFAULT_RESUME_REASONS, only: list[str] | None = None,
                stages: list[str] | None = None) -> list[str]:
         """Re-activate paused items whose reason starts with one of reasons_prefix; only: just these item ids;
         stages: just items paused at these stages."""
@@ -486,6 +487,10 @@ class Pipeline:
                 if migrated:
                     if migrated == "ok":
                         out.append(it.item_id)
+                    continue
+                if (str(it.state.get("reason", "")).startswith(reasons_prefix)
+                        and B.resume_formal_review(self.cfg, it)):
+                    out.append(it.item_id)
                     continue
                 probe_park = (it.state["status"] == "parked" and it.state.get("reason") == "parked:probe_unreviewed"
                               and (self.cfg.get("review") or {}).get("enabled"))
