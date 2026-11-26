@@ -212,6 +212,12 @@ are documented in [`gen/README.md`](gen/README.md) §3; calibrating only some it
 (`calib.prepare_command`), teacher-only routing (`calib.teacher_*`) and the S9R review settings (`review.*`, on by
 default; routed like the teacher unless set) are in §4–§5b there.
 
+Calibration preparation hooks may rewrite image settings but must preserve `[verifier].timeout_sec`.
+When an S9R config includes `TBSGEN_REVIEW_TASK_SHA` in the agent environment, sync the task and rewrite its path,
+then run `sha=$(python3 taskhash.py "$worker_config") || exit 1` on the build host before starting Harbor
+(use `gen/src/tbsgen/taskhash.py`). Write `$sha` to `review_task_sha` in each trial's `result.json`.
+A missing hash counts toward `review.infra_retries`. Jobs submitted without the env key follow the legacy protocol.
+
 ### Resolving a parked remote job
 
 For S4c, S5G, S9 and S9R, `tbsgen status` and `tbsgen report` count unresolved `remote_unknown` runs. The item reason

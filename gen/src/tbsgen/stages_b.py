@@ -1346,6 +1346,8 @@ def _after_ingest(P, it, rec, stage):
 
 def _ingest_run(P, it, rec, stage, jd, *, trial_dirs=None, settlement=None):
     remote = calib.remote_job(rec, P.ledger)
+    if stage == "S9R" and (jd / "tbsgen-remote.json").is_file():
+        remote = True  # --job-dir can supply a synced directory outside the launcher's default location.
     if remote and trial_dirs is None:
         trial_dirs, complete = calib.remote_trial_set(jd, stage, contract=review.job_contract(rec))
         if not complete:
@@ -1354,7 +1356,7 @@ def _ingest_run(P, it, rec, stage, jd, *, trial_dirs=None, settlement=None):
         raise ValueError(f"job not finished yet: {jd}")
     calib.check_job_identity(jd, rec, review=stage == "S9R")
     if stage == "S9R":
-        return _ingest_review(P, it, rec, jd, trial_dirs=trial_dirs, settlement=settlement)
+        return _ingest_review(P, it, rec, jd, remote=remote, trial_dirs=trial_dirs, settlement=settlement)
     runs = read_json(it.p("calib", "runs.json"), [])
     used = {r.get("trial", {}).get("job_dir") for r in runs if r.get("outcome") is not None}
     if str(jd.resolve()) in used:
@@ -1895,7 +1897,10 @@ def _s9r(P, it):
             if rv.get("allow_human"):
                 return finish_job_stage(P, it, "parked", f"review:human ({why})")
             return finish_job_stage(P, it, "dropped", f"review:invalid {why}")
-        return finish_job_stage(P, it, "parked", f"review:infra ({n_infra} infra, {n_invalid} invalid verdicts)")
+        why = f"review:infra ({n_infra} infra, {n_invalid} invalid verdicts)"
+        if runs[-1].get("error") == "review:launcher_no_hash":
+            why += " review:launcher_no_hash"
+        return finish_job_stage(P, it, "parked", why)
     wait = calib.preflight_wait(P.cfg, all_rnd[-1] if all_rnd else None)
     if wait:                            # the relay refused the last review run: wait, then launch the next attempt
         return it.finish("waiting", wait)
@@ -1944,14 +1949,14 @@ def _park_missing_trial(P, it, rec, save, error):
     raise ValueError(f"incomplete remote trial set: missing {error.filename}") from error
 
 
-def _ingest_review(P, it, rec, jd, *, trial_dirs=None, settlement=None):
+def _ingest_review(P, it, rec, jd, *, remote, trial_dirs=None, settlement=None):
     assigned = rec.get("suspected_scopes", [])
-    remote = calib.remote_job(rec, P.ledger)
     try:
         res = review.classify(jd, rec.get("model"), P.cfg["models"].get("prices", {}),
                               allowed_verdicts=rec.get("allowed_verdicts"), allow_human=True,
                               suspected_scopes=assigned, contract=review.job_contract(rec), require_verified=remote,
                               trial_dirs=trial_dirs)
+        remote_problem = review.remote_hash_problem(rec, trial_dirs) if remote else None
     except FileNotFoundError as e:
         if not remote:
             raise
@@ -1963,7 +1968,7 @@ def _ingest_review(P, it, rec, jd, *, trial_dirs=None, settlement=None):
                trial=res["trial"], n_trials=res["n_trials"], usage=usage, repros=res["repros"])
     # In-flight legacy jobs can verify the embedded package against their recorded package hash.
     # New jobs also verify the complete review task, which is required for a new-flow release.
-    why = review.snapshot_problem(rec)
+    why = remote_problem or review.snapshot_problem(rec)
     if why:
         rec.update(outcome="infra", error=why)
     elif res["verdict"] is not None:

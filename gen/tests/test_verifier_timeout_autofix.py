@@ -230,6 +230,15 @@ def test_package_repairs_unpacked_and_try_suite_timeouts(tmp_path, body):
     assert check["verifier_timeout_fix"]["new"] == 1200
 
 
+def test_package_uses_assignments_inside_with_body(tmp_path):
+    source = "with TemporaryDirectory() as temp:\n    limit = 300\n    run_solution(limit, temp)"
+    pipeline, it, _ = _setup(tmp_path, source)
+    stages_b.pkg(pipeline, it)
+    check = read_json(it.p("PKG_check.json"))
+    assert it.state["stage"] == "S9" and check["ok"]
+    assert check["run_solution_timeouts"]["sum_sec"] == 300
+
+
 def test_finally_with_partial_assignment_stays_dynamic(tmp_path):
     source = "t = 30\ntry:\n    prepare()\n    t = 900\nfinally:\n    run_solution(t)"
     pipeline, it, _ = _setup(tmp_path, source)

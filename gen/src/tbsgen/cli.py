@@ -282,7 +282,16 @@ def main(argv=None):
         it = P.store.item(a.item)
         with it.operator_lock():
             rnd = a.round or int(it.state.get("review_round") or 1)
-            out = review.build_task(P.cfg, it.dir, it.state, rnd, Path(a.out) if a.out else None)
+            out = Path(a.out) if a.out else it.p("review", f"preview-r{rnd}")
+            # build_task replaces the output tree. Protect formal rounds, even through --out aliases.
+            def formal_round(path):
+                return path.parent.name == "review" and path.name.startswith("r") and path.name[1:].isdigit()
+
+            target = out.resolve()
+            if (any(formal_round(p) for p in (target, *target.parents))
+                    or any(formal_round(task.parent) for task in target.rglob("r[0-9]*/task"))):
+                ap.error("review preview output overlaps a formal review directory")
+            review.build_task(P.cfg, it.dir, it.state, rnd, out)
         print(json.dumps(dict(item=a.item, round=rnd, task=str(out))))
     elif a.cmd == "status":
         print(json.dumps(P.status(), indent=1, ensure_ascii=False))

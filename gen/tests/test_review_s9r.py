@@ -97,7 +97,10 @@ def _finish(jobs, job_name, reward=None, cost=5.0, verdict=None, name="trial__a"
     t = jd / name
     (t / "verifier").mkdir(parents=True, exist_ok=True)
     (t / "agent").mkdir(parents=True, exist_ok=True)
+    conf = read_json(jd / "config.json", {})
+    review_sha = (conf.get("agents") or [{}])[0].get("env", {}).get("TBSGEN_REVIEW_TASK_SHA")
     (t / "result.json").write_text(json.dumps({
+        **({"review_task_sha": review_sha} if review_sha else {}),
         "verifier_result": {"rewards": {"reward": reward}}, "agent_result": {"cost_usd": cost},
         "agent_execution": {"started_at": "2026-11-09T01:00:00Z", "finished_at": "2026-11-09T01:30:00Z"}}))
     (t / "verifier" / "metrics.jsonl").write_text(json.dumps({"name": "m", "value": 1.0, "passed": reward >= 1}) + "\n")
@@ -610,6 +613,25 @@ def test_review_infra_retries_then_park(tmp_path):
     assert [r["outcome"] for r in _runs(P, iid, "review")] == ["infra", "infra"]
     assert st["status"] == "parked" and st["reason"].startswith("review:infra (2 infra")
     assert _runs(P, iid, "review")[1]["job_name"].endswith("-review1-a2")
+
+
+def test_review_build_preserves_submitted_drop(tmp_path):
+    from tbsgen.cli import main
+
+    P, iid, jobs = _env(tmp_path)
+    _to_label(P, iid, jobs)
+    it = P.store.item(iid)
+    [rec] = _runs(P, iid, "review")
+    _finish(jobs, rec["job_name"], verdict=V("drop", [dict(BLOCK, problem="reference_wrong")]))
+    args = ["review", "build", "--run", str(P.store.root), "--item", iid]
+    main(args)
+    watch_tick(P, only=[iid])
+    [result] = _runs(P, iid, "review")
+    assert result["outcome"] == "done" and result["verdict"] == "drop"
+    assert it.load().state["status"] == "dropped"
+    assert it.p("review/preview-r1/task.toml").is_file()
+    with pytest.raises(SystemExit):
+        main([*args, "--out", rec["task"]])
 
 
 def test_drop_and_human(tmp_path):
@@ -2345,6 +2367,122 @@ def _remote_launch(tmp_path, stage):
     assert rec["remote_route"] and rec["state"] == "launched"
     cmd = ["calib", "resolve-remote", "--run", str(P.store.root), "--item", iid, "--job", rec["job_name"]]
     return P, it, directory, rec, jobs / rec["job_name"], cmd
+
+
+def test_remote_review_hashes_worker_copy_and_checks_returned_digest(tmp_path):
+    from tbsgen import calib
+
+    P, it, _, rec, jd, _ = _remote_launch(tmp_path, "S9R")
+    src = Path(rec["task"])
+    worker = tmp_path / "worker-task"
+    shutil.copytree(src, worker)
+    statement = Path("environment/review/pkg/instruction.md")
+    cached = worker / statement
+    fresh = (src / statement).read_bytes()
+    cached.write_bytes(fresh.replace(b"spec", b"mass"))
+    shutil.copystat(src / statement, cached)
+    assert cached.stat().st_size == len(fresh) and cached.stat().st_mtime_ns == (src / statement).stat().st_mtime_ns
+    stale_sha = calib.pkg_sha(worker)
+    assert stale_sha != rec["review_task_sha"]
+    conf = read_json(Path(rec["config"]))
+    conf["tasks"][0]["path"] = str(worker)
+    write_json(jd / "config.json", conf)
+    write_json(jd / "tbsgen-remote.json", dict(local_task=str(src), remote_task=str(worker)))
+    _finish(jd.parent, jd.name, verdict=V("pass"))
+    result_path = jd / "trial__a/result.json"
+    result = read_json(result_path)
+    verify = [sys.executable, Path(calib.__file__).with_name("taskhash.py"), jd / "config.json"]
+    refused = subprocess.run(verify, capture_output=True, text=True)
+    assert refused.returncode and "review task hash mismatch" in refused.stderr and not refused.stdout
+    cached.write_bytes(fresh)
+    digest = subprocess.check_output(verify, text=True).strip()
+    assert digest == rec["review_task_sha"]
+
+    # Even a later trial with the correct digest cannot validate an earlier mismatched result.
+    write_json(jd / "config.json", dict(conf, n_attempts=2))
+    _finish(jd.parent, jd.name, verdict=V("pass"), name="trial__b")
+    write_json(result_path, dict(result, review_task_sha=stale_sha))
+    assert ingest(P, it)["outcome"] == "infra"
+    assert not it.p("review/r1/verdict.json").exists()
+
+
+def test_remote_legacy_review_without_hash_ingests_drop(tmp_path):
+    P, it, directory, rec, jd, _ = _remote_launch(tmp_path, "S9R")
+    # The old launch format already recorded a task digest in runs.json, but omitted it from the agent env.
+    config = Path(rec["config"])
+    conf = read_json(config)
+    assert conf["agents"][0]["env"].pop("TBSGEN_REVIEW_TASK_SHA") == rec["review_task_sha"]
+    write_json(config, conf)
+    write_json(jd / "config.json", conf)
+    _finish(jd.parent, jd.name, verdict=V("drop", [BLOCK]), cost=7)
+    assert "review_task_sha" not in read_json(jd / "trial__a/result.json")
+
+    watch_tick(P, only=[it.item_id])
+    [settled] = _runs(P, it.item_id, directory)
+    assert (settled["outcome"], settled["verdict"], settled["cost_usd"]) == ("done", "drop", 7)
+    assert it.load().state["status"] == "dropped" and it.state["reason"].startswith("review:drop")
+    assert read_json(config) == conf
+
+
+def test_remote_review_missing_launcher_hash_exhausts_retries(tmp_path):
+    P, it, directory, _, _, _ = _remote_launch(tmp_path, "S9R")
+    P.cfg["review"]["infra_retries"] = 1
+    for attempt in (1, 2):
+        rec = _runs(P, it.item_id, directory)[-1]
+        assert rec["attempt"] == attempt and rec["state"] == "launched"
+        # The returned config may omit the env. The submitted config determines the echo requirement.
+        remote_conf = read_json(Path(rec["config"]))
+        assert remote_conf["agents"][0]["env"].pop("TBSGEN_REVIEW_TASK_SHA") == rec["review_task_sha"]
+        jd = Path(rec["job_dir"])
+        write_json(jd / "config.json", remote_conf)
+        _finish(jd.parent, jd.name, verdict=V("pass"), cost=7)
+        watch_tick(P, only=[it.item_id])
+        settled = _runs(P, it.item_id, directory)[attempt - 1]
+        assert (settled["outcome"], settled["cost_usd"]) == ("infra", 7)
+        assert "review:launcher_no_hash" in settled["error"]
+    assert len(_runs(P, it.item_id, directory)) == 2
+    assert it.load().state["status"] == "parked" and "review:launcher_no_hash" in it.state["reason"]
+    assert not it.p("review/r1/verdict.json").exists()
+
+
+@pytest.mark.parametrize("evidence", ["launch_attempted", "started"])
+def test_launched_legacy_review_config_is_preserved(tmp_path, evidence):
+    P, it, _, rec, jd, _ = _remote_launch(tmp_path, "S9R")
+    rec.update(state="reserved", submitted=False)
+    if evidence == "started":
+        del rec["launch_attempted"]
+        jd.mkdir()
+    config = Path(rec["config"])
+    conf = read_json(config)
+    conf["agents"][0]["env"].pop("TBSGEN_REVIEW_TASK_SHA")
+    write_json(config, conf)
+
+    review.bind_launch_snapshot(it.dir, rec, read_json(config))
+    assert read_json(config) == conf
+
+
+@pytest.mark.parametrize("manual", [False, True])
+def test_old_review_intent_adds_worker_hash_before_submission(tmp_path, manual):
+    from tbsgen import stages_b
+
+    P, iid, jobs = _env(tmp_path, allow_submit=False, remote_launchers=None)
+    it = P.store.item(iid)
+    it.state.update(review_round=1, calib_label="hard")
+    it.goto("S9R", "calibrated")
+    stages_b.s9r(P, it)
+    [rec] = _runs(P, iid, "review")
+    config = Path(rec["config"])
+    conf = read_json(config)
+    conf["agents"][0]["env"].pop("TBSGEN_REVIEW_TASK_SHA", None)
+    write_json(config, conf)
+    if manual:
+        stages_b.manual_launch(P, it, rec["job_name"], rec["attempt"])
+    else:
+        P.cfg["calib"]["allow_submit"] = True
+        it.goto("S9R", "enable submission")
+        stages_b.s9r(P, it)
+    submitted = read_json(jobs / rec["job_name"] / "config.json")
+    assert submitted["agents"][0]["env"]["TBSGEN_REVIEW_TASK_SHA"] == rec["review_task_sha"]
 
 
 def test_migration_of_eight_unsubmitted_intents_holds_no_slots(tmp_path):

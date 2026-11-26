@@ -27,12 +27,14 @@ import os
 import re
 import shlex
 import time
+import tomllib
 from collections.abc import Callable
 import uuid
 from pathlib import Path
 
 from . import taskimage
 from .state import item_lock, read_json, write_json
+from .taskhash import pkg_sha
 
 INFRA_EXC = {"NetworkConnectionError", "EnvironmentStartTimeoutError", "AgentSetupTimeoutError", "CancelledError",
              "UnknownApiError", "RateLimitError", "AgentInstallError"}
@@ -160,20 +162,6 @@ def task_path(cfg: dict, item_dir: Path, who: str = "glm") -> Path:
     return item_dir / "pkg"
 
 
-def pkg_sha(pkg: Path, *, exclude=()) -> str:
-    """Content hash of a packaged task (paths + bytes): a prepared copy made from another pkg/ is stale."""
-    import hashlib
-    h = hashlib.sha256()
-    for f in sorted(p for p in Path(pkg).rglob("*") if p.is_file()):
-        if f.relative_to(pkg).as_posix() in exclude:
-            continue
-        h.update(str(f.relative_to(pkg)).encode() + b"\0")
-        with f.open("rb") as source:
-            hashlib.file_digest(source, lambda: h)
-        h.update(b"\0")
-    return h.hexdigest()[:16]
-
-
 def _prepare_receipt(path: Path) -> dict:
     try:
         prev = read_json(path, {})
@@ -182,10 +170,17 @@ def _prepare_receipt(path: Path) -> dict:
     return prev if isinstance(prev, dict) else {}
 
 
-def _copied_contents(root: Path) -> dict:
-    """Files and directories the preparation hook copies verbatim; task.toml is hook-owned."""
+def _prepared_inputs(root: Path) -> dict:
+    """Contents the hook must preserve, including the effective verifier timeout."""
     import hashlib
-    contents = {}
+    with (root / "task.toml").open("rb") as stream:
+        verifier = tomllib.load(stream).get("verifier", {})
+    if not isinstance(verifier, dict):
+        raise ValueError("invalid [verifier] table")
+    timeout = verifier.get("timeout_sec")
+    if timeout is not None and type(timeout) not in (int, float):
+        raise ValueError("invalid [verifier].timeout_sec")
+    contents = {"verifier.timeout_sec": timeout}
     for name in ("instruction.md", "tests", "solution"):
         base = root / name
         for path in (base, *base.rglob("*")):
@@ -210,9 +205,9 @@ def _prepared_matches(receipt: dict, out: Path, pkg: Path, recp: Path) -> bool:
         digest = pkg_sha(out)
         if "prepared_sha" in receipt and receipt["prepared_sha"] != digest:
             return False
-        if _copied_contents(pkg) != _copied_contents(out):
+        if _prepared_inputs(pkg) != _prepared_inputs(out):
             return False
-    except OSError:
+    except (OSError, ValueError):
         return False
     if "prepared_sha" not in receipt:
         receipt["prepared_sha"] = digest
@@ -274,9 +269,10 @@ def ensure_prepared(cfg: dict, item_dir: Path, who: str = "glm", force: bool = F
     if ok:
         try:
             prepared_sha = pkg_sha(out)
-            if _copied_contents(pkg) != _copied_contents(out):
-                ok, err = False, "prepared instruction.md, tests/ or solution/ differs from the source package"
-        except OSError as exc:
+            if _prepared_inputs(pkg) != _prepared_inputs(out):
+                ok, err = False, ("prepared verifier.timeout_sec, instruction.md, tests/ or solution/ "
+                                  "differs from the source package")
+        except (OSError, ValueError) as exc:
             ok, err = False, f"could not verify prepared copy: {exc}"
     if not ok and err is None:
         tail = log.read_text(errors="replace")[-300:] if log.exists() else ""

@@ -14,6 +14,7 @@ import re
 import time
 import tokenize
 import zipfile
+from itertools import chain, pairwise
 from pathlib import Path
 
 from .leaves import file_leaves
@@ -179,6 +180,14 @@ def _json_atoms(obj):
         yield obj
 
 
+def _numeric_cell(cell):
+    try:
+        float(cell)
+    except ValueError:
+        return False
+    return True
+
+
 def _truth_atoms(path, remaining):
     # Limit total decompressed bytes across the tree. Unknown encodings skip this advisory call.
     compressed = path.suffix.lower() == ".gz"
@@ -210,7 +219,9 @@ def _truth_atoms(path, remaining):
         atoms = (atom for line in content.splitlines() if line.strip() for atom in _json_atoms(json.loads(line)))
     else:
         rows = csv.reader(io.StringIO(content, newline=""), delimiter="," if ext == ".csv" else "\t", strict=True)
-        next(rows, None)  # Truth tables use their first row for field names.
+        first = next(rows, [])
+        if any(_numeric_cell(cell) for cell in first):
+            rows = chain([first], rows)
         atoms = (cell for row in rows for cell in row)
     return len(data), atoms
 
@@ -218,12 +229,46 @@ def _truth_atoms(path, remaining):
 _ANSWER_DECLARATION = re.compile(
     r"\b(?:answer(?:[ _-]key)?|(?:expected|correct|gold)\s+(?:answer|value|label|result|output)|ground[ _-]truth)"
     r"\s*(?:[*_`]*\s*[:=]|\bis\b)\s*\S", re.I)
-_EXPECTED_NAME = re.compile(r"(?:^|_)(?:answer|expected|truth|gold|oracle)(?:_|$)", re.I)
+_EXPECTED_NAME = re.compile(
+    r"(?:^|_)(?:answers?|truth|gold|oracle)(?:_|$)|(?:^|_)expected(?:$|_(?:labels?|values?|outputs?|results?)(?:_|$))",
+    re.I)
 
 
 def _check_declaration(text):
     if _ANSWER_DECLARATION.search(text):
         raise UnsafeGraderPacket("explicit answer declaration")
+
+
+def _control_operand(node, definitions, seen=frozenset()):
+    if isinstance(node, ast.Name) and node.id in definitions:
+        values = definitions[node.id]
+        if len(values) != 1 or node.id in seen:
+            return False
+        value = values[0]
+        # The generator contract unpacks out_dir, elapsed_sec, rc from run_solution.
+        if (node.id in {"rc", "returncode", "exit_code"} and isinstance(value, ast.Call)
+                and getattr(value.func, "id", getattr(value.func, "attr", None)) == "run_solution"):
+            return True
+        return _control_operand(value, definitions, seen | {node.id})
+    if isinstance(node, ast.Subscript):
+        return _control_operand(node.value, definitions, seen)
+    if isinstance(node, ast.Call):
+        return isinstance(node.func, ast.Name) and node.func.id == "len"
+    if isinstance(node, ast.Attribute):
+        return node.attr in {"argv", "shape", "ndim", "size", "returncode", "status_code"}
+    return isinstance(node, ast.Name) and node.id in {"__name__", "argv", "rc", "status_code", "returncode", "exit_code"}
+
+
+def _integer_guard(node, definitions, seen=frozenset()):
+    if isinstance(node, ast.Name):
+        values = definitions.get(node.id, ())
+        return (len(values) == 1 and node.id not in seen
+                and _integer_guard(values[0], definitions, seen | {node.id}))
+    if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+        return all(_integer_guard(member, definitions, seen) for member in node.elts)
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
+        node = node.operand
+    return isinstance(node, ast.Constant) and type(node.value) is int
 
 
 def _grader_literals(sources):
@@ -233,6 +278,7 @@ def _grader_literals(sources):
     # comparison using that name is ambiguous and we skip this advisory request.
     definitions = {}
     comparisons = []
+    pairs = []
     for source in sources:
         for token in tokenize.generate_tokens(io.StringIO(source).readline):
             if token.type == tokenize.COMMENT:
@@ -242,38 +288,50 @@ def _grader_literals(sources):
                 literal = str(node.value)
                 _check_declaration(literal)
                 literals.append(literal)
-            if isinstance(node, (ast.List, ast.Tuple, ast.Set, ast.Dict)):
-                try:
-                    values = ast.literal_eval(node)
-                except (TypeError, ValueError):
-                    continue
-                if values:
-                    raise UnsafeGraderPacket("embedded literal table")
             if isinstance(node, (ast.Assign, ast.AnnAssign)) and node.value is not None:
                 targets = node.targets if isinstance(node, ast.Assign) else [node.target]
                 for target in targets:
                     for name in ast.walk(target):
                         if isinstance(name, ast.Name):
                             definitions.setdefault(name.id, []).append(node.value)
-                            if _EXPECTED_NAME.search(name.id):
-                                comparisons.append(node.value)
+                            if (_EXPECTED_NAME.search(name.id)
+                                    and isinstance(node.value, (ast.List, ast.Tuple, ast.Set, ast.Dict))):
+                                try:
+                                    table = ast.literal_eval(node.value)
+                                except (TypeError, ValueError):
+                                    continue
+                                if table:
+                                    raise UnsafeGraderPacket("embedded literal table")
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                definitions.setdefault(node.name, []).append(node)
             if isinstance(node, ast.arguments):
                 positional = [*node.posonlyargs, *node.args]
                 defaults = zip(reversed(positional), reversed(node.defaults))
                 for param, default in (*defaults, *zip(node.kwonlyargs, node.kw_defaults)):
                     if default is not None:
                         definitions.setdefault(param.arg, []).append(default)
-            if isinstance(node, ast.Return) and node.value is not None:
-                comparisons.append(node.value)
-            if isinstance(node, ast.Assert):
-                comparisons.append(node.test)
             if isinstance(node, ast.Compare):
-                comparisons.extend([node.left, *node.comparators])
+                pairs.extend(pairwise([node.left, *node.comparators]))
             if isinstance(node, ast.Call) and getattr(node.func, "attr", getattr(node.func, "id", "")) in {
                     "assertEqual", "assertAlmostEqual", "assert_equal", "assert_array_equal",
                     "assert_allclose", "isclose", "allclose", "array_equal", "approx"}:
-                comparisons.extend(node.args)
-                comparisons.extend(kw.value for kw in node.keywords)
+                operands = [*node.args[:2], *(kw.value for kw in node.keywords if kw.arg not in {"atol", "rtol"})]
+                if len(operands) == 2:
+                    pairs.append(operands)
+                else:
+                    comparisons.extend(operands)
+
+    for left, right in pairs:
+        # Recognize integer metadata guards on either side. The other operand may
+        # instead compute something from an output and must then be inspected.
+        if any(isinstance(literal, ast.Constant) and type(literal.value) in (type(None), bool, str)
+               and isinstance(other, (ast.Name, ast.Attribute, ast.Subscript))
+               for literal, other in ((left, right), (right, left))):
+            continue  # Presence, flag or string check. Known truth strings are checked against the whole packet.
+        if (_control_operand(left, definitions) and _integer_guard(right, definitions)
+                or _control_operand(right, definitions) and _integer_guard(left, definitions)):
+            continue
+        comparisons.extend((left, right))
 
     seen = set()
     while comparisons:
@@ -281,9 +339,13 @@ def _grader_literals(sources):
         if node in seen:
             continue
         seen.add(node)
-        if isinstance(node, ast.Constant) and node.value is not None:
+        if isinstance(node, ast.Constant) and type(node.value) in (int, float):
             raise UnsafeGraderPacket("embedded comparison value")
-        if isinstance(node, ast.Name):
+        if isinstance(node, ast.Compare):
+            continue  # Each comparison is scanned at its own site.
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            comparisons.extend(stmt.value for stmt in ast.walk(node) if isinstance(stmt, ast.Return) and stmt.value)
+        elif isinstance(node, ast.Name):
             comparisons.extend(definitions.get(node.id, ()))
         elif isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "get":
             # Mapping lookup keys are schema. A default value can supply a hardcoded answer.

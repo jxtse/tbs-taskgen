@@ -3,6 +3,7 @@ import gzip
 import io
 import json
 import urllib.request
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -10,7 +11,7 @@ import pytest
 from tbsgen import prereview
 from tbsgen.budget import Ledger
 from tbsgen.config import load_config
-from tbsgen.models import get_client
+from tbsgen.models import FakeClient, get_client
 
 
 def put(root, path, text):
@@ -215,6 +216,52 @@ def test_grader_may_read_truth_field_name(tmp_path, name, truth):
     assert prereview.build_packet(tmp_path)["files"]["tests/measure.py"]["text"] == source
 
 
+@pytest.mark.parametrize("grader", ["toy", "generated"])
+def test_grader_control_constants_allow_prereview_call(tmp_path, grader):
+    source = (Path(__file__).parent / "fixtures/toy_task/tests/measure.py").read_text() if grader == "toy" else """
+import json, sys
+
+def compute(row):
+    dims = row.shape
+    argc = len(sys.argv)
+    max_args = 3
+    expected_shape = (4, 2)
+    expected_columns = ["mass", "label"]
+    out_dir, elapsed, rc = metrics.run_solution(600)
+    if argc > max_args or dims != expected_shape or rc != 0:
+        return {}
+    if out_dir is None or out_dir == "unused" or out_dir is False:
+        return {}
+    if row.columns != expected_columns or row.mode == "invalid" or row.status_code != 200:
+        return {}
+    if row["flag"] is False or row["label"] == "ignored":
+        return {}
+    return {"mass": row[-1]["mass"]}
+
+if __name__ == "__main__":
+    print(json.dumps(compute(load())))
+"""
+    put(tmp_path, "instruction.md", "Report the measured mass.")
+    put(tmp_path, "tests/measure.py", source)
+    put(tmp_path, "tests/truth/mass.json", '{"mass": 8173.625}')
+    cfg = load_config()
+    client = FakeClient(Ledger(tmp_path / "cost.sqlite", cfg), cfg, [{"stage": "S9P", "text": '{"findings":[]}'}])
+    result = prereview.run_prereview(tmp_path, lambda: client, item="sample")
+    assert result["error"] is None
+    assert [call["stage"] for call in client.log] == ["S9P"]
+
+
+@pytest.mark.parametrize(("filename", "first_row"), [("mass.csv", "8173.625"), ("mass.tsv", "sample\t8173.625")])
+def test_headerless_truth_in_readme_skips_request(tmp_path, filename, first_row):
+    pkg = tmp_path / "pkg"
+    put(pkg, "instruction.md", "Report the measured mass.")
+    put(pkg, "tests/truth/" + filename, first_row)
+    notes = put(tmp_path, "src/generator/README.md", "Example mass: 8173.625.")
+    result = prereview.run_prereview(pkg, lambda: pytest.fail("answer leaked to client"),
+                                     item="sample", generator_dir=notes.parent)
+    assert result["error"] == "UnsafeGraderPacket" and result["packet_hash"] is None
+
+
 @pytest.mark.parametrize("carrier", [
     "task/generator/README.md", "pkg/instruction.md", "pkg/generator/FORMAT.md",
     "pkg/environment/data/sample.csv", "pkg/tests/hidden/schema.json", "pkg/tests/measure.py",
@@ -225,7 +272,7 @@ def test_answer_boundary_checks_whole_request(tmp_path, carrier):
     put(pkg, "tests/measure.py", "def measure(stream): return len(stream)")
     if carrier == "pkg/tests/measure.py":
         # No matching truth-file value: this scalar *is* the grader's expected answer.
-        put(tmp_path, carrier, 'def measure(output): return output["value"] == "ochre-sample"')
+        put(tmp_path, carrier, 'def measure(output): return output["value"] == 8173.625')
         truth = "other-result"
     else:
         truth = "ochre-sample"
@@ -244,11 +291,15 @@ def test_answer_boundary_checks_whole_request(tmp_path, carrier):
     ("def expected(): return 'co\\x62alt'", '["cobalt"]'),
     ("def expected(): return 1.25e2", '{"answer": 125}'),
     ("# mapped to cobalt", '{"answer": "cobalt"}'),
-    ("label = 'ochre-sample'\ndef test_label(row): assert row['label'] == label", None),
+    ("mass = 8173.625\ndef test_mass(row): assert row['mass'] == mass", None),
     ("def measure(row): return np.isclose(row['mass'], 1.25e2)", None),
-    ("def expected(): return 'ochre-sample'\ndef measure(row): return row['label'] == expected()", None),
-    ("def matches(actual, target='ochre-sample'): return actual == target", None),
-    ("def test_label(row): assert row.get('label') == str('ochre-sample')", None),
+    ("def expected(): return 8173.625\ndef measure(row): return row['mass'] == expected()", None),
+    ("def matches(actual, target=8173.625): return actual == target", None),
+    ("def test_mass(row): assert row.get('mass') == float(8173.625)", None),
+    ("def test_mass(x): assert abs(x - 8173.625) < 1e-3", None),
+    ("def test_count(row):\n    count = row['count']\n    assert count == 8173", None),
+    ("def test_mass(row):\n    rc = row['rc']\n    assert rc == 200", None),
+    ("def test_mass(rows, x): assert len(rows) == x - 8173.625", None),
 ])
 def test_answer_bearing_grader_skips_model_call(tmp_path, source, truth):
     put(tmp_path, "instruction.md", "Compute the labels.")

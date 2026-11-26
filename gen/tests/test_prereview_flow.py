@@ -246,6 +246,36 @@ def test_new_flow_parks_before_unreviewed_release(flow, tmp_path, origin):
     assert it.state["requires_formal_review_sha"] == calib.pkg_sha(it.p("pkg"))
 
 
+def test_timeout_fix_rejects_reused_prepared_copy(flow):
+    P, it, _ = flow
+    P.cfg["prereview"]["mode"] = "off"
+    root = it.root / "prepared"
+    copy = ('mkdir -p {out} && cp -R {pkg}/. {out}/ && '
+            'echo \'docker_image = "fixture-template"\' >> {out}/task.toml')
+    P.cfg["calib"].update(allow_submit=True, prepared_tasks_dir=str(root), prepare_command=copy)
+    for directory in ("task", "pkg"):
+        it.p(directory, "tests/measure.py").write_text("run_solution(900)\n")
+    original = calib.ensure_prepared(P.cfg, it.dir)
+    assert original["ok"]
+    P.cfg["calib"]["prepare_command"] = "test -f {out}/task.toml"
+    it.goto("PKG", "fix verifier timeout")
+    _expect_step(P, it, "S9")
+    assert read_json(it.p("PKG_check.json"))["verifier_timeout_fix"] == dict(old=900, new=1200)
+    _expect_step(P, it, "S9")
+    receipt = read_json(it.p("calib/prepare.json"))
+    assert not receipt["ok"] and "prepared_sha" not in receipt
+    assert not it.p("calib/runs.json").exists()
+
+    # A receipt already signed by an older deployment cannot authorize the stale copy either.
+    write_json(it.p("calib/prepare.json"), dict(original, pkg_sha=calib.pkg_sha(it.p("pkg"))))
+    assert calib.stale_prepared(P.cfg, it.dir, "glm", 0)
+    P.cfg["calib"]["prepare_command"] = copy
+    it.goto("S9", "retry with the corrected preparation hook")
+    _expect_step(P, it, "S9")
+    [run] = read_json(it.p("calib/runs.json"))
+    assert run["state"] == "launched" and run["task"] == str(root / it.item_id)
+
+
 def test_base_revision_requires_fresh_prepared_copy(flow):
     P, it, _ = flow
     _repair(P, {"instruction.md": "Read the profile_id column."})
