@@ -237,6 +237,161 @@ def test_hard_goes_through_review_before_release(tmp_path):
     assert m["label"] == "hard" and m["calib_epoch"] == 0
 
 
+def test_new_flow_releases_only_completed_review_of_exact_package(tmp_path):
+    from tbsgen import calib, stages_b
+
+    P, iid, jobs = _env(tmp_path, review_kw={"model": "fixture-reviewer"})
+    it = P.store.item(iid)
+    P.cfg["prereview"]["mode"] = "shadow"
+    P._clients["prereview"] = FakeClient(P.ledger, P.cfg, [{"stage": "S9P", "text": '{"findings":[]}'}])
+    _to_label(P, iid, jobs)
+    [rr] = _runs(P, iid, "review")
+    _finish(jobs, rr["job_name"], verdict=V("pass"))
+    ingest(P, it)
+    it.load()
+    stages_b.s9r(P, it)
+    assert it.load().state["stage"] == "S10"
+    assert read_json(it.p("review/verdict.json"))["model"] == "fixture-reviewer"
+    runs = it.p("review/runs.json")
+    completed = read_json(runs)
+    write_json(runs, [dict(completed[0], outcome=None)])
+    stages_b.s10(P, it)
+    assert it.load().state["status"] == "parked" and not (it.root / "release/manifest.jsonl").exists()
+    write_json(runs, completed)
+    it.goto("S10", "retry completed review")
+    stages_b.s10(P, it)
+    manifest = json.loads((it.root / "release/manifest.jsonl").read_text())
+    assert manifest["review"]["model"] == "fixture-reviewer"
+    assert manifest["pkg_sha"] == it.state["requires_formal_review_sha"] == calib.pkg_sha(it.p("pkg"))
+    it.p("pkg/instruction.md").write_text("A different package.")
+    stages_b.s10(P, it)
+    assert it.load().state["status"] == "parked"
+    assert stages_b._live_release(P, iid) is None
+
+
+@pytest.mark.parametrize("when", ["prepare", "automatic_launch", "manual_launch", "ingest"])
+def test_review_uses_submitted_task_snapshot(tmp_path, when):
+    from tbsgen import calib, stages_b
+
+    P, iid, jobs = _env(tmp_path, allow_submit=(when == "ingest"))
+    it = P.store.item(iid)
+    it.state.update(review_round=1, calib_label="hard", requires_formal_review_sha=calib.pkg_sha(it.p("pkg")))
+    it.goto("S9R", "calibrated")
+    stages_b.s9r(P, it)
+    [rec] = _runs(P, iid, "review")
+    task = Path(rec["task"])
+    snapshot = task / "environment/review/pkg"
+    (snapshot / "instruction.md").write_text("Earlier task.")
+    if when == "prepare":
+        rebuilt = review.prepare(P.cfg, it.dir, task, 1, 2)
+        assert rebuilt["pkg_sha"] == calib.pkg_sha(snapshot) and rebuilt.get("blocked")
+    elif when == "automatic_launch":
+        P.cfg["calib"]["allow_submit"] = True
+        it.goto("S9R", "enable submission")
+        stages_b.s9r(P, it)
+        [blocked] = _runs(P, iid, "review")
+        assert not blocked["submitted"] and "review task" in blocked["blocked"]
+    elif when == "manual_launch":
+        with pytest.raises(ValueError, match="review task"):
+            stages_b.manual_launch(P, it, rec["job_name"], rec["attempt"])
+    else:
+        _finish(jobs, rec["job_name"], verdict=V("pass"))
+        assert ingest(P, it)["outcome"] == "infra"
+        assert not it.p("review/r1/verdict.json").exists()
+    assert stages_b._live_release(P, iid) is None
+
+
+@pytest.mark.parametrize("change", ["model", "source"])
+@pytest.mark.parametrize("manual", [False, True])
+def test_review_launch_rejects_changed_job_inputs(tmp_path, change, manual):
+    from tbsgen import stages_b
+
+    P, iid, _ = _env(tmp_path, allow_submit=False)
+    it = P.store.item(iid)
+    it.state.update(review_round=1, calib_label="hard")
+    it.goto("S9R", "calibrated")
+    stages_b.s9r(P, it)
+    [rec] = _runs(P, iid, "review")
+    if change == "model":
+        conf = read_json(Path(rec["config"]))
+        conf["agents"][0]["model_name"] = "alternate-reviewer"
+        write_json(Path(rec["config"]), conf)
+        reason = "prepared review model"
+    else:
+        it.p("pkg/instruction.md").write_text("New package.")
+        reason = "current package"
+    if manual:
+        with pytest.raises(ValueError, match=reason):
+            stages_b.manual_launch(P, it, rec["job_name"], rec["attempt"])
+    else:
+        P.cfg["calib"]["allow_submit"] = True
+        it.goto("S9R", "enable submission")
+        stages_b.s9r(P, it)
+        assert reason in it.load().state["reason"]
+    [rec] = _runs(P, iid, "review")
+    assert not rec["submitted"] and not rec.get("ledger_call")
+
+
+def test_release_models_parks_unapproved_formal_reviewer(tmp_path):
+    from tbsgen import calib, stages_b
+
+    P, iid, jobs = _env(tmp_path, review_kw={"model": "fixture-reviewer",
+                                             "release_models": ["approved-reviewer"]})
+    it = P.store.item(iid)
+    it.state.update(review_round=1, calib_label="hard", requires_formal_review_sha=calib.pkg_sha(it.p("pkg")))
+    it.goto("S9R", "calibrated")
+    stages_b.s9r(P, it)
+    [rec] = _runs(P, iid, "review")
+    P.cfg["review"]["model"] = "approved-reviewer"  # the completed job still used the original model
+    _finish(jobs, rec["job_name"], verdict=V("pass"))
+    watch_tick(P, only=[iid])
+    assert it.load().state["status"] == "parked" and "fixture-reviewer" in it.state["reason"]
+    assert stages_b._live_release(P, iid) is None
+    P.cfg["review"]["release_models"].append("fixture-reviewer")
+    it.goto("S10", "release policy updated")
+    stages_b.s10(P, it)
+    assert stages_b._live_release(P, iid)["review"]["model"] == "fixture-reviewer"
+
+
+@pytest.mark.parametrize("via", ["resume", "watch"])
+def test_reenabled_formal_review_resumes_parked_package(tmp_path, via):
+    from tbsgen import calib, stages_b
+
+    P, iid, jobs = _env(tmp_path, review_kw={"enabled": False})
+    P.cfg["prereview"]["mode"] = "shadow"
+    P._clients["prereview"] = FakeClient(P.ledger, P.cfg, [{"stage": "S9P", "text": '{"findings":[]}'}])
+    _to_label(P, iid, jobs)
+    it = P.store.item(iid)
+    assert it.state["reason"] == "formal review required: no review verdict"
+    assert not P.resume(only=[iid])
+    assert not watch_tick(P, only=[iid])["open"]
+    before = it.p("calib/runs.json").read_bytes(), calib.pkg_sha(it.p("pkg"))
+    P.cfg["review"]["enabled"] = True
+    if via == "resume":
+        assert P.resume(only=[iid]) == [iid]
+        assert it.load().state["stage"] == "S9R"
+    assert watch_tick(P, only=[iid])["open"][iid]["stage"] == "S9R"
+    [rec] = _runs(P, iid, "review")
+    _finish(jobs, rec["job_name"], verdict=V("pass"))
+    watch_tick(P, only=[iid])
+    assert stages_b._live_release(P, iid)["pkg_sha"] == before[1]
+    assert (it.p("calib/runs.json").read_bytes(), calib.pkg_sha(it.p("pkg"))) == before
+
+
+def test_s10_migrates_inflight_shadow_check_without_releasing(tmp_path):
+    from tbsgen import calib, stages_b
+
+    P, iid, _ = _env(tmp_path, review_kw={"enabled": False})
+    it = P.store.item(iid)
+    write_json(it.p("prereview/e0-r1.json"), dict(epoch=0, round=1, mode="shadow", status="done"))
+    it.state.update(stage="S10", calib_label="hard")
+    it.save()
+    stages_b.s10(P, it)
+    assert it.load().state["status"] == "parked"
+    assert it.state["requires_formal_review_sha"] == calib.pkg_sha(it.p("pkg"))
+    assert not (it.root / "release/manifest.jsonl").exists()
+
+
 def test_parked_teacher_failed_reviewed_but_never_released(tmp_path):
     """calib.frontier off: the old rule (teacher failures parked, reviewed as a diagnosis only)."""
     P, iid, jobs = _env(tmp_path)
@@ -634,7 +789,8 @@ def test_stale_prepared_copy_blocks_recalibration(tmp_path):
     it = P.store.item(iid)
     assert calib.stale_prepared(P.cfg, it.dir, "glm", 0) is None
     assert "predate" in calib.stale_prepared(P.cfg, it.dir, "glm", 1)
-    write_json(it.p("calib", "prepare.json"), dict(ok=True, pkg_sha=calib.pkg_sha(it.p("pkg"))))
+    P.cfg["calib"]["prepare_command"] = 'mkdir -p {out} && cp -R {pkg}/. {out}/'
+    assert calib.ensure_prepared(P.cfg, it.dir)["ok"]
     assert calib.stale_prepared(P.cfg, it.dir, "glm", 1) is None
 
 
@@ -1034,7 +1190,7 @@ def test_suspected_scopes_bind_bundle_validator_and_ingest(tmp_path, caplog):
     def check(expected):
         src = tmp_path / "verdict.json"
         write_json(src, verdict)
-        validation = subprocess.run([sys.executable, task / "tests/s9r_validate.py", src, tmp_path / "parsed.json",
+        validation = subprocess.run([sys.executable, "-B", task / "tests/s9r_validate.py", src, tmp_path / "parsed.json",
                                      journal], capture_output=True, text=True)
         assert validation.returncode == (1 if expected is None else 0), validation.stdout
         assert review.normalize(verdict, suspected_scopes=[first, second],
@@ -1112,7 +1268,7 @@ def test_reviewer_duplicate_sample_routes_to_revision(tmp_path):
     for verdict in (raw, dict(raw, probe_findings={scope: gap}), V("revise", [dict(issue, repro_id=row["repro_id"])])):
         src = tmp_path / "verdict.json"
         write_json(src, verdict)
-        subprocess.run([sys.executable, validator, src, tmp_path / "parsed.json", journal], check=True)
+        subprocess.run([sys.executable, "-B", validator, src, tmp_path / "parsed.json", journal], check=True)
         assert review.normalize(verdict, repros=records)["verdict"] == "revise"
     assert review.normalize(raw, contract="s9r-v7", repros=records)["verdict"] is None
     assert review.normalize(V("revise", [dict(issue, repro_id="missing")]))["verdict"] is None
@@ -1407,9 +1563,15 @@ def test_regate_settles_old_calibration_without_charging_a_retry(tmp_path, start
 
 
 def test_s7_allocates_above_disk_and_binds_passing_report(tmp_path, monkeypatch):
-    from tbsgen import stages_b
+    from tbsgen import package, stages_b
     P, iid, _ = _env(tmp_path)
     it = P.store.item(iid)
+    # The migration starts from a real packaged reference and private tree. Only a format note
+    # identifies which S7 attempt supplied the regenerated files.
+    initial = it.p("runs/s7-1/detA")
+    (initial / "tests/truth").mkdir(parents=True)
+    write_json(initial / "environment/data/README.md", 1)
+    package.package(P.cfg, it.dir, initial, read_json(it.p("_spec/spec.json")), {})
     it.state.update(stage="PKG", attempts={"S7": 1})
     it.save()
     write_json(it.p("gates/attempt-3.json"), {"attempt": 3})
@@ -1421,7 +1583,7 @@ def test_s7_allocates_above_disk_and_binds_passing_report(tmp_path, monkeypatch)
         assert attempt == 4
         run = item / f"runs/s7-{attempt}"
         (run / "detA/tests/truth").mkdir(parents=True)
-        write_json(run / "detA/environment/data/README.json", attempt)
+        write_json(run / "detA/environment/data/README.md", attempt)
         logs = run / "logs-ref0/metrics.jsonl"
         logs.parent.mkdir()
         logs.write_text("\n".join(json.dumps(dict(name=k, **v)) for k, v in thresholds.items()))
@@ -1436,7 +1598,7 @@ def test_s7_allocates_above_disk_and_binds_passing_report(tmp_path, monkeypatch)
     write_json(it.p("gates/attempt-5.json"), {"attempt": 5})
     assert not stages_b.legacy_report_id(it)
     stages_b.pkg(P, it)
-    assert it.state["stage"] == "S9" and read_json(it.p("pkg/environment/data/README.json")) == 4
+    assert it.state["stage"] == "S9" and read_json(it.p("pkg/environment/data/README.md")) == 4
     assert stages_b._probe_scopes(it) == ["one_confident/public"]
     bundle = review.write_bundle(it.dir, tmp_path / "bundle", it.state)
     assert bundle["suspected_scopes"] == ["one_confident/public"]
@@ -1478,7 +1640,7 @@ def test_submitted_verdict_set_controls_ingest_and_routing(tmp_path, submitted_h
     verdict = V("human")
     src = tmp_path / "verdict.json"
     write_json(src, verdict)
-    result = subprocess.run([sys.executable, Path(rec["task"]) / "tests/s9r_validate.py", src, tmp_path / "parsed.json"],
+    result = subprocess.run([sys.executable, "-B", Path(rec["task"]) / "tests/s9r_validate.py", src, tmp_path / "parsed.json"],
                             capture_output=True)
     assert (result.returncode == 0) == submitted_human
     P.cfg["review"]["allow_human"] = not submitted_human

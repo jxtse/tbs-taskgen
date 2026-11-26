@@ -48,6 +48,31 @@ def tree_hash(d: Path) -> str:
     return h.hexdigest()[:16]
 
 
+def regular_file(root, rel):
+    path = root / rel
+    return path.is_file() and path.resolve() == root.resolve() / rel
+
+
+def is_format_note(path: Path) -> bool:
+    """Names reserved for generator-authored format documentation."""
+    return path.name.casefold() in {"readme.md", "readme.txt", "format.md"}
+
+
+def format_notes(root):
+    """Only existing, public, plain README documents are eligible (never linked files)."""
+    return [p.relative_to(root).as_posix() for p in sorted((root / "environment/data").glob("*"))
+            if is_format_note(p) and regular_file(root, p.relative_to(root))]
+
+
+def format_note_bindings(task: Path) -> dict:
+    """Overrides belong to the generator that produced those format notes, across all of its seeds."""
+    path = task.parent / "_spec/format_notes.json"
+    binding = read_json(path, {})
+    if binding and binding.get("generator") == tree_hash(task / "generator"):
+        return binding["files"]
+    return {}
+
+
 def generate(cfg: dict, task: Path, seed: int, out: Path) -> dict:
     if out.exists():
         shutil.rmtree(out)
@@ -56,6 +81,16 @@ def generate(cfg: dict, task: Path, seed: int, out: Path) -> dict:
         (out / d).mkdir(parents=True)
     r = taskimage.run(cfg, task.parent, [(out, "/task", "rw")], f"cd /task && python generator/generate.py {seed}",
                     cfg["gen"]["gen_timeout"], f"tbsgen-gen-{task.parent.name}-{seed}")
+    # Task source may carry edited README format notes. Apply only to existing regular
+    # public documentation, before computing the hashes or running any solver/gate.
+    bindings = format_note_bindings(task)
+    if bindings:
+        overrides = task.parent / "_spec/format_notes"
+        for rel in format_notes(overrides):
+            note = out / rel
+            if (rel in bindings and regular_file(out, rel)
+                    and hashlib.sha256(note.read_bytes()).hexdigest() == bindings[rel]):
+                shutil.copyfile(overrides / rel, note)
     public_bytes = sum(p.stat().st_size for p in (out / "environment").rglob("*") if p.is_file())
     if taskimage.is_task(read_json(task.parent / "state.json", {})) and public_bytes > cfg["gen"]["max_public_mb"] * 1_000_000:
         r.update(rc=1, err=f"generated public data exceeds gen.max_public_mb ({public_bytes} bytes)")

@@ -432,7 +432,11 @@ def run_gates(cfg: dict, item_dir: Path, spec: dict, thresholds: dict, attempt: 
     # thresholds stated
     ins = (task / "instruction.md").read_text() if (task / "instruction.md").exists() else ""
     # the verifier-time note PKG generates is not the task author's text: never evidence for a stated threshold
-    from .package import strip_time_note
+    from .package import source_verifier_timeout, strip_time_note, verifier_timeout_check
+    # PKG enforces this check on the final bytes, after all S7 gates pass; an S8 edit cannot fix it.
+    det["run_solution_timeouts"] = verifier_timeout_check(
+        task / "tests", source_verifier_timeout(cfg, spec, task), cfg["package"].get("verifier_overhead_sec", 120),
+        packaged_helper=runner.metrics_helper_text(cfg, spec, item_dir))
     ins = strip_time_note(ins)
     missing_quotes = assumptions_stated(ins, spec.get("generator_assumptions", []), require_long_quote=review_rules)
     for name, issues in (("threshold_format", threshold_format(ins, thresholds)), ("statement_clean", statement_clean(ins)),

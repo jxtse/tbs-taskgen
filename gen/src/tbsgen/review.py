@@ -268,9 +268,17 @@ def next_round(item_dir: Path, state: dict) -> int:
     every r<k> verdict directory, so each version's review job names (review<rnd>) and verdict records are unique."""
     rnd = int(state.get("review_round") or 0)
     used = max(int(state.get("review_revisions", 0)) + 1, rnd + 1 if rnd else 1)
+    claim = state.get("prereview_version") or {}
+    reserved = claim.get("round") if claim.get("epoch") == state.get("calib_epoch", 0) else None
+    if reserved is not None:
+        used = max(used, reserved)
+        jobs = read_json(item_dir / "review" / "runs.json", []) or []
     for p in (item_dir / "review").glob("r*") if (item_dir / "review").is_dir() else []:
         q = p.name[1:]
         if q.isdigit():
+            if (reserved is not None and p.is_dir() and {f.name for f in p.iterdir()} == {"task"}
+                    and not any(r.get("n") == int(q) for r in jobs)):
+                continue  # an operator's review-build preview of this already claimed round
             used = max(used, int(q) + 1)
     return used
 
@@ -285,6 +293,19 @@ def suspected_scopes(report: dict) -> list[str]:
     return [f"{arm}/{scope}" for gate, arm in PROBE_ARMS.items()
             for scope, trial in sorted(report.get("details", {}).get(gate, {}).get("scopes", {}).items())
             if trial.get("status") == "shortcut_suspected"]
+
+
+def _formal_history(history):
+    """Exclude the complete internal statement-edit transaction, including its S7 and PKG steps."""
+    editing = False
+    for h in history:
+        if (h.get("stage"), h.get("to"), h.get("reason")) == ("S9", "S8", "statement revision"):
+            editing = True
+        if editing:
+            if h.get("to") == "S9" or (h.get("stage") == "PKG" and h.get("result") == "ok"):
+                editing = False
+            continue
+        yield {k: h[k] for k in ("stage", "result", "to", "reason") if h.get(k) is not None}
 
 
 def write_bundle(item_dir: Path, dest: Path, state: dict, digest_kb: int = 150) -> dict:
@@ -350,11 +371,9 @@ def write_bundle(item_dir: Path, dest: Path, state: dict, digest_kb: int = 150) 
         if p.parent.name != f"r{state.get('review_round', 1)}":
             (rec / "previous_reviews").mkdir(exist_ok=True)
             shutil.copy2(p, rec / "previous_reviews" / f"{p.parent.name}-verdict.json")
-    hist = [{k: h.get(k) for k in ("stage", "result", "to", "reason") if h.get(k) is not None}
-            for h in state.get("history") or []]
     (rec / "pipeline_history.json").write_text(json.dumps(dict(
         item_id=item_dir.name, calib_label=state.get("calib_label"), calib_epoch=state.get("calib_epoch", 0),
-        review_round=state.get("review_round", 1), history=hist), indent=1))
+        review_round=state.get("review_round", 1), history=list(_formal_history(state.get("history") or []))), indent=1))
     runs = _calib_records(item_dir)
     cal = dest / "calibration"
     cal.mkdir()
@@ -937,6 +956,33 @@ def job_name(item_id: str, rnd: int, attempt: int) -> str:
     return f"tbsgen-{item_id}-review{rnd}" + (f"-a{attempt}" if attempt > 1 else "")
 
 
+def snapshot_problem(rec: dict) -> str | None:
+    """Verify the package embedded in /review and the task that supplies its build context."""
+    task = Path(rec["task"])
+    pkg = task / "environment/review/pkg"
+    if not pkg.is_dir() or calib.pkg_sha(pkg) != rec["pkg_sha"]:
+        return "package in the review task differs from the prepared package"
+    if rec.get("review_task_sha") and calib.pkg_sha(task) != rec["review_task_sha"]:
+        return "review task changed after preparation"
+    return None
+
+
+def bind_launch_snapshot(item_dir: Path, rec: dict, conf: dict) -> str | None:
+    if rec["pkg_sha"] != calib.pkg_sha(item_dir / "pkg"):
+        return "package in the review task differs from the current package"
+    agents = conf.get("agents") or []
+    if len(agents) != 1 or agents[0].get("model_name") != rec["model"]:
+        return "job config differs from the prepared review model"
+    tasks = conf.get("tasks") or []
+    if len(tasks) != 1 or tasks[0].get("path") != rec["task"]:
+        return "job config differs from the prepared review task"
+    why = snapshot_problem(rec)
+    if not why and not rec.get("review_task_sha"):
+        # An unstarted intent issued before snapshots were recorded can still bind its verified task.
+        rec["review_task_sha"] = calib.pkg_sha(Path(rec["task"]))
+    return why
+
+
 def prepare(cfg: dict, item_dir: Path, task: Path, rnd: int, attempt: int, epoch: int = 0) -> dict:
     """Intent record for one review run (job config written next to the review task)."""
     rc = review_cfg(cfg)
@@ -953,7 +999,10 @@ def prepare(cfg: dict, item_dir: Path, task: Path, rnd: int, attempt: int, epoch
                config=str(p), command=command, state="intent", remote_route=calib.is_remote_launcher(c, launcher),
                submitted=False, ts=time.time(),
                job_dir=str(Path(c["jobs_dir"]) / name), task=str(task.resolve()), outcome=None,
-               ledger_stage="S9R", pkg_sha=calib.pkg_sha(item_dir / "pkg"), calib_epoch=epoch)
+               ledger_stage="S9R", pkg_sha=calib.pkg_sha(task / "environment/review/pkg"),
+               review_task_sha=calib.pkg_sha(task), calib_epoch=epoch)
+    if rec["pkg_sha"] != calib.pkg_sha(item_dir / "pkg"):
+        rec["blocked"] = "package in the review task differs from the current package"
     if cfg.get("config_path"):
         rec["config_path"] = cfg["config_path"]
     contract = json.loads((task / "tests/review_contract.json").read_text())

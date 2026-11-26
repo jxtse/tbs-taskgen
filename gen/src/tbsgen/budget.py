@@ -115,6 +115,12 @@ def price_usd(prices: dict, model: str, usage: dict) -> float:
             + cw * p.get("cache_write", p.get("in", 0) * 1.25)) / 1e6
 
 
+def settled_call_usd(db, call_id, item, stage):
+    row = db.execute("SELECT usd FROM calls WHERE id=? AND item=? AND stage=? AND ended IS NOT NULL",
+                     (call_id, item, stage)).fetchone()
+    return row[0] if row else None
+
+
 class Ledger:
     def __init__(self, path: str | Path, cfg: dict, *, init_deadline=None):
         self.path = Path(path)
@@ -145,6 +151,10 @@ class Ledger:
         return db
 
     # ------------------------------------------------------------------ reserve / finish
+    def settled_usd(self, call_id: int, item: str, stage: str) -> float | None:
+        with contextlib.closing(self._db()) as db:
+            return settled_call_usd(db, call_id, item, stage)
+
     def reserved_call(self, key: str) -> int | None:
         with self._db() as db:
             return self._reserved_call(db, key)
@@ -373,9 +383,9 @@ class Ledger:
             cap_i = b.get("max_calls_per_item")
             # authoring calls only: S9 runs have their own caps; S2/S4 screening calls (Jev, ~$0.0001) do not
             # use up an item's authoring budget
-            if cap_i is not None and item and stage not in ("S9", "S2", "S4", "S3b", "S4c", "S5G"):
+            if cap_i is not None and item and stage not in ("S9", "S9P", "S2", "S4", "S3b", "S4c", "S5G"):
                 n = db.execute("SELECT count(*) FROM calls WHERE item=? AND stage NOT IN "
-                               f"('S9','S2','S4','S3b','S4c','S5G') {made}",
+                               f"('S9','S9P','S2','S4','S3b','S4c','S5G') {made}",
                                (item,)).fetchone()[0]
                 if n >= int(cap_i):
                     raise BudgetStop("item_calls", f"{item} {cap_i} calls")

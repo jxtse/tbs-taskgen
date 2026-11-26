@@ -13,9 +13,13 @@ from __future__ import annotations
 
 import ast
 import json
+import math
+import re
 import shlex
 import shutil
+import tempfile
 import tomllib
+from itertools import chain
 from pathlib import Path
 
 from . import sandbox
@@ -122,7 +126,8 @@ def _q(s) -> str:
     return json.dumps(str(s), ensure_ascii=False)
 
 
-def package(cfg: dict, item_dir: Path, gen0: Path, spec: dict, provenance: dict) -> Path:
+def package(cfg: dict, item_dir: Path, gen0: Path, spec: dict, provenance: dict,
+            *, out: Path | None = None) -> Path:
     from . import taskimage
     from .state import read_json
     state = read_json(item_dir / "state.json", {})
@@ -138,15 +143,14 @@ def package(cfg: dict, item_dir: Path, gen0: Path, spec: dict, provenance: dict)
     else:
         recipe = dockerfile(cfg, extra_pip=spec.get("extra_pip", []))
     task = item_dir / "task"
-    out = item_dir / "pkg"
+    out = out or item_dir / "pkg"
     if out.exists():
         shutil.rmtree(out)
     (out / "environment").mkdir(parents=True)
     shutil.copytree(gen0 / "environment" / "data", out / "environment" / "data")
     (out / "tests").mkdir()
-    shutil.copy(task / "tests" / "test_outputs.py", out / "tests" / "test_outputs.py")
-    if (task / "tests" / "measure.py").exists():       # test_outputs.py imports compute() from it
-        shutil.copy(task / "tests" / "measure.py", out / "tests" / "measure.py")
+    for path in _authored_test_files(task / "tests"):
+        shutil.copy(path, out / "tests" / path.name)
     shutil.copytree(gen0 / "tests" / "truth", out / "tests" / "truth")
     if any((gen0 / "tests" / "hidden").rglob("*")):
         shutil.copytree(gen0 / "tests" / "hidden", out / "tests" / "hidden")
@@ -162,7 +166,7 @@ def package(cfg: dict, item_dir: Path, gen0: Path, spec: dict, provenance: dict)
         task_id=item_dir.name, desc=_q(spec.get("title", item_dir.name)),
         keywords=json.dumps(spec.get("competencies", [])[:8], ensure_ascii=False),
         domain=_q(spec.get("domain", "")), field=_q(spec.get("field", "")), form=_q(spec.get("form", "")),
-        expert_h=float(spec.get("expert_time_hours", 2.0)), verifier_sec=float(pk["verifier_timeout"]) + timing_budget(cfg, spec),
+        expert_h=float(spec.get("expert_time_hours", 2.0)), verifier_sec=source_verifier_timeout(cfg, spec, task),
         agent_sec=float(pk["agent_hours"] * 3600), cpus=TASK_CPUS, **network_policy(cfg)))
     provenance = dict(provenance, extra_pip=spec.get("extra_pip", []),
                       verifier_overhead_sec=pk.get("verifier_overhead_sec", 120))
@@ -196,7 +200,6 @@ def verifier_time_errors(pkg: Path, overhead: float) -> list[str]:
         src = (pkg / "tests" / "_metrics.py").read_text()
     except Exception as e:  # noqa: BLE001
         return [f"verifier time: {e}"]
-    import math
     if not math.isfinite(overhead) or overhead < 0:
         return [f"verifier time: package.verifier_overhead_sec must be finite and >= 0 (got {overhead})"]
     if not math.isfinite(vt):
@@ -242,55 +245,174 @@ def instruction_text(cfg: dict, spec: dict, text: str) -> str:
             + "\n")
 
 
-def run_solution_timeouts(src: str, budget: float, *, warnings: list[str] | None = None) -> list[str]:
-    """Resolve simple numeric bindings. Dynamic timeouts are diagnostics, not budget violations."""
+def _authored_test_files(tests: Path):
+    yield tests / "test_outputs.py"
+    if (tests / "measure.py").exists():
+        yield tests / "measure.py"
+
+
+def _timeout_calls(src: str) -> tuple[list, list[str]]:
+    """Static call sites and numeric bindings, without importing package code."""
     try:
         tree = ast.parse(src)
     except SyntaxError as e:
-        return [f"cannot check run_solution timeouts: {e.msg} at line {e.lineno}"]
-    names = {"run_solution"}
-    for node in ast.walk(tree):
-        if isinstance(node, ast.ImportFrom):
-            names.update(a.asname for a in node.names if a.name == "run_solution" and a.asname)
-    errors = []
+        return [], [f"cannot check run_solution timeouts: {e.msg} at line {e.lineno}"]
+    calls = []
+    # Alias identity travels through the same lexical bindings as numeric constants.
+    solver, possible_solver = object(), object()
+
+    def merged(left, right):
+        if left == right:
+            return left
+        return possible_solver if left in (solver, possible_solver) or right in (solver, possible_solver) else None
+
+    called = {getattr(n.func, "id", getattr(n.func, "attr", None)) for n in ast.walk(tree) if isinstance(n, ast.Call)}
+    shared = {name for node in ast.walk(tree) if isinstance(node, (ast.Global, ast.Nonlocal)) for name in node.names}
     # Module constants are taken in source order: a module-level call sees the value bound above it; a call inside a
     # function (run later, at pytest time) sees the final module-level value.
-    def divide(left, op, right):
-        if left is None or right in (None, 0):
+    def arithmetic(left, op, right):
+        if not isinstance(left, (int, float)) or not isinstance(right, (int, float)):
             return None
         try:
             if isinstance(op, ast.FloorDiv):
                 return left // right
             if isinstance(op, ast.Div):
                 return left / right
+            if isinstance(op, ast.Add):
+                return left + right
+            if isinstance(op, ast.Sub):
+                return left - right
+            if isinstance(op, ast.Mult):
+                return left * right
         except ArithmeticError:
             pass
         return None
 
     def numeric(node, bindings):
         if isinstance(node, ast.Name):
-            return bindings.get(node.id)
+            value = bindings.get(node.id)
+            return value if node.id not in shared and isinstance(value, (int, float)) else None
         if isinstance(node, ast.Constant) and type(node.value) in (int, float):
-            return node.value
+            try:
+                return float(node.value)
+            except OverflowError:
+                return None
         if isinstance(node, ast.BinOp):
-            return divide(numeric(node.left, bindings), node.op, numeric(node.right, bindings))
+            return arithmetic(numeric(node.left, bindings), node.op, numeric(node.right, bindings))
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
+            value = numeric(node.operand, bindings)
+            return -value if value is not None and isinstance(node.op, ast.USub) else value
         return None
 
+    def binding(value, bindings):
+        if isinstance(value, ast.Name):
+            target = bindings.get(value.id)
+            return target if target in (solver, possible_solver) else numeric(value, bindings)
+        if isinstance(value, ast.Attribute) and value.attr == "run_solution":
+            return solver
+        if isinstance(value, ast.IfExp):
+            return merged(binding(value.body, bindings), binding(value.orelse, bindings))
+        if isinstance(value, ast.NamedExpr):
+            return binding(value.value, bindings)
+        return numeric(value, bindings)
+
+    def expression_writes(node):
+        # Include expression assignments that can run within this statement, excluding nested bodies.
+        if isinstance(node, ast.NamedExpr):
+            yield node
+        for child in ast.iter_child_nodes(node):
+            if not isinstance(child, ast.stmt) and not (isinstance(node, ast.Lambda) and child is node.body):
+                yield from expression_writes(child)
+
+    def invalidate_walrus(node, bindings):
+        for write in expression_writes(node):
+            name = write.target.id
+            candidate = binding(write.value, bindings)
+            # Expression evaluation can be conditional. Ignore old numeric constants everywhere in the statement.
+            bindings[name] = possible_solver if any(x in (solver, possible_solver)
+                                                    for x in (bindings.get(name), candidate)) else None
+
+    def assignment_pairs(target, value):
+        """Pair literal unpacking positions; keep opaque unpacked callables uncertain."""
+        if isinstance(target, ast.Name):
+            yield target.id, value
+        elif isinstance(target, (ast.Tuple, ast.List)):
+            if (isinstance(value, (ast.Tuple, ast.List)) and len(target.elts) == len(value.elts)
+                    and not any(isinstance(x, ast.Starred) for x in (*target.elts, *value.elts))):
+                for dest, src in zip(target.elts, value.elts):
+                    yield from assignment_pairs(dest, src)
+            else:
+                for name in local_names(target):
+                    yield name, possible_solver
+
+    def invalidate_block(node, bindings):
+        # Loops and exceptional control flow can leave any of their assignments visible.
+        # Keep possible aliases (including chains) when forgetting a precise binding.
+        names = set(local_names(node))
+        aliases = set()
+        pending = [node]
+        while pending:
+            child = pending.pop()
+            if isinstance(child, scopes):
+                continue
+            if isinstance(child, (ast.Assign, ast.AnnAssign, ast.NamedExpr)):
+                targets = child.targets if isinstance(child, ast.Assign) else [child.target]
+                for target in targets:
+                    aliases.update(assignment_pairs(target, child.value))
+            if isinstance(child, ast.ImportFrom):
+                for part in child.names:
+                    if part.name == "run_solution":
+                        bindings[part.asname or part.name] = possible_solver
+            pending.extend(ast.iter_child_nodes(child))
+        while aliases:
+            found = {(name, value) for name, value in aliases
+                     if value is possible_solver or binding(value, bindings) in (solver, possible_solver)}
+            if not found:
+                break
+            bindings.update({name: possible_solver for name, _ in found})
+            aliases -= found
+        for name in names:
+            if name == "*":
+                for key in bindings:
+                    bindings[key] = merged(bindings[key], None)
+            else:
+                bindings[name] = merged(bindings.get(name), None)
+
     def bind(node, bindings):
+        invalidate_walrus(node, bindings)
         if isinstance(node, (ast.Assign, ast.AnnAssign)):
-            value = numeric(node.value, bindings)
-            for target in (node.targets if isinstance(node, ast.Assign) else [node.target]):
-                if isinstance(target, ast.Name):
-                    bindings[target.id] = value
-                else:
-                    for name in local_names(target):
-                        bindings[name] = None
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            # Evaluate every RHS against the old bindings before updating the LHS (including swaps).
+            resolved = {name: possible_solver if value is possible_solver else binding(value, bindings)
+                        for target in targets for name, value in assignment_pairs(target, node.value)}
+            bindings.update(resolved)
         elif isinstance(node, ast.AugAssign) and isinstance(node.target, ast.Name):
             name = node.target.id
-            bindings[name] = divide(bindings.get(name), node.op, numeric(node.value, bindings))
+            bindings[name] = arithmetic(bindings.get(name), node.op, numeric(node.value, bindings))
+        elif isinstance(node, ast.ImportFrom):
+            for part in node.names:
+                if part.name == "*":
+                    invalidate_block(node, bindings)
+                else:
+                    bindings[part.asname or part.name] = solver if part.name == "run_solution" else None
+        elif isinstance(node, ast.If):
+            arms = []
+            for branch in (node.body, node.orelse):
+                values = dict(bindings)
+                for stmt in branch:
+                    bind(stmt, values)
+                arms.append(values)
+            for name in set(arms[0]) | set(arms[1]):
+                bindings[name] = merged(arms[0].get(name), arms[1].get(name))
+        elif isinstance(node, ast.Try) and not node.handlers:
+            # Execution reaches the following statement only after normal completion.
+            for stmt in (*node.body, *node.finalbody):
+                bind(stmt, bindings)
+        elif isinstance(node, (ast.For, ast.AsyncFor, ast.While, ast.Try, ast.TryStar, ast.Match, ast.With, ast.AsyncWith)):
+            invalidate_block(node, bindings)
         else:
             for name in local_names(node):
-                bindings[name] = None
+                bindings[name] = merged(bindings.get(name), None) if not isinstance(node, scopes) else None
 
     scopes = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)
 
@@ -299,16 +421,42 @@ def run_solution_timeouts(src: str, budget: float, *, warnings: list[str] | None
             if hasattr(node, "name"):
                 yield node.name
             return
-        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+        if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
             yield node.id
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            yield from (part.asname or part.name.split(".")[0] for part in node.names)
+        if isinstance(node, (ast.ExceptHandler, ast.MatchAs, ast.MatchStar)) and node.name:
+            yield node.name
+        if isinstance(node, ast.MatchMapping) and node.rest:
+            yield node.rest
         for child in ast.iter_child_nodes(node):
             yield from local_names(child)
 
-    final = {}
-    for node in tree.body:
-        bind(node, final)
+    def deferred_bindings(body, current):
+        # Pytest test functions execute after module import. An explicitly invoked function or
+        # closure may have run earlier, while its enclosing scope held a different value.
+        final = dict(current)
+        stable = dict(final)
+        for stmt in body:
+            before = dict(final)
+            bind(stmt, final)
+            for key, value in final.items():
+                stable[key] = merged(stable.get(key), value) if key in before else value
+        return final, stable
+
+    def visit_branch(statements, initial, deferred, class_parent, nested_class):
+        bindings = dict(initial)
+        for stmt in statements:
+            visit(stmt, bindings, deferred, class_parent if nested_class else bindings)
+            bind(stmt, bindings)
 
     def visit(node, visible, deferred, class_parent):
+        if isinstance(node, (ast.stmt, ast.Lambda)) and any(expression_writes(node)):
+            original = visible
+            visible = dict(visible)
+            invalidate_walrus(node, visible)
+            if class_parent is original:
+                class_parent = visible
         if isinstance(node, scopes):
             body = node.body if isinstance(node.body, list) else [node.body]
             # Bases, decorators and default arguments execute in the defining scope.
@@ -325,47 +473,218 @@ def run_solution_timeouts(src: str, budget: float, *, warnings: list[str] | None
             else:
                 local = {n.arg for n in ast.walk(node.args) if isinstance(n, ast.arg)}
                 local.update(name for stmt in body for name in local_names(stmt))
-                current = {k: v for k, v in deferred.items() if k not in local}
-                later = dict(current)
-                for stmt in body:
-                    bind(stmt, later)
+                explicit = isinstance(node, ast.Lambda) or node.name in called
+                later_values = deferred[1] if explicit else deferred[0]
+                current = {k: v for k, v in later_values.items() if k not in local}
+                params = [*node.args.posonlyargs, *node.args.args]
+                defaults = list(zip(reversed(params), reversed(node.args.defaults)))
+                defaults.extend(zip(node.args.kwonlyargs, node.args.kw_defaults))
+                for param, default in defaults:
+                    if binding(default, visible) in (solver, possible_solver):
+                        current[param.arg] = possible_solver  # callers can supply another callable
+                later = deferred_bindings(body, current)
                 for stmt in body:
                     visit(stmt, current, later, current)
                     bind(stmt, current)
             return
         if isinstance(node, ast.If):
-            visit(node.test, visible, deferred, class_parent)
+            after_test = visible
+            visit(node.test, after_test, deferred, class_parent)
             for branch in (node.body, node.orelse):
-                bindings = dict(visible)
-                for stmt in branch:
-                    visit(stmt, bindings, deferred, bindings if class_parent is visible else class_parent)
-                    bind(stmt, bindings)
+                visit_branch(branch, after_test, deferred, class_parent, class_parent is not visible)
+            return
+        if isinstance(node, (ast.Try, ast.TryStar)):
+            visit_branch(node.body, visible, deferred, class_parent, class_parent is not visible)
+            normal = dict(visible)
+            for stmt in node.body:
+                bind(stmt, normal)
+            visit_branch(node.orelse, normal, deferred, class_parent, class_parent is not visible)
+            # Handlers and finally may run after a partially completed body. Forget the
+            # bindings it may have changed, then visit each suite in its own source order.
+            uncertain = dict(visible)
+            may_have_exited = False
+            for stmt in (*node.body, *node.orelse):
+                # Leading assignments of literals to names complete before any later
+                # exception can enter finally. After a possible exception, join conservatively.
+                if (not may_have_exited and isinstance(stmt, ast.Assign) and isinstance(stmt.value, ast.Constant)
+                        and all(isinstance(target, ast.Name) for target in stmt.targets)):
+                    bind(stmt, uncertain)
+                else:
+                    may_have_exited = True
+                    invalidate_block(stmt, uncertain)
+            for handler in node.handlers:
+                local = dict(uncertain)
+                if handler.type:
+                    visit(handler.type, local, deferred, class_parent)
+                if handler.name:
+                    local[handler.name] = None
+                visit_branch(handler.body, local, deferred, class_parent, class_parent is not visible)
+            for handler in node.handlers:
+                invalidate_block(handler, uncertain)
+            visit_branch(node.finalbody, uncertain, deferred, class_parent, class_parent is not visible)
+            return
+        if isinstance(node, (ast.For, ast.AsyncFor, ast.While)):
+            # An iteration may inherit values from earlier iterations. Within the body,
+            # unconditional assignments establish new bindings in statement order.
+            entering = dict(visible)
+            invalidate_block(node, entering)
+            if isinstance(node, ast.While):
+                visit(node.test, entering, deferred, class_parent)
+            else:
+                visit(node.iter, visible, deferred, class_parent)
+                visit(node.target, entering, deferred, class_parent)
+            for branch in (node.body, node.orelse):
+                visit_branch(branch, entering, deferred, class_parent, class_parent is not visible)
+            return
+        if isinstance(node, (ast.ListComp, ast.SetComp, ast.GeneratorExp, ast.DictComp)):
+            current = dict(visible)
+            for generator in node.generators:
+                visit(generator.iter, current, deferred, class_parent)
+                current.update(dict.fromkeys(local_names(generator.target)))
+                for condition in generator.ifs:
+                    visit(condition, current, deferred, class_parent)
+            elements = (node.key, node.value) if isinstance(node, ast.DictComp) else (node.elt,)
+            for element in elements:
+                visit(element, current, deferred, class_parent)
             return
         if isinstance(node, ast.Call):
-            name = getattr(node.func, "id", None)
-            if name in names or getattr(node.func, "attr", None) == "run_solution":
+            target = binding(node.func, visible)
+            if target in (solver, possible_solver):
                 arg = next((k.value for k in node.keywords if k.arg == "timeout_sec"), None)
                 if arg is None and node.args:
                     arg = node.args[0]
-                value = numeric(arg, visible)
-                if value is None and arg is not None:
-                    diagnostics = warnings if warnings is not None else errors
-                    diagnostics.append(f"line {node.lineno}: run_solution timeout unknown")
-                elif value is not None and value >= budget:
-                    errors.append(f"line {node.lineno}: run_solution timeout {value:g}s >= verifier budget {budget:g}s")
+                if isinstance(arg, ast.Starred) and isinstance(arg.value, (ast.List, ast.Tuple)):
+                    arg = next(iter(arg.value.elts), None)
+                if arg is None:
+                    for kw in node.keywords:
+                        if kw.arg is None and isinstance(kw.value, ast.Dict):
+                            for key, val in reversed(list(zip(kw.value.keys, kw.value.values))):
+                                if not isinstance(key, ast.Constant):
+                                    break    # a later dynamic key or **mapping may override the literal
+                                if key.value == "timeout_sec":
+                                    arg = val
+                                    break
+                            if arg is not None:
+                                break
+                value = numeric(arg, visible) if target is solver else None
+                if value is not None and (not math.isfinite(value) or value < 0):
+                    value = None
+                calls.append((node.lineno, value))
         if isinstance(node, ast.stmt) and any(isinstance(c, ast.stmt) for c in ast.iter_child_nodes(node)):
             # Branch/loop execution is unknown. Never reuse a binding it might overwrite.
             visible = dict(visible)
-            for name in local_names(node):
-                visible[name] = None
+            invalidate_block(node, visible)
         for child in ast.iter_child_nodes(node):
             visit(child, visible, deferred, class_parent)
 
-    sofar = {}
+    sofar = {"run_solution": solver}
+    final = deferred_bindings(tree.body, sofar)
     for node in tree.body:
         visit(node, sofar, final, sofar)
         bind(node, sofar)
+    return calls, []
+
+
+def _timeout_diagnostics(calls, budget, errors, unknown):
+    for line, value in calls:
+        if value is None:
+            unknown.append(f"line {line}: run_solution timeout unknown")
+        elif value >= budget:
+            errors.append(f"line {line}: run_solution timeout {value:g}s >= verifier budget {budget:g}s")
+
+
+def run_solution_timeouts(src: str, budget: float, *, warnings: list[str] | None = None) -> list[str]:
+    """Per-call diagnostics for callers inspecting one source file."""
+    calls, errors = _timeout_calls(src)
+    _timeout_diagnostics(calls, budget, errors, warnings if warnings is not None else errors)
     return errors
+
+
+def source_verifier_timeout(cfg: dict, spec: dict, task: Path) -> float:
+    pk = cfg["package"]
+    default = float(pk["verifier_timeout"]) + timing_budget(cfg, spec)
+    state = read_json(task.parent / "state.json", {})
+    approved = (state.get("verifier_timeout_pending") or {}).get("new") or state.get("approved_verifier_timeout")
+    if approved is None:
+        # Migration for a successful fix made before its approval was retained in state.
+        approved = (read_json(task.parent / "PKG_check.json", {}).get("verifier_timeout_fix") or {}).get("new")
+    if approved is None or approved > pk.get("max_verifier_timeout_s", 7200):
+        return default
+    source = task / "task.toml"
+    try:
+        value = tomllib.loads(source.read_text())["verifier"]["timeout_sec"]
+        if type(value) in (int, float) and value == approved and math.isfinite(value):
+            return max(default, float(value))
+    except (OSError, ValueError, KeyError, TypeError, OverflowError):
+        # A legacy source without a usable override still builds with the configured timeout.
+        # An attempted repair must successfully update the source TOML before the item advances.
+        pass
+    return default
+
+
+def verifier_timeout_check(tests: Path, current: float, overhead: float, *, packaged_helper: str | None = None) -> dict:
+    """Gate and repair use the same call sites, sum and reserved verifier overhead."""
+    total = 0.0
+    budget = current - overhead
+    errors, unknown, invalid = [], [], []
+    paths = tests.glob("*.py") if packaged_helper is None else _authored_test_files(tests)
+    sources = ((p.name, p.read_text()) for p in sorted(paths) if p.is_file())
+    if packaged_helper is not None:
+        sources = chain(sources, [("_metrics.py", packaged_helper)])
+    for name, source in sources:
+        calls, parse_errors = _timeout_calls(source)
+        problems = []
+        diagnostics = []
+        # Invalid Python is a grader error. It cannot be repaired by increasing the timeout.
+        invalid.extend(f"{name}: {p}" for p in parse_errors)
+        _timeout_diagnostics(calls, budget, problems, diagnostics)
+        errors.extend(f"{name}: {p}" for p in problems)
+        unknown.extend(f"{name}: {p}" for p in diagnostics)
+        total += sum(value for _, value in calls if value is not None)
+    if total and total >= budget and not errors:
+        errors.append(f"run_solution timeouts sum to {total:g}s >= verifier budget {budget:g}s")
+    # The gate is strict at equality. Leave at least one second when a large configured
+    # overhead would otherwise put the repaired package exactly on the gate boundary.
+    required = None
+    if math.isfinite(total + overhead) and overhead >= 0:
+        required = max(math.ceil(total + max(overhead, 300)), math.floor(total + overhead) + 1)
+    return dict(current=current, sum_sec=total, required=required, errors=errors, unknown=unknown, invalid=invalid)
+
+
+def set_verifier_timeout(path: Path, seconds: float):
+    """Update the one generated TOML field while preserving all unrelated bytes."""
+    original = path.read_bytes() if path.exists() else b""
+    before = tomllib.loads(original.decode())
+    header = re.search(rb"(?m)^[ \t]*\[verifier\][ \t]*(?:#[^\r\n]*)?\r?$", original)
+    value = str(float(seconds)).encode()
+    if header:
+        end = re.search(rb"(?m)^\s*\[", original[header.end():])
+        stop = header.end() + end.start() if end else len(original)
+        section = original[header.end():stop]
+        key = re.search(rb"(?m)^([ \t]*timeout_sec[ \t]*=[ \t]*)([^#\s]+)", section)
+        if key:
+            section = section[:key.start(2)] + value + section[key.end(2):]
+        else:
+            section = b"\ntimeout_sec = " + value + section
+        updated = original[:header.end()] + section + original[stop:]
+    else:
+        newline = b"\n" if original and not original.endswith(b"\n") else b""
+        updated = original + newline + b"[verifier]\ntimeout_sec = " + value + b"\n"
+    if not isinstance(before.setdefault("verifier", {}), dict):
+        raise ValueError("source verifier is not a TOML table")
+    before["verifier"]["timeout_sec"] = float(seconds)
+    if tomllib.loads(updated.decode()) != before:
+        raise ValueError("could not safely update [verifier].timeout_sec")
+    with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as handle:
+        tmp = Path(handle.name)
+        try:
+            handle.write(updated)
+            handle.flush()
+            if path.exists():
+                shutil.copymode(path, tmp)
+            tmp.replace(path)
+        finally:
+            tmp.unlink(missing_ok=True)
 
 
 def network_errors(t: dict, mode: str) -> tuple[list, list]:
@@ -404,6 +723,7 @@ def validate_pkg(pkg: Path, cfg: dict | None = None) -> dict:
     provenance = read_json(pkg / "provenance.json", {})
     missing = [r for r in REQUIRED if not (pkg / r).exists()]
     errs, warnings = [], []
+    check = {}
     try:
         t = tomllib.loads((pkg / "task.toml").read_text())
         for sec in ("task", "verifier", "agent", "environment"):
@@ -415,13 +735,10 @@ def validate_pkg(pkg: Path, cfg: dict | None = None) -> dict:
         network, warnings = network_errors(t, policy)
         errs.extend(network)
         overhead = float((cfg or {}).get("package", {}).get("verifier_overhead_sec", provenance.get("verifier_overhead_sec", 120)))
-        budget = float(t["verifier"]["timeout_sec"]) - overhead
-        for name in ("measure.py", "test_outputs.py"):
-            path = pkg / "tests" / name
-            if path.is_file():
-                unknown = []
-                errs.extend(f"{name}: {e}" for e in run_solution_timeouts(path.read_text(), budget, warnings=unknown))
-                warnings.extend(f"{name}: {w}" for w in unknown)
+        check = verifier_timeout_check(pkg / "tests", float(t["verifier"]["timeout_sec"]), overhead)
+        errs.extend(check["errors"])
+        errs.extend(check["unknown"])
+        errs.extend(check["invalid"])
     except Exception as e:  # noqa: BLE001
         errs.append(f"task.toml: {e}")
     if cfg is not None and not missing:
@@ -435,4 +752,4 @@ def validate_pkg(pkg: Path, cfg: dict | None = None) -> dict:
     for gen_only in ("generator", "baselines", "_spec"):
         if (pkg / gen_only).exists():
             errs.append(f"{gen_only}/ must not be packaged")
-    return dict(ok=not missing and not errs, missing=missing, errors=errs, warnings=warnings)
+    return dict(ok=not missing and not errs, missing=missing, errors=errs, warnings=warnings, run_solution_timeouts=check)
