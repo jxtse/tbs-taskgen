@@ -125,11 +125,22 @@ def threshold_format(text: str, thresholds: dict | None = None) -> list[str]:
     return list(dict.fromkeys(bad))
 
 
+_INLINE_MARKUP = re.compile(r"(\*\*|__|\*|`)")
+
+
+def _plain(text: str) -> str:
+    """Whitespace-normalized text without inline Markdown emphasis/code markers (`**x**`, `*x*`, `__x__`, `` `x` ``)."""
+    return " ".join(_INLINE_MARKUP.sub("", text).split()).casefold()
+
+
 def assumptions_stated(text: str, assumptions: list, require_long_quote: bool = True) -> list[str]:
+    """A stated assumption must appear verbatim in the statement. Inline Markdown markers and letter case are ignored on both sides:
+    an author may quote `**in log units**` while the statement says it in plain prose, or vice versa."""
     normalized = " ".join(strip_time_note(text).split())
+    plain = _plain(normalized)
     missing = []
     for a in assumptions:
         quote = assumption_quote(a["where"], require_long_quote)
-        if a["stated"] and (not quote or quote not in normalized):
+        if a["stated"] and (not quote or (quote not in normalized and _plain(quote) not in plain)):
             missing.append(a["where"])
     return missing

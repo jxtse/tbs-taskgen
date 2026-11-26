@@ -86,6 +86,13 @@ def test_versioned_spec_and_quotes():
     assert not assumptions_stated("Additive   Gaussian\nnoise", [a])
     assert assumptions_stated("Other noise", [a]) == [a["where"]]
     assert assumptions_stated("Gaussian", [dict(a, where="Gaussian")])
+    # Inline Markdown markers are ignored on both sides; the words themselves must still match.
+    md = dict(a, where="rates are **in log units** per step")
+    assert not assumptions_stated("All rates are in log units per step.", [md])
+    assert not assumptions_stated("All rates are `in log units` per step.", [dict(a, where="rates are in log units per step")])
+    assert assumptions_stated("All rates are in linear units per step.", [md]) == [md["where"]]
+    assert not assumptions_stated("Sampling. With a weight of at most 5 %, from a second source.",
+                                  [dict(a, where="with a weight of at most 5 %, from a second")])
     for bad in ("string", [None], [dict(a, stated=0)], [dict(a, stated=False)], [dict(a, where="")]):
         assert validate_spec(dict(spec, generator_assumptions=bad), cfg)
     assert not validate_spec(dict(spec, generator_assumptions=[
