@@ -309,6 +309,56 @@ def test_prepare_hook_builds_the_prepared_copy_and_the_job_uses_it(tmp_path):
     assert (tmp_path / "prep_calls").read_text().count("\n") == 2
 
 
+@pytest.mark.parametrize("change", ["root", "instruction.md", "tests/test_outputs.py", "task.toml"])
+def test_prepared_receipt_binds_target_and_contents(tmp_path, change):
+    import shutil
+
+    root = tmp_path / "prepared"
+    P, [iid], _, _ = _env(tmp_path, prepared_tasks_dir=str(root), prepare_command=_hook(tmp_path))
+    it = P.store.item(iid)
+    it.p("pkg/tests").mkdir()
+    it.p("pkg/tests/test_outputs.py").write_text("assert True\n")
+    assert calib.ensure_prepared(P.cfg, it.dir)["ok"]
+    if change == "root":
+        other = tmp_path / "another"
+        shutil.copytree(root, other)
+        P.cfg["calib"]["prepared_tasks_dir"] = str(other)
+    else:
+        (root / iid / change).write_text("stale prepared data\n")
+    assert calib.stale_prepared(P.cfg, it.dir, "glm", 1)
+    receipt = calib.ensure_prepared(P.cfg, it.dir)
+    assert receipt["ok"] and not receipt.get("reused")
+    assert not calib.stale_prepared(P.cfg, it.dir, "glm", 1)
+    assert calib.ensure_prepared(P.cfg, it.dir)["reused"]
+
+
+@pytest.mark.parametrize("state", ["intent", "reserved"])
+def test_unstarted_attempt_reprepares_and_submits_new_destination(tmp_path, state):
+    import shutil
+
+    root = tmp_path / "prepared"
+    P, [iid], counter, _ = _env(tmp_path, allow_submit=False, prepared_tasks_dir=str(root),
+                                prepare_command=_hook(tmp_path))
+    it = P.store.item(iid)
+    it.state["require_prepared_receipt"] = True
+    it.save()
+    P.run(only=[iid])
+    [rec] = _runs(P, iid)
+    if state == "reserved":
+        rec.update(state="reserved", ledger_call=P.ledger.reserve(rec["model"], "S9", iid, True, est_usd=30.0))
+        it.p("calib/runs.json").write_text(json.dumps([rec]))
+    other = tmp_path / "another"
+    shutil.copytree(root, other)
+    (other / iid / "instruction.md").write_text("stale")
+    P.cfg["calib"].update(allow_submit=True, prepared_tasks_dir=str(other))
+    P.run(only=[iid])
+    [launched] = _runs(P, iid)
+    assert launched["state"] == "launched" and counter.exists()
+    assert launched["task"] == json.loads(Path(launched["config"]).read_text())["tasks"][0]["path"]
+    assert Path(launched["task"]) == other / iid
+    assert (other / iid / "instruction.md").read_bytes() == it.p("pkg/instruction.md").read_bytes()
+
+
 def test_prepare_hook_failure_blocks_without_launch_and_is_not_retried(tmp_path):
     prep = tmp_path / "prepared"
     P, [iid], counter, _ = _env(tmp_path, prepared_tasks_dir=str(prep), prepare_command=_hook(tmp_path, fail=True))

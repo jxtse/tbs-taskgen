@@ -174,6 +174,19 @@ def pkg_sha(pkg: Path, *, exclude=()) -> str:
     return h.hexdigest()[:16]
 
 
+def _prepare_receipt(path: Path) -> dict:
+    try:
+        prev = read_json(path, {})
+    except (OSError, ValueError):
+        return {}
+    return prev if isinstance(prev, dict) else {}
+
+
+def _prepared_matches(receipt: dict, out: Path) -> bool:
+    return (receipt.get("ok") and receipt.get("out") == str(out.resolve())
+            and (out / "task.toml").is_file() and receipt.get("prepared_sha") == pkg_sha(out))
+
+
 def ensure_prepared(cfg: dict, item_dir: Path, who: str = "glm", force: bool = False) -> dict:
     """Environment-preparation hook (calib.prepare_command): build the run-ready copy of pkg/ that a remote
     backend needs (image + registered template, task.toml pointing at it) at <prepared_tasks_dir>/<item_id>.
@@ -181,25 +194,26 @@ def ensure_prepared(cfg: dict, item_dir: Path, who: str = "glm", force: bool = F
     The command is a template run with bash in calib.prepare_cwd (default: the role's harbor_root); placeholders
     {item_id} {pkg} {out} {who} are shell-quoted, and the same values are in the environment as TBSGEN_ITEM_ID /
     TBSGEN_PKG / TBSGEN_PREPARED_DIR / TBSGEN_WHO.  It must leave <out>/task.toml.  The outcome is recorded in
-    calib/prepare.json with the pkg/ hash: a copy made from the same pkg/ is reused, a failure for the same pkg/
-    is not retried automatically (force=True, i.e. `tbsgen calib prepare`, retries)."""
+    calib/prepare.json with source and prepared hashes and the resolved output path. A successful copy is reused
+    while all three match. A failed preparation for the same source and destination is not retried automatically (force=True, i.e. `tbsgen calib prepare`, retries)."""
     import subprocess
     c = cfg["calib"]
     cmd, d = c.get("prepare_command"), prepared_dir(cfg, who)
-    if not cmd or not d:
-        return dict(ok=bool(not d or (Path(d) / item_dir.name / "task.toml").exists()), skipped="no prepare_command")
-    out = Path(d).resolve() / item_dir.name          # the hook runs in another cwd
+    if not d:
+        return dict(ok=True, skipped="no prepared_tasks_dir")
+    if not cmd:
+        epoch = read_json(item_dir / "state.json", {}).get("calib_epoch", 0)
+        why = stale_prepared(cfg, item_dir, who, epoch)
+        return dict(ok=not why and (Path(d) / item_dir.name / "task.toml").is_file(),
+                    skipped="no prepare_command", error=why)
+    out = (Path(d) / item_dir.name).resolve()          # the hook runs in another cwd
     pkg = item_dir / "pkg"
     sha = pkg_sha(pkg)
     recp = item_dir / "calib" / f"prepare-{who}.json" if who != "glm" else item_dir / "calib" / "prepare.json"
-    prev = {}
-    try:
-        prev = json.loads(recp.read_text())
-    except (OSError, ValueError):
-        pass
+    prev = _prepare_receipt(recp)
     image = taskimage.package_identity(item_dir)
-    if prev.get("pkg_sha") == sha and not force:
-        if prev.get("ok") and (out / "task.toml").exists() and (not image or _push_matches(item_dir, prev)):
+    if prev.get("pkg_sha") == sha and prev.get("out") == str(out) and not force:
+        if _prepared_matches(prev, out) and (not image or _push_matches(item_dir, prev)):
             return dict(prev, reused=True)
         if not prev.get("ok"):
             return dict(prev, reused=True)          # same pkg failed before: needs `tbsgen calib prepare`
@@ -229,11 +243,13 @@ def ensure_prepared(cfg: dict, item_dir: Path, who: str = "glm", force: bool = F
         err = f"exit {rc}" + ("" if (out / "task.toml").exists() else f"; no {out}/task.toml") + f": {tail}"
     res = dict(ok=ok, pkg_sha=sha, out=str(out), rc=rc, error=err, sec=round(time.time() - t0, 1), ts=time.time(),
                log=str(log))
+    if ok:
+        res["prepared_sha"] = pkg_sha(out)
     if ok and image:
         res["published_digest"] = env.get("TBSGEN_IMAGE_DIGEST")
         if not _push_matches(item_dir, res):
             res.update(ok=False, error="prepare_command did not record the verified OCI digest for this package")
-    recp.write_text(json.dumps(res, indent=1))
+    write_json(recp, res)
     return res
 
 
@@ -382,24 +398,41 @@ def _push_matches(item_dir, prepared):
 def stale_prepared(cfg: dict, item_dir: Path, who: str, epoch: int) -> str | None:
     """After a review revision (epoch > 0) a prepared copy must be one made from the current pkg/ (recorded by
     ensure_prepared with the pkg hash); a copy prepared by hand before the revision would calibrate the old task."""
-    if not prepared_dir(cfg, who):
+    directory = prepared_dir(cfg, who)
+    if not directory:
         return None
+    out = (Path(directory) / item_dir.name).resolve()
     image = taskimage.package_identity(item_dir)
-    if not epoch and not image:
-        if (task_path(cfg, item_dir, who) == item_dir / "pkg"
-                or not read_json(item_dir / "state.json", {}).get("require_prepared_receipt")):
-            return None
     recp = item_dir / "calib" / ("prepare.json" if who == "glm" else f"prepare-{who}.json")
-    try:
-        prev = json.loads(recp.read_text())
-    except (OSError, ValueError):
-        prev = {}
+    prev = _prepare_receipt(recp)
+    if (not epoch and not image and not cfg["calib"].get("prepare_command") and not recp.exists()
+            and not read_json(item_dir / "state.json", {}).get("require_prepared_receipt")):
+        return None
     if image and not _push_matches(item_dir, prev):
         return "prepared task has no matching verified OCI digest; run calib prepare"
-    if prev.get("ok") and prev.get("pkg_sha") == pkg_sha(item_dir / "pkg"):
+    if prev.get("pkg_sha") == pkg_sha(item_dir / "pkg") and _prepared_matches(prev, out):
         return None
     return (f"the prepared {who} copy may predate the current package (no calib/{recp.name} for the current pkg/): "
-            "set calib.prepare_command (S9 re-prepares) or prepare it and run `tbsgen calib prepare --item ID`")
+            "set calib.prepare_command so S9 can rebuild it, or retry the configured hook with `tbsgen calib prepare --item ID`")
+
+
+def bind_launch_task(cfg, item_dir, rec, conf):
+    """Bind an unsent attempt to the verified prepared path, including after a destination change."""
+    current = task_path(cfg, item_dir, rec["who"]).resolve()
+    if _unprepared(cfg, rec["who"], str(current)):
+        return "no prepared sandbox template for this item"
+    why = stale_prepared(cfg, item_dir, rec["who"], int(rec.get("epoch") or 0))
+    if why:
+        return why
+    tasks = conf.get("tasks") or []
+    # A crash can leave the config pointing at the verified destination before runs.json is saved.
+    if len(tasks) != 1 or tasks[0].get("path") not in (rec["task"], str(current)):
+        return "job config names a different task; prepare the current task before launch"
+    if tasks[0]["path"] != str(current):
+        tasks[0]["path"] = str(current)
+        write_json(Path(rec["config"]), conf)
+    rec["task"] = str(current)
+    return None
 
 
 def remote_alias(job_dir: Path, *, if_missing=None) -> dict:
@@ -669,30 +702,22 @@ def launch(cfg: dict, rec: dict, ledger, save, *, started=None) -> dict:
         return adopt_started(cfg, rec, ledger, save)
     if rec.get("launch_attempted"):
         return _fail_launch(rec, ledger, save, rec.get("launch_uncertain") or "launch did not start")
+    # Preserve the persisted job identity, model and route. Only an unstarted calibration
+    # job may switch to the run-ready copy of this same item.
+    try:
+        conf = json.loads(Path(rec["config"]).read_text())
+    except (OSError, ValueError) as e:
+        rec["blocked"] = f"job config {rec['config']} unreadable ({type(e).__name__}); run prepare again"
+        save(rec)
+        return rec
+    if rec["who"] != "review":
+        why = bind_launch_task(cfg, Path(rec["config"]).parent.parent, rec, conf)
+        if why:
+            rec["blocked"] = why
+            save(rec)
+            return rec
     if rec["state"] in ("intent", "cancelled_unstarted"):
-        # an intent has no side effect outside item_dir.  It may have been written while submit was off, before
-        # calib.agent_allowed_hosts was set: update only that field of its job config (model, job dir and task stay
-        # those of the record, which ingest() checks the result against) and re-check it
-        try:
-            conf = json.loads(Path(rec["config"]).read_text())
-        except (OSError, ValueError) as e:
-            # never rebuild from the current settings: model / job dir could differ from the record
-            rec["blocked"] = f"job config {rec['config']} unreadable ({type(e).__name__}); run prepare again"
-            save(rec)
-            return rec
         hosts = [str(h) for h in role(c, rec["who"], "agent_allowed_hosts") or []]
-        # an intent written before its sandbox copy existed points at pkg/: switch it to the prepared copy (same
-        # task, run-ready); the record's task changes with it, so ingest() still checks the job against it
-        item_dir = Path(rec["config"]).parent.parent
-        cur = task_path(cfg, item_dir, rec["who"])
-        if Path(rec["task"]) == (item_dir / "pkg").resolve() and cur != item_dir / "pkg":
-            for t in conf.get("tasks") or []:
-                t["path"] = str(cur.resolve())
-            rec["task"] = str(cur.resolve())
-        if _unprepared(cfg, rec["who"], rec["task"]):
-            rec["blocked"] = "no prepared sandbox template for this item"
-            save(rec)
-            return rec
         for a in conf.get("agents") or []:
             if hosts:
                 a["extra_allowed_hosts"] = hosts
@@ -710,11 +735,7 @@ def launch(cfg: dict, rec: dict, ledger, save, *, started=None) -> dict:
         rec["ledger_call"] = reserve_job()
         rec["state"] = "reserved"
         save(rec)
-    # the record may predate a config change (written while submit was off): re-check the job's own config
-    try:
-        conf = json.loads(Path(rec["config"]).read_text())
-    except (OSError, ValueError):
-        conf = {}
+    # Reserved attempts may predate a config change. Check their own config before sending.
     why = network_problem(cfg, Path(rec["task"]), conf)
     if why:
         return _fail_launch(rec, ledger, save, f"not launched: {why}")

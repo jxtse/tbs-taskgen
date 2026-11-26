@@ -70,13 +70,14 @@ Crossref · arXiv · Europe PMC              → S5 spec (teacher) → S6 genera
    At PKG, `package.autofix_verifier_timeout` (default `true`) repairs an otherwise valid package when
    the sum of its static `run_solution` timeouts reaches the verifier budget. It raises the timeout in the source
    and package, reserving at least 300 seconds for overhead. Dynamic timeouts or a required timeout above
-   `package.max_verifier_timeout_s` (default 7200) park the item. A repaired reviewed package needs fresh S9R
-   approval. A verifier timeout recorded in the current calibration epoch also triggers recalibration.
+   `package.max_verifier_timeout_s` (default 7200) park the item. Every repaired package needs S9R approval of its final bytes before release. A verifier timeout recorded in the current calibration epoch also triggers recalibration.
 
    Before calibration, `prereview.mode` defaults to `"off"`. In `"shadow"`, one S9P call records evidenced
-   statement inconsistencies and missing conditions. In `"enforce"`, S8 can edit the statement and public
-   README format notes once, followed by S7 and PKG. Call or packet errors and rejected edits continue with the
-   original package. S9 and independent S9R still run normally. Set `models.prereview.model`,
+   statement inconsistencies and missing conditions. Its packet excludes hidden inputs and truth files.
+   In `"enforce"`, S8 can edit the statement and generator-authored `README.md`, `README.txt` or `FORMAT.md`
+   directly under `environment/data/` (case-insensitive) once, followed by S7 and PKG. Call or packet errors
+   and rejected edits continue with the original package. S10 parks a pre-reviewed version until its final
+   package has a passing S9R verdict. The release manifest records the reviewer model. Set `models.prereview.model`,
    `models.prereview.url` (Messages endpoint), optional `key_env`, and the model's entry in `models.prices`.
    `prereview.allowed_contexts` defaults to `["base", "review_revision"]`.
    Use `tbsgen report --run RUN --prereview` for per-mode S9P and repair spend and later a/b blocker counts.

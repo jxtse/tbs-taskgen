@@ -10,15 +10,18 @@ import io
 import json
 import math
 import os
+import re
 import time
 import zipfile
 from pathlib import Path
 
+from .leaves import file_leaves
 from .runner import is_format_note
 
 TEXT_BYTES = 24_000
 JSON_INPUT_BYTES = 32 * 1024 * 1024
 NPZ_INDEX_BYTES = 2 * 1024 * 1024
+TRUTH_SCAN_BYTES = 2 * 1024 * 1024
 PACKET_BYTES = 256_000
 TRUNCATED = "\n[truncated]"
 
@@ -86,13 +89,13 @@ class _ZipHeaderReader(io.BufferedReader):
         return super().read(size)
 
 
-def _data_entry(path: Path) -> dict:
+def _data_entry(path: Path, *, format_note: bool) -> dict:
     entry = {"size": path.stat().st_size}
     compressed = path.suffix.lower() == ".gz"
     inner = path.with_suffix("") if compressed else path
     ext = inner.suffix.lower()
     open_data = gzip.open if compressed else open
-    if is_format_note(path):
+    if format_note:
         entry["text"] = _text(path)
     elif ext in (".csv", ".tsv"):
         # Bound even a CSV with no newline; preserve only complete rows when the prefix was truncated.
@@ -156,6 +159,108 @@ def _safe_file(root: Path, rel: Path) -> bool:
     return p.is_file()
 
 
+class UnsafeGraderPacket(ValueError):
+    """The grader could carry answers, or its comparison with truth was inconclusive."""
+
+
+def _json_atoms(obj):
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            yield key
+            yield from _json_atoms(value)
+    elif isinstance(obj, list):
+        for value in obj:
+            yield from _json_atoms(value)
+    else:
+        yield obj
+
+
+def _truth_atoms(path, remaining):
+    # Limit total decompressed bytes across the tree. Unknown encodings skip this advisory call.
+    compressed = path.suffix.lower() == ".gz"
+    ext = (path.with_suffix("") if compressed else path).suffix.lower()
+    if ext == ".npy" and not compressed:
+        size = path.stat().st_size
+        if size > remaining:
+            raise UnsafeGraderPacket("truth exceeds scan budget")
+        import numpy as np
+        # Validate the complete numeric payload without allocating from an untrusted header.
+        array = np.load(path, allow_pickle=False, mmap_mode="r")
+        if not isinstance(array, np.ndarray) or array.dtype.kind not in "fiub" or array.nbytes > size:
+            raise UnsafeGraderPacket("unsupported truth array")
+        count = array.size
+        leaves = file_leaves(path, path.name)
+        if not leaves or leaves[0].values.size != count:
+            raise UnsafeGraderPacket("unreadable numeric truth array")
+        return size, leaves[0].values
+    if ext not in {".csv", ".tsv", ".json", ".jsonl"}:
+        raise UnsafeGraderPacket("unsupported truth format")
+    with (gzip.open if compressed else open)(path, "rb") as f:
+        data = f.read(remaining + 1)
+    if len(data) > remaining:
+        raise UnsafeGraderPacket("truth exceeds scan budget")
+    content = data.decode("utf-8-sig")
+    if ext == ".json":
+        atoms = _json_atoms(json.loads(content))
+    elif ext == ".jsonl":
+        atoms = (atom for line in content.splitlines() if line.strip() for atom in _json_atoms(json.loads(line)))
+    else:
+        rows = csv.reader(io.StringIO(content, newline=""), delimiter="," if ext == ".csv" else "\t", strict=True)
+        atoms = (cell for row in rows for cell in row)
+    return len(data), atoms
+
+
+def _check_graders(pkg, sources):
+    if not sources:
+        return
+    # Compare decoded constants as well as source text (including comments). A self-contained
+    # literal table can supply its own answers, with no corresponding file under tests/truth.
+    literals = []
+    for source in sources:
+        for node in ast.walk(ast.parse(source)):
+            if isinstance(node, ast.Constant):
+                literals.append(str(node.value))
+            if isinstance(node, (ast.List, ast.Tuple, ast.Set, ast.Dict)):
+                try:
+                    values = ast.literal_eval(node)
+                except (TypeError, ValueError):
+                    continue
+                if values:
+                    raise UnsafeGraderPacket("embedded literal table")
+    haystack = "\n".join([*sources, *literals]).casefold()
+    # Also catch alternate numeric spellings, including exponential notation in comments.
+    number_pattern = r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[-+]?\d+)?"
+    numbers = {format(float(m[0]), ".6g") for m in re.finditer(number_pattern, haystack)}
+    # Python and JSON spell Boolean and non-finite values as words.
+    for spelling, value in (("true", "1"), ("false", "0"), ("nan", "nan"), ("inf", "inf"), ("-inf", "-inf")):
+        if spelling in haystack:
+            numbers.add(value)
+    # Bound substring comparisons even for millions of distinct short labels.
+    string_scans_left = 250_000_000 // max(1, len(haystack))
+    remaining = TRUTH_SCAN_BYTES
+    truth = pkg / "tests/truth"
+    if truth.resolve() != truth:
+        raise UnsafeGraderPacket("linked truth directory")
+    for path in truth.rglob("*"):
+        if not _safe_file(pkg, path.relative_to(pkg)):
+            continue
+        size, atoms = _truth_atoms(path, remaining)
+        remaining -= size
+        for atom in atoms:
+            try:
+                number = float(atom)
+            except (ValueError, TypeError):
+                string_scans_left -= 1
+                if string_scans_left < 0:
+                    raise UnsafeGraderPacket("truth comparison exceeds scan budget")
+                word = str(atom).strip().casefold()
+                if word and word in haystack:
+                    raise UnsafeGraderPacket("grader overlaps truth")
+            else:
+                if format(number, ".6g") in numbers:
+                    raise UnsafeGraderPacket("grader overlaps numeric truth")
+
+
 def build_packet(pkg: Path, *, generator_dir: Path | None = None) -> dict:
     """Use only allowlisted package bytes. Fail open at the caller if even the inventory is too large."""
     if generator_dir is not None:
@@ -176,14 +281,25 @@ def build_packet(pkg: Path, *, generator_dir: Path | None = None) -> dict:
             raise ValueError("pre-review packet exceeds byte limit")
         target[path] = entry
 
+    graders = []
     for name in ("instruction.md", "tests/test_outputs.py", "tests/measure.py"):
         rel = Path(name)
         if _safe_file(pkg, rel):
-            add(rel, {"text": _text(pkg / rel)})
+            if name == "instruction.md":
+                add(rel, {"text": _text(pkg / rel)})
+                continue
+            with (pkg / rel).open("rb") as f:
+                data = f.read(TRUTH_SCAN_BYTES + 1)
+            if len(data) > TRUTH_SCAN_BYTES:
+                raise UnsafeGraderPacket("grader exceeds scan budget")
+            graders.append(data.decode("utf-8"))
+            visible = data[:TEXT_BYTES].decode("utf-8", errors="ignore")
+            add(rel, {"text": visible + (TRUNCATED if len(data) > TEXT_BYTES else "")})
+    _check_graders(pkg, graders)
     if "instruction.md" not in files:
         raise ValueError("missing instruction.md")
 
-    for dirname in ("generator", "environment/data", "tests/hidden"):
+    for dirname in ("generator", "environment/data"):
         root = pkg / dirname
         if root.resolve() != root:
             raise ValueError(f"linked directory outside packet scope: {dirname}")
@@ -193,7 +309,7 @@ def build_packet(pkg: Path, *, generator_dir: Path | None = None) -> dict:
             if dirname == "generator" and not is_format_note(path):
                 continue
             if _safe_file(pkg, rel):
-                add(rel, _data_entry(path))
+                add(rel, _data_entry(path, format_note=path.parent == root and is_format_note(path)))
 
     if _safe_file(pkg, Path("provenance.json")):
         with (pkg / "provenance.json").open("rb") as f:
@@ -237,14 +353,29 @@ def _supported(entry: dict, evidence: dict) -> bool:
         return 0 <= offset < sum(map(len, lines[:line]))
     if "columns" in entry:
         column = evidence.get("column")
-        if isinstance(column, str):
-            return column in entry["columns"] and quote in entry["sample"]
+        columns = entry["columns"]
+        if not isinstance(column, str) or columns.count(column) != 1 or quote not in entry["sample"]:
+            return False
+        delimiter = "\t" if evidence["file"].lower().removesuffix(".gz").endswith(".tsv") else ","
+        rows = csv.reader(io.StringIO(entry["sample"], newline=""), delimiter=delimiter)
+        index = columns.index(column)
+        header = next(rows, [])
+        if header != columns:
+            return False
+        if quote in column or any(index < len(row) and quote in row[index] for row in rows):
+            return True
+        # A multi-column header quote must contain the named header as a complete field.
+        quoted = list(csv.reader(io.StringIO(quote, newline=""), delimiter=delimiter))
+        if len(quoted) == 1 and column in quoted[0]:
+            start = index - quoted[0].index(column)
+            return start >= 0 and columns[start:start + len(quoted[0])] == quoted[0]
+        return False
     key = evidence.get("key")
     if not isinstance(key, str):
         return False
     for field in ("keys", "arrays", "thresholds"):
         if key in entry.get(field, {}):
-            return quote in _json(entry[field])
+            return quote in _json({key: entry[field][key]})
     # Binary files and top-level JSON arrays have no named columns or members.
     return key in ("type", "size") and key in entry and quote in _json({key: entry[key]})
 
@@ -270,7 +401,8 @@ def validate_findings(packet: dict, raw: list) -> tuple[list, int]:
     return kept, len(raw) - len(kept)
 
 
-def run_prereview(pkg: Path, client_factory, *, item: str, generator_dir: Path | None = None) -> dict:
+def run_prereview(pkg: Path, client_factory, *, item: str, generator_dir: Path | None = None,
+                  on_reserved=None) -> dict:
     """Make a single ledgered call. Return an auditable record, also on setup, model or parse failure."""
     start = time.monotonic()
     result = dict(packet_hash=None, raw=[], validated=[], discarded=0, usd=0.0, model=None, error=None)
@@ -280,7 +412,7 @@ def run_prereview(pkg: Path, client_factory, *, item: str, generator_dir: Path |
         result["packet_hash"] = hashlib.sha256(body.encode()).hexdigest()
         client = client_factory()
         result["model"] = client.name
-        answer = client.chat(PROMPT, body, stage="S9P", item=item)
+        answer = client.chat(PROMPT, body, stage="S9P", item=item, on_reserved=on_reserved)
         result.update(usd=answer.usd, model=answer.model)
         if answer.stop_reason not in {None, "end_turn", "stop_sequence"}:
             raise ValueError(f"incomplete pre-review: {answer.stop_reason}")

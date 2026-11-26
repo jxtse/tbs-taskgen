@@ -102,15 +102,18 @@ class _Base:
         self.ledger, self.cfg = ledger, cfg
 
     def chat(self, system: str, user: str, *, stage: str, item: str = "", max_tokens: int | None = None,
-             effort: str | None = None, retry_thinking: bool = True) -> ModelResult:
+             effort: str | None = None, retry_thinking: bool = True, require_price: bool = False,
+             on_reserved: Callable[[int], None] | None = None) -> ModelResult:
         """effort: per-call override of the teacher's reasoning effort (None: models.<alias>.effort_by_stage
         for this stage, else models.<alias>.effort)."""
-        if stage == "S9P" and self.real and self.name not in self.cfg["models"].get("prices", {}):
+        if (stage == "S9P" or require_price) and self.real and not self.cfg["models"].get("prices", {}).get(self.name):
             raise ModelError("config", f"missing models.prices entry for {self.name}")
         cid = self.ledger.reserve(self.name, stage, item, self.real, _sha(system, user), send=self.real)
         t0 = time.time()
         kw = {"effort": effort} if effort else {}
         try:
+            if on_reserved is not None:
+                on_reserved(cid)  # persist the exact charge id before sending any potentially billable request
             text, usage, resp_model, stop = self._call(system, user, stage=stage, max_tokens=max_tokens, **kw)
         except ModelError as e:
             # a call that reached the model is billed even when it failed (empty answer after thinking)

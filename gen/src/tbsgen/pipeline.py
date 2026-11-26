@@ -260,7 +260,7 @@ class Pipeline:
         self.store.event("stage_start", item=it.item_id, stage=st)
         t0 = time.time()
         try:
-            if advisory and prereview_flow.resume_edit(it):
+            if advisory and prereview_flow.resume_edit(it, self.ledger):
                 return "ok"
             if stopped:
                 prereview_flow.reject(it, "S8 repair model unavailable")

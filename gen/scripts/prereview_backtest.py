@@ -16,7 +16,7 @@ from tbsgen.calib import pkg_sha
 from tbsgen.config import load_config, resolve_role
 from tbsgen.models import get_client
 from tbsgen.prereview import run_prereview
-from tbsgen.report import configured_reviewer, round_verdict
+from tbsgen.report import round_verdict
 from tbsgen.state import write_json
 
 
@@ -89,7 +89,7 @@ def replay(run: Path, out: Path, rnd: int, items, repeat: int, config=None):
         return client
 
     selected = set(items or [])
-    fallback_model = configured_reviewer(run)
+    unverified = []
     rows = []
     eligible = compared = flips = evidence_flips = errors = 0
     skipped = {}
@@ -100,11 +100,14 @@ def replay(run: Path, out: Path, rnd: int, items, repeat: int, config=None):
         task = directory / "task"
         bundle = task / "environment/review"
         package = bundle / "pkg" if bundle.is_dir() else task
-        result = round_verdict(directory, fallback_model)
+        result = round_verdict(directory)
         if not result or not (package / "instruction.md").is_file():
             skipped[item] = "no eligible S9R verdict or package snapshot"
             continue
         verdict, issues = result
+        if verdict["model_source"] == "unverified":
+            unverified.append(item)
+            continue
         if verdict["pkg_sha"] and verdict["pkg_sha"] != pkg_sha(package):
             skipped[item] = "verdict belongs to a different package"
             continue
@@ -147,7 +150,8 @@ def replay(run: Path, out: Path, rnd: int, items, repeat: int, config=None):
         writer.writerows(rows)
     summary = dict(items=eligible, attempts=len(rows), errors=errors, repeat_comparisons=compared, blocking_flips=flips,
                    blocking_flip_rate=flips / compared if compared else None,
-                   evidence_flip_rate=evidence_flips / compared if compared else None, skipped=skipped)
+                   evidence_flip_rate=evidence_flips / compared if compared else None, skipped=skipped,
+                   unverified_reviewers=unverified)
     write_json(out / "summary.json", summary)
     return summary
 

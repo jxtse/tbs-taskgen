@@ -1,11 +1,12 @@
 """Static verifier-budget correction and PKG routing, using only synthetic tasks."""
 import hashlib
+import shutil
 import tomllib
 from types import SimpleNamespace
 
 import pytest
 
-from tbsgen import package, stages_b
+from tbsgen import calib, package, stages_b
 from tbsgen.config import load_config
 from tbsgen.state import Item, read_json, write_json
 
@@ -38,6 +39,10 @@ def _setup(tmp_path, source, *, locked=False, timeout=None):
     events = []
     pipeline = SimpleNamespace(cfg=load_config(), item_cost=lambda _: 0,
                                store=SimpleNamespace(root=tmp_path, event=lambda *args, **kw: events.append((args, kw))))
+    if locked:
+        out = package.package(pipeline.cfg, it.dir, it.p("runs/s7-1/detA"), read_json(it.p("_spec/spec.json")), {})
+        it.state["regates"] = [dict(pkg_sha=calib.pkg_sha(out))]
+        it.save()
     return pipeline, it, events
 
 
@@ -141,7 +146,9 @@ def test_other_pkg_failure_blocks_timeout_fix(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("legacy", [False, True])
-@pytest.mark.parametrize("changed_path", [None, "task/tests/test_outputs.py", "task/solution/solve.py"])
+@pytest.mark.parametrize("changed_path", [None, "task/tests/test_outputs.py", "task/solution/solve.py",
+                                          "runs/s7-1/detA/tests/truth/README_labels.json",
+                                          "runs/s7-1/detA/tests/hidden/README.md"])
 def test_regate_keeps_calibration_only_when_timeout_is_the_only_edit(tmp_path, changed_path, legacy):
     from tbsgen import calib
     pipeline, it, _ = _setup(tmp_path, "run_solution(900)", locked=True)
@@ -152,9 +159,14 @@ def test_regate_keeps_calibration_only_when_timeout_is_the_only_edit(tmp_path, c
     if not legacy:
         it.state["rescore_pending"]["inputs_sha"] = stages_b._timeout_independent_sha(out)
     if changed_path:
+        it.p(changed_path).parent.mkdir(parents=True, exist_ok=True)
         it.p(changed_path).write_text("assert 4 + 4 == 8\n")
     it.save()
     stages_b.pkg(pipeline, it)
+    if changed_path and changed_path != "task/tests/test_outputs.py":
+        assert it.state["status"] == "dropped" and it.state["reason"].startswith("review:gate_failed")
+        assert "locked reference" in it.state["reason"]
+        return
     assert ("rescore_pending" in it.state) == bool(changed_path)
     assert it.state["stage"] == ("S9" if changed_path else "S9R")
     assert it.state["calib_epoch"] == 2 and it.state["review_revisions"] == 1
@@ -213,3 +225,128 @@ def test_s7_timeout_projection_matches_packaged_sources(tmp_path):
     out = package.package(pipeline.cfg, it.dir, it.p("runs/s7-1/detA"), {}, {})
     assert package.validate_pkg(out)["run_solution_timeouts"] == source
     assert source["sum_sec"] == 900
+
+
+@pytest.mark.parametrize("interrupt", ["verifier_timeout_fixed", "partial_move", "calib_archived", "final_state"])
+def test_retry_completes_timeout_fix_once(tmp_path, monkeypatch, interrupt):
+    pipeline, it, _ = _setup(tmp_path, "run_solution(900)", locked=True, timeout="VerifierTimeoutError")
+    runs = it.p("calib/runs.json").read_bytes()
+    event = pipeline.store.event
+    save = it.save
+
+    def fail_event(name, **kwargs):
+        if name == interrupt:
+            raise OSError("synthetic interruption")
+        event(name, **kwargs)
+
+    def fail_move(src, dst):
+        if interrupt == "partial_move":
+            shutil.move(src / "runs.json", dst / "runs.json")
+            raise OSError("synthetic interruption")
+        move(src, dst)
+
+    move = stages_b._move_records
+
+    def fail_transition():
+        if interrupt == "final_state" and it.state["stage"] == "S9":
+            raise OSError("synthetic interruption")
+        save()
+
+    with monkeypatch.context() as m:
+        m.setattr(pipeline.store, "event", fail_event)
+        m.setattr(it, "save", fail_transition)
+        m.setattr(stages_b, "_move_records", fail_move)
+        with pytest.raises(OSError, match="synthetic interruption"):
+            stages_b.pkg(pipeline, it)
+    it.bump("crash:PKG")
+    it.load()
+    stages_b.pkg(pipeline, it)
+    it.load()
+    assert it.state["stage"] == "S9" and it.state["calib_epoch"] == 3
+    assert it.state["requires_formal_review_sha"] == calib.pkg_sha(it.p("pkg"))
+    assert not it.state.get("verifier_timeout_pending") and not it.state.get("calib_label")
+    assert [record["epoch"] for record in it.state["calib_history"]] == [2]
+    assert it.p("calib/epoch-2/runs.json").read_bytes() == runs
+
+
+@pytest.mark.parametrize("legacy", [True, False])
+def test_later_trial_timeout_archives_calibration(tmp_path, legacy):
+    pipeline, it, _ = _setup(tmp_path, "run_solution(900)", locked=True)
+    pipeline.ledger = None
+    jd = tmp_path / "jobs" / "retry"
+    write_json(jd / "result.json", dict(finished_at="today"))
+    write_json(jd / "config.json", dict(job_name="retry"))
+    for name, exc in (("attempt-a", "EnvironmentStartTimeoutError"), ("attempt-b", "VerifierTimeoutError")):
+        write_json(jd / name / "result.json", dict(exception_info=dict(exception_type=exc)))
+    rec = dict(job_dir=str(jd), job_name="retry", epoch=2)
+    stages_b._ingest_run(pipeline, it, rec, "S9", jd)
+    if legacy:
+        runs = read_json(it.p("calib/runs.json"))
+        runs[-1].pop("trial_verifier_timeouts", None)
+        write_json(it.p("calib/runs.json"), runs)
+    else:
+        assert rec["trial_verifier_timeouts"] == {"attempt-a": False, "attempt-b": True}
+        # Proof survives job-result retention.
+        for path in jd.glob("*/result.json"):
+            path.unlink()
+    it.state["stage"] = "PKG"
+    it.save()
+    stages_b.pkg(pipeline, it)
+    assert it.state["stage"] == "S9" and it.state["calib_epoch"] == 3
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_unapproved_source_timeout_cannot_override_configuration(tmp_path, enabled):
+    pipeline, it, _ = _setup(tmp_path, "run_solution(900)")
+    it.p("task/task.toml").write_text("[verifier]\ntimeout_sec=10000\n")
+    pipeline.cfg["package"]["autofix_verifier_timeout"] = enabled
+    stages_b.pkg(pipeline, it)
+    config = tomllib.loads(it.p("pkg/task.toml").read_text())
+    assert config["verifier"]["timeout_sec"] == (1200 if enabled else 900)
+    assert it.state["status"] == ("active" if enabled else "parked")
+
+
+@pytest.mark.parametrize("source", [
+    "t = 30\n(t := 900, run_solution(t))",
+    "t = 30\nignored = (flag and (t := 900))\nrun_solution(t)",
+    "invoke = run_solution if flag else int\ninvoke(10)",
+    "if flag:\n    invoke = run_solution\nelse:\n    invoke = int\ninvoke(10)",
+    "((invoke := run_solution), invoke(10))",
+    "t=30\ndef choose(value=(t:=900)): pass\nrun_solution(t)",
+    "def check(invoke=run_solution): invoke(10)",
+])
+def test_ambiguous_timeout_or_alias_parks(tmp_path, source):
+    pipeline, it, _ = _setup(tmp_path, source)
+    stages_b.pkg(pipeline, it)
+    assert it.state["status"] == "parked"
+    assert read_json(it.p("PKG_check.json"))["run_solution_timeouts"]["unknown"]
+
+
+def test_timeout_alias_is_local_to_its_function(tmp_path):
+    source = ("def first():\n    invoke = run_solution\n    invoke(30)\n"
+              "def second():\n    invoke = int\n    invoke('42')\n"
+              "def third(invoke):\n    invoke('43')\n")
+    pipeline, it, _ = _setup(tmp_path, source)
+    stages_b.pkg(pipeline, it)
+    assert it.state["stage"] == "S9"
+    report = read_json(it.p("PKG_check.json"))["run_solution_timeouts"]
+    assert report["sum_sec"] == 30 and not report["unknown"]
+
+
+@pytest.mark.parametrize("snapshot_present", [True, False])
+def test_regate_never_adopts_drifted_live_reference(tmp_path, snapshot_present):
+    pipeline, it, _ = _setup(tmp_path, "run_solution(900)", locked=True)
+    sha = calib.pkg_sha(it.p("pkg"))
+    write_json(it.p("review/verdict.json"), dict(round=2, calib_epoch=2, pkg_sha=sha))
+    if snapshot_present:
+        shutil.copytree(it.p("pkg"), it.p("review/r2/task/environment/review/pkg"))
+    for tree in ("pkg", "task"):
+        it.p(tree, "solution/solve.py").write_text("# drifted reference\n")
+    it.state.pop("thresholds_locked")
+    it.state.update(stage="S10", status="done")
+    it.save()
+    stages_b.regate(pipeline, it, "updated verifier")
+    it.state["stage"] = "PKG"
+    it.save()
+    stages_b.pkg(pipeline, it)
+    assert it.state["status"] == "dropped" and it.state["reason"].startswith("review:gate_failed")

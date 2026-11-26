@@ -32,8 +32,12 @@ def test_snapshot_backtest_and_flip_rate(tmp_path):
     (directory / "task/instruction.md").write_text("Review the whole package.")
     (item / "pkg").mkdir()
     (item / "pkg/instruction.md").write_text("Revised statement.")
-    write_json(directory / "verdict.json", {"pkg_sha": pkg_sha(pkg), "_normalized": {"verdict": "revise",
+    write_json(directory / "verdict.json", {"pkg_sha": pkg_sha(pkg), "model": "fixture-opus", "calib_epoch": 0, "_normalized": {"verdict": "revise",
                "issues": [ISSUE, dict(ISSUE, id="C2", severity="minor")]}})
+    unknown = run / "items/unknown/review/r1"
+    (unknown / "task").mkdir(parents=True)
+    (unknown / "task/instruction.md").write_text("Review.")
+    write_json(unknown / "verdict.json", {"_normalized": {"verdict": "pass"}})
     # The fake answers only the snapshot prompt, then reverses its blocking decision on the repeat.
     script = tmp_path / "fake.json"
     write_json(script, [{"stage": "S9P", "match": "Group by profile.", "text": json.dumps({"findings": findings})}
@@ -44,15 +48,16 @@ def test_snapshot_backtest_and_flip_rate(tmp_path):
 
     out = tmp_path / "results"
     cmd = [sys.executable, str(Path(__file__).resolve().parents[1] / "scripts/prereview_backtest.py"),
-           "--run", str(run), "--out", str(out), "--round", "1", "--items", "sample", "--repeat", "2"]
+           "--run", str(run), "--out", str(out), "--round", "1", "--items", "sample", "unknown", "--repeat", "2"]
     proc = subprocess.run(cmd, capture_output=True, text=True, check=True)
     summary = json.loads(proc.stdout)
     assert summary["items"] == summary["repeat_comparisons"] == summary["blocking_flip_rate"] == 1
+    assert summary["unverified_reviewers"] == ["unknown"]
     assert summary["attempts"] == 2 and summary["errors"] == 0
     with (out / "comparison.csv").open(newline="") as f:
         first, second = csv.DictReader(f)
     assert first["opus_verdict"] == "revise"
-    assert first["reviewer_model_source"] == "configured"
+    assert first["reviewer_model_source"] == "recorded"
     assert json.loads(first["opus_blocking_ab"]) == [
         {k: ISSUE[k] for k in ("id", "category", "title", "evidence")}]
     assert json.loads(first["prereview_validated"]) == [FINDING]
@@ -72,13 +77,15 @@ def test_mode_report_joins_frozen_round_and_epoch(tmp_path, capsys):
     write_json(item / "prereview/e0-r1.json", dict(rec, epoch=0, round=1, usd=0, revision_applied=False))
     write_json(item / "prereview/e2-r3.json", dict(rec, mode="shadow", epoch=2, round=3))
     verdict = {"_normalized": {"verdict": "revise", "issues": [ISSUE, dict(ISSUE, category="d")]}}
-    write_json(item / "review/r2/verdict.json", dict(verdict, calib_epoch=1))
+    write_json(item / "review/r2/verdict.json", dict(verdict, calib_epoch=1, model="fixture-opus"))
     write_json(item / "review/r1/verdict.json", dict(verdict, calib_epoch=8))
+    write_json(item / "review/r3/verdict.json", dict(verdict, calib_epoch=2))
     assert cli.main(["report", "--run", str(tmp_path), "--prereview"]) == 0
     rows = json.loads(capsys.readouterr().out)
     assert rows["enforce"] == dict(items_checked=1, checks=2, findings_raw=4, findings_validated=2,
                                    revisions_applied=1, prereview_usd=.031, revision_usd=.12, usd=.151,
-                                   errors=0, opus_verdicts=1, opus_blocking_ab=1)
+                                   errors=0, opus_verdicts=1, opus_blocking_ab=1, unverified_verdicts=0)
+    assert rows["shadow"]["unverified_verdicts"] == 1
     assert rows["shadow"]["opus_verdicts"] == rows["off"]["items_checked"] == 0
 
 
@@ -95,6 +102,16 @@ def test_archived_verdict_uses_bound_job_and_routed_judgment(tmp_path):
     assert verdict["model_source"] == "recorded"
     write_json(directory.parent / "runs.json", [dict(job, model="sample-other")])
     assert round_verdict(directory) is None
+
+
+def test_missing_epoch_is_not_joined_to_current_prereview(tmp_path):
+    from tbsgen.report import prereview_summary
+
+    item = tmp_path / "items/sample"
+    write_json(item / "prereview/e2-r3.json", {"mode": "shadow", "round": 3, "epoch": 2})
+    write_json(item / "review/r3/verdict.json", {"model": "fixture-opus", "verdict": "pass"})
+    row = prereview_summary(tmp_path)["shadow"]
+    assert row["unverified_verdicts"] == 1 and row["opus_verdicts"] == 0
 
 
 @pytest.mark.parametrize(("citation", "matches"), [

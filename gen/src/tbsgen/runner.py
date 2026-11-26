@@ -54,13 +54,13 @@ def regular_file(root, rel):
 
 
 def is_format_note(path: Path) -> bool:
-    """Recognize README variants while keeping data and executable files out of editable docs."""
-    return path.name.lower().startswith("readme") and path.suffix.lower() in {"", ".md", ".txt", ".rst"}
+    """Names reserved for generator-authored format documentation."""
+    return path.name.casefold() in {"readme.md", "readme.txt", "format.md"}
 
 
 def format_notes(root):
     """Only existing, public, plain README documents are eligible (never linked files)."""
-    return [p.relative_to(root).as_posix() for p in sorted((root / "environment/data").rglob("*"))
+    return [p.relative_to(root).as_posix() for p in sorted((root / "environment/data").glob("*"))
             if is_format_note(p) and regular_file(root, p.relative_to(root))]
 
 

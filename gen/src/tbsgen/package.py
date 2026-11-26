@@ -258,25 +258,20 @@ def _timeout_calls(src: str) -> tuple[list, list[str]]:
     except SyntaxError as e:
         return [], [f"cannot check run_solution timeouts: {e.msg} at line {e.lineno}"]
     calls = []
-    names = {"run_solution"}
-    for node in ast.walk(tree):
-        if isinstance(node, ast.ImportFrom):
-            names.update(a.asname for a in node.names if a.name == "run_solution" and a.asname)
-    # Preserve ordinary local aliases of the helper, including a chain of aliases.
-    aliases = [(target.id, node.value) for node in ast.walk(tree) if isinstance(node, (ast.Assign, ast.AnnAssign))
-               for target in (node.targets if isinstance(node, ast.Assign) else [node.target]) if isinstance(target, ast.Name)]
-    while True:
-        added = {name for name, value in aliases if getattr(value, "id", None) in names
-                 or getattr(value, "attr", None) == "run_solution"} - names
-        if not added:
-            break
-        names.update(added)
+    # Alias identity travels through the same lexical bindings as numeric constants.
+    solver, possible_solver = object(), object()
+
+    def merged(left, right):
+        if left == right:
+            return left
+        return possible_solver if left in (solver, possible_solver) or right in (solver, possible_solver) else None
+
     called = {getattr(n.func, "id", getattr(n.func, "attr", None)) for n in ast.walk(tree) if isinstance(n, ast.Call)}
     shared = {name for node in ast.walk(tree) if isinstance(node, (ast.Global, ast.Nonlocal)) for name in node.names}
     # Module constants are taken in source order: a module-level call sees the value bound above it; a call inside a
     # function (run later, at pytest time) sees the final module-level value.
     def arithmetic(left, op, right):
-        if left is None or right is None:
+        if not isinstance(left, (int, float)) or not isinstance(right, (int, float)):
             return None
         try:
             if isinstance(op, ast.FloorDiv):
@@ -295,7 +290,8 @@ def _timeout_calls(src: str) -> tuple[list, list[str]]:
 
     def numeric(node, bindings):
         if isinstance(node, ast.Name):
-            return None if node.id in shared else bindings.get(node.id)
+            value = bindings.get(node.id)
+            return value if node.id not in shared and isinstance(value, (int, float)) else None
         if isinstance(node, ast.Constant) and type(node.value) in (int, float):
             try:
                 return float(node.value)
@@ -308,9 +304,69 @@ def _timeout_calls(src: str) -> tuple[list, list[str]]:
             return -value if value is not None and isinstance(node.op, ast.USub) else value
         return None
 
+    def binding(value, bindings):
+        if isinstance(value, ast.Name):
+            target = bindings.get(value.id)
+            return target if target in (solver, possible_solver) else numeric(value, bindings)
+        if isinstance(value, ast.Attribute) and value.attr == "run_solution":
+            return solver
+        if isinstance(value, ast.IfExp):
+            return merged(binding(value.body, bindings), binding(value.orelse, bindings))
+        if isinstance(value, ast.NamedExpr):
+            return binding(value.value, bindings)
+        return numeric(value, bindings)
+
+    def expression_writes(node):
+        # Include expression assignments that can run within this statement, excluding nested bodies.
+        if isinstance(node, ast.NamedExpr):
+            yield node
+        for child in ast.iter_child_nodes(node):
+            if not isinstance(child, ast.stmt) and not (isinstance(node, ast.Lambda) and child is node.body):
+                yield from expression_writes(child)
+
+    def invalidate_walrus(node, bindings):
+        for write in expression_writes(node):
+            name = write.target.id
+            candidate = binding(write.value, bindings)
+            # Expression evaluation can be conditional. Ignore old numeric constants everywhere in the statement.
+            bindings[name] = possible_solver if any(x in (solver, possible_solver)
+                                                    for x in (bindings.get(name), candidate)) else None
+
+    def invalidate_block(node, bindings):
+        # Loops and exceptional control flow can leave any of their assignments visible.
+        # Keep possible aliases (including chains) when forgetting a precise binding.
+        names = set(local_names(node))
+        aliases = set()
+        pending = [node]
+        while pending:
+            child = pending.pop()
+            if isinstance(child, scopes):
+                continue
+            if isinstance(child, (ast.Assign, ast.AnnAssign, ast.NamedExpr)):
+                targets = child.targets if isinstance(child, ast.Assign) else [child.target]
+                aliases.update((target.id, child.value) for target in targets if isinstance(target, ast.Name))
+            if isinstance(child, ast.ImportFrom):
+                for part in child.names:
+                    if part.name == "run_solution":
+                        bindings[part.asname or part.name] = possible_solver
+            pending.extend(ast.iter_child_nodes(child))
+        while aliases:
+            found = {(name, value) for name, value in aliases if binding(value, bindings) in (solver, possible_solver)}
+            if not found:
+                break
+            bindings.update({name: possible_solver for name, _ in found})
+            aliases -= found
+        for name in names:
+            if name == "*":
+                for key in bindings:
+                    bindings[key] = merged(bindings[key], None)
+            else:
+                bindings[name] = merged(bindings.get(name), None)
+
     def bind(node, bindings):
+        invalidate_walrus(node, bindings)
         if isinstance(node, (ast.Assign, ast.AnnAssign)):
-            value = numeric(node.value, bindings)
+            value = binding(node.value, bindings)
             for target in (node.targets if isinstance(node, ast.Assign) else [node.target]):
                 if isinstance(target, ast.Name):
                     bindings[target.id] = value
@@ -320,8 +376,13 @@ def _timeout_calls(src: str) -> tuple[list, list[str]]:
         elif isinstance(node, ast.AugAssign) and isinstance(node.target, ast.Name):
             name = node.target.id
             bindings[name] = arithmetic(bindings.get(name), node.op, numeric(node.value, bindings))
+        elif isinstance(node, ast.ImportFrom):
+            for part in node.names:
+                if part.name == "*":
+                    invalidate_block(node, bindings)
+                else:
+                    bindings[part.asname or part.name] = solver if part.name == "run_solution" else None
         elif isinstance(node, ast.If):
-            bindings.update(dict.fromkeys(local_names(node.test)))
             arms = []
             for branch in (node.body, node.orelse):
                 values = dict(bindings)
@@ -329,13 +390,12 @@ def _timeout_calls(src: str) -> tuple[list, list[str]]:
                     bind(stmt, values)
                 arms.append(values)
             for name in set(arms[0]) | set(arms[1]):
-                bindings[name] = arms[0].get(name) if arms[0].get(name) == arms[1].get(name) else None
+                bindings[name] = merged(arms[0].get(name), arms[1].get(name))
+        elif isinstance(node, (ast.For, ast.AsyncFor, ast.While, ast.Try, ast.TryStar, ast.Match, ast.With, ast.AsyncWith)):
+            invalidate_block(node, bindings)
         else:
             for name in local_names(node):
-                if name == "*":
-                    bindings.update(dict.fromkeys(bindings))
-                else:
-                    bindings[name] = None
+                bindings[name] = merged(bindings.get(name), None) if not isinstance(node, scopes) else None
 
     scopes = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)
 
@@ -359,12 +419,13 @@ def _timeout_calls(src: str) -> tuple[list, list[str]]:
         # Pytest test functions execute after module import. An explicitly invoked function or
         # closure may have run earlier, while its enclosing scope held a different value.
         final = dict(current)
-        changed = set()
+        stable = dict(final)
         for stmt in body:
             before = dict(final)
             bind(stmt, final)
-            changed.update(k for k in before if before[k] != final.get(k))
-        return final, {k: v for k, v in final.items() if k not in changed}
+            for key, value in final.items():
+                stable[key] = merged(stable.get(key), value) if key in before else value
+        return final, stable
 
     def visit_branch(statements, initial, deferred, class_parent, nested_class):
         bindings = dict(initial)
@@ -373,6 +434,12 @@ def _timeout_calls(src: str) -> tuple[list, list[str]]:
             bind(stmt, bindings)
 
     def visit(node, visible, deferred, class_parent):
+        if isinstance(node, (ast.stmt, ast.Lambda)) and any(expression_writes(node)):
+            original = visible
+            visible = dict(visible)
+            invalidate_walrus(node, visible)
+            if class_parent is original:
+                class_parent = visible
         if isinstance(node, scopes):
             body = node.body if isinstance(node.body, list) else [node.body]
             # Bases, decorators and default arguments execute in the defining scope.
@@ -392,13 +459,19 @@ def _timeout_calls(src: str) -> tuple[list, list[str]]:
                 explicit = isinstance(node, ast.Lambda) or node.name in called
                 later_values = deferred[1] if explicit else deferred[0]
                 current = {k: v for k, v in later_values.items() if k not in local}
+                params = [*node.args.posonlyargs, *node.args.args]
+                defaults = list(zip(reversed(params), reversed(node.args.defaults)))
+                defaults.extend(zip(node.args.kwonlyargs, node.args.kw_defaults))
+                for param, default in defaults:
+                    if binding(default, visible) in (solver, possible_solver):
+                        current[param.arg] = possible_solver  # callers can supply another callable
                 later = deferred_bindings(body, current)
                 for stmt in body:
                     visit(stmt, current, later, current)
                     bind(stmt, current)
             return
         if isinstance(node, ast.If):
-            after_test = {**visible, **dict.fromkeys(local_names(node.test))}
+            after_test = visible
             visit(node.test, after_test, deferred, class_parent)
             for branch in (node.body, node.orelse):
                 visit_branch(branch, after_test, deferred, class_parent, class_parent is not visible)
@@ -406,7 +479,8 @@ def _timeout_calls(src: str) -> tuple[list, list[str]]:
         if isinstance(node, (ast.For, ast.AsyncFor, ast.While)):
             # An iteration may inherit values from earlier iterations. Within the body,
             # unconditional assignments establish new bindings in statement order.
-            entering = {**visible, **dict.fromkeys(local_names(node))}
+            entering = dict(visible)
+            invalidate_block(node, entering)
             if isinstance(node, ast.While):
                 visit(node.test, entering, deferred, class_parent)
             else:
@@ -427,8 +501,8 @@ def _timeout_calls(src: str) -> tuple[list, list[str]]:
                 visit(element, current, deferred, class_parent)
             return
         if isinstance(node, ast.Call):
-            name = getattr(node.func, "id", None)
-            if name in names or getattr(node.func, "attr", None) == "run_solution":
+            target = binding(node.func, visible)
+            if target in (solver, possible_solver):
                 arg = next((k.value for k in node.keywords if k.arg == "timeout_sec"), None)
                 if arg is None and node.args:
                     arg = node.args[0]
@@ -445,20 +519,19 @@ def _timeout_calls(src: str) -> tuple[list, list[str]]:
                                     break
                             if arg is not None:
                                 break
-                value = numeric(arg, visible)
+                value = numeric(arg, visible) if target is solver else None
                 if value is not None and (not math.isfinite(value) or value < 0):
                     value = None
                 calls.append((node.lineno, value))
         if isinstance(node, ast.stmt) and any(isinstance(c, ast.stmt) for c in ast.iter_child_nodes(node)):
             # Branch/loop execution is unknown. Never reuse a binding it might overwrite.
             visible = dict(visible)
-            for name in local_names(node):
-                visible[name] = None
+            invalidate_block(node, visible)
         for child in ast.iter_child_nodes(node):
             visit(child, visible, deferred, class_parent)
 
-    final = deferred_bindings(tree.body, {})
-    sofar = {}
+    sofar = {"run_solution": solver}
+    final = deferred_bindings(tree.body, sofar)
     for node in tree.body:
         visit(node, sofar, final, sofar)
         bind(node, sofar)
@@ -481,11 +554,19 @@ def run_solution_timeouts(src: str, budget: float, *, warnings: list[str] | None
 
 
 def source_verifier_timeout(cfg: dict, spec: dict, task: Path) -> float:
-    default = float(cfg["package"]["verifier_timeout"]) + timing_budget(cfg, spec)
+    pk = cfg["package"]
+    default = float(pk["verifier_timeout"]) + timing_budget(cfg, spec)
+    state = read_json(task.parent / "state.json", {})
+    approved = (state.get("verifier_timeout_pending") or {}).get("new") or state.get("approved_verifier_timeout")
+    if approved is None:
+        # Migration for a successful fix made before its approval was retained in state.
+        approved = (read_json(task.parent / "PKG_check.json", {}).get("verifier_timeout_fix") or {}).get("new")
+    if approved is None or approved > pk.get("max_verifier_timeout_s", 7200):
+        return default
     source = task / "task.toml"
     try:
         value = tomllib.loads(source.read_text())["verifier"]["timeout_sec"]
-        if type(value) in (int, float) and math.isfinite(value):
+        if type(value) in (int, float) and value == approved and math.isfinite(value):
             return max(default, float(value))
     except (OSError, ValueError, KeyError, TypeError, OverflowError):
         # A legacy source without a usable override still builds with the configured timeout.

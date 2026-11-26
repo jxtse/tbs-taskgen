@@ -30,8 +30,8 @@ def test_packet_is_deterministic_bounded_and_excludes_answers(tmp_path):
     put(tmp_path, "tests/hidden/README", "Hidden schema.")
     put(tmp_path, "tests/test_outputs.py", "abc\n" * prereview.TEXT_BYTES)
     put(tmp_path, "tests/measure.py", "def measure(sample): pass")
-    np.save(tmp_path / "tests/hidden/layers.npy", np.array([[913]]))
-    np.savez_compressed(tmp_path / "tests/hidden/grid.npz", pixels=np.zeros((3, 2)), labels=np.zeros(2))
+    np.save(tmp_path / "environment/data/layers.npy", np.array([[913]]))
+    np.savez_compressed(tmp_path / "environment/data/grid.npz", pixels=np.zeros((3, 2)), labels=np.zeros(2))
     for rel in ["tests/truth/data.csv", "solution/solve.py", "generator/generate.py"]:
         put(tmp_path, rel, "private-content")
     put(tmp_path, "provenance.json", json.dumps({"thresholds": {
@@ -50,8 +50,8 @@ def test_packet_is_deterministic_bounded_and_excludes_answers(tmp_path):
     assert files["environment/data/table.csv"]["columns"] == ["profile_id", "q"]
     assert files["environment/data/table.csv"]["sample"].splitlines() == ["profile_id,q", "a,1", "b,2", "c,3"]
     assert files["environment/data/schema.json"]["keys"] == {"samples": "array", "units": "string"}
-    assert files["tests/hidden/grid.npz"]["arrays"] == {"pixels": [3, 2], "labels": [2]}
-    assert files["tests/hidden/layers.npy"]["arrays"] == {"layers": [1, 1]}
+    assert files["environment/data/grid.npz"]["arrays"] == {"pixels": [3, 2], "labels": [2]}
+    assert files["environment/data/layers.npy"]["arrays"] == {"layers": [1, 1]}
     assert files["provenance.json"]["thresholds"] == {"mean": {"direction": ">=", "threshold": .75}}
 
 
@@ -59,16 +59,16 @@ def test_validator_binds_statement_file_quote_and_exact_locator(tmp_path):
     put(tmp_path, "instruction.md", "Group samples by profile.")
     put(tmp_path, "environment/data/table.csv", "profile_id,score\na,1")
     put(tmp_path, "tests/measure.py", "import math\nmetric = 'median'\n")
-    put(tmp_path, "tests/hidden/schema.json", '{"cutoff": 100}')
-    put(tmp_path, "tests/hidden/batch.json", '[1,2,3]')
+    put(tmp_path, "environment/data/schema.json", '{"cutoff": 100}')
+    put(tmp_path, "environment/data/batch.json", '[1,2,3]')
     packet = prereview.build_packet(tmp_path)
     evidence = {"file": "environment/data/table.csv", "column": "profile_id", "quote": "profile_id,score"}
     good = {"category": "a", "statement_quote": "Group samples by profile.", "evidence": evidence,
             "fix": "Group samples by profile_id."}
     omission = dict(good, category="b", statement_quote="",
                     evidence={"file": "tests/measure.py", "line": 2, "quote": "metric = 'median'"})
-    key = dict(omission, evidence={"file": "tests/hidden/schema.json", "key": "cutoff", "quote": "cutoff"})
-    top_level = dict(omission, evidence={"file": "tests/hidden/batch.json", "key": "type", "quote": "array"})
+    key = dict(omission, evidence={"file": "environment/data/schema.json", "key": "cutoff", "quote": "cutoff"})
+    top_level = dict(omission, evidence={"file": "environment/data/batch.json", "key": "type", "quote": "array"})
     bad = [dict(good, statement_quote="Sort by score."), dict(good, evidence=dict(evidence, quote="not-a-header")),
            dict(good, evidence=dict(evidence, column="profile")), dict(good, evidence=dict(evidence, file="absent")),
            dict(omission, evidence=dict(omission["evidence"], line=1)), dict(key, evidence=dict(key["evidence"], key="cut")),
@@ -79,16 +79,16 @@ def test_validator_binds_statement_file_quote_and_exact_locator(tmp_path):
 
 def test_compressed_schemas_format_notes_and_partial_csv(tmp_path):
     put(tmp_path, "instruction.md", "Describe the samples.")
-    notes = put(tmp_path, "source/generator/README-format.rst", "Format notes.")
+    notes = put(tmp_path, "source/generator/FORMAT.md", "Format notes.")
     put(tmp_path, "source/generator/README-helper.py", "private-source")
-    put(tmp_path, "environment/data/README-format.md", "Tabular notes.")
+    put(tmp_path, "environment/data/README.md", "Tabular notes.")
     put(tmp_path, "environment/data/table.csv", "id,value\ra,one\rb," + "x" * prereview.TEXT_BYTES)
     with gzip.open(tmp_path / "environment/data/counts.npy.gz", "wb") as fp:
         np.save(fp, np.array([8341]))
     packet = prereview.build_packet(tmp_path, generator_dir=notes.parent)
-    assert packet["format_notes"] == {"generator/README-format.rst": "Format notes."}
+    assert packet["format_notes"] == {"generator/FORMAT.md": "Format notes."}
     files = packet["files"]
-    assert files["environment/data/README-format.md"]["text"] == "Tabular notes."
+    assert files["environment/data/README.md"]["text"] == "Tabular notes."
     sample = files["environment/data/table.csv"]
     assert sample["sample"].splitlines() == ["id,value", "a,one"] and sample["truncated"]
     assert files["environment/data/counts.npy.gz"]["arrays"] == {"counts": [1]}
@@ -181,3 +181,42 @@ def test_missing_prereview_price_fails_open_before_transport(tmp_path, monkeypat
     assert call["error"] == "config" and call["usd"] == 0 and call["raw"] == call["validated"] == []
     with ledger._db() as db:
         assert db.execute("SELECT COUNT(*) FROM calls").fetchone()[0] == 0
+
+
+def test_packet_omits_private_readmes_and_inventory(tmp_path):
+    put(tmp_path, "instruction.md", "Read the public inputs.")
+    for root in ("tests/hidden", "tests/truth"):
+        put(tmp_path, root + "/README.md", "private answer for sample three")
+        put(tmp_path, root + "/sample.csv", "answer\ncobalt")
+    payload = json.dumps(prereview.build_packet(tmp_path))
+    assert all(token not in payload for token in ("tests/hidden", "tests/truth", "private answer", "cobalt"))
+
+
+@pytest.mark.parametrize(("source", "truth"), [
+    ("EXPECTED = ['cobalt', 'ochre']", None),
+    ("def expected(): return 'co\\x62alt'", '["cobalt"]'),
+    ("def expected(): return 1.25e2", '{"answer": 125}'),
+    ("# mapped to cobalt", '{"answer": "cobalt"}'),
+])
+def test_answer_bearing_grader_skips_model_call(tmp_path, source, truth):
+    put(tmp_path, "instruction.md", "Compute the labels.")
+    put(tmp_path, "tests/measure.py", source)
+    if truth:
+        put(tmp_path, "tests/truth/results.json", truth)
+    result = prereview.run_prereview(tmp_path, lambda: pytest.fail("answer leaked to client"), item="sample")
+    assert result["error"] == "UnsafeGraderPacket"
+    assert result["packet_hash"] is None and result["usd"] == 0
+
+
+def test_evidence_must_match_named_member_or_cell(tmp_path):
+    put(tmp_path, "instruction.md", "Read the fields.")
+    put(tmp_path, "environment/data/types.json", '{"count": 8, "label": "cobalt"}')
+    put(tmp_path, "environment/data/records.tsv", 'count\tlabel\n8\tcobalt')
+    packet = prereview.build_packet(tmp_path)
+    base = dict(category="b", statement_quote="", fix="Name the field.")
+    csv = dict(file="environment/data/records.tsv", column="count")
+    key = dict(file="environment/data/types.json", key="count")
+    bad = [dict(base, evidence=dict(csv, quote="cobalt")), dict(base, evidence=dict(csv, quote="label")),
+           dict(base, evidence=dict(key, quote='"label":"string"'))]
+    good = [dict(base, evidence=dict(csv, quote="8")), dict(base, evidence=dict(key, quote='"count":"number"'))]
+    assert prereview.validate_findings(packet, bad + good) == (good, len(bad))

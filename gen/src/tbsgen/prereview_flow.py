@@ -10,18 +10,57 @@ from .runner import format_note_bindings, format_notes, regular_file, tree_hash
 from .state import passed_gate_attempt, read_json, write_json
 
 
+def version_origin(state):
+    """Replay the version-producing transitions. Reverting a hardening round restores its parent's origin."""
+    origin = None
+    before_round = {}
+    for h in state.get("history", []):
+        if h.get("to") == "S6A_run" and str(h.get("reason", "")).startswith("review revision "):
+            origin = "review_revision"
+        elif h.get("result") in {"harden", "variant"}:
+            before_round[h.get("round")] = origin or "base"
+            origin = h["result"]
+        elif h.get("result") == "harden_revert":
+            origin = before_round.get(h.get("round"), "base")
+    if origin:
+        return origin
+    # Older or imported items can have counters without a version-transition history.
+    if state.get("variant_round") or state.get("harden_round"):
+        return "variant" if state.get("variant_round") else "harden"
+    return "review_revision" if state.get("review_revisions") else "base"
+
+
 def start(P, it):
     """Called under S9's lock, before a first run intent exists. A saved claim prevents duplicate model calls."""
     try:
         cfg = P.cfg.get("prereview") or {}
         mode = cfg.get("mode", "off")
-        context = "review_revision" if it.state.get("review_revisions") else "base"
-        if (mode not in ("shadow", "enforce") or it.state.get("harden_round") or it.state.get("variant_round")
-                or context not in cfg.get("allowed_contexts", ["base", "review_revision"])):
-            return False
         epoch = int(it.state.get("calib_epoch", 0))
-        rnd = review.next_round(it.dir, it.state)
+        claim = it.state.get("prereview_version") or {}
+        if mode not in ("shadow", "enforce") and claim.get("epoch") != epoch:
+            return False
+        context = version_origin(it.state)
+        eligible = (mode in ("shadow", "enforce") and context not in {"harden", "variant"}
+                    and context in cfg.get("allowed_contexts", ["base", "review_revision"]))
+        if claim.get("epoch") == epoch:
+            rnd = claim["round"]
+        elif eligible:
+            # Migrate an existing check before considering preview directories in next_round.
+            rounds = (p.stem.removeprefix(f"e{epoch}-r") for p in it.p("prereview").glob(f"e{epoch}-r*.json"))
+            old = [int(r) for r in rounds if r.isdigit()]
+            rnd = max(old) if old else review.next_round(it.dir, it.state)
+            it.state["prereview_version"] = dict(epoch=epoch, round=rnd)
+            it.state["requires_formal_review_sha"] = calib.pkg_sha(it.p("pkg"))
+            it.save()
+        else:
+            return False
         key = f"e{epoch}-r{rnd}"
+        if not eligible:
+            path = it.p("prereview", key + ".json")
+            rec = read_json(path) or {}
+            if rec.get("status") == "checking":
+                _interrupt_check(P, it, path, rec)
+            return False
         rec = _check_once(P, it, key, mode, epoch, rnd, context)
     except Exception as exc:
         P.store.event("prereview_error", item=it.item_id, error=type(exc).__name__)
@@ -44,18 +83,29 @@ def _check_once(P, it, key, mode, epoch, rnd, context):
         write_json(path, rec)
         try:
             from .prereview import run_prereview
+
+            def bind(call_id):
+                rec["call_id"] = call_id
+                write_json(path, rec)
+
             rec.update(run_prereview(it.p("pkg"), lambda: P.client("prereview"), item=it.item_id,
-                                     generator_dir=it.p("task", "generator")))
+                                     generator_dir=it.p("task", "generator"), on_reserved=bind))
         except Exception as exc:
             rec["error"] = type(exc).__name__
         rec["status"] = "ready" if mode == "enforce" and rec["validated"] and not rec.get("error") else "done"
         write_json(path, rec)
         P.store.event("prereview", item=it.item_id, epoch=epoch, round=rnd, mode=mode,
                       validated=len(rec["validated"]), error=rec.get("error"))
-    elif isinstance(rec, dict) and rec.get("status") == "checking":
-        rec.update(status="done", error="interrupted pre-review")
-        write_json(path, rec)
+    elif rec.get("status") == "checking":
+        _interrupt_check(P, it, path, rec)
     return rec
+
+
+def _interrupt_check(P, it, path, rec):
+    if rec.get("call_id"):
+        rec["usd"] = P.ledger.settled_usd(rec["call_id"], it.item_id, "S9P") or 0.
+    rec.update(status="done", error="interrupted pre-review")
+    write_json(path, rec)
 
 
 def _record(it):
@@ -74,6 +124,7 @@ def _finish(it, rec, *, applied=False, reason=None):
     if applied:
         # Even the first epoch can now have an out-of-date prebuilt calibration task.
         it.state["require_prepared_receipt"] = True
+        it.state["requires_formal_review_sha"] = calib.pkg_sha(it.p("pkg"))
         it.advance("PKG", "S9")
     else:
         it.goto("S9", "continue calibration")
@@ -155,7 +206,11 @@ def revise(P, it, request_patch):
                 rec["revision_usd"] = usd
                 write_json(path, rec)
 
-            patch = request_patch(P, it, prompt, record_cost=record_cost)
+            def bind(call_id):
+                rec["revision_call_id"] = call_id
+                write_json(path, rec)
+
+            patch = request_patch(P, it, prompt, record_cost=record_cost, on_reserved=bind)
             if not patch or not set(patch) <= allowed:
                 return reject(it, "empty patch or file outside the allowed documents")
             for rel in patch:
@@ -206,6 +261,8 @@ def finish_package(it, out, validation):
     if not validation["ok"]:
         return reject(it, "PKG: " + str(validation.get("errors"))[:500])
     # Provenance includes the build timestamp and cumulative ledger spend. Keep the original bytes.
+    if not set(patch) <= {"instruction.md", *format_notes(pkg)}:
+        return reject(it, "file outside the allowed documents")
     skip = {"provenance.json", *patch}
     if (hashlib.sha256(it.p("thresholds.json").read_bytes()).hexdigest() != rec["threshold_hash"]
             or calib.pkg_sha(out, exclude=skip) != calib.pkg_sha(pkg, exclude=skip)):
@@ -225,9 +282,26 @@ def finish_package(it, out, validation):
     resume_edit(it)
 
 
-def resume_edit(it):
+def resume_edit(it, ledger=None):
     """Complete a saved commit or rollback before the interrupted stage runs again."""
     rec = read_json(_record(it))
+    # Older in-flight transactions admitted README-prefix input files as editable notes.
+    # Recheck before resuming S7/PKG or replaying even one of their saved writes.
+    if rec.get("patch") and rec["status"] in {"editing", "committing", "done"}:
+        eligible = {"instruction.md", *format_notes(it.p("pkg"))}
+        if not set(rec["patch"]) <= eligible:
+            if any(it.p("pkg", rel).read_bytes() == body.encode() for rel, body in rec.get("approved", {}).items()):
+                it.finish("parked", "legacy pre-review transaction needs original package restoration")
+            else:
+                rec.update(status="rejecting", revision_error="file outside the allowed documents")
+                write_json(_record(it), rec)
+                _rollback(it, rec)
+            return True
+    if rec["status"] == "requesting" and ledger and rec.get("revision_call_id"):
+        usd = ledger.settled_usd(rec["revision_call_id"], it.item_id, "S8")
+        if usd is not None and rec.get("revision_usd") != usd:
+            rec["revision_usd"] = usd
+            write_json(_record(it), rec)
     if rec["status"] == "done":
         _finish(it, rec, applied=rec["revision_applied"], reason=rec.get("revision_error"))
         return True

@@ -8,7 +8,6 @@ from pathlib import Path
 
 from .calib import manual_command
 from .budget import today
-from .config import load_config
 from .state import read_json
 
 
@@ -19,13 +18,8 @@ def _read_review_record(path, default):
         return default
 
 
-def configured_reviewer(run: Path) -> str:
-    cfg = load_config(run / "config.toml")
-    return cfg["review"].get("model") or cfg["calib"]["teacher_model"]
-
-
-def round_verdict(directory: Path, fallback_model: str | None = None) -> tuple[dict, list] | None:
-    """Read one frozen S9R judgment, excluding jobs explicitly attributed to another model."""
+def round_verdict(directory: Path) -> tuple[dict, list] | None:
+    """Read the frozen verdict and attribute it only from evidence for this job and package."""
     record = _read_review_record(directory / "verdict.json", {}) or {}
     if not isinstance(record, dict):
         return None
@@ -37,25 +31,25 @@ def round_verdict(directory: Path, fallback_model: str | None = None) -> tuple[d
     verdict = record.get("_normalized", record)
     if not isinstance(verdict, dict) or verdict.get("verdict") not in ("pass", "revise", "drop", "human"):
         return None
-    # Historical snapshots may predate job bindings. Mark config-derived attribution
-    # explicitly so a replay can distinguish it from the model recorded by S9R.
     runs = _read_review_record(directory.parent / "runs.json", []) or []
-    if record.get("job"):
-        job = next((r for r in runs if isinstance(r, dict) and r.get("job_name") == record["job"]), {})
-        if (job.get("outcome") not in (None, "done")
-                or job.get("pkg_sha", record.get("pkg_sha")) != record.get("pkg_sha")
-                or job.get("calib_epoch", record.get("calib_epoch", 0)) != record.get("calib_epoch", 0)):
-            return None
-    else:
-        jobs = [r for r in runs if isinstance(r, dict) and directory.name == f"r{r.get('n')}"
-                and r.get("outcome") == "done" and r.get("pkg_sha") == record.get("pkg_sha")
-                and r.get("calib_epoch", 0) == record.get("calib_epoch", 0)]
-        if len({r.get("model") for r in jobs}) > 1:
-            return None
-        job = jobs[-1] if jobs else {}
-    recorded_model = job.get("model") or record.get("model")
-    model = recorded_model or fallback_model
-    if not model or "opus" not in str(model).lower():
+    epoch, sha = record.get("calib_epoch"), record.get("pkg_sha")
+    job_name = record.get("job")
+    candidates = [r for r in runs if isinstance(r, dict)
+                  and (r.get("job_name") == job_name if job_name else directory.name == f"r{r.get('n')}")]
+    models = set()
+    for job in candidates:
+        if not sha or not job.get("pkg_sha") or epoch is None or job.get("calib_epoch") is None:
+            continue  # incomplete historical bindings cannot supply a reviewer identity
+        if (job.get("outcome") != "done" or job["pkg_sha"] != sha or epoch != job["calib_epoch"]
+                or (job.get("n") is not None and directory.name != f"r{job['n']}")):
+            if job_name:
+                return None
+            continue
+        models.add(job.get("model"))
+    if record.get("model"):
+        models.add(record["model"])
+    model = next(iter(models)) if len(models) == 1 else None
+    if model and "opus" not in str(model).lower():
         return None
     issues = [{k: issue.get(k) for k in ("id", "category", "title", "evidence")}
               for issue in verdict.get("issues") or []
@@ -63,17 +57,16 @@ def round_verdict(directory: Path, fallback_model: str | None = None) -> tuple[d
               and issue.get("category") in ("a", "b", "a_consistency", "b_missing_conditions")]
     return dict(verdict=verdict["verdict"], epoch=record.get("calib_epoch"),
                 pkg_sha=record.get("pkg_sha"), model=model,
-                model_source="recorded" if recorded_model else "configured"), issues
+                model_source="recorded" if model else "unverified"), issues
 
 
 def prereview_summary(run: Path) -> dict:
     """Count distinct items per mode. Compare records only with the verdict of their own epoch and round."""
     rows = {mode: dict(items_checked=0, checks=0, findings_raw=0, findings_validated=0,
                        revisions_applied=0, prereview_usd=0., revision_usd=0., usd=0.,
-                       errors=0, opus_verdicts=0, opus_blocking_ab=0)
+                       errors=0, opus_verdicts=0, opus_blocking_ab=0, unverified_verdicts=0)
             for mode in ("off", "shadow", "enforce")}
     seen = defaultdict(set)
-    fallback_model = configured_reviewer(run)
     for path in sorted((run / "items").glob("*/prereview/e*-r*.json")):
         record = _read_review_record(path, {}) or {}
         mode = record.get("mode") if isinstance(record, dict) else None
@@ -89,8 +82,12 @@ def prereview_summary(run: Path) -> dict:
         row["prereview_usd"] += record.get("usd") or 0.
         row["revision_usd"] += record.get("revision_usd") or 0.
         row["errors"] += bool(record.get("error"))
-        result = round_verdict(item / "review" / f"r{record.get('round')}", fallback_model)
-        if result and result[0]["epoch"] in (None, record.get("epoch")):
+        result = round_verdict(item / "review" / f"r{record.get('round')}")
+        if not result or result[0]["epoch"] not in (None, record.get("epoch")):
+            continue
+        if result[0]["model_source"] == "unverified" or result[0]["epoch"] is None:
+            row["unverified_verdicts"] += 1
+        else:
             row["opus_verdicts"] += 1
             row["opus_blocking_ab"] += len(result[1])
     for mode, row in rows.items():
