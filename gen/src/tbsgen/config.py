@@ -31,6 +31,7 @@ DEFAULTS: dict[str, Any] = {
         "daily_usd_total": None,
         "window_caps": [],
         "daily_usd_per_model": {},          # e.g. {"claude-opus-5-5": 50.0}
+        "daily_total_exempt_models": [],    # models outside daily_usd_total (not checked, not counted)
         "daily_usd_per_stage": {},          # e.g. {"S6A": 20.0}
         "daily_calls_per_model": {},        # hard call caps, e.g. {"claude-opus-5-5": 6}
         "run_usd_total": None,              # whole-run caps (all days; daily caps reset at 0:00 UTC+8)
