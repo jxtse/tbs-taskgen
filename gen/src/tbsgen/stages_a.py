@@ -972,7 +972,7 @@ def _record_infra_signature(P, it, stage, rec):
         sigs["count"] = int(sigs.get("count") or 0) + 1
     else:
         sigs.update(last=verdict.signature, count=1)
-    repeat = max(1, int(P.cfg["code"].get("infra_repeat_park") or 2))
+    repeat = failclass.repeat_limit(verdict.signature, P.cfg["code"])
     if failclass.repeat_is_deterministic(verdict) and sigs["count"] >= repeat:
         it.save()
         P.store.event("agent_infra_repeat", item=it.item_id, stage=stage, job=rec.get("job_name"),

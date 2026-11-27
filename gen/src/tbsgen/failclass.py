@@ -358,6 +358,28 @@ def repeat_is_deterministic(verdict: Verdict) -> bool:
     return verdict.kind != MODEL_FAILED
 
 
+# Failures that usually clear on their own (rate limits, dropped connections, gateway errors).  Two in a row is not
+# yet evidence of a deterministic fault: a 30-minute apt 429 storm hit every job at once on 2026-11-27.  Such a
+# signature parks only after code/calib.infra_repeat_park_transient identical repeats (default 3), each one after the
+# normal backoff.
+TRANSIENT = re.compile(r"(\b429\b|too many requests|throttl|flow control|rate limit|\bReadError\b|"
+                       r"RemoteProtocolError|ConnectError|ConnectTimeout|ReadTimeout|\b50[234]\b|"
+                       r"temporarily unavailable|connection reset|service unavailable|bad gateway)", re.I)
+
+
+def is_transient(signature: str | None) -> bool:
+    return bool(signature) and bool(TRANSIENT.search(signature))
+
+
+def repeat_limit(signature: str | None, section: dict) -> int:
+    """How many identical consecutive signatures park the item: infra_repeat_park (default 2), or
+    infra_repeat_park_transient (default 3) for a signature that looks transient."""
+    base = max(1, int(section.get("infra_repeat_park") or 2))
+    if is_transient(signature):
+        return max(base, int(section.get("infra_repeat_park_transient") or 3))
+    return base
+
+
 def note(verdict: Verdict) -> str:
     """Short human note for a ledger row / spent.json charge."""
     if verdict.kind == NO_MODEL_CALL:

@@ -28,6 +28,8 @@ import re
 import shlex
 import time
 import tomllib
+
+from . import failclass
 from collections.abc import Callable
 import uuid
 from pathlib import Path
@@ -128,7 +130,7 @@ def next_action(runs: list[dict], cfg: dict) -> tuple[str, str | None]:
     trailing_infra = len(trailing)
     if trailing_infra > c["infra_retries"]:
         return "label", "parked:infra"
-    repeat = max(1, int(c.get("infra_repeat_park") or 2))
+    repeat = failclass.repeat_limit(streak[0].get("error_signature") if streak else None, c)
     window = streak[:repeat]
     if len(window) >= repeat:
         sigs = [r.get("error_signature") for r in window]

@@ -363,6 +363,7 @@ DEFAULTS: dict[str, Any] = {
         # many consecutive times parks it as infra_repeat:<signature> instead of retrying forever.
         "infra_backoff_s": 600,
         "infra_repeat_park": 2,
+        "infra_repeat_park_transient": 3,
     },
     "probe": {
         "tbs_tasks_root": None,             # TB-Science task texts (<task>/instruction.md ...); None -> no dedup
@@ -534,6 +535,7 @@ DEFAULTS: dict[str, Any] = {
         # error signature park the item (parked:infra_repeat:<signature>) instead of retrying; a run proven to
         # have made no model call is retried after infra_backoff_s and is not counted in the infra streak.
         "infra_repeat_park": 2,
+        "infra_repeat_park_transient": 3,
         "infra_backoff_s": 600,
         # A remote_unknown job is auto-resolved only after its launcher exit status has been on disk this long
         # (the final sync may still be delivering files right after the launcher returns). 0 = resolve at once.

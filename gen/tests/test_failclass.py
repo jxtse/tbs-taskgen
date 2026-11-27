@@ -247,7 +247,8 @@ def test_parked_remote_unknown_with_proven_end_is_reconciled(tmp_path, monkeypat
 def test_s9_next_action_skips_no_model_runs_and_parks_repeats():
     cfg = load_config(None, {})
     base = dict(who="glm", outcome="infra", result_type="infra")
-    sig = {"error_signature": "ReadError:read", "error_signature_short": "abc123", "deterministic": True}
+    sig = {"error_signature": "AddTestsDirError:failed to add tests directory to environment",
+           "error_signature_short": "abc123", "deterministic": True}
     runs = [dict(base, no_model_call=True)]
     assert calib.next_action(runs, cfg) == ("run", "glm")       # zero-model run is not an infra attempt
     runs = [dict(base, no_model_call=True)] * 5                # many zero-model runs never reach parked:infra ...
@@ -258,3 +259,40 @@ def test_s9_next_action_skips_no_model_runs_and_parks_repeats():
     assert calib.next_action([transient, transient], cfg) == ("run", "glm")   # model failures: old budget
     runs = [dict(base, **sig), dict(base, **sig)]
     assert calib.next_action(runs, cfg) == ("label", "parked:infra_repeat:abc123")
+
+
+def test_transient_signature_needs_three_repeats_to_park():
+    """A rate-limit / dropped-connection signature is retried (after the backoff) once more than a deterministic one:
+    two apt 429s in a row during a mirror storm must not park every item at once."""
+    assert failclass.is_transient("RuntimeError:E: Failed to fetch http://deb.debian.org 429 Too Many Requests")
+    assert failclass.is_transient("ReadError:")
+    assert not failclass.is_transient("ValueError:network_mode='allowlist' is not supported")
+    assert not failclass.is_transient("AddTestsDirError:failed to add tests directory to environment")
+    code = {"infra_repeat_park": 2}
+    assert failclass.repeat_limit("ReadError:", code) == 3
+    assert failclass.repeat_limit("ValueError:pull access denied", code) == 2
+    assert failclass.repeat_limit("ReadError:", {"infra_repeat_park": 2, "infra_repeat_park_transient": 5}) == 5
+    assert failclass.repeat_limit("ReadError:", {"infra_repeat_park": 4}) == 4      # never below the base limit
+
+    cfg = load_config(None, {})
+    base = dict(who="glm", outcome="infra", result_type="infra", no_model_call=True,
+                error_signature="RuntimeError:E: Failed to fetch 429 Too Many Requests",
+                error_signature_short="apt429", deterministic=True)
+    assert calib.next_action([base, base], cfg) == ("run", "glm")
+    assert calib.next_action([base, base, base], cfg) == ("label", "parked:infra_repeat:apt429")
+
+
+def test_stage_transient_repeat_parks_on_third(tmp_path, monkeypatch):
+    launcher = ProbeLauncher("E: Failed to fetch http://deb.debian.org/debian/pool/x.deb  429  Too Many Requests")
+    P, it = _item(tmp_path, monkeypatch, launcher)
+    for n in range(3):
+        P.run(max_steps=1, only=[it.item_id])                   # launch job n+1
+        P.run(max_steps=1, only=[it.item_id])                   # observe it
+        st = it.load().state
+        if n < 2:
+            assert st["status"] != "parked", (n, st)
+            st["infra_backoff_until"] = 0
+            it.save()
+    st = it.load().state
+    assert st["status"] == "parked" and st["reason"].startswith("infra_repeat:"), st
+    assert len(launcher.calls) == 3
