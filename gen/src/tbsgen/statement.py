@@ -125,11 +125,48 @@ def threshold_format(text: str, thresholds: dict | None = None) -> list[str]:
     return list(dict.fromkeys(bad))
 
 
+_MARKUP = re.compile(r"[*_`]+")
+_QUOTES = str.maketrans({"\u2018": "'", "\u2019": "'", "\u201c": '"', "\u201d": '"', "\u2212": "-",
+                         "\u2013": "-", "\u2014": "-", "\u00a0": " "})
+
+
+def quote_key(text: str) -> str:
+    """Comparison form of a statement quote: Markdown emphasis / code marks (* _ `) dropped, typographic quotes and
+    dashes folded to ASCII, case folded (a quote that starts a sentence is capitalized), whitespace collapsed.  A
+    quote rendered in bold or code font in the statement still counts as present; any change of words does not."""
+    return " ".join(_MARKUP.sub("", text.translate(_QUOTES)).split()).casefold()
+
+
 def assumptions_stated(text: str, assumptions: list, require_long_quote: bool = True) -> list[str]:
-    normalized = " ".join(strip_time_note(text).split())
+    plain = " ".join(strip_time_note(text).split())
+    keyed = quote_key(plain)
     missing = []
     for a in assumptions:
         quote = assumption_quote(a["where"], require_long_quote)
-        if a["stated"] and (not quote or quote not in normalized):
+        if a["stated"] and (not quote or (quote not in plain and quote_key(quote) not in keyed)):
             missing.append(a["where"])
     return missing
+
+
+def stated_quotes(assumptions: list | None) -> list[str]:
+    """Whitespace-normalized statement quotes the S7 assumptions_stated gate looks for (spec generator_assumptions
+    with stated=true)."""
+    return [" ".join(a["where"].split()) for a in assumptions or []
+            if isinstance(a, dict) and a.get("stated") and isinstance(a.get("where"), str) and a["where"].strip()]
+
+
+def quote_block(assumptions: list | None) -> str:
+    """Prompt block for a stage that (re)writes instruction.md: the exact quotes S7 requires, one per line."""
+    quotes = stated_quotes(assumptions)
+    if not quotes:
+        return ""
+    lines = "\n".join(f"- {json_quote(q)}" for q in quotes)
+    return ("\nThe S7 gate assumptions_stated requires each of these exact statement quotes (from the spec's "
+            "generator_assumptions[].where) to appear word for word in instruction.md.  Keep every one verbatim in "
+            "the sentence that discloses that assumption (Markdown emphasis may be added around it; do not reword, "
+            "split, abbreviate or re-punctuate it):\n" + lines + "\n")
+
+
+def json_quote(q: str) -> str:
+    import json
+    return json.dumps(q, ensure_ascii=False)
