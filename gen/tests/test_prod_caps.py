@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from tbsgen.budget import BudgetStop, Ledger, item_usd_left
+from tbsgen.config import load_config
 from tbsgen.state import read_json
 
 from test_codeagent import _agent_item
@@ -387,3 +388,22 @@ def test_crash_between_numbering_and_launch_keeps_the_admission(tmp_path, monkey
     st = P.store.item(it.item_id).state
     assert st["reason"].startswith("relay_down") and st["attempts"]["S4c:job"] == 2, st
     assert it.item_id in (P.store.root / "s4c-admissions.jsonl").read_text()
+
+
+def test_daily_total_exempt_models(tmp_path):
+    """budget.daily_total_exempt_models: an exempt model is never stopped by daily_usd_total and its spend does not
+    count toward it; other models still are, and the exempt model's own per-model cap still applies."""
+    from tbsgen.budget import BudgetStop, Ledger
+    cfg = load_config(None, {"run": {"root": str(tmp_path)},
+                             "budget": {"daily_usd_total": 10.0, "daily_total_exempt_models": ["flash"],
+                                        "daily_usd_per_model": {"flash": 50.0}}})
+    led = Ledger(tmp_path / "ledger.sqlite", cfg)
+    for _ in range(4):                                            # $32 of flash: over the shared total, allowed
+        cid = led.reserve("flash", "S4c", "it", True, est_usd=8.0)
+        led.settle(cid, usd=8.0)
+    cid = led.reserve("opus", "S5G", "it", True, est_usd=8.0)   # flash spend is not counted for opus
+    led.settle(cid, usd=8.0)
+    with pytest.raises(BudgetStop, match="daily_total"):
+        led.reserve("opus", "S5G", "it", True, est_usd=3.0)    # 8 + 3 > 10 for the shared models
+    with pytest.raises(BudgetStop, match="daily_model"):
+        led.reserve("flash", "S4c", "it", True, est_usd=20.0)  # 32 + 20 > its own 50 cap

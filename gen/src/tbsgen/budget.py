@@ -324,8 +324,14 @@ class Ledger:
                     q = f"SELECT COALESCE(SUM(COALESCE(usd, est_usd)),0) FROM calls WHERE day=? AND real=1 {where}"
                     return db.execute(q, (day, *args)).fetchone()[0]
 
-                if spent("") + est > float(b["daily_usd_total"]) + 1e-12:
-                    raise BudgetStop("daily_total", f"{b['daily_usd_total']} USD")
+                # budget.daily_total_exempt_models: models outside the shared daily total -- neither checked
+                # against it nor counted in it (their own daily_usd_per_model cap, item caps and breakers still apply)
+                exempt = [str(m) for m in (b.get("daily_total_exempt_models") or [])]
+                if model not in exempt:
+                    marks = ",".join("?" * len(exempt))
+                    shared = spent(f"AND model NOT IN ({marks})", *exempt) if exempt else spent("")
+                    if shared + est > float(b["daily_usd_total"]) + 1e-12:
+                        raise BudgetStop("daily_total", f"{b['daily_usd_total']} USD")
                 if b.get("run_usd_total") is not None:     # whole-run cap across days (daily caps reset at 0:00)
                     allrun = db.execute("SELECT COALESCE(SUM(COALESCE(usd, est_usd)),0) FROM calls WHERE real=1"
                                         ).fetchone()[0]

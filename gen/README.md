@@ -436,6 +436,7 @@ timeout_s = 30
 |---|---|---|
 | `budget.daily_usd_total` | **None** | 未设置时拒绝一切真实模型调用（预算暂不定） |
 | `budget.daily_usd_per_model / per_stage / daily_calls_per_model` | 空 | 可选的细分上限 |
+| `budget.daily_total_exempt_models` | 空 | 不受 `daily_usd_total` 约束、也不计入它的模型列表（例如便宜的学生 / S4c 模型）；它们自己的 `daily_usd_per_model`、单题上限和熔断照常生效 |
 | `budget.max_calls_per_item` | 24 | 单条目出题调用（S5–S8，所有尝试）总上限；S9 不计入 |
 | `budget.run_usd_total / run_calls_per_model` | None / 空 | 整个运行目录（跨天）的总上限；S9 每次按 `calib.est_usd_per_run` 预留 |
 | `budget.breaker_open_on` | quota, auth | 出现即熔断；另有连续 4 次错误也熔断 |
