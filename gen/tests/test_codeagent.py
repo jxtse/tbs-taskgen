@@ -673,3 +673,37 @@ esac
     (tmp_path / "sha").write_text("not-a-sha")
     r = fetch()
     assert r.get("ok") is False and r.get("why") == "clone_failed"
+
+
+def test_fetch_spec_quotes_zenodo_file_names():
+    spec = codeagent.fetch_spec({"host": "zenodo", "key": "zenodo:5266407",
+                                 "files": ["CIA-Oceanix-DinAE_4DVarNN_torch-9eef031 2.zip"]})
+    assert spec["url"] == ("https://zenodo.org/records/5266407/files/CIA-Oceanix-DinAE_4DVarNN_torch-9eef031%202.zip"
+                           "?download=1")
+    spec = codeagent.fetch_spec({"host": "zenodo", "key": "zenodo:7024834", "files": ["SmritiChawla/Precily-v1.0.0.zip"]})
+    assert "/files/SmritiChawla/Precily-v1.0.0.zip?" in spec["url"]
+
+
+def test_zenodo_pick_smallest_archive_that_fits(monkeypatch):
+    from tbsgen import codegate
+    files = [{"key": "oil-4C.tar.gz", "size": 7_087_000_000}, {"key": "solid-3D.tar.gz", "size": 336_000_000},
+             {"key": "code.zip", "size": 2_000_000}, {"key": "README.md", "size": 1000}]
+    monkeypatch.setattr(codegate, "http_json", lambda url, cfg, timeout=30: (200, {"files": files}))
+    spec = codeagent._zenodo_pick(dict(kind="archive", url="first", zenodo="10023590"), 500, {})
+    assert spec["url"].endswith("/files/code.zip?download=1")
+    big = [{"key": "Precily-v1.0.0.zip", "size": 3_472_000_000}]
+    monkeypatch.setattr(codegate, "http_json", lambda url, cfg, timeout=30: (200, {"files": big}))
+    spec = codeagent._zenodo_pick(dict(kind="archive", url="first", zenodo="7024834"), 500, {})
+    assert spec["kind"] == "none" and "larger than 500 MB" in spec["why"]
+    monkeypatch.setattr(codegate, "http_json", lambda url, cfg, timeout=30: (0, None))
+    assert codeagent._zenodo_pick(dict(kind="archive", url="first", zenodo="1"), 500, {})["url"] == "first"
+
+
+def test_cran_url_falls_back_to_archive(monkeypatch):
+    from tbsgen import codegate
+    monkeypatch.setattr(codegate, "http_head", lambda url, cfg, timeout=30: 404)
+    assert codeagent._cran_url("hdmed", "hdmed_1.0.1.tar.gz", {}) == \
+        "https://cran.r-project.org/src/contrib/Archive/hdmed/hdmed_1.0.1.tar.gz"
+    monkeypatch.setattr(codegate, "http_head", lambda url, cfg, timeout=30: 200)
+    assert codeagent._cran_url("hdmed", "hdmed_1.0.1.tar.gz", {}) == \
+        "https://cran.r-project.org/src/contrib/hdmed_1.0.1.tar.gz"

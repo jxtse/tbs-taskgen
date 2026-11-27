@@ -61,6 +61,19 @@ def _opener(proxy: str):
     return urllib.request.build_opener(*([urllib.request.ProxyHandler({})] if proxy == "none" else []))
 
 
+def http_head(url: str, cfg: dict, timeout: float = 30) -> int:
+    """HEAD -> status (redirects followed); 0 = network error.  No credentials are ever sent."""
+    req = urllib.request.Request(url, method="HEAD", headers={"User-Agent": "tbsgen-code/0.1 (mailto:%s)" % ccfg(
+        cfg).get("mailto", "noreply@example.org")})
+    try:
+        with _opener(ccfg(cfg).get("proxy", "env")).open(req, timeout=timeout) as r:
+            return r.status
+    except urllib.error.HTTPError as e:
+        return e.code
+    except Exception:  # noqa: BLE001
+        return 0
+
+
 def http_json(url: str, cfg: dict, timeout: float = 30) -> tuple[int, dict | list | None]:
     """GET -> (status, parsed json | None).  status 0 = network error.  No credentials are ever sent."""
     req = urllib.request.Request(url, headers={"User-Agent": "tbsgen-code/0.1 (mailto:%s)" % ccfg(cfg).get(
