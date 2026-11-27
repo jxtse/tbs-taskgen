@@ -14,6 +14,7 @@ from . import calib, difficulty, gates, package, prereview_flow, repair, review,
 from .models import parse_files
 from .prompts import METRICS_API, S6C_TESTS, S8_EXPLOIT, S8_REPAIR, S8_REVIEW, SYSTEM
 from .stages_a import _write_files, chat_files, save_raw
+from .statement import quote_block
 from .state import item_lock, gate_attempts, latest_gate_report, passed_gate_attempt, passed_gate_report, read_json, write_json
 
 
@@ -29,6 +30,9 @@ def s6c(P, it):
                                 measure=json.dumps({k: meas[k] for k in ("ref", "mid", "naive")}),
                                 thresholds=json.dumps(thr), mid_drop=g.get("mid_drop"), naive_drop=g.get("naive_drop"),
                                 hours=P.cfg["package"]["agent_hours"])
+        # S6C rewrites the whole statement: name the S5G quotes S7 checks word for word, or a paraphrase of a
+        # correctly disclosed assumption fails assumptions_stated and S8 cannot see what the original wording was
+        user += quote_block(spec.get("generator_assumptions", []))
         need = {"tests/test_outputs.py", "instruction.md"}
         files, log = chat_files(P, it, "tests", "S6C", user, need, max_tokens=P.cfg["gen"].get("s6c_max_tokens"),
                                 need_prefix=("baselines/exploit_",))
@@ -150,6 +154,8 @@ def s8(P, it):
     slim = json.dumps(_slim(gate_log), default=str)[:20000]
     user = S8_REPAIR.format(gates=slim, depgraph=json.dumps(spec["depgraph"]), files=repair.files_for_repair(task, gate_log),
                             metrics_api=METRICS_API)
+    if "assumptions_stated" in (gate_log or {}).get("blocking", []):
+        user += quote_block(spec.get("generator_assumptions", []))
     r = P.client("repair").chat(SYSTEM, user, stage="S8", item=it.item_id,
                                 max_tokens=P.cfg["gen"].get("s6a_max_tokens"))
     save_raw(it, "S8", r)
@@ -2263,6 +2269,7 @@ def _s8_review_locked_(P, it):
                                                                      + ", baselines/exploit_*.py, "
                                                                      + review.GATING_PATH,
                             gating=json.dumps(bool(spec.get("resource_metric_gating"))))
+    user += quote_block(spec.get("generator_assumptions", []))     # a revision may rewrite instruction.md too
     patch = _request_revision_patch(P, it, user)
     chk = review.revision_review(task, patch, spec["depgraph"], th)
     d = it.p("repair", f"review-{n + 1}")
