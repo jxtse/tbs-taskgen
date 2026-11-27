@@ -170,6 +170,13 @@ reference / mid / naive 实测中成立（`difficulty.preferred_problem`），�
   `.agent-slots.lock` 下完成。
 - `code.max_concurrent_agent_jobs`：同时运行的 S4c + S5G 作业上限；满时条目 waiting（`queued: agent slots full`），
   下一轮自动重试。
+- `code.agent_job_caps`（如 `{S4c = 10}`）：给某个阶段单设上限。该阶段只按自己的在跑作业计数，并退出共享的
+  `max_concurrent_agent_jobs` 池（S4c 改走另一条模型路由时，S5G 的 Opus 名额不再被 S4c 占用）。
+- S4c 单独换模型：`code.runnability_model`（如 `"deepseek-flash"`）、`code.runnability_env`（agent 环境变量覆盖，
+  如 `{ANTHROPIC_BASE_URL = "http://<relay>"}`，优先于启动器进程环境）、`code.runnability_effort`、
+  `code.runnability_cli_budget = false`（Claude Code 的价格表不认识非 Anthropic 模型时不传 `--max-budget-usd`；
+  账本照常按报告或 token×`models.prices` 结算，单篇上限仍生效）。不设 `runnability_model` 时 S4c 与 S5G 同用
+  `agent_model`，行为不变。
 
 ### 0d. S9b：easy 题目的更难变体（`calib.variant_depth`，2026-11-16 起，默认关 = 0，仅代码驱动条目）
 

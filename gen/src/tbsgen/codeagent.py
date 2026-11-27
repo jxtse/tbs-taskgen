@@ -385,22 +385,43 @@ def build_agent_task(cfg: dict, kind: str, item_id: str, work: Path, out: Path, 
     return out
 
 
-def agent_job_config(cfg: dict, task: Path, job_name: str, jobs_dir: Path, max_usd: float | None) -> dict:
+def stage_model(cfg: dict, kind: str | None = None) -> str:
+    """Model of an S4c / S5G agent job: code.runnability_model for S4c when set, else code.agent_model, else the
+    teacher model."""
+    c = _c(cfg)
+    if kind == "S4c" and c.get("runnability_model"):
+        return str(c["runnability_model"])
+    return c.get("agent_model") or cfg["calib"]["teacher_model"]
+
+
+def agent_job_config(cfg: dict, task: Path, job_name: str, jobs_dir: Path, max_usd: float | None,
+                     kind: str | None = None) -> dict:
+    """Harbor job config of one S4c / S5G agent job.  S4c may run on its own model (code.runnability_model) and
+    endpoint (code.runnability_env: agent env overrides such as ANTHROPIC_BASE_URL, which take precedence over the
+    launcher's process env) with its own effort (code.runnability_effort); code.runnability_cli_budget = false
+    leaves out Claude Code's --max-budget-usd (its built-in price table does not know non-Anthropic models; the
+    ledger still settles the job and the paper caps still apply)."""
     c = cfg["calib"]
+    cc = _c(cfg)
     from .calib import AGENT_ENV, _ref, role
-    kw = {"version": c["cc_version"], "reasoning_effort": _c(cfg).get("agent_effort", "high")}
-    if max_usd:
+    own = kind == "S4c" and bool(cc.get("runnability_model"))
+    effort = (cc.get("runnability_effort") if own else None) or cc.get("agent_effort", "high")
+    kw = {"version": c["cc_version"], "reasoning_effort": effort}
+    if max_usd and not (own and cc.get("runnability_cli_budget", True) is False):
         kw["max_budget_usd"] = f"{float(max_usd):.2f}"
-    agent = {**_ref(_c(cfg).get("agent") or role(c, "teacher", "agent"), "name", c["harness"]),
-             "model_name": _c(cfg).get("agent_model") or c["teacher_model"], "kwargs": kw, "env": dict(AGENT_ENV)}
+    env = dict(AGENT_ENV)
+    if own:
+        env.update({str(k): str(v) for k, v in (cc.get("runnability_env") or {}).items()})
+    agent = {**_ref(cc.get("agent") or role(c, "teacher", "agent"), "name", c["harness"]),
+             "model_name": stage_model(cfg, kind), "kwargs": kw, "env": env}
     hosts = [str(h) for h in (_c(cfg).get("agent_allowed_hosts") or role(c, "teacher", "agent_allowed_hosts") or [])]
     if hosts:
         agent["extra_allowed_hosts"] = hosts
-    env = _c(cfg).get("agent_environment") or role(c, "teacher", "environment")
+    env_ref = cc.get("agent_environment") or role(c, "teacher", "environment")
     return {"job_name": job_name, "jobs_dir": str(jobs_dir), "n_attempts": 1, "n_concurrent_trials": 1,
             "timeout_multiplier": 1.0, "agent_timeout_multiplier": 1.0,
             "retry": {"max_retries": 1, "include_exceptions": ["AgentSetupTimeoutError", "EnvironmentStartTimeoutError"]},
-            "environment": {**_ref(env, "type", "docker"), "delete": True},
+            "environment": {**_ref(env_ref, "type", "docker"), "delete": True},
             "verifier": {"disable": False}, "agents": [agent], "tasks": [{"path": str(task.resolve())}]}
 
 
@@ -580,7 +601,7 @@ def reconcile_remote_agent(cfg, it, kind, rec, ledger):
     rec.update(item=it.item_id, ledger_stage=kind)
     if conf:
         rec.update(model=conf["agents"][0]["model_name"], task=conf["tasks"][0]["path"])
-    rec.setdefault("model", _c(cfg).get("agent_model") or cfg["calib"]["teacher_model"])
+    rec.setdefault("model", stage_model(cfg, kind))
     rec.setdefault("task", str(it.p(kind, "task").resolve()))
     rec.setdefault("reservation_key", json.dumps([it.item_id, kind, rec["job_name"]]))
     return calib.reconcile_remote(cfg, rec, ledger, lambda r: write_json(it.p(kind, "run.json"), r))

@@ -670,7 +670,8 @@ def _agent_stage(P, it, kind: str, instruction: str, need: list[str], timeout_s:
             task = codeagent.build_agent_task(P.cfg, kind, it.item_id, work, it.p(kind, "task"), instruction, need,
                                               timeout_s, image_outputs=images)
             jobs = Path(codeagent._c(P.cfg).get("agent_jobs_dir") or it.p(kind, "jobs"))
-            conf = codeagent.agent_job_config(P.cfg, task, f"tbsgen-{it.item_id}-{kind.lower()}{n}", jobs, max_usd)
+            conf = codeagent.agent_job_config(P.cfg, task, f"tbsgen-{it.item_id}-{kind.lower()}{n}", jobs, max_usd,
+                                              kind=kind)
             extra = dict(budget=dict(timeout_s=timeout_s, max_usd=max_usd), est_usd=est_usd)
             if kind == "S5G":
                 from .prompts_code import CODE_PROMPT_VERSION, LEGACY_CODE_PROMPT_VERSION
@@ -1290,13 +1291,19 @@ def _agent_admission(P, it, kind: str) -> str | None:
         if why:
             return why
     c = codegate.ccfg(P.cfg)
-    cap = c.get("max_concurrent_agent_jobs")
+    # code.agent_job_caps {"S4c": n, ...}: a stage with its own cap counts only its own running jobs against it and
+    # is left out of the shared code.max_concurrent_agent_jobs pool (e.g. S4c on another model route)
+    own_caps = {k: v for k, v in (c.get("agent_job_caps") or {}).items() if k in ("S4c", "S5G") and v is not None}
+    if kind in own_caps:
+        cap, kinds = own_caps[kind], (kind,)
+    else:
+        cap, kinds = c.get("max_concurrent_agent_jobs"), tuple(k for k in ("S4c", "S5G") if k not in own_caps)
     if cap is not None:
         running = 0
         for other in P.store.items():
             if other.item_id == it.item_id:
                 continue
-            for k in ("S4c", "S5G"):
+            for k in kinds:
                 r = read_json(other.p(k, "run.json"), None) or {}
                 if r.get("state") in ("reserved", "launched", "remote_unknown"):
                     running += 1
