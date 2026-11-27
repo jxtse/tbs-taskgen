@@ -379,6 +379,57 @@ allow_submit = false
 
 凭据：出题阶段的 teacher 模型走 Anthropic 兼容端点（`models.teacher.url` 或环境变量 `TBS_TEACHER_URL`，没有默认值；未设置时模型阶段以 `model:config` 暂停）。不设 `key_env` 时本进程不发送 key（适用于持有凭据的本机网关）。如果改走需要 key 的端点，设置 `models.teacher.key_env`，再用 `uv run tbsgen ...` 注入；key 只放在请求头里，不写日志或文件，错误信息会先脱敏。
 
+## 3b. 环境自检（`tbsgen smoke`）
+
+换主机、换模型路由之后，先跑一次自检再开真实运行。它只看环境，不碰任何生产条目（不读也不写
+`<run>/items/`）：
+
+```bash
+cd gen
+uv run tbsgen smoke --run runs/R --config config.toml --dry-run        # 只列出会做什么，不发请求
+uv run tbsgen smoke --run runs/R --config config.toml                  # 全量自检，JSON 报告写 runs/R/smoke/last-report.json
+uv run tbsgen smoke --run runs/R --config config.toml --stage-job      # 再加每个 agent 路由一个最小真实作业
+```
+
+八项检查（可 `--skip config,breakers,docker,buildx,egress,launchers,disk` 单项跳过）：
+
+| 检查 | 内容 | 常见失败原因 |
+|---|---|---|
+| `config` | run 目录存在、`models.teacher.url`/`model` 有价格条目、`budget.daily_usd_total` 已设 | 忘了设 url 或价格表里没有新模型 |
+| `breakers` | 只读打开 `<run>/ledger.sqlite`，有打开的熔断就失败并给出复位命令 | 账本是从旧主机拷来的，带着旧的熔断状态 |
+| `models` | 每个配置的模型路由发一次极小的真实请求（教师路由走 `TeacherClient`，S4c/S5G 走 Claude Code 的 `ANTHROPIC_BASE_URL`/token），并核对回流模型名 | 中继路由错、模型名不符（S4c 走了 S5G 的路由）、key 失效 |
+| `docker` | 启动器那个构建主机上的 docker daemon 可达 | 迁移后 docker 没起 |
+| `buildx` | 用启动器会选的 builder（`taskimage.builder`）对本地一个 `tbsgen-task:` 镜像做两行 Dockerfile 的 `docker buildx build --output type=cacheonly` | 用了容器驱动的 builder，看不到宿主镜像库 → 真实构建时 `pull access denied`；报告会直接给这条提示 |
+| `egress` | 构建主机上 `curl` 探 `models.teacher.url` 与 `code.install_hosts`（可 `[smoke.egress] urls` 覆盖），每个都限时 | Harbor 出口探针超时 |
+| `launchers` | `calib.harbor_root` / `code.agent_harbor_root` 下的启动脚本存在且 `bash -n` 通过 | 迁移后路径不对 |
+| `disk` | 构建主机 `code.remote_root` 剩余空间（`[smoke.disk] min_free_gb`，默认 10） | 镜像写满 |
+
+失败时退出码非 0，报告里每项都有 `ok/skipped/blocking` 与细节。
+
+**账本与花费上限**：自检的真实调用记在单独的 `<run>/smoke/ledger.sqlite`（stage = `SMOKE`），总花费
+硬上限 0.05 USD（`--budget-usd` 或 `[smoke] max_usd`）。生产账本只读，不会被写一条 —— 一次失败的自检
+不该打开生产正在用的模型的熔断。
+
+**`--stage-job`**：每个 agent 路由（S4c、S5G）在 `<run>/smoke/stage-job/` 里跑一个内置玩具任务（
+`codeagent.build_agent_task` 的产物），`--max-budget-usd` 默认 0.50、超时 `[smoke] stage_job_timeout_s`
+默认 1800，结束后用 `codeagent.complete_remote_agent` 校验该阶段要求的交付文件是否收到。
+`calib.allow_submit = false` 时这项跳过并打印可手工提交的命令。
+
+`[smoke]` 可选配置（都有默认值，不必写）：
+
+```toml
+[smoke]
+max_usd = 0.05              # 自检真实调用总上限
+timeout_s = 120             # 单次请求超时
+stage_job_max_usd = 0.50    # 每个玩具 agent 作业上限
+stage_job_timeout_s = 1800
+[smoke.disk]
+min_free_gb = 10
+[smoke.egress]
+urls = []                   # 空 = 由 models.teacher.url + code.install_hosts 推导
+timeout_s = 30
+```
+
 ## 4. 配置项与待定项默认值
 
 | 配置 | 默认 | 说明 |
@@ -558,6 +609,12 @@ S9 打出标签后，**hard / unstable**（`calib.keep_labels`）必须先过审
   - 其余拉不开 → S6M 一次；之后默认直接丢弃（`gen.back_to_spec_max` 默认 0）；若打开，只有“差一点”（失败 1 到 max_mid_fail+1 项）才回 S5；
   - `ref_worse_than_naive` 且某指标参考比 naive 差 ≥ `gen.ref_gross_ratio` 倍（默认 10）→ 判为参考实现错误，带倍数回 S6A 重写全部代码一次（规则 `ref_gross`，`gen.ref_rewrite_max`=1），仍然如此 → `dropped: ref_grossly_wrong`；倍数较小的仍走 S8。
   - 依据：e2e-prod-20261109 的离线回放（9 篇丢弃题的真实 S6A/S6M/S8 产物重新在沙箱实测）：3 篇入库题首轮 S6B 均为 mid 失败 3/4 判据、S6M 后变成 1 项，规则不误伤；回 S5 的 5 篇无一救回。
+
+- **阶段间契约回放测试**（`tests/test_stage_contracts.py` + `tests/fixtures/contracts/`）：四个合成但 `validate_spec` 通过的条目固定件，用真实的生产/门函数机械断言阶段间的约定 ——
+  (a) S5G `generator_assumptions[stated].where` 的原文必须原样保留到 S6C 重写后的 instruction.md（S6C 提示词通过 `statement.quote_block` 带上这些原文；改成同义句时 `assumptions_stated` 必须逐条报出缺失）；
+  (b) S6C 的交付文件正好是 S7 需要的集合（`instruction.md`、`tests/test_outputs.py`、`baselines/exploit_*`，缺一个就 `s6c_missing_files`），题面声明的 CSV 表头必须等于参考输出的表头（`gates.output_contract`）；
+  (c) PKG 的 `instruction_text` 幂等，`strip_time_note` 后的题面仍通过 `assumptions_stated`/`statement_clean`/`threshold_format`，且 verifier 时间说明里的数字永远不算“题面声明的阈值”；
+  (d) S4c 的 `runnability.json` + `HOWTO.md` + run 收据正是 S5G 采集（`codeagent._required_outputs`/`_agent_trial_complete`）并放进 `/work` 的那一组。
 
 ### 6c. 题面、隐藏集与题库分布（2026-11-24）
 

@@ -1,0 +1,9 @@
+{
+ "runnable": true,
+ "reason": "ok",
+ "entry": "python fit_orientations.py --example",
+ "python": "3.11",
+ "setup_script": "setup.sh",
+ "example_frames": ["frame_001.tif", "frame_002.tif"],
+ "notes": "PyPI install only; the example frame pair is enough to reproduce the reported fit."
+}

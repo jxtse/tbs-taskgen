@@ -84,7 +84,8 @@ def main(argv=None):
     ap = argparse.ArgumentParser(prog="tbsgen")
     sub = ap.add_subparsers(dest="cmd", required=True)
     for name in ("ingest", "run", "resume", "status", "report", "ledger", "diversity", "breaker", "calib-ingest", "ping", "reset",
-                 "harbor-local", "fetch", "remote", "fulltext", "calib", "taskimage", "requeue-image", "review", "regate", "harden", "variant"):
+                 "harbor-local", "fetch", "remote", "fulltext", "calib", "taskimage", "requeue-image", "review", "regate", "harden", "variant",
+                 "smoke"):
         s = sub.add_parser(name)
         s.add_argument("--run", required=True)
         s.add_argument("--config", default=None)
@@ -195,6 +196,17 @@ def main(argv=None):
             s.add_argument("--calls", type=int, default=1)
             s.add_argument("--budget-usd", type=float, required=True)
             s.add_argument("--max-tokens", type=int, default=1024)
+        if name == "smoke":
+            s.add_argument("--json-out", default=None, help="also write the JSON report here")
+            s.add_argument("--budget-usd", type=float, default=None,
+                           help="hard cap of the smoke model calls in total (smoke.max_usd, default 0.05)")
+            s.add_argument("--stage-job", action="store_true",
+                           help="launch ONE minimal agent job per agent route (S4c, S5G) on the toy task")
+            s.add_argument("--stage-job-timeout", type=float, default=None)
+            s.add_argument("--base-image", default=None, help="local tbsgen-task: image for the buildx probe")
+            s.add_argument("--timeout", type=float, default=None, help="per-request timeout (s)")
+            s.add_argument("--skip", default="", help="check names to skip (comma-separated)")
+            s.add_argument("--dry-run", action="store_true", help="no external action; report what would run")
     a = ap.parse_args(argv)
     if getattr(a, "loop", None) is not None and (not math.isfinite(a.loop) or a.loop <= 0):
         ap.error("--loop requires a positive interval")
@@ -204,6 +216,8 @@ def main(argv=None):
         ap.error("--max-wait requires a finite non-negative interval")
     if a.cmd == "ping":
         return _ping(a)
+    if a.cmd == "smoke":
+        return _smoke(a)
     if a.cmd == "report" and a.prereview:
         if a.day or a.throughput:
             ap.error("--prereview cannot be combined with --day or --throughput")
@@ -627,6 +641,19 @@ def _ping(a):
             out.append(dict(ok=False, error=str(e)[:300]))
     print(json.dumps(dict(results=out, ledger=P.ledger.summary(None)), indent=1, ensure_ascii=False))
     return 0
+
+
+def _smoke(a):
+    """Preflight the run's environment (`tbsgen smoke`); no production item is touched."""
+    from . import smoke
+    cfg = load_config(a.config or Path(a.run) / "config.toml", {"run": {"root": a.run}})
+    rep = smoke.run_smoke(cfg, stage_job_flag=a.stage_job, max_usd=a.budget_usd, skip=a.skip,
+                          dry_run=a.dry_run, base_image=a.base_image, timeout=a.timeout,
+                          stage_job_timeout=a.stage_job_timeout)
+    print(smoke.format_report(rep))
+    if a.json_out:
+        Path(a.json_out).write_text(json.dumps(rep, indent=1, ensure_ascii=False, default=str))
+    return 0 if rep["ok"] else 1
 
 
 if __name__ == "__main__":
