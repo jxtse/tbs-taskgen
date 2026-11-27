@@ -45,6 +45,7 @@ import uuid
 from pathlib import Path
 from urllib.parse import quote
 
+from . import failclass
 from .state import read_json, write_json
 
 # ----------------------------------------------------------------------------------------------- remote shell
@@ -778,19 +779,33 @@ def poll_agent(cfg: dict, it, kind: str, ledger) -> dict | None:
             if revoke_lost_session(cfg["calib"], rec):
                 return _fail_launch(cfg, it, kind, rec, ledger)
         if exitf.exists() and calib.remote_job(rec):
-            reconcile_remote_agent(cfg, it, kind, rec, ledger)
+            action = reconcile_remote_agent(cfg, it, kind, rec, ledger)
+            if action == "not_started":
+                it.state["infra_backoff_until"] = time.time() + float(cfg["code"].get("infra_backoff_s") or 600)
             return rec
         if exitf.exists() and not (jd / "config.json").exists():
+            verdict = failclass.classify(jd, rec)
             rec.update(state="finished", outcome="launcher_failed",
+                       failure_class=verdict.kind, error_signature=verdict.signature,
+                       error_signature_short=verdict.short,
                        error=Path(rec["log"]).read_text(errors="replace")[-400:] if Path(rec["log"]).exists() else "")
             if ledger is not None and rec.get("ledger_call"):
                 ledger.settle(rec["ledger_call"], 0.0, status="error", kind="not_launched", note=rec["error"][:300])
             write_json(recp, rec)
             return rec
         if exitf.exists() and time.time() - exitf.stat().st_mtime > 300:
-            rec.update(state="finished", outcome="no_result")
+            verdict = failclass.classify(jd, rec)
+            rec.update(state="finished", outcome="no_result", failure_class=verdict.kind,
+                       error_signature=verdict.signature, error_signature_short=verdict.short)
+            if verdict.kind == failclass.NO_MODEL_CALL:
+                # provably no model call: settle 0 (not the reservation) and let the stage retry with a backoff
+                usd, kind = 0.0, "not_started"
+                rec.update(cost_usd=0.0, cost_kind="not_started")
+            else:
+                usd, kind = None, "reservation"
             if ledger is not None and rec.get("ledger_call"):
-                ledger.settle(rec["ledger_call"], None, status="error", note="job ended without result.json")
+                ledger.settle(rec["ledger_call"], usd, status="error", kind=kind,
+                              note=f"job ended without result.json ({failclass.note(verdict)})")
             write_json(recp, rec)
             return rec
         return None
@@ -811,11 +826,18 @@ def collect_agent(cfg, recp, rec, ledger):
     usd, kind, usage = job_cost([trial_cost(t, rec.get("model"), prices) for t in trials])
     tr = read_json(trial / "result.json", {}) if trial else {}
     exc = ((tr or {}).get("exception_info") or {}).get("exception_type")
+    reward = (((tr or {}).get("verifier_result") or {}).get("rewards") or {}).get("reward")
+    verdict = failclass.classify(jd, rec)
+    if verdict.kind == failclass.NO_MODEL_CALL and reward != 1:
+        # Harbor finished but no trial has agent files, token usage or a reported cost: no model call, no charge
+        usd, kind, usage = 0.0, "not_started", None
     if transient_agent_error(exc):
         rec["outcome"] = "agent_error"
     rec.update(state="finished", finished_ts=time.time(), trial=str(trial) if trial else None, cost_usd=usd,
                cost_kind=kind, usage=usage, exception=exc,
-               reward=(((tr or {}).get("verifier_result") or {}).get("rewards") or {}).get("reward"),
+               failure_class=verdict.kind, error_signature=verdict.signature,
+               error_signature_short=verdict.short,
+               reward=reward,
                minutes=_minutes(tr))
     if ledger is not None and rec.get("ledger_call"):
         ledger.settle(rec["ledger_call"], usd, status="ok" if not exc else "error",
