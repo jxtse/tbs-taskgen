@@ -338,6 +338,10 @@ DEFAULTS: dict[str, Any] = {
         "agent": None,                      # agent import path (default calib.teacher_agent)
         "agent_environment": None,          # environment import path (default calib.teacher_environment)
         "agent_model": None,                # default calib.teacher_model
+        "runnability_model": None,          # S4c only (None = agent_model); e.g. "deepseek-flash"
+        "runnability_env": {},              # S4c agent env overrides when runnability_model is set (ANTHROPIC_BASE_URL)
+        "runnability_effort": None,         # S4c reasoning effort when runnability_model is set (None = agent_effort)
+        "runnability_cli_budget": True,     # False: no --max-budget-usd for the S4c model (unknown to Claude Code)
         "agent_effort": "high",
         "agent_allowed_hosts": None,        # model endpoint host(s) (default calib.teacher_agent_allowed_hosts)
         "install_hosts": ["pypi.org", "files.pythonhosted.org", "github.com", "codeload.github.com",
@@ -353,6 +357,7 @@ DEFAULTS: dict[str, Any] = {
         "daily_new_runnability": None,
         "daily_new_authoring": None,
         "max_concurrent_agent_jobs": None,
+        "agent_job_caps": {},               # per-stage caps, e.g. {"S4c": 10}: that stage leaves the shared pool
     },
     "probe": {
         "tbs_tasks_root": None,             # TB-Science task texts (<task>/instruction.md ...); None -> no dedup
