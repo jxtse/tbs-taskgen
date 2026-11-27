@@ -177,6 +177,17 @@ reference / mid / naive 实测中成立（`difficulty.preferred_problem`），�
   `code.runnability_cli_budget = false`（Claude Code 的价格表不认识非 Anthropic 模型时不传 `--max-budget-usd`；
   账本照常按报告或 token×`models.prices` 结算，单篇上限仍生效）。不设 `runnability_model` 时 S4c 与 S5G 同用
   `agent_model`，行为不变。
+- **失败分类（`failclass.py`）**：每个失败/结束的 S4c / S5G / S9 / S9R 作业按自身证据归为 `no_model_call`
+  （无 trial `agent/` 文件、无 token 用量、无报告费用，证明模型从未运行）、`model_failed`（模型运行过，正常的
+  失败结局）或 `infra_after_model`（模型运行后基础设施出错），并记录 `error_signature`（异常类 + 归一化后的首行
+  消息，去掉数字/ID/路径）。`no_model_call` 在账本里按 0 结算（`cost_kind="not_started"`），`spent.json` 记
+  0/0，不增加 `S4c:infra` / `S5G:infra` 或 `calib` 的 infra 连续次数；条目在 `code.infra_backoff_s`
+  （S9 用 `calib.infra_backoff_s`）后重试，而不是被 drop。同一 item+stage 连续出现同一 `error_signature`
+  `code.infra_repeat_park` 次（S9 / S9R 用 `calib.infra_repeat_park`，默认都是 2）时直接 `parked:infra_repeat:<签名>`；
+  模型失败保持原有的重试次数与计费规则不变。远端 `remote_unknown` 作业若 launcher 已明确结束（launch log `.exit`
+  存在 / tmux 会话消失）且 `result.json` 已结束或 job 目录证明 Harbor 从未建作业，`run` / `calib watch` 会走原
+  reconcile 路径自动收尾（完成作业照常 ingest，未启动作业按 0 记账后重试），不再无限期占槽；证据不明确的仍留在
+  `remote_unknown` 等人工处理。
 
 ### 0d. S9b：easy 题目的更难变体（`calib.variant_depth`，2026-11-16 起，默认关 = 0，仅代码驱动条目）
 

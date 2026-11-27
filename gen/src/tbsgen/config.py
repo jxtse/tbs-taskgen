@@ -358,6 +358,11 @@ DEFAULTS: dict[str, Any] = {
         "daily_new_authoring": None,
         "max_concurrent_agent_jobs": None,
         "agent_job_caps": {},               # per-stage caps, e.g. {"S4c": 10}: that stage leaves the shared pool
+        # failure classification (failclass.py): a job that provably made no model call is charged 0, does not
+        # use up the stage infra retries and is retried after infra_backoff_s; the same error signature this
+        # many consecutive times parks it as infra_repeat:<signature> instead of retrying forever.
+        "infra_backoff_s": 600,
+        "infra_repeat_park": 2,
     },
     "probe": {
         "tbs_tasks_root": None,             # TB-Science task texts (<task>/instruction.md ...); None -> no dedup
@@ -525,6 +530,14 @@ DEFAULTS: dict[str, Any] = {
         # difficulty; review.frontier_*).  False: the old parked:teacher_failed.
         "frontier": True,
         "infra_retries": 2,                 # API quota / sandbox errors do not count as attempts
+        # failure classification (failclass.py), same rule as [code]: these many consecutive runs with the same
+        # error signature park the item (parked:infra_repeat:<signature>) instead of retrying; a run proven to
+        # have made no model call is retried after infra_backoff_s and is not counted in the infra streak.
+        "infra_repeat_park": 2,
+        "infra_backoff_s": 600,
+        # A remote_unknown job is auto-resolved only after its launcher exit status has been on disk this long
+        # (the final sync may still be delivering files right after the launcher returns). 0 = resolve at once.
+        "stale_remote_grace_s": 300,
         # A job the model relay refused at its preflight (launcher log "relay preflight http=<non-200>", exit 3, no
         # Harbor job) ran nothing: S4c / S5G / S9 / S9R wait this long and launch again, without using up
         # infra_retries / code infra retries / review.infra_retries (calib.relay_preflight_refused).

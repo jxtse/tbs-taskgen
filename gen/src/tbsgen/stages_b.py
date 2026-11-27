@@ -10,7 +10,7 @@ from pathlib import Path
 
 import shutil
 
-from . import calib, difficulty, gates, package, prereview_flow, repair, review, runner
+from . import calib, difficulty, failclass, gates, package, prereview_flow, repair, review, runner
 from .models import parse_files
 from .prompts import METRICS_API, S6C_TESTS, S8_EXPLOIT, S8_REPAIR, S8_REVIEW, SYSTEM
 from .stages_a import _write_files, chat_files, save_raw
@@ -283,6 +283,13 @@ def _reconcile_remote(P, it, rec, save):
     action = calib.reconcile_remote(cfg, rec, P.ledger, lambda r: save(it, r))
     if action == "remote_unknown":
         it.finish("parked", f"remote_unknown: {rec['job_name']}")
+    elif action == "not_started":
+        # launcher ended and no Harbor job ran: zero-model job settled, the stage schedules the next attempt
+        if (rec.get("ledger_stage") or "S9") not in ("S4c", "S5G"):
+            it.state["infra_backoff_until"] = time.time() + float(cfg["calib"].get("infra_backoff_s") or 600)
+        it.state["status"] = "active"
+        it.state.pop("reason", None)
+        it.save()
     return action
 
 
@@ -960,6 +967,10 @@ def _s9(P, it):
         if _rescore_pending(P, it) is not None:
             return None                     # waiting (sandbox trouble) or sent back to S9 to recalibrate
     runs = _job_runs(P.cfg, it, "S9")
+    if runs and runs[-1].get("no_model_call"):
+        until = float(it.state.get("infra_backoff_until") or 0)
+        if until > time.time():
+            return it.finish("waiting", "calib:infra_backoff", job=runs[-1].get("job_name"), backoff_until=until)
     if not runs and prereview_flow.start(P, it):
         return
     for rec in runs:                                         # reconcile interrupted submissions
@@ -1084,6 +1095,7 @@ def _s9(P, it):
         # reservations only gate admission; a single Harbor run has no hard cost ceiling, so once settled
         # actual spend reaches the cap no further run is started (review #6)
         return it.finish("paused", f"budget:run_total_actual ({calib.actual_spend(P.ledger):.2f} >= {cap})")
+    it.state.pop("infra_backoff_until", None)     # a new scheduled run ends the no-model backoff
     with slot_lock(P):
         full = _slots_full(P, rec["job_name"], rec["who"])
         if not full:
@@ -1304,11 +1316,18 @@ def _resolve_remote_agent(P, it, stage, job, synced, ended_without_result, remot
                 rec = codeagent.collect_agent(P.cfg, path, rec, P.ledger)
             elif ended_without_result:
                 calib.check_job_identity(jd, rec, partial=True)
-                usd, kind, usage = _unfinished_job_cost(P, rec, jd, confirmed=True)
+                verdict = failclass.classify(jd, rec)
+                if verdict.kind == failclass.NO_MODEL_CALL:
+                    # no agent files / usage / reported cost: the reservation is not a model charge
+                    usd, kind, usage = 0.0, "not_started", None
+                else:
+                    usd, kind, usage = _unfinished_job_cost(P, rec, jd, confirmed=True)
                 if rec.get("ledger_call"):
                     P.ledger.settle(rec["ledger_call"], usd, status="error", kind=kind, usage=usage,
-                                    note="remote agent ended without a complete result")
-                rec.update(state="finished", outcome="no_result", finished_ts=time.time(), cost_usd=usd, cost_kind=kind)
+                                    note=f"remote agent ended without a complete result ({failclass.note(verdict)})")
+                rec.update(state="finished", outcome="no_result", finished_ts=time.time(), cost_usd=usd, cost_kind=kind,
+                           failure_class=verdict.kind, error_signature=verdict.signature,
+                           error_signature_short=verdict.short)
                 calib.archive_run_marker(rec)
                 write_json(path, rec)
             else:
@@ -1380,6 +1399,14 @@ def _ingest_run(P, it, rec, stage, jd, *, trial_dirs=None, settlement=None, conf
         raise ValueError("no trial results in job dir")
     t = dict(trials[0], job_dir=str(jd.resolve()))
     usd, kind, usage = settlement or calib.job_cost(trials)
+    verdict = failclass.classify(jd, rec, trials=trials)
+    rec.update(failure_class=verdict.kind, error_signature=verdict.signature,
+               error_signature_short=verdict.short, deterministic=failclass.repeat_is_deterministic(verdict))
+    if t["outcome"] == "infra" and verdict.kind == failclass.NO_MODEL_CALL:
+        # provably no model call: settle 0 instead of the reservation, and do not count it in the infra streak
+        usd, kind, usage = 0.0, "not_started", None
+        rec["no_model_call"] = True
+        it.state["infra_backoff_until"] = time.time() + float(P.cfg["calib"].get("infra_backoff_s") or 600)
     rec.update(outcome=t["outcome"], result_type=t["result_type"], minutes=t["minutes"], trial=t,
                cost_usd=usd, cost_kind=kind, n_trials=len(trials),
                trial_verifier_timeouts={r["trial"]: r.get("exception") in _VERIFIER_TIMEOUT_EXCEPTIONS for r in trials})
@@ -1614,14 +1641,23 @@ def _settle_dead_job(P, it, rec: dict, save=_save_run, *, confirmed=False):
     the trials written so far show (tokens), else unknown (reservation kept, not counted as actual spend)."""
     if not confirmed and calib.remote_job(rec, P.ledger):
         return _reconcile_remote(P, it, rec, save)
-    usd, kind, usage = _unfinished_job_cost(P, rec, Path(rec["job_dir"]), confirmed=confirmed)
+    verdict = failclass.classify(Path(rec["job_dir"]), rec)
+    if verdict.kind == failclass.NO_MODEL_CALL:
+        usd, kind, usage = 0.0, "not_started", None
+    else:
+        usd, kind, usage = _unfinished_job_cost(P, rec, Path(rec["job_dir"]), confirmed=confirmed)
     if rec.get("ledger_call"):
         P.ledger.settle(rec["ledger_call"], usd, status="error", kind=kind, usage=usage,
                         note="harbor job ended without a complete result")
     exf = Path(rec.get("log", "") + ".exit")
     ex = exf.read_text().strip() if exf.exists() else "none recorded"
     rec.update(state="died", outcome="infra", result_type="infra", cost_usd=usd, cost_kind=kind,
+               failure_class=verdict.kind, error_signature=verdict.signature,
+               error_signature_short=verdict.short, deterministic=failclass.repeat_is_deterministic(verdict),
                error=f"launcher exit {ex}; harbor job ended without a complete result")
+    if verdict.kind == failclass.NO_MODEL_CALL and (rec.get("ledger_stage") or "S9") == "S9":
+        rec["no_model_call"] = True
+        it.state["infra_backoff_until"] = time.time() + float(P.cfg["calib"].get("infra_backoff_s") or 600)
     save(it, rec)
     P.store.event("calib_job_died", item=it.item_id, job=rec["job_name"], cost_kind=kind)
 
@@ -1666,8 +1702,30 @@ def poll_calibration(P, it):
         runs = _job_runs(P.cfg, it, stage)
         cur = next((r for r in runs if calib.pending_launcher(r, P.ledger)), None)
         if _remote_parked(it):
-            if cur and cur.get("state") == "remote_unknown" and calib.remember_remote_marker(cur):
-                (_save_run if stage == "S9" else _save_review)(it, cur)
+            if cur and cur.get("state") == "remote_unknown":
+                save = _save_run if stage == "S9" else _save_review
+                cfg = review.review_cfg(P.cfg) if stage == "S9R" else P.cfg
+                action = calib.reconcile_remote(cfg, cur, P.ledger, lambda r: save(it, r))
+                if action == "remote_unknown":
+                    if calib.remember_remote_marker(cur):
+                        save(it, cur)
+                    return None
+                # the launcher's end is proven: unpark and let this tick attach / reschedule through the normal path
+                if action == "not_started":
+                    it.state["infra_backoff_until"] = time.time() + float(P.cfg["calib"].get("infra_backoff_s") or 600)
+                it.state["status"] = "active"
+                it.state.pop("reason", None)
+                it.save()
+                P.store.event("remote_unknown_reconciled", item=it.item_id, stage=stage, job=cur["job_name"],
+                              action=action)
+                if action == "awaiting_ingest":
+                    try:
+                        t = _ingest_run(P, it, cur, stage, Path(cur["job_dir"]))
+                        return dict(item=it.item_id, action="reconciled_ingest", job=cur["job_name"],
+                                    outcome=t.get("outcome"), result_type=t.get("result_type"))
+                    except ValueError as e:
+                        return dict(item=it.item_id, action="ingest_error", job=cur["job_name"], error=str(e)[:300])
+                return dict(item=it.item_id, action="reconciled", job=cur["job_name"], result=action)
             return None
         if cur is None:
             if runs and runs[-1].get("outcome") is not None and (

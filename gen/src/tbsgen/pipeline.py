@@ -383,6 +383,20 @@ class Pipeline:
         rewoken: set[str] = set()
         polled: set[str] = set()
 
+        # A remote_unknown agent item is parked, so the loop would never look at it again.  Reconcile the ones
+        # whose launcher has demonstrably ended before filtering (failclass / calib.remote_end_evidence).
+        for it in self.store.items():
+            if only and it.item_id not in only:
+                continue
+            if not (it.state.get("status") == "parked" and it.state.get("stage") in AGENT_STAGES
+                    and str(it.state.get("reason") or "").startswith("remote_unknown: ")):
+                continue
+            try:
+                made_progress |= bool(A.reconcile_parked_agent(self, it))
+            except Exception as exc:  # noqa: BLE001 - a bad job dir must not stop the run
+                self.store.event("remote_unknown_reconcile_error", item=it.item_id,
+                                 err=f"{type(exc).__name__}: {exc}")
+
         def runnable(it) -> bool:
             if it.item_id in skipped:
                 return False

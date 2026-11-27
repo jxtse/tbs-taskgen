@@ -10,7 +10,7 @@ import shutil
 import re
 from pathlib import Path
 
-from . import blocklist, codegate, intake, runner, screen_jev, taskimage
+from . import blocklist, codegate, failclass, intake, runner, screen_jev, taskimage
 from .budget import BudgetStop
 from .config import resolve_role
 from .models import ModelError, extract_json, parse_files  # noqa: F401
@@ -556,6 +556,18 @@ def _observe_remote_agent(P, it, stage):
         if action == "remote_unknown":
             it.finish("parked", f"remote_unknown: {rec['job_name']}")
             return True
+        if action == "not_started":
+            # the launcher ended and the job dir proves Harbor never ran: a zero-model-call job, not a park
+            rec = codeagent.read_agent_run(P.cfg, it, stage) or rec
+            if rec.get("not_started"):
+                with _agent_slot_lock(P):
+                    _withdraw_admission(P, it, stage, job=rec.get("job_name"), why="not_launched")
+                    _record_nostart(it, stage, rec.get("job_name"))
+            it.state["infra_backoff_until"] = time.time() + float(P.cfg["code"].get("infra_backoff_s") or 600)
+            it.state["status"] = "active"
+            it.state.pop("reason", None)
+            it.save()
+            return False
         if action == "waiting":
             reason = f"{stage}:agent_running"
             if it.state["status"] != "waiting" or it.state.get("reason") != reason:
@@ -568,6 +580,44 @@ def _observe_remote_agent(P, it, stage):
         finish_job_stage(P, it, finish["status"], finish["reason"], **finish["info"])
         return True
     return False
+
+
+def reconcile_parked_agent(P, it):
+    """Unpark a remote_unknown S4c / S5G item whose launcher has ended (failclass / launch evidence).
+
+    A parked remote job is never stepped again, so a launcher that finished hours ago used to hold an agent
+    slot forever.  When calib's end evidence is positive (launch log .exit present / tmux session gone AND a
+    finished result.json or a job dir that proves Harbor never ran) the same reconcile path resolves it: a
+    finished job is collected by the normal stage flow, a never-started job is accounted as a zero-model job
+    and retried.  Anything ambiguous stays parked for the operator.  Returns True if the item was unparked."""
+    from . import codeagent
+    from .stages_b import item_lock
+    with item_lock(it):
+        it.load()
+        stage = it.state.get("stage")
+        if (it.state.get("status") != "parked" or stage not in ("S4c", "S5G")
+                or not str(it.state.get("reason") or "").startswith("remote_unknown: ")):
+            return False
+        rec = codeagent.read_agent_run(P.cfg, it, stage) or {}
+        if rec.get("state") != "remote_unknown":
+            return False
+        with _agent_slot_lock(P):
+            action = codeagent.reconcile_remote_agent(P.cfg, it, stage, rec, P.ledger)
+            if action == "not_started" and rec.get("not_started"):
+                _withdraw_admission(P, it, stage, job=rec.get("job_name"), why="not_launched")
+                _record_nostart(it, stage, rec.get("job_name"))
+        if action == "remote_unknown":
+            return False
+        if action == "not_started":
+            it.state["infra_backoff_until"] = time.time() + float(P.cfg["code"].get("infra_backoff_s") or 600)
+        it.state["history"].append(dict(stage=stage, result="reconciled", prev_reason=it.state.get("reason"),
+                                        action=action, ts=time.time()))
+        it.state["status"] = "active"
+        it.state.pop("reason", None)
+        it.save()
+        P.store.event("remote_unknown_reconciled", item=it.item_id, stage=stage, job=rec.get("job_name"),
+                      action=action)
+        return True
 
 
 def _agent_stage(P, it, kind: str, instruction: str, need: list[str], timeout_s: float, max_usd: float | None,
@@ -587,6 +637,11 @@ def _agent_stage(P, it, kind: str, instruction: str, need: list[str], timeout_s:
         rec["retry"] = True                     # a finished job of another version never counts for this round
         write_json(recp, rec)
     if rec is not None and rec.get("state") in ("launch_failed", "cancelled_unstarted"):
+        if rec.get("failure_class") == failclass.NO_MODEL_CALL:
+            parked = _record_infra_signature(P, it, kind, rec)   # same deterministic start failure again -> park
+            if parked:
+                it.finish("parked", parked)
+                return None
         if rec.get("not_started"):
             with _agent_slot_lock(P):
                 _withdraw_admission(P, it, kind, job=rec.get("job_name"), why="not_launched")
@@ -594,9 +649,16 @@ def _agent_stage(P, it, kind: str, instruction: str, need: list[str], timeout_s:
         rec["state"] = "finished"
         if rec.get("not_started"):
             _record_nostart(it, kind, rec.get("job_name"))     # tmux never started it: no job of the paper ran
+        write_json(recp, rec)                   # persist the transition before a possible backoff return
     if rec is not None and rec.get("state") == "finished" and rec.get("retry"):
         _account_refusal(P, it, kind, rec)      # idempotent: completes a refusal's accounting cut short by a crash
     if rec is None or (rec.get("state") == "finished" and rec.get("retry")):
+        until = float(it.state.get("infra_backoff_until") or 0)
+        if until > time.time():
+            reason = f"{kind}:infra_backoff"
+            if it.state.get("status") != "waiting" or it.state.get("reason") != reason:
+                it.finish("waiting", reason, job=(rec or {}).get("job_name"), backoff_until=until)
+            return None
         from .calib import preflight_wait
         wait = preflight_wait(P.cfg, rec)
         if wait:                                # the relay refused the last job: wait before the next one
@@ -613,22 +675,33 @@ def _agent_stage(P, it, kind: str, instruction: str, need: list[str], timeout_s:
         charges = read_json(sp, {}) or {}
         if rec is not None and rec.get("job_name") and rec["job_name"] not in charges:
             if rec.get("not_started") or not rec.get("launch_attempted"):
-                usd, sec = 0.0, 0.0             # confirmed never started
-            elif _failed_before_harbor(rec):
-                # explicit pre-start failure evidence in this job's own launcher log (the relay preflight refused,
-                # so Harbor never ran and no model was called): no model cost.  A refusal handled as such
-                # (preflight_refused) used no agent time either; an older record keeps its wall time
-                usd = 0.0
-                sec = 0.0 if rec.get("preflight_refused") else \
-                    max(0.0, float(rec.get("finished_ts") or time.time()) - float(rec["launch_attempted"]))
+                usd, sec, cost_kind = 0.0, 0.0, "not_launched"   # confirmed never started
             else:
-                # a job that may have run: unknown cost counts as its whole allowance, unknown time as wall time
-                # since the launch (never as zero)
-                b = rec.get("budget") or {}
-                usd = rec.get("cost_usd")
-                usd = float(usd) if usd is not None else float(b.get("max_usd") or max_usd or 0.0)
-                sec = 60.0 * float(rec["minutes"]) if rec.get("minutes") is not None else \
-                    max(0.0, float(rec.get("finished_ts") or time.time()) - float(rec["launch_attempted"]))
+                # failclass: only a job that provably made no model call (no agent files, no token usage, no
+                # reported cost) is charged 0; every other unknown-cost job keeps counting its whole allowance.
+                verdict = failclass.classify(rec.get("job_dir"), rec)
+                rec["failure_class"], rec["error_signature"] = verdict.kind, verdict.signature
+                rec["error_signature_short"] = verdict.short
+                write_json(recp, rec)
+                if verdict.kind == failclass.NO_MODEL_CALL:
+                    usd, sec, cost_kind = 0.0, 0.0, "not_started"
+                elif _failed_before_harbor(rec):
+                    # explicit pre-start failure evidence in this job's own launcher log (the relay preflight
+                    # refused, so Harbor never ran and no model was called): no model cost.  A refusal handled as
+                    # such (preflight_refused) used no agent time either; an older record keeps its wall time
+                    usd = 0.0
+                    sec = 0.0 if rec.get("preflight_refused") else \
+                        max(0.0, float(rec.get("finished_ts") or time.time()) - float(rec["launch_attempted"]))
+                    cost_kind = "relay_refused" if rec.get("preflight_refused") else "not_launched"
+                else:
+                    # a job that may have run: unknown cost counts as its whole allowance, unknown time as wall
+                    # time since the launch (never as zero)
+                    b = rec.get("budget") or {}
+                    usd = rec.get("cost_usd")
+                    usd = float(usd) if usd is not None else float(b.get("max_usd") or max_usd or 0.0)
+                    sec = 60.0 * float(rec["minutes"]) if rec.get("minutes") is not None else \
+                        max(0.0, float(rec.get("finished_ts") or time.time()) - float(rec["launch_attempted"]))
+                    cost_kind = rec.get("cost_kind") if rec.get("cost_usd") is not None else "reservation"
             charges[rec["job_name"]] = dict(usd=usd, sec=sec)
             write_json(sp, charges)
         spent = dict(usd=sum(c["usd"] for c in charges.values()), sec=sum(c["sec"] for c in charges.values()))
@@ -655,6 +728,7 @@ def _agent_stage(P, it, kind: str, instruction: str, need: list[str], timeout_s:
             # with a per-paper cap the ledger reserves the job's whole allowance: an unknown final cost then counts
             # as that allowance in the ledger too (the same bound spent.json uses), never as a smaller estimate
             est_usd = float(max_usd)
+        it.state.pop("infra_backoff_until", None)
         with _agent_slot_lock(P):
             # admission check, job number, intent, reservation and launch under one run-level lock: two processes
             # stepping different papers cannot both take the last slot / daily admission
@@ -884,24 +958,70 @@ def s4c(P, it):
         return _s4c(P, it)
 
 
-def _retry_agent_infra(it, stage, rec):
+def _record_infra_signature(P, it, stage, rec):
+    """Count consecutive identical error signatures for one item+stage; park when deterministic and repeated.
+
+    Returns the park reason or None.  Stored on state.infra_signatures ({stage: {last, count}}) so a resumed
+    step sees the same count; the signature never contains job ids, paths or numbers."""
+    if not rec.get("error_signature"):
+        return None
+    verdict = failclass.Verdict(kind=rec.get("failure_class") or failclass.MODEL_FAILED,
+                                signature=rec["error_signature"], short=rec.get("error_signature_short") or "sig")
+    sigs = it.state.setdefault("infra_signatures", {}).setdefault(stage, {})
+    if sigs.get("last") == verdict.signature:
+        sigs["count"] = int(sigs.get("count") or 0) + 1
+    else:
+        sigs.update(last=verdict.signature, count=1)
+    repeat = max(1, int(P.cfg["code"].get("infra_repeat_park") or 2))
+    if failclass.repeat_is_deterministic(verdict) and sigs["count"] >= repeat:
+        it.save()
+        P.store.event("agent_infra_repeat", item=it.item_id, stage=stage, job=rec.get("job_name"),
+                      signature=verdict.signature, failure_class=verdict.kind)
+        return f"infra_repeat:{verdict.short}"
+    return None
+
+
+def _retry_agent_infra(P, it, stage, rec):
     """Retry a stage job whose agent or launcher failed before it delivered: at most twice for transient agent errors
     (API, timeout, non-zero exit), once for launcher_failed / no_result. A job that delivered complete outputs is used
-    as is even if the agent ended with an error."""
+    as is even if the agent ended with an error.
+
+    failclass: a job that provably made no model call does not count as an infra attempt -- it is retried after
+    code.infra_backoff_s.  The same error signature code.infra_repeat_park times in a row (deterministic failures
+    only; model failures keep their old budget) parks the item as ``infra_repeat:<signature>``.  Returns
+    ("retry"|"park"|"", reason)."""
     outcome = rec.get("outcome")
     if outcome not in ("agent_error", "launcher_failed", "no_result"):
-        return False
+        return "", ""
+    verdict = failclass.classify(rec.get("job_dir"), rec)
+    rec["failure_class"], rec["error_signature"] = verdict.kind, verdict.signature
+    rec["error_signature_short"] = verdict.short
+    write_json(it.p(stage, "run.json"), rec)
+    parked = _record_infra_signature(P, it, stage, rec)
+    if parked:
+        return "park", parked
     counter = f"{stage}:infra"
-    # A resumed step can see the same finished job after the counter was saved.
-    if it.state.get("last_agent_infra_job") != rec["job_name"]:
-        it.state["last_agent_infra_job"] = rec["job_name"]
-        it.bump(counter)
-    limit = 2 if outcome == "agent_error" else 1
-    if it.state.get("attempts", {}).get(counter, 0) > limit:
-        return False
+    if verdict.kind == failclass.NO_MODEL_CALL:
+        # zero-spend infra failure: no stage infra attempt, plain retry after a backoff (the lifetime of the
+        # failure is bounded by the repeat-signature rule above, not by the dropped-paper rule)
+        backoff = float(P.cfg["code"].get("infra_backoff_s") or 600)
+        it.state["infra_backoff_until"] = time.time() + backoff
+        it.state.pop("last_agent_infra_job", None)
+        _record_nostart(it, stage, rec.get("job_name"), save=False)   # nor an authoring_max_jobs job
+    else:
+        # A resumed step can see the same finished job after the counter was saved.
+        if it.state.get("last_agent_infra_job") != rec["job_name"]:
+            it.state["last_agent_infra_job"] = rec["job_name"]
+            it.bump(counter)
+        limit = 2 if outcome == "agent_error" else 1
+        if it.state.get("attempts", {}).get(counter, 0) > limit:
+            return "", ""
     rec["retry"] = True
     write_json(it.p(stage, "run.json"), rec)
-    return True
+    it.save()
+    P.store.event("agent_infra_retry", item=it.item_id, stage=stage, job=rec.get("job_name"),
+                  failure_class=verdict.kind, signature=verdict.signature, backoff=verdict.kind == failclass.NO_MODEL_CALL)
+    return "retry", verdict.short
 
 
 def _s4c(P, it):
@@ -950,7 +1070,10 @@ def _s4c(P, it):
                                                   minutes=rec.get("minutes"), result=res))
     if not isinstance(res, dict) or (rec.get("outcome") == "agent_error" and res.get("reason") == "invalid_result"):
         # No verdict, or the agent failed (API error, timeout) before it could back its verdict with evidence.
-        if _retry_agent_infra(it, "S4c", rec):
+        act, why = _retry_agent_infra(P, it, "S4c", rec)
+        if act == "park":
+            return it.finish("parked", why)
+        if act == "retry":
             return it.goto("S4c", "runnability job infra failure: retry")
         if not isinstance(res, dict):
             return it.finish("dropped", "code_runnability_agent_failed")
@@ -1065,7 +1188,10 @@ def _s5g(P, it):
                                              difficulty_profile=difficulty.provenance(prof), harden_round=hround,
                                              harden_kind=hkind))
     if miss:
-        if _retry_agent_infra(it, "S5G", rec):
+        act, why = _retry_agent_infra(P, it, "S5G", rec)
+        if act == "park":
+            return it.finish("parked", why)
+        if act == "retry":
             return it.goto("S5G", "authoring job infra failure: retry")
         return it.finish("dropped", "s5g_missing_files", missing=miss[:5])
     try:

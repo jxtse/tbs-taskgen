@@ -28,7 +28,7 @@ from pathlib import Path
 from .dlledger import sqlite_wait
 
 CN = dt.timezone(dt.timedelta(hours=8))
-EXCLUDE_UNSTARTED_JOBS = "COALESCE(cost_kind,'') NOT IN ('probe_migration_cancelled','cancelled_unstarted','expired_unsent')"
+EXCLUDE_UNSTARTED_JOBS = "COALESCE(cost_kind,'') NOT IN ('probe_migration_cancelled','cancelled_unstarted','expired_unsent','not_started')"
 # hardening round of the item being stepped (Pipeline.step sets it while state.harden_active; 0 = not a hardening
 # round).  Every reservation is tagged with it (calls.harden), so budget.item_harden_usd_cap can keep a hardening
 # round's authoring spend (S5G, S6A, S6M, S6C, S7, S8 ...) apart from the first version's budget.item_usd_cap.

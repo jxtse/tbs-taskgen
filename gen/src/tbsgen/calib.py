@@ -116,15 +116,25 @@ def next_action(runs: list[dict], cfg: dict) -> tuple[str, str | None]:
         real = decisive_runs(runs, cfg)
     except _Park as e:
         return "label", str(e)
-    trailing_infra = 0
+    trailing, streak = [], []
     for r in reversed(runs):
         if r.get("preflight_refused") or r.get("obsolete_probe_job"):
             continue                    # no attempt was made
         if r["outcome"] != "infra":
             break
-        trailing_infra += 1
+        streak.append(r)                # every consecutive infra run, for the repeated-signature rule
+        if not r.get("no_model_call"):
+            trailing.append(r)          # a run proven to make no model call is not an infra attempt
+    trailing_infra = len(trailing)
     if trailing_infra > c["infra_retries"]:
         return "label", "parked:infra"
+    repeat = max(1, int(c.get("infra_repeat_park") or 2))
+    window = streak[:repeat]
+    if len(window) >= repeat:
+        sigs = [r.get("error_signature") for r in window]
+        if sigs[0] and len(set(sigs)) == 1 and all(r.get("deterministic", True) for r in window):
+            short = window[0].get("error_signature_short") or "sig"
+            return "label", f"parked:infra_repeat:{short}"
     glm = [r for r in real if r["who"] == "glm"]
     tea = [r for r in real if r["who"] == "teacher"]
     if not glm:
@@ -955,16 +965,93 @@ def _remote_results_ready(cfg, rec, final=False):
     return complete_remote_trials(jd, stage or "S9", contract=contract)
 
 
+def remote_end_evidence(c: dict, rec: dict) -> str | None:
+    """Positive local evidence that a remote job's launcher has ended.
+
+    "finished"    -- the launcher wrote its exit status (after its final sync) at least calib.stale_remote_grace_s
+                     ago AND Harbor wrote a finished result.json (the caller still requires a complete trial set).
+    "not_started" -- the same exit status AND the job dir proves Harbor never created a job (no remote marker, no
+                     config.json, no trial result.json, no result.json); safe to settle as a no-model job.
+    None          -- no positive evidence.  A vanished tmux session without an exit status does not prove the
+                     final sync completed, so it stays with the operator (calib resolve-remote).
+    """
+    log = rec.get("log")
+    exit_file = Path(log + ".exit") if log else None
+    exited = bool(exit_file and exit_file.exists())
+    if not exited or exit_file is None:
+        return None
+    try:
+        if time.time() - exit_file.stat().st_mtime < float(c.get("stale_remote_grace_s", 300)):
+            return None                      # the final sync may still be delivering files
+    except OSError:
+        return None
+    jd = Path(rec["job_dir"])
+    summary = _load(jd / "result.json")
+    if exited and isinstance(summary, dict) and summary.get("finished_at"):
+        # the launcher writes its exit status only after the final sync: the local copy is what it delivered
+        return "finished"
+    # A remote marker is the launcher's job identity: the local job dir is only a synced copy, so its absence
+    # proves nothing.  Keep the operator path for those.
+    if rec.get("remote_marker") is not None or has_remote_marker(rec) or (jd / "tbsgen-remote.json").exists():
+        return None
+    if not exited or isinstance(summary, dict):
+        return None
+    try:
+        if (jd / "config.json").exists() or any(jd.glob("*/result.json")):
+            return None
+    except OSError:
+        return None
+    # the local copy is empty: only the launcher log can prove nothing ran (a failed copy-back after a real run
+    # leaves the same empty directory, and must keep the operator path)
+    from . import failclass
+    if failclass.classify(jd, rec).kind == failclass.NO_MODEL_CALL:
+        return "not_started"
+    return None
+
+
+def _settle_never_ran(cfg, rec, ledger, save):
+    """A remote launcher ended and the job dir proves Harbor never ran: a zero-model job, not a park."""
+    from . import failclass
+    verdict = failclass.classify(Path(rec["job_dir"]), {**rec, "not_started": True})
+    stage = rec.get("ledger_stage")
+    rec.update(state="launch_failed", not_started=True, cost_usd=0.0, cost_kind="not_started",
+               failure_class=failclass.NO_MODEL_CALL, error_signature=verdict.signature,
+               error_signature_short=verdict.short,
+               error="remote launcher ended; the job dir proves Harbor never ran")
+    if stage not in ("S4c", "S5G"):
+        # S9 / S9R run records must carry an outcome; next_action skips no_model_call runs in the infra streak
+        rec.update(outcome="infra", result_type="infra", no_model_call=True)
+    if ledger is not None and rec.get("ledger_call"):
+        ledger.settle(rec["ledger_call"], 0.0, status="error", kind="not_started",
+                      note="remote launcher ended; no Harbor job ran (no model call)")
+    save(rec)
+    return "not_started"
+
+
 def reconcile_remote(cfg, rec, ledger, save):
-    """Observe the original submission locally. Only the operator can clear remote_unknown."""
+    """Observe the original submission locally.
+
+    An ambiguous remote_unknown still needs the operator.  When the launcher has demonstrably ended
+    (remote_end_evidence), the job is reconciled instead: a finished job is ingested by the normal path, a
+    job dir that proves Harbor never ran is settled as a zero-model job and retried.
+    """
     jd = Path(rec["job_dir"])
     state = rec.get("state")
     remembered = remember_remote_marker(rec)
     if state == "remote_unknown":
-        action = "remote_unknown"
+        end = remote_end_evidence(cfg.get("calib") or {}, rec)
+        if end == "finished" and _remote_results_ready(cfg, rec, final=True):
+            action = "awaiting_ingest"
+        elif end == "not_started":
+            return _settle_never_ran(cfg, rec, ledger, save)
+        else:
+            action = "remote_unknown"
     else:
         rec.setdefault("tmux", rec["job_name"][-60:])
         exit_file = Path(rec["log"] + ".exit") if rec.get("log") else None
+        end = remote_end_evidence(cfg.get("calib") or {}, rec)
+        if end == "not_started":
+            return _settle_never_ran(cfg, rec, ledger, save)
         alive = False
         if not (exit_file and exit_file.exists()):
             alive = session_alive(cfg["calib"], rec)
