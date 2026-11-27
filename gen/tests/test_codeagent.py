@@ -741,3 +741,11 @@ def test_cran_url_falls_back_to_archive(monkeypatch):
     monkeypatch.setattr(codegate, "http_head", lambda url, cfg, timeout=30: 200)
     assert codeagent._cran_url("hdmed", "hdmed_1.0.1.tar.gz", {}) == \
         "https://cran.r-project.org/src/contrib/hdmed_1.0.1.tar.gz"
+
+
+def test_zenodo_pick_follows_a_superseded_record(monkeypatch):
+    from tbsgen import codegate
+    monkeypatch.setattr(codegate, "http_json", lambda url, cfg, timeout=30: (
+        200, {"id": 10615686, "files": [{"key": "scCASE_zenodo.zip", "size": 1_000_000}]}))
+    spec = codeagent._zenodo_pick(dict(kind="archive", url="first", zenodo="8382876"), 500, {})
+    assert spec["url"] == "https://zenodo.org/records/10615686/files/scCASE_zenodo.zip?download=1"
