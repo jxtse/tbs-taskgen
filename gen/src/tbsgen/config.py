@@ -450,7 +450,9 @@ DEFAULTS: dict[str, Any] = {
         "tdm_verbatim_channels": ["elsevier", "wiley"],
         "tdm_verbatim_unknown": False,      # True: a full text of unknown channel is checked too
     },
-    "diversity": {"max_area_share": 0.25, "max_per_template": 2, "min_released": 20, "enforce": False},
+    "diversity": {"max_area_share": 0.25, "max_per_template": 2, "min_released": 20, "enforce": False,
+                  # official-task quota before S5G authoring (diversity.o70_quota); off unless an inventory is set
+                  "o70_inventory": None, "o70_max_hard": 4, "o70_enforce": False},
     "taskimage": {
         "enabled": False, "host": None, "docker_config": None, "builder": None,
         "build_timeout_s": 2400, "build_args": {}, "max_gb": 5, "keep_days": 7, "catalog": None,

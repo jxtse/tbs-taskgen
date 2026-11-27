@@ -145,9 +145,70 @@ def report(run: Path, runs_root: Path | None = None):
     return summarize(list(live.values()), [r for i, r in pending.items() if i not in live])
 
 
-def admission(P, it, stage):
-    """Record the same decision in observation and enforcement modes; return a reason only when enforced."""
+def released_labels(run):
+    """{item_id: label} of the live releases (same last-record semantics as released_ids)."""
+    manifest = run / "release/manifest.jsonl"
+    live = {}
+    if manifest.exists():
+        for line in manifest.read_text().splitlines():
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(row, dict) or not isinstance(row.get("item_id"), str):
+                continue
+            if row.get("withdrawn"):
+                live.pop(row["item_id"], None)
+            else:
+                live[row["item_id"]] = row.get("label")
+    return live
+
+
+def o70_quota(P, it):
+    """Hard tasks already held for the candidate's official-task group, from an operator-maintained inventory.
+
+    diversity.o70_inventory is a JSON file with target_group {S1 target -> official task}, library {official task ->
+    {"hard": n, ...}} and library_items [item ids already counted in library].  Live hard releases of this run that
+    the library has not counted yet are added.  Returns None when no inventory is configured; an unreadable inventory
+    or an unmapped target never blocks.
+    """
     cfg = P.cfg["diversity"]
+    path = cfg.get("o70_inventory")
+    if not path:
+        return None
+    inv = read_json(Path(path), None)
+    if not isinstance(inv, dict) or not isinstance(inv.get("target_group"), dict):
+        return dict(error="inventory_unreadable", reason=None)
+    groups = inv["target_group"]
+    target = (read_json(it.p("S1_candidate.json"), {}) or {}).get("_target") or ""
+    group = groups.get(target)
+    if not group:
+        return dict(target=target, group=None, reason=None)
+    counted = set(inv.get("library_items") or [])
+    library_hard = int(((inv.get("library") or {}).get(group) or {}).get("hard", 0))
+    released = []
+    for i, label in sorted(released_labels(P.store.root).items()):
+        if label != "hard" or i == it.item_id or i in counted:
+            continue
+        t = (read_json(P.store.root / "items" / i / "S1_candidate.json", {}) or {}).get("_target")
+        if groups.get(t) == group:
+            released.append(i)
+    cap = int(cfg.get("o70_max_hard", 4))
+    hard = library_hard + len(released)
+    return dict(target=target, group=group, library_hard=library_hard, released_hard=released, hard=hard, cap=cap,
+                reason=f"diversity:o70_full:{group}" if hard >= cap else None)
+
+
+def admission(P, it, stage):
+    """Record the same decision in observation and enforcement modes; return a reason only when enforced.
+
+    The official-task quota (diversity.o70_*) is checked before a paper's first authoring job only (S5G): the tier of
+    a new task is not known yet, and a group that already holds o70_max_hard hard tasks cannot use another task of
+    any tier.  It is enforced by diversity.o70_enforce, independently of the area / template rules."""
+    cfg = P.cfg["diversity"]
+    # only a paper's first authoring: re-authoring after a finished S5G job and hardening rounds are already invested
+    first = stage == "S5G" and not it.state.get("harden_active") and not it.p("S5G_result.json").exists()
+    o70 = o70_quota(P, it) if first else None
     candidate = item_template(it.dir, early=stage == "S5G")
     ids = released_ids(P.store.root) - {it.item_id}
     live = [item_template(P.store.root / "items" / i) for i in sorted(ids)]
@@ -163,11 +224,15 @@ def admission(P, it, stage):
         reason = f"diversity:template_full:{cluster}"
     decision = dict(area=candidate.area, released=len(live), share=share, template_members=members, reason=reason,
                     enforce=cfg["enforce"])
+    if o70 is not None:
+        decision["o70"] = dict(o70, enforce=bool(cfg.get("o70_enforce")))
     history = it.state.setdefault("diversity", {})
     if history.get(stage) != decision:
         history[stage] = decision
         it.save()
         P.store.event("diversity_admission", item=it.item_id, stage=stage, **decision)
+    if o70 and o70.get("reason") and cfg.get("o70_enforce"):
+        return o70["reason"]
     return reason if cfg["enforce"] else None
 
 
