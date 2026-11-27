@@ -415,9 +415,13 @@ def launchers(cfg: dict) -> list[dict]:
     c = cfg["calib"]
     cc = cfg.get("code") or {}
     out = []
-    for label, root, script in (("calib.teacher", c.get("harbor_root"), c.get("teacher_launcher")),
+    # the same roots the launch paths use: the teacher (and review) launcher lives in calib.teacher_harbor_root when
+    # that is set (calib.role), the code agent in code.agent_harbor_root, else the teacher root
+    from .calib import role
+    teacher_root = role(c, "teacher", "harbor_root")
+    for label, root, script in (("calib.teacher", teacher_root, c.get("teacher_launcher")),
                                 ("calib.student", c.get("harbor_root"), c.get("student_launcher")),
-                                ("code.agent", cc.get("agent_harbor_root"),
+                                ("code.agent", cc.get("agent_harbor_root") or c.get("teacher_harbor_root"),
                                  cc.get("agent_launcher") or c.get("teacher_launcher"))):
         if script and root:
             out.append(dict(label=label, root=str(root), script=str(script), path=str(Path(str(root)) / str(script))))

@@ -433,3 +433,16 @@ def test_cli_smoke_subcommand_is_registered():
     finally:
         cli._smoke = orig
     assert seen["a"].dry_run is True and seen["a"].skip == "docker" and seen["a"].budget_usd == 0.01
+
+
+def test_launchers_use_the_teacher_harbor_root():
+    """Production (h20x) keeps the teacher launcher in calib.teacher_harbor_root, apart from the student's harbor_root:
+    the check must look where calib.role() launches it, not report it missing."""
+    cfg = {"calib": {"harbor_root": "/a", "teacher_harbor_root": "/t", "teacher_launcher": "h20-harbor.sh",
+                     "student_launcher": "h20-o70.sh"}, "code": {}}
+    got = {x["label"]: x["path"] for x in smoke.launchers(cfg)}
+    assert got == {"calib.teacher": "/t/h20-harbor.sh", "calib.student": "/a/h20-o70.sh",
+                   "code.agent": "/t/h20-harbor.sh"}
+    cfg["calib"].pop("teacher_harbor_root")
+    got = {x["label"]: x["path"] for x in smoke.launchers(cfg)}
+    assert got["calib.teacher"] == "/a/h20-harbor.sh" and "code.agent" not in got
