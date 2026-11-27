@@ -399,7 +399,7 @@ uv run tbsgen smoke --run runs/R --config config.toml --stage-job      # 再加�
 | `breakers` | 只读打开 `<run>/ledger.sqlite`，有打开的熔断就失败并给出复位命令 | 账本是从旧主机拷来的，带着旧的熔断状态 |
 | `models` | 每个配置的模型路由发一次极小的真实请求（教师路由走 `TeacherClient`，S4c/S5G 走 Claude Code 的 `ANTHROPIC_BASE_URL`/token），并核对回流模型名 | 中继路由错、模型名不符（S4c 走了 S5G 的路由）、key 失效 |
 | `docker` | 启动器那个构建主机上的 docker daemon 可达 | 迁移后 docker 没起 |
-| `buildx` | 用启动器会选的 builder（`taskimage.builder`）对本地一个 `tbsgen-task:` 镜像做两行 Dockerfile 的 `docker buildx build --output type=cacheonly` | 用了容器驱动的 builder，看不到宿主镜像库 → 真实构建时 `pull access denied`；报告会直接给这条提示 |
+| `buildx` | 用启动器构建 `FROM tbsgen-task:` 时实际选的 builder（宿主 daemon 的 `default`，可由 `[smoke] buildx_builder` 覆盖）对本地一个 `tbsgen-task:` 镜像做 `FROM` + `LABEL` 两行 Dockerfile 的 `docker buildx build --output type=cacheonly`（不含 `RUN`，不需要构建网络） | builder 看不到宿主镜像库 → 真实构建时 `pull access denied`；报告会直接给这条提示 |
 | `egress` | 构建主机上 `curl` 探 `models.teacher.url` 与 `code.install_hosts`（可 `[smoke.egress] urls` 覆盖），每个都限时 | Harbor 出口探针超时 |
 | `launchers` | `calib.harbor_root` / `code.agent_harbor_root` 下的启动脚本存在且 `bash -n` 通过 | 迁移后路径不对 |
 | `disk` | 构建主机 `code.remote_root` 剩余空间（`[smoke.disk] min_free_gb`，默认 10） | 镜像写满 |
