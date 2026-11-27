@@ -210,10 +210,22 @@ becomes due again when the earliest of those limits lifts. `tbsgen fetch --only 
 idents) processes just those entries, due or not. Only one `tbsgen fetch` drains a queue at a time, and only one
 process at a time uses a browser TaskSpace (a second one skips the browser channel). With full text, a teacher endpoint and a
 budget in `my.toml` (see below), `tbsgen run` continues into the model stages. The other commands
-(`resume`, `reset`, `breaker`, `calib-ingest`, `calib watch`, `calib prepare`, `review build`, `harbor-local`, `ping`)
-are documented in [`gen/README.md`](gen/README.md) §3; calibrating only some items, the environment-preparation hook
+(`resume`, `reset`, `breaker`, `calib-ingest`, `calib watch`, `calib prepare`, `review build`, `harbor-local`, `ping`,
+`smoke`) are documented in [`gen/README.md`](gen/README.md) §3; calibrating only some items, the environment-preparation hook
 (`calib.prepare_command`), teacher-only routing (`calib.teacher_*`) and the S9R review settings (`review.*`, on by
 default; routed like the teacher unless set) are in §4–§5b there.
+
+Before the first real run on a (new) host, `uv run --directory gen tbsgen smoke --run ../runs/R --config ../my.toml`
+preflights the environment without touching a production item: each configured model route (teacher, pre-review, and
+the S4c / S5G agent routes with their own `ANTHROPIC_BASE_URL`) answers one tiny real request booked under stage
+`SMOKE` in `<run>/smoke/ledger.sqlite` with a hard total cap of $0.05 (the run's own ledger is only read), the run's
+circuit breakers are inspected, and the Docker daemon, the buildx builder the launcher would pick (a container-driver
+builder that cannot see the local `tbsgen-task:` image store fails here with `pull access denied`), the build host's
+egress probe, the launcher scripts (`bash -n`) and free disk are checked. `--stage-job` additionally launches ONE
+minimal real agent job per agent route on a built-in toy task under `<run>/smoke/` (never the items directory, capped
+by `--max-budget-usd`) and verifies the stage's required outputs are harvested. The command exits nonzero on failure
+and always writes a JSON report (`<run>/smoke/last-report.json`, or `--json-out`); `--dry-run` performs no external
+action. Details and the optional `[smoke]` settings: [`gen/README.md`](gen/README.md) §3b.
 
 Calibration preparation hooks may rewrite image settings but must preserve `[verifier].timeout_sec`.
 When an S9R config includes `TBSGEN_REVIEW_TASK_SHA` in the agent environment, sync the task and rewrite its path,

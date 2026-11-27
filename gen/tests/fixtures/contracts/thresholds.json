@@ -1,0 +1,8 @@
+{
+ "thresholds": {
+  "hidden_match_f1": {"threshold": 0.85, "direction": "min"},
+  "public_match_f1": {"threshold": 0.8, "direction": "min"},
+  "hidden_median_angle_err_deg": {"threshold": 0.15, "direction": "max"},
+  "public_coverage": {"threshold": 0.9, "direction": "min"}
+ }
+}

@@ -1,0 +1,41 @@
+{
+ "prompt_version": "3.0",
+ "form": "PROG",
+ "domain": "electron microscopy of polycrystalline thin films",
+ "shared_inputs": ["detector_params.json", "sample_metadata.csv"],
+ "data_formats": ["csv", "npy"],
+ "extra_pip": ["numpy==2.1.0", "scipy==1.13.1", "scikit-image==0.24.0"],
+ "depgraph": {
+  "nodes": [
+   {"id": "load", "kind": "compute", "desc": "read the particle table (detector_params.json) and the sample metadata"},
+   {"id": "denoise", "kind": "shift", "desc": "correct the detector gain drift from the metadata when it is recorded"},
+   {"id": "cluster", "kind": "compute", "desc": "assign detected particles to crystallite nuclei"},
+   {"id": "truth", "provision": "hidden_truth", "desc": "held-out crystallite labels for the hidden input sets"},
+   {"id": "score", "kind": "compute", "desc": "score the submitted matches against the held-out labels"},
+   {"id": "matches", "kind": "deliverable", "carrier": "output/matches.csv", "desc": "one row per matched crystallite"}
+  ],
+  "edges": [["load", "denoise"], ["denoise", "cluster"], ["cluster", "matches"], ["truth", "score"],
+            ["matches", "score"]],
+  "mid_drop": ["cluster"],
+  "naive_drop": ["cluster", "denoise"],
+  "deliverables": ["output/matches.csv"]
+ },
+ "metrics": [
+  {"name": "hidden_match_f1", "direction": ">=", "on": "hidden"},
+  {"name": "public_match_f1", "direction": ">=", "on": "public"},
+  {"name": "hidden_median_angle_err_deg", "direction": "<=", "on": "hidden"},
+  {"name": "public_coverage", "direction": ">=", "on": "public"}
+ ],
+ "output_contract": {"output/matches.csv": ["crystallite_id", "orientation_deg", "size_nm"]},
+ "generator_assumptions": [
+  {"assumption": "particle-to-nucleus assignment rule",
+   "stated": true,
+   "where": "each true crystallite is matched to the predicted nucleus that contains the largest number of its particles"},
+  {"assumption": "detector gain default",
+   "stated": true,
+   "where": "the detector gain is taken as unity when the metadata leaves it unset"},
+  {"assumption": "noise floor estimate",
+   "stated": false,
+   "where": "recovered from data: the median of the lowest-signal decile of the measured intensities"}
+ ]
+}

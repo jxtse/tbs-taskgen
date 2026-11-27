@@ -810,7 +810,8 @@ def test_model_reservation_entry_points():
                 send = next(kw.value for kw in call.keywords if kw.arg == "send")
                 sites.append((path.name, ast.unparse(send)))
     assert sorted(sites) == [("budget.py", "send"), ("calib.py", "send"), ("codeagent.py", "send"),
-                             ("models.py", "self.real"), ("screen_jev.py", "True"), ("stages_b.py", "True")]
+                             ("models.py", "self.real"), ("screen_jev.py", "True"), ("smoke.py", "True"),
+                             ("stages_b.py", "True")]
 
 
 def test_browser_plan_before_remote_lease_downloads_once(tmp_path, monkeypatch):
