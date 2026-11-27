@@ -35,6 +35,7 @@ import copy
 import json
 import os
 import shlex
+import shutil
 import sqlite3
 import subprocess
 import time
@@ -368,10 +369,13 @@ def check_buildx(cfg: dict, env, cap_timeout: float = 600, base_image: str | Non
     detail["builder"] = builder
     bx = taskimage._buildx({**cfg, "taskimage": {**cfg["taskimage"], "builder": builder}})
     argv = bx + ["--progress=plain", "--output", "type=cacheonly", "-f", "Dockerfile", "."]
-    with env.context(cfg, src) as ctx:
-        if str(ctx) != str(src):
-            argv = bx + ["--progress=plain", "--output", "type=cacheonly", "-f", f"{ctx}/Dockerfile", str(ctx)]
-        r = env.docker(argv, timeout=cap_timeout)
+    try:
+        with env.context(cfg, src) as ctx:
+            if str(ctx) != str(src):
+                argv = bx + ["--progress=plain", "--output", "type=cacheonly", "-f", f"{ctx}/Dockerfile", str(ctx)]
+            r = env.docker(argv, timeout=cap_timeout)
+    finally:
+        shutil.rmtree(src, ignore_errors=True)     # one probe dir per pid: do not accumulate them under <run>/smoke
     err = (r.get("err") or "") + (r.get("out") or "")
     ok = r.get("rc") == 0
     hint = None

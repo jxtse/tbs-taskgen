@@ -269,8 +269,8 @@ def test_buildx_probe_builds_from_a_local_tbsgen_task_image(tmp_path):
     argv = [a for k, a in env.calls if k == "docker" and " buildx build " in a][0]
     assert "--builder default" in argv and "type=cacheonly" in argv and c["detail"]["builder"] == "default"
     assert (tmp_path / "run" / "smoke").is_dir()
-    df = next((tmp_path / "run" / "smoke").glob("buildx-probe-*/Dockerfile")).read_text()
-    assert "RUN" not in df                       # no build network needed for the probe
+    assert "RUN" not in smoke.SMOKE_DOCKERFILE           # no build network needed for the probe
+    assert not list((tmp_path / "run" / "smoke").glob("buildx-probe-*"))   # probe dir removed afterwards
     cfg = _cfg(tmp_path, taskimage=dict(builder="tbsgen-builder"), smoke=dict(buildx_builder="tbsgen-builder"))
     env = FakeEnv(cfg)
     smoke.check_buildx(cfg, env)
