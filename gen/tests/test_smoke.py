@@ -260,13 +260,21 @@ def test_docker_daemon_unreachable_fails(tmp_path):
 
 
 def test_buildx_probe_builds_from_a_local_tbsgen_task_image(tmp_path):
+    """Builds FROM a daemon-local tbsgen-task: image use the daemon's `default` builder (as h20-harbor.sh does), not the
+    docker-container taskimage.builder, which cannot see the image store; [smoke] buildx_builder overrides."""
     cfg = _cfg(tmp_path, taskimage=dict(builder="tbsgen-builder"))
     env = FakeEnv(cfg)
     c = smoke.check_buildx(cfg, env)
     assert c["ok"] is True and c["detail"]["base_image"] == "tbsgen-task:abc123"
     argv = [a for k, a in env.calls if k == "docker" and " buildx build " in a][0]
-    assert "--builder tbsgen-builder" in argv and "type=cacheonly" in argv
+    assert "--builder default" in argv and "type=cacheonly" in argv and c["detail"]["builder"] == "default"
     assert (tmp_path / "run" / "smoke").is_dir()
+    df = next((tmp_path / "run" / "smoke").glob("buildx-probe-*/Dockerfile")).read_text()
+    assert "RUN" not in df                       # no build network needed for the probe
+    cfg = _cfg(tmp_path, taskimage=dict(builder="tbsgen-builder"), smoke=dict(buildx_builder="tbsgen-builder"))
+    env = FakeEnv(cfg)
+    smoke.check_buildx(cfg, env)
+    assert "--builder tbsgen-builder" in [a for k, a in env.calls if k == "docker" and " buildx build " in a][0]
 
 
 def test_buildx_builder_that_cannot_see_the_image_store_fails_with_a_hint(tmp_path):

@@ -337,7 +337,13 @@ def check_docker(cfg: dict, env, dry_run: bool = False) -> dict:
                                                error=None if ok else (r.get("err") or r.get("out") or "")[-600:]))
 
 
-SMOKE_DOCKERFILE = "FROM {image}\nRUN true\n"
+# LABEL, not RUN: the probe is about the builder seeing the base image; a RUN step also needs a build network, which
+# the host daemon's default builder does not have on h20x ("network bridge not found") and real task images never use
+SMOKE_DOCKERFILE = "FROM {image}\nLABEL tbsgen.smoke=1\n"
+# Builds FROM a daemon-local tbsgen-task: image (teacher / review / code-agent tasks) go through the host daemon's
+# `default` builder: the launcher (h20-harbor.sh) switches to it because a docker-container builder such as
+# taskimage.builder cannot see the daemon image store.  [smoke] buildx_builder overrides.
+SMOKE_BUILDX_BUILDER = "default"
 
 
 def check_buildx(cfg: dict, env, cap_timeout: float = 600, base_image: str | None = None,
@@ -358,12 +364,13 @@ def check_buildx(cfg: dict, env, cap_timeout: float = 600, base_image: str | Non
     src = smoke_dir(cfg) / f"buildx-probe-{os.getpid()}"
     src.mkdir(parents=True, exist_ok=True)
     (src / "Dockerfile").write_text(SMOKE_DOCKERFILE.format(image=image))
-    argv = taskimage._buildx(cfg) + ["--progress=plain", "--output", "type=cacheonly",
-                                     "-f", "Dockerfile", "."]
+    builder = str(settings(cfg).get("buildx_builder") or SMOKE_BUILDX_BUILDER)
+    detail["builder"] = builder
+    bx = taskimage._buildx({**cfg, "taskimage": {**cfg["taskimage"], "builder": builder}})
+    argv = bx + ["--progress=plain", "--output", "type=cacheonly", "-f", "Dockerfile", "."]
     with env.context(cfg, src) as ctx:
         if str(ctx) != str(src):
-            argv = taskimage._buildx(cfg) + ["--progress=plain", "--output", "type=cacheonly",
-                                             "-f", f"{ctx}/Dockerfile", str(ctx)]
+            argv = bx + ["--progress=plain", "--output", "type=cacheonly", "-f", f"{ctx}/Dockerfile", str(ctx)]
         r = env.docker(argv, timeout=cap_timeout)
     err = (r.get("err") or "") + (r.get("out") or "")
     ok = r.get("rc") == 0
