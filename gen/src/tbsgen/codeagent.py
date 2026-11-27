@@ -43,6 +43,7 @@ import subprocess
 import time
 import uuid
 from pathlib import Path
+from urllib.parse import quote
 
 from .state import read_json, write_json
 
@@ -214,7 +215,9 @@ def fetch_spec(primary: dict) -> dict:
         files = [f for f in primary.get("files") or [] if re.search(r"\.(zip|tar\.gz|tgz|tar)$", f, re.I)]
         if not files:
             return dict(kind="none", why="zenodo record without an archive")
-        return dict(kind="archive", url=f"https://zenodo.org/records/{rec}/files/{files[0]}?download=1", ref=None)
+        # file keys can hold spaces / '#' / '?' (e.g. "...-9eef031 2.zip"): quote each path segment, keep the '/'
+        return dict(kind="archive", url=f"https://zenodo.org/records/{rec}/files/{quote(files[0], safe='/')}?download=1",
+                    ref=None, zenodo=rec)
     if h == "cran":
         return dict(kind="archive", url="", ref=None, cran=str(primary.get("key", "")).split(":")[-1])
     if h == "pypi":
@@ -230,8 +233,10 @@ def s3c_fetch(cfg: dict, item_id: str, primary: dict, runner=None) -> dict:
         spec = dict(kind="archive", url=d, ref=None) if st else dict(kind="none", why=d)
     if spec.get("cran"):
         tb = _cran_tarball(str(spec["cran"]), cfg)
-        spec = dict(kind="archive", url=f"https://cran.r-project.org/src/contrib/{tb}", ref=None) if tb else \
+        spec = dict(kind="archive", url=_cran_url(str(spec["cran"]), tb, cfg), ref=None) if tb else \
             dict(kind="none", why="CRAN version unknown")
+    if spec.get("zenodo"):
+        spec = _zenodo_pick(spec, int(_c(cfg).get("max_repo_mb", 500)), cfg)
     if spec["kind"] == "none":
         return dict(ok=False, why="unsupported", detail=spec.get("why"))
     d = remote_item_dir(cfg, item_id)
@@ -265,6 +270,36 @@ def _pypi_sdist(name: str, cfg: dict) -> tuple[bool, str]:
         if u.get("packagetype") == "sdist":
             return True, u["url"]
     return False, "no sdist"
+
+
+def _cran_url(name: str, tarball: str, cfg: dict) -> str:
+    """src/contrib/<tarball> while the version is current; a package removed from CRAN (or superseded) keeps its
+    sources only under src/contrib/Archive/<name>/ -- crandb still reports that last version."""
+    current = f"https://cran.r-project.org/src/contrib/{tarball}"
+    from .codegate import http_head
+    if http_head(current, cfg) == 200:
+        return current
+    return f"https://cran.r-project.org/src/contrib/Archive/{name}/{tarball}"
+
+
+def _zenodo_pick(spec: dict, max_mb: int, cfg: dict) -> dict:
+    """A Zenodo record often carries several archives (code + data dumps).  Take the smallest archive that fits
+    code.max_repo_mb instead of the first one listed (2026-11-27: a 7 GB data tarball listed first hid the code);
+    when sizes are unknown keep the first archive.  No fitting archive -> kind none (too_large, not retried)."""
+    from .codegate import http_json
+    st, d = http_json(f"https://zenodo.org/api/records/{spec['zenodo']}", cfg)
+    if st != 200 or not isinstance(d, dict):
+        return spec
+    arch = [(f.get("key") or "", int(f.get("size") or 0)) for f in d.get("files") or []
+            if re.search(r"\.(zip|tar\.gz|tgz|tar)$", f.get("key") or "", re.I)]
+    if not arch:
+        return spec
+    fit = sorted((s, k) for k, s in arch if 0 < s <= max_mb * 1024 * 1024)
+    if not fit:
+        return dict(kind="none", why=f"zenodo archives all larger than {max_mb} MB: "
+                                     + ", ".join(f"{k} ({s // 1048576} MB)" for k, s in arch[:4]))
+    key = fit[0][1]
+    return dict(spec, url=f"https://zenodo.org/records/{spec['zenodo']}/files/{quote(key, safe='/')}?download=1")
 
 
 def _cran_tarball(name: str, cfg: dict) -> str | None:
