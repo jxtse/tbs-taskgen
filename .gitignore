@@ -18,6 +18,10 @@ config.local.toml
 *.local.toml
 
 # Internal development notes (design drafts, run logs, cost estimates) live here and are never committed.
+# Test fixtures that mirror a run receipt directory (`<out>/runs/*.json` + its log) are data, not run logs.
+!gen/tests/fixtures/contracts/s4c/runs/
+!gen/tests/fixtures/contracts/s4c/runs/**
+
 docs/internal/
 docs/DESIGN.md
 docs/E2E_LOG.md
