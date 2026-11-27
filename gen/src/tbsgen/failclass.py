@@ -57,6 +57,7 @@ PRE_AGENT = re.compile(r"(network_mode\s*=?\s*'?\w+'? is not supported|egress[- 
                        r"docker build .*failed|failed to fetch .*\b429\b|\b429 too many requests\b|"
                        r"E: (?:Failed to fetch|Unable to fetch)|EnvironmentStartTimeoutError|"
                        r"AgentSetupTimeoutError|AgentInstallError|environment (?:setup|start) failed)", re.I)
+PRE_AGENT_TAIL = 1500        # chars of the launcher log tail searched for a pre-agent failure
 _PATH = re.compile(r"(?:[A-Za-z]:)?(?:/[\w.\-+@%]+){2,}/?")
 _HEX = re.compile(r"\b[0-9a-f]{8,}\b", re.I)
 _NUM = re.compile(r"\b\d+(?:\.\d+)?\b")
@@ -270,6 +271,7 @@ def classify(job_dir=None, rec: dict | None = None, *, trials=None, log_text: st
 
     exc = None
     msg = None
+    msg_from_log = False
     for _, r in trial_res:
         exc, m = _exception_of(r)
         if not exc:
@@ -297,6 +299,7 @@ def classify(job_dir=None, rec: dict | None = None, *, trials=None, log_text: st
         tail = log_text if log_text is not None else (_read_text(Path(rec["log"])) if rec.get("log") else "")
         if not msg and tail:
             msg = tail
+            msg_from_log = True
         if not exc and tail:
             m = re.search(r"(\w+(?:\.\w+)*(?:Error|Exception|Exit|Timeout))", tail)
             exc = m.group(1) if m else None
@@ -314,10 +317,15 @@ def classify(job_dir=None, rec: dict | None = None, *, trials=None, log_text: st
     #   * Harbor recorded the trial's failure (exception_info) and the trial has no agent start, files, usage or cost,
     #   * the launcher log / exception text names a failure that can only happen before the agent runs
     #     (egress-control probe, image build / pull, apt rate limit, environment start).
+    # Only the END of a launcher log counts: a setup step that hit apt 429 and then succeeded on retry leaves the
+    # 429 line early in the log of a job whose agent went on to run (a missing local copy would then look unstarted).
+    log_tail = (log_text if log_text is not None else
+                (_read_text(Path(rec["log"]), PRE_AGENT_TAIL) if rec.get("log") else ""))[-PRE_AGENT_TAIL:]
+    # a message picked out of the whole launcher log is evidence only if it sits in that tail
+    msg_ev = "" if msg_from_log and msg and msg not in log_tail else (msg or "")
     blob = "\n".join(x for x in (
-        exc or "", msg or "", str(rec.get("error") or ""),
-        _read_text(Path(rec["log"]), 4000) if rec.get("log") else "",
-        log_text or "", _exception_file(jd) if jd is not None else "") if x)
+        "" if msg_from_log and not msg_ev else (exc or ""), msg_ev, str(rec.get("error") or ""), log_tail,
+        _exception_file(jd) if jd is not None else "") if x)
     recorded = any(isinstance(r, dict) and r.get("exception_info") for t, r in trial_res if t is not None)
     pre_agent = bool(PRE_AGENT.search(blob))
     proved = bool(ev.get("not_started")) or recorded or pre_agent

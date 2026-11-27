@@ -296,3 +296,14 @@ def test_stage_transient_repeat_parks_on_third(tmp_path, monkeypatch):
     st = it.load().state
     assert st["status"] == "parked" and st["reason"].startswith("infra_repeat:"), st
     assert len(launcher.calls) == 3
+
+
+def test_pre_agent_text_counts_only_at_the_end_of_the_log(tmp_path):
+    """An apt 429 that a setup retry got past, followed by a long agent run, is not proof of 'no model call' when the
+    local job copy is missing: only the log's tail is searched."""
+    early = "E: Failed to fetch http://deb.debian.org/x.deb  429  Too Many Requests\n"
+    run = "".join(f"agent step {i}: tool call ok\n" for i in range(200)) + "harbor exit 1\n"
+    v = failclass.classify(tmp_path / "absent", {"job_dir": str(tmp_path / "absent")}, log_text=early + run)
+    assert v.kind == failclass.MODEL_FAILED, v
+    v = failclass.classify(tmp_path / "absent", {"job_dir": str(tmp_path / "absent")}, log_text=run + early)
+    assert v.kind == failclass.NO_MODEL_CALL, v
