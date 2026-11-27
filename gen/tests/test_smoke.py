@@ -260,14 +260,15 @@ def test_docker_daemon_unreachable_fails(tmp_path):
 
 
 def test_buildx_probe_builds_from_a_local_tbsgen_task_image(tmp_path):
-    """Builds FROM a daemon-local tbsgen-task: image use the daemon's `default` builder (as h20-harbor.sh does), not the
-    docker-container taskimage.builder, which cannot see the image store; [smoke] buildx_builder overrides."""
+    """Builds FROM a daemon-local tbsgen-task: image use the daemon's own docker-driver builder (as h20-harbor.sh
+    does; its name follows the docker context, so no --builder), not the docker-container taskimage.builder, which
+    cannot see the image store; [smoke] buildx_builder overrides."""
     cfg = _cfg(tmp_path, taskimage=dict(builder="tbsgen-builder"))
     env = FakeEnv(cfg)
     c = smoke.check_buildx(cfg, env)
     assert c["ok"] is True and c["detail"]["base_image"] == "tbsgen-task:abc123"
     argv = [a for k, a in env.calls if k == "docker" and " buildx build " in a][0]
-    assert "--builder default" in argv and "type=cacheonly" in argv and c["detail"]["builder"] == "default"
+    assert "--builder" not in argv and "type=cacheonly" in argv and c["detail"]["builder"] == "(context default)"
     assert (tmp_path / "run" / "smoke").is_dir()
     assert "RUN" not in smoke.SMOKE_DOCKERFILE           # no build network needed for the probe
     assert not list((tmp_path / "run" / "smoke").glob("buildx-probe-*"))   # probe dir removed afterwards

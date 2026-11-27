@@ -341,10 +341,12 @@ def check_docker(cfg: dict, env, dry_run: bool = False) -> dict:
 # LABEL, not RUN: the probe is about the builder seeing the base image; a RUN step also needs a build network, which
 # the host daemon's default builder does not have on h20x ("network bridge not found") and real task images never use
 SMOKE_DOCKERFILE = "FROM {image}\nLABEL tbsgen.smoke=1\n"
-# Builds FROM a daemon-local tbsgen-task: image (teacher / review / code-agent tasks) go through the host daemon's
-# `default` builder: the launcher (h20-harbor.sh) switches to it because a docker-container builder such as
-# taskimage.builder cannot see the daemon image store.  [smoke] buildx_builder overrides.
-SMOKE_BUILDX_BUILDER = "default"
+# Builds FROM a daemon-local tbsgen-task: image (teacher / review / code-agent tasks) go through the daemon's own
+# docker-driver builder: the launcher (h20-harbor.sh) switches to it because a docker-container builder such as
+# taskimage.builder cannot see the daemon image store.  That builder is named after the docker context in use
+# (`default` under DOCKER_HOST, `tbs-local` under the tbs-local context), so the probe passes no --builder and lets
+# buildx pick the current context's own one.  [smoke] buildx_builder overrides.
+SMOKE_BUILDX_BUILDER = None
 
 
 def check_buildx(cfg: dict, env, cap_timeout: float = 600, base_image: str | None = None,
@@ -365,8 +367,8 @@ def check_buildx(cfg: dict, env, cap_timeout: float = 600, base_image: str | Non
     src = smoke_dir(cfg) / f"buildx-probe-{os.getpid()}"
     src.mkdir(parents=True, exist_ok=True)
     (src / "Dockerfile").write_text(SMOKE_DOCKERFILE.format(image=image))
-    builder = str(settings(cfg).get("buildx_builder") or SMOKE_BUILDX_BUILDER)
-    detail["builder"] = builder
+    builder = settings(cfg).get("buildx_builder") or SMOKE_BUILDX_BUILDER
+    detail["builder"] = builder or "(context default)"
     bx = taskimage._buildx({**cfg, "taskimage": {**cfg["taskimage"], "builder": builder}})
     argv = bx + ["--progress=plain", "--output", "type=cacheonly", "-f", "Dockerfile", "."]
     try:
