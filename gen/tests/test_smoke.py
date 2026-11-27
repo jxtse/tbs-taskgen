@@ -260,13 +260,22 @@ def test_docker_daemon_unreachable_fails(tmp_path):
 
 
 def test_buildx_probe_builds_from_a_local_tbsgen_task_image(tmp_path):
+    """Builds FROM a daemon-local tbsgen-task: image use the daemon's own docker-driver builder (as h20-harbor.sh
+    does; its name follows the docker context, so no --builder), not the docker-container taskimage.builder, which
+    cannot see the image store; [smoke] buildx_builder overrides."""
     cfg = _cfg(tmp_path, taskimage=dict(builder="tbsgen-builder"))
     env = FakeEnv(cfg)
     c = smoke.check_buildx(cfg, env)
     assert c["ok"] is True and c["detail"]["base_image"] == "tbsgen-task:abc123"
     argv = [a for k, a in env.calls if k == "docker" and " buildx build " in a][0]
-    assert "--builder tbsgen-builder" in argv and "type=cacheonly" in argv
+    assert "--builder" not in argv and "type=cacheonly" in argv and c["detail"]["builder"] == "(context default)"
     assert (tmp_path / "run" / "smoke").is_dir()
+    assert "RUN" not in smoke.SMOKE_DOCKERFILE           # no build network needed for the probe
+    assert not list((tmp_path / "run" / "smoke").glob("buildx-probe-*"))   # probe dir removed afterwards
+    cfg = _cfg(tmp_path, taskimage=dict(builder="tbsgen-builder"), smoke=dict(buildx_builder="tbsgen-builder"))
+    env = FakeEnv(cfg)
+    smoke.check_buildx(cfg, env)
+    assert "--builder tbsgen-builder" in [a for k, a in env.calls if k == "docker" and " buildx build " in a][0]
 
 
 def test_buildx_builder_that_cannot_see_the_image_store_fails_with_a_hint(tmp_path):
@@ -433,3 +442,16 @@ def test_cli_smoke_subcommand_is_registered():
     finally:
         cli._smoke = orig
     assert seen["a"].dry_run is True and seen["a"].skip == "docker" and seen["a"].budget_usd == 0.01
+
+
+def test_launchers_use_the_teacher_harbor_root():
+    """Production (h20x) keeps the teacher launcher in calib.teacher_harbor_root, apart from the student's harbor_root:
+    the check must look where calib.role() launches it, not report it missing."""
+    cfg = {"calib": {"harbor_root": "/a", "teacher_harbor_root": "/t", "teacher_launcher": "h20-harbor.sh",
+                     "student_launcher": "h20-o70.sh"}, "code": {}}
+    got = {x["label"]: x["path"] for x in smoke.launchers(cfg)}
+    assert got == {"calib.teacher": "/t/h20-harbor.sh", "calib.student": "/a/h20-o70.sh",
+                   "code.agent": "/t/h20-harbor.sh"}
+    cfg["calib"].pop("teacher_harbor_root")
+    got = {x["label"]: x["path"] for x in smoke.launchers(cfg)}
+    assert got["calib.teacher"] == "/a/h20-harbor.sh" and "code.agent" not in got

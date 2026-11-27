@@ -35,6 +35,7 @@ import copy
 import json
 import os
 import shlex
+import shutil
 import sqlite3
 import subprocess
 import time
@@ -337,7 +338,15 @@ def check_docker(cfg: dict, env, dry_run: bool = False) -> dict:
                                                error=None if ok else (r.get("err") or r.get("out") or "")[-600:]))
 
 
-SMOKE_DOCKERFILE = "FROM {image}\nRUN true\n"
+# LABEL, not RUN: the probe is about the builder seeing the base image; a RUN step also needs a build network, which
+# the host daemon's default builder does not have on h20x ("network bridge not found") and real task images never use
+SMOKE_DOCKERFILE = "FROM {image}\nLABEL tbsgen.smoke=1\n"
+# Builds FROM a daemon-local tbsgen-task: image (teacher / review / code-agent tasks) go through the daemon's own
+# docker-driver builder: the launcher (h20-harbor.sh) switches to it because a docker-container builder such as
+# taskimage.builder cannot see the daemon image store.  That builder is named after the docker context in use
+# (`default` under DOCKER_HOST, `tbs-local` under the tbs-local context), so the probe passes no --builder and lets
+# buildx pick the current context's own one.  [smoke] buildx_builder overrides.
+SMOKE_BUILDX_BUILDER = None
 
 
 def check_buildx(cfg: dict, env, cap_timeout: float = 600, base_image: str | None = None,
@@ -358,13 +367,17 @@ def check_buildx(cfg: dict, env, cap_timeout: float = 600, base_image: str | Non
     src = smoke_dir(cfg) / f"buildx-probe-{os.getpid()}"
     src.mkdir(parents=True, exist_ok=True)
     (src / "Dockerfile").write_text(SMOKE_DOCKERFILE.format(image=image))
-    argv = taskimage._buildx(cfg) + ["--progress=plain", "--output", "type=cacheonly",
-                                     "-f", "Dockerfile", "."]
-    with env.context(cfg, src) as ctx:
-        if str(ctx) != str(src):
-            argv = taskimage._buildx(cfg) + ["--progress=plain", "--output", "type=cacheonly",
-                                             "-f", f"{ctx}/Dockerfile", str(ctx)]
-        r = env.docker(argv, timeout=cap_timeout)
+    builder = settings(cfg).get("buildx_builder") or SMOKE_BUILDX_BUILDER
+    detail["builder"] = builder or "(context default)"
+    bx = taskimage._buildx({**cfg, "taskimage": {**cfg["taskimage"], "builder": builder}})
+    argv = bx + ["--progress=plain", "--output", "type=cacheonly", "-f", "Dockerfile", "."]
+    try:
+        with env.context(cfg, src) as ctx:
+            if str(ctx) != str(src):
+                argv = bx + ["--progress=plain", "--output", "type=cacheonly", "-f", f"{ctx}/Dockerfile", str(ctx)]
+            r = env.docker(argv, timeout=cap_timeout)
+    finally:
+        shutil.rmtree(src, ignore_errors=True)     # one probe dir per pid: do not accumulate them under <run>/smoke
     err = (r.get("err") or "") + (r.get("out") or "")
     ok = r.get("rc") == 0
     hint = None
@@ -415,9 +428,13 @@ def launchers(cfg: dict) -> list[dict]:
     c = cfg["calib"]
     cc = cfg.get("code") or {}
     out = []
-    for label, root, script in (("calib.teacher", c.get("harbor_root"), c.get("teacher_launcher")),
+    # the same roots the launch paths use: the teacher (and review) launcher lives in calib.teacher_harbor_root when
+    # that is set (calib.role), the code agent in code.agent_harbor_root, else the teacher root
+    from .calib import role
+    teacher_root = role(c, "teacher", "harbor_root")
+    for label, root, script in (("calib.teacher", teacher_root, c.get("teacher_launcher")),
                                 ("calib.student", c.get("harbor_root"), c.get("student_launcher")),
-                                ("code.agent", cc.get("agent_harbor_root"),
+                                ("code.agent", cc.get("agent_harbor_root") or c.get("teacher_harbor_root"),
                                  cc.get("agent_launcher") or c.get("teacher_launcher"))):
         if script and root:
             out.append(dict(label=label, root=str(root), script=str(script), path=str(Path(str(root)) / str(script))))
