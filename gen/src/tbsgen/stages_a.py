@@ -934,7 +934,7 @@ def _s4c(P, it):
         # a runnable verdict needs: reason "ok", the how-to, a verifier pass and a wrapper receipt with exit code 0
         # whose command is the reported entry (and its log)
         ok_runs = [r for r in receipts if r.get("rc") == 0 and str(r.get("cmd", "")).strip() ==
-                   str(res.get("entry", "")).strip() and out and codeagent.safe_read(out / str(r.get("log", "")),
+                   str(res.get("entry", "")).strip() and out and codeagent.safe_log_tail(out / str(r.get("log", "")),
                                                                                     root=out) is not None]
         bad = [k for k, ok in (("reason", res.get("reason") == "ok"), ("entry", bool(str(res.get("entry", "")).strip())),
                                ("HOWTO.md", it.p("S4c", "HOWTO.md").exists()), ("reward", rec.get("reward") == 1),
@@ -942,7 +942,7 @@ def _s4c(P, it):
         if bad:
             res = dict(res, runnable=False, reason="invalid_result", invalid=bad)
         else:
-            it.p("S4c", "run.log").write_text(codeagent.safe_read(out / str(ok_runs[-1]["log"]), root=out) or "")
+            it.p("S4c", "run.log").write_text(codeagent.safe_log_tail(out / str(ok_runs[-1]["log"]), root=out) or "")
     elif isinstance(res, dict) and not isinstance(res.get("runnable"), bool):
         res = dict(res, runnable=False, reason="invalid_result", invalid=["runnable"])
     write_json(it.p("S4c_runnability.json"), dict(job=rec.get("job_name"), outcome=rec.get("outcome"),

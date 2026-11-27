@@ -556,7 +556,7 @@ def _trial_delivered(trial, kind, required, image_outputs=False):
             for receipt in receipts:
                 log = receipt.get("log")
                 if isinstance(log, str) and (out / log).is_relative_to(out):
-                    if safe_read(out / log, root=out) is None:
+                    if safe_log_tail(out / log, root=out) is None:
                         return False
             return bool(receipts)
     return True
@@ -958,3 +958,23 @@ def safe_read(p: Path, limit: int = 2_000_000, root: Path | None = None) -> str 
     if not _inside(Path(root or p.parent), p) or not p.is_file() or p.stat().st_size > limit:
         return None
     return p.read_text(errors="replace")
+
+
+LOG_TAIL_BYTES = 2_000_000
+
+
+def safe_log_tail(p: Path, root: Path | None = None, limit: int = LOG_TAIL_BYTES) -> str | None:
+    """A run log (S4c receipt log) as evidence: same link rule as safe_read, but a log larger than `limit` is not
+    "missing" -- its last `limit` bytes are returned (with a one-line truncation note).  A long build/train log is
+    normal for a real author run (2026-11-27: an 8 MB and a 2.05 MB log made finished runnable jobs look
+    undelivered / invalid)."""
+    p = Path(p)
+    if not _inside(Path(root or p.parent), p) or not p.is_file():
+        return None
+    size = p.stat().st_size
+    if size <= limit:
+        return p.read_text(errors="replace")
+    with p.open("rb") as f:
+        f.seek(size - limit)
+        tail = f.read(limit).decode(errors="replace")
+    return f"[log truncated: first {size - limit} of {size} bytes omitted]\n" + tail

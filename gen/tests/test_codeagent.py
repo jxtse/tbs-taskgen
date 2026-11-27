@@ -364,6 +364,40 @@ def test_s4c_runnable_then_s5g(tmp_path, monkeypatch):
     assert rows == [("S4c", 3.5, "ok")]
 
 
+def test_s4c_runnable_with_a_large_run_log(tmp_path, monkeypatch):
+    """A real author run can log more than safe_read's 2 MB: the receipt log still counts as evidence (its tail is
+    kept), so a finished runnable job is collected and advances (2026-11-27: a 2.05 MB log left it remote_unknown)."""
+    big = "x" * 100 + "\n"
+    log = big * 25_000 + "final line: ok\n"                     # ~2.5 MB
+    P, it, fl = _agent_item(tmp_path, monkeypatch, {
+        "runnability.json": json.dumps({"runnable": True, "reason": "ok", "language": "Python", "seconds": 3,
+                                        "entry": "python -m fastsmoother"}),
+        "HOWTO.md": "pip install .; python -m fastsmoother",
+        "runs/0.json": json.dumps({"cmd": "python -m fastsmoother", "rc": 0, "seconds": 3, "log": "runs/0.log"}),
+        "runs/0.log": log})
+    P.run(max_steps=1, until="S4c")
+    P.run(max_steps=2, until="S4c")
+    st = P.store.item(it.item_id).state
+    assert st["stage"] == "S5G", st
+    kept = it.p("S4c", "run.log").read_text()
+    assert kept.startswith("[log truncated:") and kept.endswith("final line: ok\n") and len(kept) < 2_100_000
+
+
+def test_safe_log_tail_keeps_the_link_rule(tmp_path):
+    from tbsgen import codeagent
+    out = tmp_path / "out"
+    (out / "runs").mkdir(parents=True)
+    (out / "runs" / "small.log").write_text("ok\n")
+    (out / "runs" / "big.log").write_text("a" * 50 + "TAIL")
+    (tmp_path / "secret").write_text("nope")
+    (out / "runs" / "link.log").symlink_to(tmp_path / "secret")
+    assert codeagent.safe_log_tail(out / "runs/small.log", root=out) == "ok\n"
+    tail = codeagent.safe_log_tail(out / "runs/big.log", root=out, limit=10)
+    assert tail.endswith("aaaaaaTAIL") and "first 44 of 54 bytes omitted" in tail
+    assert codeagent.safe_log_tail(out / "runs/link.log", root=out) is None
+    assert codeagent.safe_log_tail(out / "runs/missing.log", root=out) is None
+
+
 def test_s4c_not_runnable_gpu(tmp_path, monkeypatch):
     P, it, _ = _agent_item(tmp_path, monkeypatch, {
         "runnability.json": json.dumps({"runnable": False, "reason": "needs_gpu"}), "HOWTO.md": "x"})
