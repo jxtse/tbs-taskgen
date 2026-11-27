@@ -300,7 +300,10 @@ def _zenodo_pick(spec: dict, max_mb: int, cfg: dict) -> dict:
         return dict(kind="none", why=f"zenodo archives all larger than {max_mb} MB: "
                                      + ", ".join(f"{k} ({s // 1048576} MB)" for k, s in arch[:4]))
     key = fit[0][1]
-    return dict(spec, url=f"https://zenodo.org/records/{spec['zenodo']}/files/{quote(key, safe='/')}?download=1")
+    # A superseded record id redirects (302) to its newest version; the API answer carries that version's id, and the
+    # old id's /files/ URLs return 404 (2026-11-27: records 8382876 -> 10615686, 10552675 -> 10607854).
+    rec = str(d.get("id") or spec["zenodo"])
+    return dict(spec, url=f"https://zenodo.org/records/{rec}/files/{quote(key, safe='/')}?download=1")
 
 
 def _cran_tarball(name: str, cfg: dict) -> str | None:
