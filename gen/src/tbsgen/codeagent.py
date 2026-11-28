@@ -916,6 +916,24 @@ def stage_inputs(cfg: dict, it, work: Path, with_contract: bool) -> dict:
     return dict(work=str(work))
 
 
+def review_issues(item_dir: Path, max_items: int = 40) -> list[dict]:
+    """What earlier S9R reviews of this item found (both severities), oldest first: the hardening author must keep
+    every fix.  Only the reviewer's own titles / problem kinds / suggested fixes, never trace or verifier output."""
+    out = []
+    for p in sorted((Path(item_dir) / "review").glob("r*/verdict.json"),
+                    key=lambda q: int(q.parent.name[1:]) if q.parent.name[1:].isdigit() else 0):
+        v = read_json(p, None)
+        if not isinstance(v, dict):
+            continue
+        for i in (v.get("_normalized") or {}).get("issues") or v.get("issues") or []:
+            if not isinstance(i, dict) or not i.get("title"):
+                continue
+            out.append(dict(review=p.parent.name, verdict=(v.get("_normalized") or {}).get("verdict") or
+                            v.get("verdict"), severity=i.get("severity"), problem=i.get("problem"),
+                            title=str(i.get("title"))[:400], fix=str(i.get("fix") or "")[:600]))
+    return out[-max_items:]
+
+
 def _stage_difficulty(cfg: dict, it, work: Path) -> None:
     """S5G inputs of the difficulty targeting (difficulty.py): the weakness profile (/work/weakness_profile.md),
     and in a hardening round the previous version (/work/previous_version/: its task files, spec, difficulty
@@ -940,6 +958,9 @@ def _stage_difficulty(cfg: dict, it, work: Path) -> None:
                 "S5G/report.md"):
         if (prev / rel).is_file():
             (dst / Path(rel).name).write_bytes((prev / rel).read_bytes())
+    issues = review_issues(it.dir)
+    if issues:
+        write_json(dst / "review_issues.json", issues)
     for f in ("feedback.json",):
         if (rd / f).is_file():
             shutil.copy(rd / f, work / "student_feedback.json")

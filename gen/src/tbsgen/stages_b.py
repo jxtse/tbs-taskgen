@@ -1029,7 +1029,7 @@ def _s9(P, it):
     if it.state.get("harden_pending") or difficulty.should_harden(P.cfg, it, runs):
         # hardening loop: the student solved this version on its first attempt -> back to S5G (difficulty.py)
         return start_hardening(P, it)
-    act, what = calib.next_action(runs, P.cfg)
+    act, what = calib.next_action(runs, P.cfg, hardened=difficulty.hardened_version(it))
     if act == "run":
         wait = calib.preflight_wait(P.cfg, runs[-1] if runs else None)
         if wait:                        # the relay refused the last run: wait, then launch the same role again
@@ -2724,7 +2724,7 @@ def variant_cmd(P, it, reason: str) -> dict:
         if st.get("rescore_pending") or st.get("thresholds_locked") or st.get("review_revision_pending"):
             raise ValueError("variant: finish the pending re-score / revision / regate first")
         dec = difficulty.decisive(runs, P.cfg) or []
-        act, what = calib.next_action(runs, P.cfg)
+        act, what = calib.next_action(runs, P.cfg, hardened=difficulty.hardened_version(it))
         if (act, what) != ("label", "easy"):
             raise ValueError(f"variant: the current calibration is not easy ({act}: {what}); "
                              "a version needs both decisive student passes (or a quick pass)")

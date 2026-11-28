@@ -279,3 +279,74 @@ def test_s7_design_gate_off_still_measures_the_preferred_lever(tmp_path, monkeyp
     g = read_json(it.p("gates", "difficulty.json"))
     assert g["mode"] == "off" and any("preferred lever (EX01)" in x for x in g["hardening"]), g
     assert P.store.item(iid).state["reason"] == "difficulty_design_unproven"
+
+
+@pytest.mark.parametrize("exc", ["UnknownApiError", "ApiRateLimitError"])
+def test_model_connection_death_before_the_spec_is_infra(tmp_path, exc):
+    """Claude Code's "API Error: Connection dropped (ECONNRESET)" (UnknownApiError) or a relay 429 a few minutes
+    into the authoring job, before any spec: the round never got to work and must not use up its depth."""
+    from tbsgen.state import Item
+    it = Item(tmp_path, "x").load()
+    write_json(it.p("S5G_result.json"), dict(outcome="agent_error", exception=exc, minutes=6.3,
+                                             missing=["_spec/spec.json", "task/instruction.md"]))
+    assert difficulty.revert_infra(it, "S5G", "s5g_missing_files") == f"s5g:{exc}"
+    write_json(it.p("S5G_result.json"), dict(outcome="agent_error", exception=exc, missing=["report.md"]))
+    assert difficulty.revert_infra(it, "S5G", "s5g_missing_files") is None     # got as far as its spec: real
+
+
+def test_hardened_version_tracks_packaged_unreverted_rounds(tmp_path):
+    from tbsgen.state import Item
+    it = Item(tmp_path, "x").load()
+    assert not difficulty.hardened_version(it)
+    difficulty.write_round(it, 1, packaged=1.0)
+    assert difficulty.hardened_version(it)
+    difficulty.write_round(it, 2, reverted=dict(why="S5G:s5g_missing_files"))   # round 2 reverted: round 1 stays
+    assert difficulty.hardened_version(it)
+    difficulty.write_round(it, 1, reverted=dict(why="S8:x"))
+    assert not difficulty.hardened_version(it)
+
+
+def test_hardened_version_needs_two_student_runs_before_hard():
+    from tbsgen import calib
+    cfg = load_config(None, {})
+    f, p = dict(who="glm", outcome="fail", minutes=30), dict(who="glm", outcome="pass", minutes=30)
+    t = dict(who="teacher", outcome="pass", minutes=30)
+    assert calib.next_action([f], cfg) == ("run", "teacher")                       # first version: unchanged
+    assert calib.next_action([f, t], cfg) == ("label", "hard")
+    assert calib.next_action([f], cfg, hardened=True) == ("run", "glm")
+    assert calib.next_action([f, f], cfg, hardened=True) == ("run", "teacher")
+    assert calib.next_action([f, f, t], cfg, hardened=True) == ("label", "hard")
+    assert calib.next_action([f, p], cfg, hardened=True) == ("label", "unstable")
+    assert calib.next_action([f, t], cfg, hardened=True) == ("run", "glm")      # a teacher pass alone is not enough
+    assert calib.next_action([f, t, f], cfg, hardened=True) == ("label", "hard")
+    inf = dict(who="glm", outcome="infra", minutes=1)
+    assert calib.next_action([inf, f, inf], cfg, hardened=True) == ("run", "glm")   # infra runs are no attempts
+    one = load_config(None, {"calib": {"hardened_min_student_runs": 1}})
+    assert calib.next_action([f], one, hardened=True) == ("run", "teacher")
+
+
+def test_hardening_round_sees_earlier_review_issues(tmp_path, monkeypatch):
+    from tbsgen import codeagent
+    from tbsgen.stages_b import watch_tick
+    P, iid, counter, jobs = _calib_item(tmp_path, monkeypatch)
+    it = P.store.item(iid)
+    write_json(it.p("review", "r1", "verdict.json"), dict(verdict="revise", _normalized=dict(verdict="revise", issues=[
+        dict(id="I2", severity="blocking", problem="statement", title="signal is total, statement says specific",
+             fix="define it as total", evidence=["SECRET-EVIDENCE"])])))
+    watch_tick(P, only=[iid])
+    it = P.store.item(iid)
+    assert it.state["harden_active"]
+    work = tmp_path / "w"
+    codeagent._stage_difficulty(P.cfg, it, work.mkdir() or work)
+    got = read_json(work / "previous_version" / "review_issues.json")
+    assert got == [dict(review="r1", verdict="revise", severity="blocking", problem="statement",
+                        title="signal is total, statement says specific", fix="define it as total")]
+    assert "SECRET-EVIDENCE" not in json.dumps(got)
+
+
+def test_hardening_prompt_asks_for_an_edit_not_a_rewrite():
+    from tbsgen.prompts_code import CODE_PROMPT_VERSION, S5G_HARDEN, S5G_VARIANT
+    for p in (S5G_HARDEN, S5G_VARIANT):
+        assert "Edit the previous version, do not rewrite it" in p and "review_issues.json" in p
+        p.format(round=1, max_rounds=2, preferred="")
+    assert CODE_PROMPT_VERSION.startswith("cg-v8")

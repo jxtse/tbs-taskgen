@@ -125,18 +125,27 @@ regate 不复查（它们不改科学内容）。
 3. 清掉上一版的构建计数与过期产物，回到 S5G。S5G 额外得到 `/work/previous_version/`、`/work/student_feedback.json`
    （以及更早轮次的用时与余量 `earlier_rounds.json`），指令要求按画像从科学上加难，不允许只收紧阈值、把题面写含糊、
    加格式陷阱或缩短时限；`difficulty_design.json` 必须写 `hardening.changes` 和 `why_previous_solution_fails_now`。
+   自 `cg-v8`：要求在上一版基础上**局部修改**而非整篇重写（与新难点无关的题面句子、输入输出列名/单位、计分量定义保持
+   不变，必须改时各处一起改），并给出 `previous_version/review_issues.json`（此前各轮 S9R 发现的问题标题、类型与建议
+   修法，不含证据和 verifier 输出），要求不得把已修好的问题改回去；交付前逐行核对题面与生成器、参考解、计分脚本；
    每轮另给一份 S5G 额度（`harden_authoring_timeout_s` / `harden_authoring_max_usd`，默认等于 `code.authoring_*`）和一份
    `authoring_max_jobs`；
 4. 新版本照常 S6A_run → S6B（阈值按新测量和分离规则重推）→ S6C → S7（含上面的完整性检查）→ PKG → S9（从学生重新校准）；
 5. 新版本在 S5G..PKG 被淘汰 / 搁置（且尚未进入 S9R）时自动**回退**到上一版（`harden_revert`：文件从 `prev/` 还原，
    失败版本移到 `round-k/failed/`，上一版的校准记录从 epoch 归档移回），按原规则继续校准。回退原因若属于基础设施
    （`difficulty.revert_infra`：S5G 作业 launcher_failed / no_result，或 agent 以 NonZeroAgentExitCodeError /
-   AgentSetupTimeoutError / EnvironmentStartTimeoutError 结束且缺交付文件；`code:*:launch_failed`；
+   AgentSetupTimeoutError / EnvironmentStartTimeoutError，或模型连接失败 UnknownApiError（Claude Code 的
+   `API Error: Connection dropped (ECONNRESET)`）/ ApiRateLimitError / RateLimitError / NetworkConnectionError 结束，
+   且连 `_spec/spec.json` 都没交；`code:*:launch_failed`；
    `model_error:*:network|stream|empty`），记 `harden_reverted[].infra`，**不消耗** `harden_max_rounds`，也不设
    `harden_exhausted`，上一版的学生通过记录会再触发一次加难；其他原因（费用上限 `s5g_budget_exhausted` /
    `item_harden_usd_cap`、agent 超时、交付不全、分离不成立等）计为一轮并设 `harden_exhausted=true`；
 6. 轮次用尽（不计 infra 回退的轮数 ≥ `harden_max_rounds`，或总加难启动次数 ≥ `harden_max_attempts`，默认 4，防止
    infra 死循环；或 `harden_exhausted`）后按原规则：第 2 次学生运行 → easy / unstable。
+7. **加难后版本的 hard 门槛**（`calib.hardened_min_student_runs`，默认 2；`difficulty.hardened_version`：有已打包且未
+   回退的加难/S9b 轮次）：学生首次失败不直接进教师分支，先补跑学生到 2 次有效尝试（infra 不计）；其中有一次通过 →
+   unstable；都失败才看教师（教师已有通过也要等学生补齐）。原因：加难重写可能引入题面缺陷，单次学生失败不足以说明
+   题目真难。设为 1 恢复旧规则。
 
 可中断、可恢复、幂等：每一步先写状态再动文件；快照有 `DONE` 标记；epoch 只在仍为当前 epoch 时归档；重跑 S9 时用
 `harden_pending` 继续同一轮，不会再次付费。账本里加难作业仍记为阶段 `S5G`；事件 `harden_start`、`harden_authored`、
