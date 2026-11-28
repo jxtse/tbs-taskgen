@@ -26,6 +26,10 @@ The tasks are meant for evaluating terminal agents and for building agent traini
 
 ## How it works
 
+![TB-Science task-generation pipeline: steps and where each one runs](docs/figures/pipeline.png)
+
+*The production pipeline (labels in Chinese): blue lines follow one paper through three phases — paper admission, task building, calibration and release; black lines are data moving between the production host, the full-text download host, the monitoring workstation and external services. The last step (training library admission) is run by a separate repository.*
+
 ```
 retrieval/ (tbsretr)                       gen/ (tbsgen)
 ────────────────────                       ──────────────────────────────────────────────────────────
