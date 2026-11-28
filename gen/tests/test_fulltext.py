@@ -251,6 +251,32 @@ def test_daily_cap_and_hourly_cap(tmp_path):
         led.acquire("elsevier", "api.elsevier.com", "d3")
 
 
+def test_meta_limits_per_host(tmp_path):
+    """fulltext.meta_limits raises one metadata host's caps; other hosts keep META_LIMITS."""
+    clock = FakeClock()
+    fast = dict(daily_calls=3, hourly_calls=3, gap_s=0, jitter_s=0)
+    led = DownloadLedger(tmp_path / "l.sqlite", clock=clock, sleep=clock.sleep,
+                         meta_limits={"api.unpaywall.org": dict(fast, daily_calls=5, hourly_calls=5)})
+    led.meta = dict(fast)                                      # default for every other host
+    for _ in range(5):
+        led.acquire_meta("api.unpaywall.org")
+    with pytest.raises(LimitReached, match="metadata cap reached for api.unpaywall.org"):
+        led.acquire_meta("api.unpaywall.org")
+    for _ in range(3):
+        led.acquire_meta("www.ebi.ac.uk")
+    with pytest.raises(LimitReached, match="metadata cap reached for www.ebi.ac.uk"):
+        led.acquire_meta("www.ebi.ac.uk")
+
+
+def test_meta_limits_from_config(tmp_path):
+    cfg = load_config(None, {"run": {"root": str(tmp_path)},
+                             "fulltext": {"meta_limits": {"api.unpaywall.org": {"daily_calls": 20000}}}})
+    f = Fetcher(cfg)
+    assert f.ledger.meta_host["api.unpaywall.org"]["daily_calls"] == 20000
+    assert f.ledger.meta_host["api.unpaywall.org"]["hourly_calls"] == 400   # unspecified keys keep the default
+    assert "www.ebi.ac.uk" not in f.ledger.meta_host
+
+
 def test_pending_reservations_count_against_caps(tmp_path):
     clock = FakeClock()
     led = DownloadLedger(tmp_path / "l.sqlite", {"browser": {"daily_ok": 1, "gap_s": 0, "jitter_s": 0}},

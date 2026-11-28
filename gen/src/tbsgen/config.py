@@ -291,6 +291,7 @@ DEFAULTS: dict[str, Any] = {
         "limits": {},
         "global_limits": {},
         "host_caps": {},
+        "meta_limits": {},                  # per metadata host: daily_calls / hourly_calls / gap_s / jitter_s
     },
     # Order in which active items are stepped (pipeline.Pipeline.order).  Matters for the expensive model stages:
     # with a daily call cap only the first few papers get S5 each day.  e2e-prod-20261109 ordered globally by Jev
