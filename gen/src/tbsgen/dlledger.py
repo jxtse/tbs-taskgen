@@ -161,7 +161,8 @@ def sqlite_wait(db, operation, deadline, resource):
 
 class DownloadLedger:
     def __init__(self, path: str | Path, limits: dict | None = None, global_limits: dict | None = None,
-                 host_caps: dict | None = None, clock=time.time, sleep=time.sleep, *, init_deadline=None):
+                 host_caps: dict | None = None, clock=time.time, sleep=time.sleep, *, init_deadline=None,
+                 meta_limits: dict | None = None):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.limits = {k: dict(v) for k, v in DEFAULT_LIMITS.items()}
@@ -169,7 +170,10 @@ class DownloadLedger:
             self.limits[ch] = {**self.limits.get(ch, DEFAULT_LIMITS["oa"]), **v}
         self.g = {**DEFAULT_GLOBAL, **(global_limits or {})}
         self.host_caps = {**DEFAULT_HOST_CAPS, **(host_caps or {})}
+        # per-host overrides of META_LIMITS, e.g. {"api.unpaywall.org": {"daily_calls": 20000}} (Unpaywall asks
+        # for at most 100,000 calls/day); unlisted hosts keep META_LIMITS
         self.meta = dict(META_LIMITS)
+        self.meta_host = {h: {**META_LIMITS, **v} for h, v in (meta_limits or {}).items()}
         self._exclude: int | None = None
         self.clock, self.sleep = clock, sleep
         self._local = threading.local()      # one sqlite connection per thread (browser workers run in threads)
@@ -349,16 +353,17 @@ class DownloadLedger:
                                     (self.today(), host)).fetchone()[0]
             n_hour = self.db.execute("select count(*) from meta_calls where ts>? and host=?",
                                      (now - 3600, host)).fetchone()[0]
-            if n_day >= self.meta["daily_calls"]:
+            meta = self.meta_host.get(host, self.meta)
+            if n_day >= meta["daily_calls"]:
                 raise LimitReached(f"metadata cap reached for {host}", "cap", "host", until=next_midnight(now))
-            if n_hour >= self.meta["hourly_calls"]:
+            if n_hour >= meta["hourly_calls"]:
                 t0 = self.db.execute("select min(ts) from meta_calls where ts>? and host=?",
                                      (now - 3600, host)).fetchone()[0]
                 raise LimitReached(f"metadata cap reached for {host}", "cap", "host", until=(t0 or now) + 3600)
             nxt = self.db.execute("select next_ts from hosts where host=?", (key,)).fetchone()
             slot = max(now, nxt[0] if nxt else 0.0)
             self.db.execute("insert or replace into hosts values(?,?)",
-                            (key, slot + self.meta["gap_s"] + random.uniform(0, self.meta["jitter_s"])))
+                            (key, slot + meta["gap_s"] + random.uniform(0, meta["jitter_s"])))
             self.db.execute("insert into meta_calls values(?,?,?,?,?)", (slot, local_day(slot), host, "sent", None))
         if (wait := slot - self.clock()) > 0:
             self.sleep(wait)

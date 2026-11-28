@@ -467,7 +467,8 @@ class Fetcher:
             self.transport = make_transport(bool(ft.get("use_env_proxy")), ft.get("ca_file"))
         if self.ledger is None:
             self.ledger = DownloadLedger(ledger_path(self.cfg), ft.get("limits"), ft.get("global_limits"),
-                                         ft.get("host_caps"), init_deadline=init_deadline)
+                                         ft.get("host_caps"), init_deadline=init_deadline,
+                                         meta_limits=ft.get("meta_limits"))
         self._egress: dict | None = None
         self._egress_browser: dict | None = None
         self._egress_lock = threading.Lock()
