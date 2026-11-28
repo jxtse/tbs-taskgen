@@ -528,6 +528,9 @@ DEFAULTS: dict[str, Any] = {
         "agent_allowed_hosts": [],
         "glm_runs_on_first_fail": 1,        # first GLM fail -> teacher (no 2nd GLM run)
         "teacher_runs_max": 2,
+        # decisive student runs a version built by a hardening / S9b round needs before the teacher branch can
+        # label it hard (its first failure may come from a defect the re-authoring introduced); 1 = the old rule
+        "hardened_min_student_runs": 2,
         "quick_pass_minutes": None,         # 待定: 1st-pass shortcut to "easy" (e.g. 30); None=off
         "keep_labels": ["hard", "unstable"],  # decision 2026-11-05: GLM 1/2, or GLM 0 + teacher pass
         # GLM 0 + every teacher run a real (non-infra, non-timeout) fail -> "frontier": released on its own channel

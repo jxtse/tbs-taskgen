@@ -354,6 +354,17 @@ def decisive(runs: list[dict], cfg: dict) -> list[dict] | None:
         return None
 
 
+def hardened_version(it) -> bool:
+    """The current version was built by a hardening / S9b round: some round's new version was packaged and that
+    round was not reverted (a revert puts the round's previous version back, which may itself be an earlier
+    round's hardened version)."""
+    for p in it.p("harden").glob("round-*/record.json") if it.p("harden").is_dir() else []:
+        rec = read_json(p, {}) or {}
+        if rec.get("packaged") and not rec.get("reverted"):
+            return True
+    return False
+
+
 def rounds_used(it) -> int:
     """Hardening rounds that count against harden_max_rounds: every start except those reverted for
     infrastructure (state.harden_reverted[].infra)."""
@@ -428,7 +439,10 @@ def variant_rounds_left(cfg: dict, it) -> bool:
 
 
 # reasons of a failed hardened version that are infrastructure, not the round's science or budget
-_INFRA_EXC = {"NonZeroAgentExitCodeError", "AgentSetupTimeoutError", "EnvironmentStartTimeoutError"}
+_INFRA_EXC = {"NonZeroAgentExitCodeError", "AgentSetupTimeoutError", "EnvironmentStartTimeoutError",
+              # the model connection failed (Claude Code: "API Error: Connection dropped (ECONNRESET)" ->
+              # UnknownApiError; a relay 429 -> ApiRateLimitError): the authoring agent never got to work
+              "UnknownApiError", "ApiRateLimitError", "RateLimitError", "NetworkConnectionError"}
 _INFRA_MODEL = re.compile(r"^model_error:[^:]+:(network|stream|empty)$")
 
 

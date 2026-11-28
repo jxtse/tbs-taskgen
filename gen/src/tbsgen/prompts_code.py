@@ -3,7 +3,7 @@
 from .prompts import ASSUMPTION_RULES, GRADING_RULES
 
 LEGACY_CODE_PROMPT_VERSION = "cg-v6-2026-11-25"
-CODE_PROMPT_VERSION = "cg-v7-2026-11-25"
+CODE_PROMPT_VERSION = "cg-v8-2026-11-29"
 
 S4C_RUNNABILITY = """# Runnability check of a paper's published code ({item})
 
@@ -217,6 +217,15 @@ paper's principle) and change the task so that the decisive part needs what the 
 the generic method breaks, residual structure that matters for the score, a disclosed hidden shift, a per-object /
 per-parameter criterion on the scientifically hard object, a setting that must be estimated, ...).  Rules:
 - Keep it the same paper and the same core scientific problem; keep the statement complete and fair.
+- **Edit the previous version, do not rewrite it.**  Start from `/work/previous_version/task/` and change only what
+  the new difficulty needs.  Every other sentence of `instruction.md`, the input / output schema (file names,
+  column names, units), the definitions of the scored quantities and the data notes stay as they were unless the
+  change itself requires them to change; when one must change, change it in every place it appears (statement,
+  generator, reference, metric script).
+- `/work/previous_version/review_issues.json` (if present) lists what earlier reviews of this task found and what
+  was fixed.  Every one of those fixes must still hold in the new version: do not reintroduce an issue.
+- Before you finish, check the final `instruction.md` line by line against what the generator writes (columns,
+  files, units), what the reference computes and what the metric script scores; fix any mismatch.
 - **Not allowed**: only tightening thresholds or moving them towards the reference (thresholds are derived by the
   pipeline from your measured reference / mid / naive values, with the usual separation rules), making the wording
   vaguer, hiding requirements, format traps, shortening the time limit, inflating data sizes without a scientific
@@ -243,6 +252,15 @@ task so that the decisive part needs what the paper really does (a regime where 
 structure that matters for the score, a disclosed hidden shift, a per-object / per-parameter criterion on the
 scientifically hard object, a setting that must be estimated, ...).  Rules:
 - Keep it the same paper and the same core scientific problem; keep the statement complete and fair.
+- **Edit the previous version, do not rewrite it.**  Start from `/work/previous_version/task/` and change only what
+  the new difficulty needs.  Every other sentence of `instruction.md`, the input / output schema (file names,
+  column names, units), the definitions of the scored quantities and the data notes stay as they were unless the
+  change itself requires them to change; when one must change, change it in every place it appears (statement,
+  generator, reference, metric script).
+- `/work/previous_version/review_issues.json` (if present) lists what earlier reviews of this task found and what
+  was fixed.  Every one of those fixes must still hold in the new version: do not reintroduce an issue.
+- Before you finish, check the final `instruction.md` line by line against what the generator writes (columns,
+  files, units), what the reference computes and what the metric script scores; fix any mismatch.
 - **Not allowed**: only tightening thresholds or moving them towards the reference (thresholds are derived by the
   pipeline from your measured reference / mid / naive values, with the usual separation rules), making the wording
   vaguer, hiding requirements, format traps, shortening the time limit, inflating data sizes without a scientific

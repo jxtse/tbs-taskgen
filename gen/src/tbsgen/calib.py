@@ -108,11 +108,14 @@ def frontier_evidence(runs: list[dict], cfg: dict) -> dict:
                 teacher_result_types=[r.get("result_type") for r in dec])
 
 
-def next_action(runs: list[dict], cfg: dict) -> tuple[str, str | None]:
+def next_action(runs: list[dict], cfg: dict, hardened: bool = False) -> tuple[str, str | None]:
     """runs: [{"who": "glm"|"teacher", "outcome": "pass"|"fail"|"infra", "minutes": float,
     "result_type": optional}] in order.
     Returns ("run", "glm"|"teacher") or ("label", "hard"|"unstable"|"easy"|"frontier"|"parked:<why>").
-    (The hardening loop -- difficulty.should_harden -- is checked by S9 before this rule.)"""
+    (The hardening loop -- difficulty.should_harden -- is checked by S9 before this rule.)
+    hardened: the current version was built by a hardening / S9b round.  Its first student failure is not enough
+    evidence (it may come from a defect the re-authoring introduced): the student runs again
+    (calib.hardened_min_student_runs decisive runs) before the teacher; a pass among them labels it unstable."""
     c = cfg["calib"]
     try:
         real = decisive_runs(runs, cfg)
@@ -141,6 +144,12 @@ def next_action(runs: list[dict], cfg: dict) -> tuple[str, str | None]:
     tea = [r for r in real if r["who"] == "teacher"]
     if not glm:
         return "run", "glm"
+    need = int(c.get("hardened_min_student_runs", 1) or 1) if hardened else 1
+    if glm[0]["outcome"] == "fail" and need > 1:
+        if any(g["outcome"] == "pass" for g in glm):
+            return "label", "unstable"          # the student solved the hardened version once: GLM 1/2
+        if len(glm) < need:
+            return "run", "glm"                 # (also when a teacher run already exists: the label waits)
     if glm[0]["outcome"] == "fail":
         if any(t["outcome"] == "pass" for t in tea):
             return "label", "hard"
